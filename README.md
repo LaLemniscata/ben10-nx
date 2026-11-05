@@ -30,10 +30,10 @@ a native renderer on deko3d, the Switch's own GPU API. It targets **30 FPS at tw
 
 ## How to install
 
-Follow the **[install page](https://lalemniscata.github.io/ben10-nx/)**. In short, on Windows 10 or 11, with about 3 GB
+Follow the **[install page](https://lalemniscata.github.io/ben10-nx/)**. In short, on Windows 10 or 11, with about 4 GB
 free and your own disc image (`.iso`) of the game:
 
-1. **[Download the installer](https://github.com/LaLemniscata/ben10-nx/releases/download/v1.1.1/Ben10-NX-Installer.zip)**
+1. **[Download the installer](https://github.com/LaLemniscata/ben10-nx/releases/download/v1.1.2/Ben10-NX-Installer.zip)**
    and extract the ZIP.
 2. Double-click **Install Ben 10.exe**. Windows may warn about a new, unsigned program: choose "More info", then
    "Run anyway". A page opens in your browser, served only from your own computer.

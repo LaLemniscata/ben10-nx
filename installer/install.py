@@ -45,6 +45,8 @@ COMPILE_MEMORY_BYTES = 700 * 1024 * 1024
 UI_PORT = 47123
 IDLE_EXIT_SECONDS = 180  # a browser may wake a background tab only once a minute
 COPY_BLOCK_BYTES = 4 * 1024 * 1024
+MAX_ISO_BYTES = 2 * 1024 * 1024 * 1024  # a PSP disc holds 1.8 GB
+FREE_BYTES_NEEDED = 3 * 1024 * 1024 * 1024
 
 TOOLCHAIN_URL = ("https://developer.arm.com/-/media/Files/downloads/gnu/15.2.rel1/binrel/"
                  "arm-gnu-toolchain-15.2.rel1-mingw-w64-x86_64-aarch64-none-elf.zip")
@@ -64,7 +66,8 @@ ERRORS = {
         "wrong_game": "This disc is {found}. The port needs {wanted}, the American edition of the game.",
         "wrong_version": "This copy's game program differs from the supported one. The supported copy is {wanted}, version 1.01. Your file may be a different version, or damaged.",
         "download": "The compiler could not be downloaded from Arm's website. Check your internet connection and try again.",
-        "disk": "There is not enough free space on this drive. The installer needs about 3 GB.",
+        "disk": "There is not enough free space on this drive. The installer needs about 4 GB.",
+        "receive": "The file could not be read. Try choosing it again.",
         "step": "This step failed. The details are in the log.",
         "sd_space": "The card does not have enough free space: {needed} MB are needed.",
         "sd_write": "The files could not be copied to the card. Check that it is connected and not locked.",
@@ -74,7 +77,8 @@ ERRORS = {
         "wrong_game": "Este disco é {found}. O port precisa de {wanted}, a edição americana do jogo.",
         "wrong_version": "O programa do jogo nesta cópia é diferente do suportado. A cópia suportada é {wanted}, versão 1.01. O arquivo pode ser de outra versão ou estar danificado.",
         "download": "Não foi possível baixar o compilador do site da Arm. Confira sua internet e tente de novo.",
-        "disk": "Não há espaço livre suficiente nesta unidade. O instalador precisa de cerca de 3 GB.",
+        "disk": "Não há espaço livre suficiente nesta unidade. O instalador precisa de cerca de 4 GB.",
+        "receive": "Não foi possível ler o arquivo. Tente escolher de novo.",
         "step": "Esta etapa falhou. Os detalhes estão no log.",
         "sd_space": "O cartão não tem espaço livre suficiente: são necessários {needed} MB.",
         "sd_write": "Não foi possível copiar os arquivos para o cartão. Confira se ele está conectado e destravado.",
@@ -168,6 +172,7 @@ class Iso:
         self.handle.seek(16 * SECTOR)
         descriptor = self.handle.read(SECTOR)
         if descriptor[1:6] != b"CD001":
+            self.handle.close()
             raise ValueError("no ISO 9660 volume")
         self.root = self._record(descriptor[156:190])
 
@@ -212,13 +217,17 @@ def disc_id(iso):
 
 
 def check_iso(path):
+    iso = None
     try:
         iso = Iso(path)
         found = disc_id(iso)
     except (OSError, ValueError, struct.error) as error:
+        if iso:
+            iso.handle.close()
         log(f"not a disc image: {error}")
         raise InstallError("not_iso") from error
     if found != TITLE["disc_id"]:
+        iso.handle.close()
         raise InstallError("wrong_game", found=found, wanted=TITLE["disc_id"])
     return iso
 
@@ -497,7 +506,8 @@ def clean_work():
     """The translated game and the compiler are no longer needed, and the first must not linger."""
     for name in ("input", "package", "obj", "tc"):
         shutil.rmtree(WORK / name, ignore_errors=True)
-    for name in ("ben10-psp.elf", "ben10-psp.nro", "objects.rsp"):
+    # The output folder's game.iso is a link to or a copy of work/game.iso, so it stays.
+    for name in ("ben10-psp.elf", "ben10-psp.nro", "objects.rsp", "game.iso", "game.iso.part"):
         (WORK / name).unlink(missing_ok=True)
 
 
@@ -575,6 +585,7 @@ def pipeline(iso_path, keep_work=False):
         iso = check_iso(iso_path)
         stage_toolchain()
         stage_extract(iso)
+        iso.handle.close()
         stage_translate()
         objects = stage_compile()
         nro = stage_link(objects)
@@ -595,19 +606,36 @@ def pipeline(iso_path, keep_work=False):
         STATE.set(screen="failed", error=ERRORS[LANG]["step"])
 
 
-def choose_iso():
-    script = ("Add-Type -AssemblyName System.Windows.Forms;"
-              "$o=New-Object System.Windows.Forms.Form;$o.TopMost=$true;"
-              "$d=New-Object System.Windows.Forms.OpenFileDialog;"
-              "$d.Filter='PSP disc image (*.iso)|*.iso';"
-              "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
-              "if($d.ShowDialog($o) -eq 'OK'){$d.FileName}")
-    done = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", script], capture_output=True, text=True,
-                          encoding="utf-8-sig", creationflags=subprocess.CREATE_NO_WINDOW, stdin=subprocess.DEVNULL)
-    return done.stdout.strip()
+def receive_iso(stream, length):
+    """Take the disc image the page hands over, from the browser's own file dialog, into work/.
+
+    A web page never learns a file's path, so the image comes through this computer's local connection.
+    """
+    if not 0 < length <= MAX_ISO_BYTES:
+        raise InstallError("not_iso")
+    if shutil.disk_usage(ROOT).free < length + FREE_BYTES_NEEDED:
+        raise InstallError("disk")
+    WORK.mkdir(parents=True, exist_ok=True)
+    partial = WORK / "game.iso.part"
+    left = length
+    with open(partial, "wb") as out:
+        while left:
+            block = stream.read(min(left, COPY_BLOCK_BYTES))
+            if not block:
+                raise OSError("the page stopped sending")
+            out.write(block)
+            left -= len(block)
+    try:
+        check_iso(partial).handle.close()
+    except InstallError:
+        partial.unlink()
+        raise
+    received = WORK / "game.iso"
+    partial.replace(received)
+    return received
 
 
-PICKING = threading.Lock()
+RECEIVING = threading.Lock()
 
 
 class Page(http.server.BaseHTTPRequestHandler):
@@ -653,19 +681,21 @@ class Page(http.server.BaseHTTPRequestHandler):
             self._send(b"{}", status=403)
             return
         snapshot = STATE.snapshot()
-        if url.path == "/pick" and snapshot["screen"] == "welcome":
-            # A second click while the file dialog is open must not bring up another one.
-            if PICKING.acquire(blocking=False):
+        if url.path == "/upload" and snapshot["screen"] == "welcome":
+            if RECEIVING.acquire(blocking=False):
+                STATE.set(iso="", iso_name="", error="")
                 try:
-                    chosen = choose_iso()
-                    if chosen:
-                        try:
-                            check_iso(chosen)
-                            STATE.set(iso=chosen, iso_name=Path(chosen).name, error="")
-                        except InstallError as error:
-                            STATE.set(iso="", iso_name="", error=str(error))
+                    length = int(self.headers.get("Content-Length") or 0)
+                    received = receive_iso(self.rfile, length)
+                    name = Path(query.get("name", ["game.iso"])[0]).name[:200]
+                    STATE.set(iso=str(received), iso_name=name)
+                except InstallError as error:
+                    STATE.set(error=str(error))
+                except (OSError, ValueError) as error:
+                    log(f"receiving the disc image failed: {error}")
+                    STATE.set(error=ERRORS[LANG]["receive"])
                 finally:
-                    PICKING.release()
+                    RECEIVING.release()
         elif url.path == "/start" and snapshot["iso"] and snapshot["screen"] in ("welcome", "failed"):
             STATE.set(screen="working", error="", stage="compiler", fraction=0.0, detail="")
             threading.Thread(target=pipeline, args=(snapshot["iso"], self.keep_work), daemon=True).start()

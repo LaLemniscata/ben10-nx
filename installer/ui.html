@@ -83,10 +83,16 @@
     <p class="muted" data-t="welcome_note"></p>
     <div class="file" id="chosen" hidden></div>
     <div class="error" id="welcome_error" hidden></div>
+    <div id="upload" hidden>
+      <p style="margin:14px 0 0" data-t="uploading"></p>
+      <div class="bar"><i id="uploadbar"></i></div>
+    </div>
+    <input type="file" id="file" accept=".iso" hidden>
     <div class="actions">
       <button id="pick" class="primary" data-t="pick"></button>
       <button id="start" class="primary" data-t="start" hidden></button>
     </div>
+    <p class="muted" id="drag" style="margin:12px 0 0" data-t="drag"></p>
   </section>
 
   <section id="working" hidden>
@@ -134,8 +140,9 @@ const TEXT = {
     closed_text: 'This page has stopped working. Open Install Ben 10 again to continue, and you can close this tab.',
     welcome_title: 'Choose the game file',
     welcome_text: 'Select the .iso file of Ben 10: Protector of Earth for PSP, American version (code ULUS10307). You need to have this file on your PC.',
-    welcome_note: 'This page runs only on your computer, which is why its address starts with 127.0.0.1. Your game is not sent anywhere. The program downloads one thing: Arm\'s free compiler, about 170 MB.',
+    welcome_note: 'This page runs only on your computer, which is why its address starts with 127.0.0.1. Your game does not leave this computer. The program downloads one thing: Arm\'s free compiler, about 170 MB.',
     pick: 'Choose the .iso file', pick_other: 'Choose another', start: 'Build the port',
+    drag: 'You can also drag the file onto this page.', uploading: 'Checking the file...',
     working_title: 'Building your port',
     working_text: 'This takes 5 to 30 minutes, and the computer will be busy. You can leave this page open and do something else.',
     s_compiler: 'Getting the compiler', s_decrypt: 'Reading the game from your disc', s_translate: 'Translating the game',
@@ -155,8 +162,9 @@ const TEXT = {
     closed_text: 'Esta página parou de funcionar. Abra o Install Ben 10 de novo para continuar. Esta aba pode ser fechada.',
     welcome_title: 'Escolha o arquivo do jogo',
     welcome_text: 'Selecione o arquivo .iso do Ben 10: Protector of Earth de PSP, versão americana (código ULUS10307). Você precisa ter esse arquivo no seu PC.',
-    welcome_note: 'Esta página roda só no seu computador, por isso o endereço começa com 127.0.0.1. Seu jogo não é enviado para lugar nenhum. O programa só baixa uma coisa: o compilador gratuito da Arm, de cerca de 170 MB.',
+    welcome_note: 'Esta página roda só no seu computador, por isso o endereço começa com 127.0.0.1. Seu jogo não sai deste computador. O programa só baixa uma coisa: o compilador gratuito da Arm, de cerca de 170 MB.',
     pick: 'Escolher o arquivo .iso', pick_other: 'Escolher outro', start: 'Gerar o port',
+    drag: 'Você também pode arrastar o arquivo para esta página.', uploading: 'Conferindo o arquivo...',
     working_title: 'Gerando o seu port',
     working_text: 'Isso leva de 5 a 30 minutos, e o computador vai ficar ocupado. Pode deixar esta página aberta e fazer outra coisa.',
     s_compiler: 'Obtendo o compilador', s_decrypt: 'Lendo o jogo do seu disco', s_translate: 'Traduzindo o jogo',
@@ -228,12 +236,16 @@ function renderDrives(state) {
 function render(state) {
   if (state.lang !== lang) { lang = state.lang; applyText(); }
   ['welcome', 'working', 'failed', 'done'].forEach(id => { $(id).hidden = state.screen !== id; });
-  $('chosen').hidden = !state.iso_name;
+  screen = state.screen;
+  $('upload').hidden = !uploading;
+  $('chosen').hidden = !state.iso_name || uploading;
   $('chosen').textContent = state.iso_name;
-  $('start').hidden = !state.iso;
+  $('start').hidden = !state.iso || uploading;
+  $('pick').hidden = uploading;
+  $('drag').hidden = uploading || Boolean(state.iso);
   $('pick').className = state.iso ? '' : 'primary';
   $('pick').textContent = TEXT[lang][state.iso ? 'pick_other' : 'pick'];
-  $('welcome_error').hidden = !state.error;
+  $('welcome_error').hidden = !state.error || uploading;
   $('welcome_error').textContent = state.error;
   $('failed_error').textContent = state.error;
   if (state.screen === 'working') renderSteps(state);
@@ -274,7 +286,27 @@ async function poll() {
 
 $('cover').src = `/cover.jpg?t=${token}`;
 applyText();
-$('pick').addEventListener('click', () => api('/pick'));
+let uploading = false;
+let screen = 'welcome';
+
+// The browser's own dialog always opens in front of the page, and it hands over the file, not its path.
+function sendFile(file) {
+  if (!file || uploading || screen !== 'welcome') return;
+  uploading = true;
+  $('uploadbar').style.width = '0';
+  const request = new XMLHttpRequest();
+  request.open('POST', `/upload?t=${token}&name=${encodeURIComponent(file.name)}`);
+  request.upload.onprogress = event => {
+    if (event.lengthComputable) $('uploadbar').style.width = `${event.loaded / event.total * 100}%`;
+  };
+  request.onloadend = () => { uploading = false; };
+  request.send(file);
+}
+
+$('pick').addEventListener('click', () => $('file').click());
+$('file').addEventListener('change', () => { sendFile($('file').files[0]); $('file').value = ''; });
+document.addEventListener('dragover', event => event.preventDefault());
+document.addEventListener('drop', event => { event.preventDefault(); sendFile(event.dataTransfer.files[0]); });
 $('start').addEventListener('click', () => api('/start'));
 $('retry').addEventListener('click', () => api('/start'));
 $('showlog').addEventListener('click', () => api('/log'));
