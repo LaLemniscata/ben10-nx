@@ -26,6 +26,9 @@
   main { width: 100%; max-width: 560px; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 28px; }
   header { display: flex; align-items: center; gap: 16px; margin-bottom: 22px; }
   header img { width: 64px; height: 64px; border-radius: 12px; }
+  .lang { margin-left: auto; align-self: flex-start; display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .lang button { border: 0; border-radius: 0; padding: 4px 10px; font-size: 13px; font-weight: 500; color: var(--muted); }
+  .lang button[aria-pressed="true"] { background: var(--soft); color: var(--ink); font-weight: 650; }
   h1 { font-size: 20px; line-height: 1.25; margin: 0; font-weight: 650; }
   header p { margin: 2px 0 0; color: var(--muted); font-size: 14px; }
   h2 { font-size: 17px; margin: 0 0 6px; font-weight: 600; }
@@ -69,6 +72,10 @@
     <div>
       <h1>Ben 10: Protector of Earth</h1>
       <p data-t="subtitle"></p>
+    </div>
+    <div class="lang" role="group" aria-label="Language">
+      <button type="button" data-l="en" aria-pressed="true">EN</button>
+      <button type="button" data-l="pt" aria-pressed="false">PT</button>
     </div>
   </header>
 
@@ -189,6 +196,7 @@ function api(path) { return fetch(`${path}${path.includes('?') ? '&' : '?'}t=${t
 
 function applyText() {
   document.documentElement.lang = lang === 'pt' ? 'pt-BR' : 'en';
+  document.querySelectorAll('.lang button').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.l === lang)));
   document.querySelectorAll('[data-t]').forEach(node => { node.textContent = TEXT[lang][node.dataset.t]; });
   $('steps').replaceChildren(...STEPS.map(step => {
     const row = document.createElement('li');
@@ -303,6 +311,7 @@ function sendFile(file) {
   request.send(file);
 }
 
+document.querySelectorAll('.lang button').forEach(button => button.addEventListener('click', () => api(`/lang?l=${button.dataset.l}`)));
 $('pick').addEventListener('click', () => $('file').click());
 $('file').addEventListener('change', () => { sendFile($('file').files[0]); $('file').value = ''; });
 document.addEventListener('dragover', event => event.preventDefault());

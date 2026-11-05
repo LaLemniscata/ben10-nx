@@ -86,13 +86,8 @@ ERRORS = {
 }
 
 
-def language():
-    if os.name == "nt":
-        return "pt" if (ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF) == 0x16 else "en"
-    return "pt" if os.environ.get("LANG", "").startswith("pt") else "en"
-
-
-LANG = language()
+# English unless the page switches to Portuguese; messages are written in the language set when they occur.
+LANG = "en"
 
 
 class InstallError(Exception):
@@ -675,6 +670,7 @@ class Page(http.server.BaseHTTPRequestHandler):
             self._send(b"{}", status=404)
 
     def do_POST(self):
+        global LANG  # the page's language switch changes it
         url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(url.query)
         if not self._allowed(query):
@@ -703,6 +699,9 @@ class Page(http.server.BaseHTTPRequestHandler):
             letter = query.get("drive", [""])[0][:1].upper()
             if letter.isalpha():
                 threading.Thread(target=copy_to_card, args=(letter,), daemon=True).start()
+        elif url.path == "/lang" and query.get("l", [""])[0] in ERRORS:
+            LANG = query["l"][0]
+            STATE.set(lang=LANG)
         elif url.path == "/folder" and snapshot["screen"] == "done":
             os.startfile(OUTPUT)
         elif url.path == "/log":
