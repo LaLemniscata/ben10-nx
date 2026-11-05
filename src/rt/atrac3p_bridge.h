@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 the Nakagawa Recomp authors
+
+/*
+ * atrac3p_bridge.h — Nakagawa-authored PSP ATRAC3+ and plain-AT3 bridges.
+ *
+ * Owns distinct standalone decoder instances for ATRAC3+ and plain AT3
+ * (src/rt/atrac3p/, FFmpeg n4.4), and exposes each codec's frame contract to
+ * the HLE ring model: blockAlign-sized input and interleaved s16 output.
+ *
+ * This file is Nakagawa-authored and is not a PPSSPP code translation.
+ * It is the thin integration layer over the project's own FFmpeg n4.4
+ * import; PPSSPP was consulted only as historical/comparative provenance
+ * for the #286 decision record. The decoder itself is byte-exact FFmpeg
+ * n4.4 (LGPL-2.1-or-later, see src/rt/atrac3p/PROVENANCE.md).
+ *
+ * Failure contract (no fake PCM): every decode either succeeds with its
+ * codec-specific sample count, or returns a negative AVERROR_* code with
+ * *samples_out left at 0.
+ *
+ * Thread-safety: distinct instances are independent; a single instance is
+ * single-threaded by contract (same as the PR-A API).
+ */
+
+#ifndef SR_ATRAC3P_BRIDGE_H
+#define SR_ATRAC3P_BRIDGE_H
+
+#include <stdint.h>
+
+/* The bridge's own interface needs only <stdint.h>: a caller that also uses the decoder's
+ * constants (ATRAC3P_FRAME_SAMPLES, ATRAC3P_MAX_CHANNELS, ...) includes atrac3p/atrac3p_api.h,
+ * which needs the FFmpeg subset's include paths; this header does not, so any runtime unit can
+ * include it. */
+
+/* Opaque bridge instance. NULL is never a valid instance. */
+typedef struct Atrac3pBridge Atrac3pBridge;
+
+/*
+ * Create a decoder instance for the PSP stream configuration.
+ *
+ *   channels    - 1, 2, 3, 4, 6, 7 or 8 (PSP ATRAC3+ streams)
+ *   block_align - positive frame size in bytes (RIFF fmt blockAlign)
+ *   out         - receives the instance, or NULL on failure
+ *
+ * Returns 0 on success, a negative AVERROR_* code otherwise.
+ */
+int atrac3p_bridge_create(int channels, int block_align, Atrac3pBridge **out);
+
+/*
+ * Decode one frame to interleaved signed-16 PCM.
+ *
+ *   frame       - exactly block_align bytes of ATRAC3+ data
+ *   frame_size  - must equal the block_align passed at create time
+ *   pcm_out     - capacity channels * ATRAC3P_FRAME_SAMPLES int16 values
+ *   samples_out - ATRAC3P_FRAME_SAMPLES on success, 0 on failure
+ *
+ * Returns 0 on success or a negative AVERROR_* code on failure. Output is
+ * deterministic (bit-exact decoder). A decoder failure is latched: later
+ * calls return the same error without re-entering mutated decoder state until
+ * atrac3p_bridge_reset() succeeds.
+ */
+int atrac3p_bridge_decode(Atrac3pBridge *b, const uint8_t *frame, int frame_size,
+                          int16_t *pcm_out, int *samples_out);
+
+/*
+ * Reset all decoder history to the post-create state. Used by the HLE for
+ * PSP seek (sceAtracResetPlayPosition) and loop rewind so cross-frame
+ * decoder state cannot leak across a jump. Returns 0 on success.
+ */
+int atrac3p_bridge_reset(Atrac3pBridge *b);
+
+/*
+ * Release the instance. Safe to call with NULL.
+ */
+void atrac3p_bridge_destroy(Atrac3pBridge *b);
+
+/* Plain ATRAC3 has its own RIFF fmt extension and 1024-sample frame contract;
+ * it must not be routed through the ATRAC3+ decoder above. */
+typedef struct Atrac3Bridge Atrac3Bridge;
+int atrac3_bridge_create(int channels, int block_align,
+                         const uint8_t *fmt_extradata, Atrac3Bridge **out);
+int atrac3_bridge_decode(Atrac3Bridge *b, const uint8_t *frame, int frame_size,
+                         int16_t *pcm_out, int *samples_out);
+int atrac3_bridge_reset(Atrac3Bridge *b);
+void atrac3_bridge_destroy(Atrac3Bridge *b);
+
+#endif /* SR_ATRAC3P_BRIDGE_H */

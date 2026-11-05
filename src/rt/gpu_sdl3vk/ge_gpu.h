@@ -1,0 +1,259 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025-2026 the psp-recomp authors
+// Copyright (C) 2026 the Nakagawa Recomp authors
+// Derived from sal063/PSP-recompilation-project (GPL-2.0-or-later)
+// Modified by Nakagawa Recomp contributors, 2026-08-10.
+// See NOTICE.md for upstream lineage and modification provenance.
+
+#ifndef GE_GPU_H
+#define GE_GPU_H
+
+#include <stdint.h>
+#include <stdlib.h>
+
+/* Pure parser for the render-scale environment (Settings > Internal Render
+ * Resolution). The explicit diagnostic SR_GPU_SCALE wins when present; otherwise
+ * the player-facing SR_RESOLUTION_SCALE is used. Values clamp to
+ * [1, max_scale]; missing or non-numeric input yields 1 (native). */
+static inline int sr_parse_render_scale(const char *gpu_scale,
+                                        const char *res_scale,
+                                        int max_scale) {
+    const char *raw = (gpu_scale && gpu_scale[0]) ? gpu_scale : res_scale;
+    if (!raw || !raw[0]) return 1;
+    long parsed = strtol(raw, NULL, 10);
+    if (parsed < 1) return 1;
+    if (max_scale >= 1 && parsed > (long)max_scale) return max_scale;
+    return (int)parsed;
+}
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Create the Vulkan objects (shares the sdl3vk device; sdl3vk_init() must have
+ * succeeded) and register the capture hooks with ge.c. Returns 1 on success; on
+ * failure nothing is registered and the software rasterizer runs unchanged. */
+int  gegpu_init(void);
+
+/* GE sync points ("listend", "loadclut"); the backend decides what each requires.
+ * Safe to call when idle/uninitialized. */
+void gegpu_flush(const char *reason);
+
+/* Present the framebuffer at fbaddr straight from its GPU image. The result is one of:
+ * GEGPU_PRESENT_SHOWN: the frame is on screen.
+ * GEGPU_PRESENT_WINDOW_CLOSED: the user closed the window.
+ * GEGPU_PRESENT_NOT_RESIDENT: no GPU-valid target owns the address (e.g. CPU-written movie
+ *   frames); the caller should convert guest VRAM instead.
+ * GEGPU_PRESENT_TARGET_FAILED: a GPU-valid target exists, but preparing or presenting it failed,
+ *   so its newest pixels may exist only in the GPU image. The caller must make guest VRAM current
+ *   with gegpu_sync_guest_fb() before converting it, or decline the frame.
+ * SHOWN and WINDOW_CLOSED keep the values sdl3vk_present_image_ex() returns for them. */
+#define GEGPU_PRESENT_SHOWN 1
+#define GEGPU_PRESENT_WINDOW_CLOSED 0
+#define GEGPU_PRESENT_NOT_RESIDENT (-1)
+#define GEGPU_PRESENT_TARGET_FAILED (-2)
+int  gegpu_present(unsigned int fbaddr, int fmt, unsigned int stride);
+int  gegpu_capture_materialize(void);
+int  gegpu_replay_reset(void);
+
+/* Complete guest-framebuffer geometry used by the explicit snapshot boundary. The
+ * visible extent is separate from stride because PSP display buffers commonly have
+ * padding columns that are not part of the published image. */
+typedef struct GeGpuFbDescriptor {
+    uint32_t addr;
+    uint32_t format;
+    uint32_t stride;
+    uint32_t width;
+    uint32_t height;
+} GeGpuFbDescriptor;
+
+typedef struct GeGpuFbSpan {
+    uint32_t base;
+    uint32_t bytes_per_pixel;
+    uint32_t row_pitch;
+    uint32_t total_bytes;
+    int in_vram;
+    uint32_t vram_offset;
+} GeGpuFbSpan;
+
+#define GEGPU_FB_MAX_STRIDE 1024u
+#define GEGPU_FB_MAX_HEIGHT 1024u
+#define GEGPU_VRAM_BYTES    0x00200000u
+
+int gegpu_validate_guest_fb_descriptor(const GeGpuFbDescriptor *desc,
+                                       GeGpuFbSpan *out_span, const char **why);
+
+/* Memory type for a host-mapped buffer: `type_flags` are the device's per-type Vulkan
+ * property flags, `allowed_bits` the buffer's memoryTypeBits, and `cpu_reads` nonzero for a
+ * buffer the GPU copies into for the CPU to read. Returns UINT32_MAX when no allowed type is
+ * host-visible and host-coherent. */
+uint32_t gegpu_pick_host_mem_type(const uint32_t *type_flags, uint32_t type_count,
+                                  uint32_t allowed_bits, int cpu_reads);
+
+typedef enum GeGpuSyncResult {
+    GEGPU_SYNC_FAILED = -1,
+    GEGPU_SYNC_OK = 1,
+    GEGPU_SYNC_NO_TARGET = 2,
+} GeGpuSyncResult;
+
+/* Materialize a live GPU target into guest memory, or prove that no target owns the
+ * validated span. This is target-scoped and does not make ordinary presentation wait. */
+int gegpu_sync_guest_fb(const GeGpuFbDescriptor *desc);
+
+typedef enum GeGpuReplayBoundaryKind {
+    GEGPU_BOUNDARY_RENDER_SNAPSHOT = 0,
+    GEGPU_BOUNDARY_TEXTURE_UPLOAD,
+    GEGPU_BOUNDARY_TARGET_UPLOAD,
+    GEGPU_BOUNDARY_DEPTH_UPLOAD,
+    GEGPU_BOUNDARY_READBACK,
+    GEGPU_BOUNDARY_PRESENT,
+    GEGPU_BOUNDARY_LIFETIME,
+    GEGPU_BOUNDARY_OTHER,
+    GEGPU_BOUNDARY_COUNT,
+} GeGpuReplayBoundaryKind;
+
+typedef struct GeGpuReplayBoundaryStats {
+    unsigned long long submits;
+    unsigned long long submit_ns;
+    unsigned long long waits;
+    unsigned long long wait_ns;
+} GeGpuReplayBoundaryStats;
+
+typedef enum GeGpuCpuPhase {
+    GEGPU_CPU_STATE_PREP = 0,
+    GEGPU_CPU_STATE_KEY,
+    GEGPU_CPU_PIPELINE_LOOKUP,
+    GEGPU_CPU_PIPELINE_CREATE,
+    GEGPU_CPU_DESCRIPTOR_ALLOC,
+    GEGPU_CPU_DESCRIPTOR_UPDATE,
+    GEGPU_CPU_BIND_RECORD,
+    GEGPU_CPU_OBJECT_LOOKUP,
+    GEGPU_CPU_TEXTURE_DECODE,
+    GEGPU_CPU_TEXTURE_SHADOW,
+    GEGPU_CPU_VERTEX_PREP,
+    GEGPU_CPU_SNAPSHOT_TARGET,
+    GEGPU_CPU_SNAPSHOT_DECISION,
+    GEGPU_CPU_SNAPSHOT_REGION,
+    GEGPU_CPU_SNAPSHOT_METADATA,
+    GEGPU_CPU_COMMAND_RECORD,
+    GEGPU_CPU_MEMCPY,
+    GEGPU_CPU_HEAP,
+    GEGPU_CPU_PHASE_COUNT,
+} GeGpuCpuPhase;
+
+typedef struct GeGpuCpuPhaseStats {
+    unsigned long long calls;
+    unsigned long long ns;
+} GeGpuCpuPhaseStats;
+
+typedef struct GeGpuCpuProfileStats {
+    int enabled;
+    GeGpuCpuPhaseStats phase[GEGPU_CPU_PHASE_COUNT];
+    GeGpuCpuPhaseStats hook_phase[GEGPU_CPU_PHASE_COUNT];
+    unsigned long long hook_calls;
+    unsigned long long hook_submit_ns;
+    unsigned long long hook_wait_ns;
+    unsigned long long state_key_builds;
+    unsigned long long state_cache_hits;
+    unsigned long long state_cache_misses;
+    unsigned long long pipeline_hits;
+    unsigned long long pipeline_misses;
+    unsigned long long pipeline_creations;
+    unsigned long long descriptor_allocations;
+    unsigned long long descriptor_updates;
+    unsigned long long pipeline_binds;
+    unsigned long long pipeline_bind_redundant;
+    unsigned long long descriptor_binds;
+    unsigned long long descriptor_bind_redundant;
+    unsigned long long texture_hits;
+    unsigned long long texture_misses;
+    unsigned long long texture_shadow_checks;
+    unsigned long long texture_shadow_hits;
+    unsigned long long texture_shadow_bytes;
+    unsigned long long snapshot_requests;
+    unsigned long long snapshot_copies;
+    unsigned long long vertex_bytes;
+    unsigned long long memcpy_bytes;
+    unsigned long long target_calls;
+    unsigned long long target_fast_hits;
+    unsigned long long target_acquires;
+    unsigned long long ensure_room_calls;
+    unsigned long long ensure_room_flushes;
+    unsigned long long append_calls;
+    unsigned long long append_compare_calls;
+    unsigned long long append_merges;
+} GeGpuCpuProfileStats;
+
+/* Why a primitive left the Vulkan batch model for ge.c's software rasterizer. */
+enum {
+    GEGPU_FALLBACK_STENCIL, GEGPU_FALLBACK_COLOR_TEST, GEGPU_FALLBACK_LOGIC_OP,
+    GEGPU_FALLBACK_WRITE_MASK, GEGPU_FALLBACK_RAM_FB, GEGPU_FALLBACK_WIDE_STRIDE,
+    GEGPU_FALLBACK_MIPS, GEGPU_FALLBACK_LINE, GEGPU_FALLBACK_POINT, GEGPU_FALLBACK_REASONS
+};
+
+typedef struct GeGpuReplayStats {
+    unsigned long long queue_submits;
+    unsigned long long render_submits;
+    unsigned long long render_waits;
+    unsigned long long render_wait_ns;
+    unsigned long long snapshot_requests;
+    unsigned long long snapshot_copies;
+    unsigned long long snapshot_copy_px;   /* device pixels those copies moved */
+    /* Primitives drawn by ge.c's software rasterizer inside the GPU path, and the
+     * fallbacks that took a GPU-valid colour target back to guest VRAM (a synchronous
+     * colour and depth readback each), by reason: GEGPU_FALLBACK_*. */
+    unsigned long long fallback_prims;
+    unsigned long long fallback_readbacks[9];
+    /* Stencil primitives that started a new batch because their box met the batch's
+     * earlier primitives and the state reads what it writes (a snapshot copy between). */
+    unsigned long long stencil_splits;
+    /* Stencil state builds that need no destination read (stencil_fixed_alpha in ge_gpu.c):
+     * the colour takes the fixed-function path and the stencil is a constant or kept. */
+    unsigned long long stencil_fixed;
+    /* CPU writes into resident targets: each one noted, and the groups applied to an image
+     * when the GE next used the target (one or more patch uploads per group). */
+    unsigned long long cpu_write_notes;
+    unsigned long long cpu_write_syncs;
+    unsigned long long snapshot_submits;
+    unsigned long long snapshot_waits;
+    unsigned long long snapshot_wait_ns;
+    unsigned long long mixed_waits;
+    unsigned long long mixed_wait_ns;
+    unsigned long long mixed_submits;
+    unsigned long long batches;
+    unsigned long long draws;
+    unsigned long long upload_ring_reservations;
+    unsigned long long upload_ring_bytes;
+    unsigned long long upload_ring_wraps;
+    unsigned long long upload_ring_fallbacks;
+    unsigned long long upload_ring_high_water;
+    GeGpuReplayBoundaryStats boundary[GEGPU_BOUNDARY_COUNT];
+} GeGpuReplayStats;
+
+void gegpu_replay_stats_reset(void);
+void gegpu_replay_stats_get(GeGpuReplayStats *out);
+void gegpu_cpu_profile_stats_get(GeGpuCpuProfileStats *out);
+
+/* Selftest entry points: defined only in selftest builds (see ge_gpu.c), but
+ * declared unconditionally so no translation unit ever sees an implicit
+ * declaration under any flag combination. */
+int gegpu_coherence_selftest(void);
+/* Ace Mode's texture filtering (src/rt/ace.h): the anisotropy level the renderer uses (0 in an
+ * authentic run), the anisotropic samplers it has made, and its texture descriptor pool's
+ * size. Invariant A2: an authentic run makes none and keeps MAX_TEX sets. */
+typedef struct {
+    int af;
+    unsigned long long af_samplers;
+    unsigned tex_pool_sets;
+} GeGpuAceStats;
+void gegpu_ace_stats(GeGpuAceStats *out);
+int gegpu_snapshot_sync_selftest(void);
+int gegpu_ace_af_selftest(void);   /* 1 pass, 0 fail, 77 no anisotropic filtering */
+
+void gegpu_shutdown(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

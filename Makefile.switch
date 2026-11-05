@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Nintendo Switch build of one recompiled title, for WSL or Linux with devkitA64 and libnx.
+#
+#   make -f Makefile.switch -j8 PACKAGE_DIR=/path/to/package
+#
+# PACKAGE_DIR is a package built by the desktop player: <TITLE>_recomp*.c, sr_title_config.h. Its
+# generated C comes from your own game: never publish it or the .nro this produces.
+ifeq ($(strip $(DEVKITPRO)),)
+$(error DEVKITPRO is not set. Run: export DEVKITPRO=/opt/devkitpro)
+endif
+
+comma := ,
+PACKAGE_DIR ?= $(error PACKAGE_DIR is required)
+TITLE       ?= experimental-ulus10307
+ENTRY       ?= 0x088994d4
+APP_NAME    ?= Ben 10: Protector of Earth
+APP_AUTHOR  ?= LaLemniscata
+APP_VERSION ?= 1.0.0
+BUILD       := build_switch
+TARGET      := ben10-psp
+
+PREFIX  := $(DEVKITPRO)/devkitA64/bin/aarch64-none-elf-
+CC      := $(PREFIX)gcc
+ARCH    := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
+OPT_RT  ?= -O2
+OPT_GEN ?= -O2
+
+COMMON  := $(ARCH) -ffunction-sections -D__SWITCH__ -fno-strict-aliasing -w -include src/rt/switch/nk_switch_compat.h
+DEFS    := -DSR_FLIGHT_RECORDER_LINKED -DPERF_AOT_INSTRUCTIONS=0 -DSR_PUBLIC_SAFE -DSR_H264_FFMPEG -DSR_CORO_BACKEND_ASM
+RT_INC  := -Isrc/rt/switch/sdl_shim -Isrc/rt/switch -Isrc/rt -Isrc/core -Isrc/ui -Isrc/rt/overlay -Ithird_party/clay \
+           -Isrc/rt/atrac3p -Isrc/rt/atrac3p/libavcodec -Isrc/rt/atrac3p/libavutil -I$(PACKAGE_DIR) \
+           -I$(DEVKITPRO)/libnx/include
+# -ffp-contract=off: the PSP rounds a product before adding it, so guest arithmetic must not fuse.
+RT_FLAGS := $(COMMON) -ffp-contract=off $(OPT_RT) $(DEFS) $(RT_INC) -DNK_SWITCH_TITLE=\"$(TITLE)\" -DNK_SWITCH_ENTRY=\"$(ENTRY)\"
+
+H264_FLAGS := $(COMMON) -O2 -std=gnu11 -DSR_PUBLIC_SAFE -DSR_H264_FFMPEG -DHAVE_AV_CONFIG_H -D_ISOC99_SOURCE \
+              -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -Isrc/rt/h264_ffmpeg_sub -Isrc/rt \
+              -I$(DEVKITPRO)/libnx/include -include src/rt/h264_ffmpeg_sub/nk_h264_symbols.h
+
+GEN_FLAGS := $(ARCH) -ffunction-sections -D__SWITCH__ -w -fno-strict-aliasing -fno-var-tracking -ffp-contract=off $(OPT_GEN) -DSR_FLIGHT_RECORDER_LINKED \
+             -include src/rt/switch/nk_switch_compat.h \
+             -I$(PACKAGE_DIR) -Isrc/rt/switch/sdl_shim -Isrc/rt -I$(DEVKITPRO)/libnx/include
+
+RT_SRCS   := $(shell tr -d '\r' < src/rt/switch/sources.txt) src/rt/ge.c
+ATRAC_SRCS := $(shell tr -d '\r' < CMakeLists.txt | grep -oE '^[[:space:]]*src/rt/atrac3p/[^ ]+\.c' | tr -d ' ' | sort -u)
+H264_SRCS := $(shell tr -d '\r' < CMakeLists.txt | grep -oE '^[[:space:]]*src/rt/h264_ffmpeg_sub/[^ ]+\.c' | tr -d ' ' | sort -u)
+GEN_SRCS  := $(wildcard $(PACKAGE_DIR)/$(TITLE)_recomp.c $(PACKAGE_DIR)/$(TITLE)_recomp_*.c $(PACKAGE_DIR)/nk_lib_*.c)
+
+RT_OBJS    := $(addprefix $(BUILD)/,$(RT_SRCS:.c=.o))
+ATRAC_OBJS := $(addprefix $(BUILD)/,$(ATRAC_SRCS:.c=.o))
+H264_OBJS  := $(addprefix $(BUILD)/,$(H264_SRCS:.c=.o))
+GEN_OBJS   := $(patsubst $(PACKAGE_DIR)/%.c,$(BUILD)/gen/%.o,$(GEN_SRCS))
+# The renderer's shaders, compiled by uam and linked into the program.
+SHADERS    := ge_dk.vert ge_dk_tnl.vert ge_dk.frag ge_dk_fast.frag ge_dk_fast_at.frag present.vert present.frag
+SHADER_OBJS := $(addprefix $(BUILD)/shaders/,$(subst .,_,$(SHADERS:=)))
+SHADER_OBJS := $(addsuffix .dksh.o,$(SHADER_OBJS))
+OBJS       := $(RT_OBJS) $(ATRAC_OBJS) $(H264_OBJS) $(GEN_OBJS) $(SHADER_OBJS)
+
+LDFLAGS := $(ARCH) -specs=$(DEVKITPRO)/libnx/switch.specs -Wl,--wrap=open,--wrap=close,--wrap=dup,--wrap=fstat,--wrap=fsync,--wrap=closedir,--wrap=statvfs \
+           -Wl,-Map,$(BUILD)/$(TARGET).map -L$(DEVKITPRO)/libnx/lib
+LIBS    := -ldeko3d -lnx -lm
+
+# A function order from the profiler is optional, and stays in the build folder because it comes
+# from a run of your game. An icon.jpg there replaces the one in the repository.
+ORDER_FILE := $(wildcard $(BUILD)/hot_order.ld)
+LDFLAGS += $(if $(ORDER_FILE),-Wl$(comma)--section-ordering-file=$(ORDER_FILE))
+ICON_FILE := $(firstword $(wildcard $(BUILD)/icon.jpg) src/rt/switch/icon/icon.jpg)
+
+.PHONY: all clean
+# Keep the compiled shaders, so a changed shader source always rebuilds its object.
+.SECONDARY:
+all: $(TARGET).nro
+
+ifeq ($(strip $(GEN_SRCS)),)
+$(error No $(TITLE)_recomp*.c found in PACKAGE_DIR=$(PACKAGE_DIR))
+endif
+
+$(TARGET).nro: $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).nacp $(ICON_FILE)
+	$(DEVKITPRO)/tools/bin/elf2nro $< $@ --nacp=$(BUILD)/$(TARGET).nacp --icon=$(ICON_FILE)
+	@echo Built $@
+
+$(BUILD)/$(TARGET).nacp: Makefile.switch
+	@mkdir -p $(dir $@)
+	$(DEVKITPRO)/tools/bin/nacptool --create "$(APP_NAME)" "$(APP_AUTHOR)" "$(APP_VERSION)" $@
+
+$(BUILD)/$(TARGET).elf: $(OBJS) $(ORDER_FILE)
+	$(CC) $(LDFLAGS) $(OBJS) $(LIBS) -o $@
+
+# The ge.c and H.264 subset rules come first so their flags win.
+$(BUILD)/src/rt/ge.o: src/rt/ge.c
+	@mkdir -p $(dir $@)
+	$(CC) $(COMMON) -O3 -fno-math-errno -Isrc/rt/switch/sdl_shim -Isrc/rt -I$(DEVKITPRO)/libnx/include -c $< -o $@
+
+# Video and fonts keep their full paths: on the desktop these sit behind the SDL3 build's define.
+$(BUILD)/src/rt/mpeg.o $(BUILD)/src/rt/pgf_public.o: RT_FLAGS += -DSR_SDL3VK
+# driver.c's main becomes the entry switch_main.c calls.
+$(BUILD)/src/rt/driver.o: RT_FLAGS += -Dmain=sr_driver_main
+
+$(H264_OBJS): $(BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(H264_FLAGS) -c $< -o $@
+
+$(filter-out $(BUILD)/src/rt/ge.o,$(RT_OBJS)) $(ATRAC_OBJS): $(BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(RT_FLAGS) -c $< -o $@
+
+$(BUILD)/gen/%.o: $(PACKAGE_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(GEN_FLAGS) -c $< -o $@
+
+# The short fragment shader's alpha-test form is the same source with one switch flipped.
+$(BUILD)/shaders/ge_dk_fast_at_frag.dksh: src/rt/switch/shaders/ge_dk_fast.frag
+	@mkdir -p $(dir $@)
+	sed 's/^#define ALPHA_TEST 0/#define ALPHA_TEST 1/' $< > $(BUILD)/shaders/ge_dk_fast_at.frag
+	$(DEVKITPRO)/tools/bin/uam -s frag -o $@ $(BUILD)/shaders/ge_dk_fast_at.frag
+
+$(BUILD)/shaders/%_vert.dksh: src/rt/switch/shaders/%.vert
+	@mkdir -p $(dir $@)
+	$(DEVKITPRO)/tools/bin/uam -s vert -o $@ $<
+
+$(BUILD)/shaders/%_frag.dksh: src/rt/switch/shaders/%.frag
+	@mkdir -p $(dir $@)
+	$(DEVKITPRO)/tools/bin/uam -s frag -o $@ $<
+
+$(BUILD)/shaders/%.dksh.o: $(BUILD)/shaders/%.dksh
+	$(DEVKITPRO)/tools/bin/bin2s -a 256 $< > $<.s
+	$(CC) $(ARCH) -x assembler -c $<.s -o $@
+
+clean:
+	rm -rf $(BUILD) $(TARGET).nro

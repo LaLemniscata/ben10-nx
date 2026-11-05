@@ -1,0 +1,241 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 the Nakagawa Recomp authors */
+
+#ifndef NK_ISO_H
+#define NK_ISO_H
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+
+#ifndef NK_ISO_NO_PLAYER_EXTRAS
+#include "nk_types.h"
+#include "generated/nk_title_catalog.h"
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Low-level / VFS ISO reader interface */
+typedef struct NkIsoReader NkIsoReader;
+
+typedef struct {
+    char name[256];
+    uint32_t lba;
+    uint32_t size;
+    bool is_directory;
+    bool multi_extent;
+} NkIsoDirEntry;
+
+/* PSP guest-module source roots are traversed recursively with this shared
+ * bound. Depth is measured below SYSDIR/USRDIR; depth 4 includes the observed
+ * USRDIR/DATA/MODULE/MODULE layout (depth 3). */
+#define NK_ISO_MODULE_TREE_MAX_DEPTH 4u
+#define NK_ISO_MODULE_TREE_MAX_DIRECTORIES 1024u
+#ifndef NK_ISO_MODULE_TREE_MAX_PATH_BYTES
+#define NK_ISO_MODULE_TREE_MAX_PATH_BYTES 1200u
+#endif
+
+typedef enum {
+    NK_ISO_MODULE_WALK_OK = 0,
+    NK_ISO_MODULE_WALK_INVALID_ARGUMENT,
+    NK_ISO_MODULE_WALK_DIRECTORY_LIMIT,
+    NK_ISO_MODULE_WALK_PATH_LIMIT,
+    NK_ISO_MODULE_WALK_INVALID_TREE,
+    NK_ISO_MODULE_WALK_CALLBACK_STOPPED
+} NkIsoModuleWalkStatus;
+
+typedef bool (*NkIsoModuleWalkCallback)(const char *member_path,
+                                        const NkIsoDirEntry *entry,
+                                        void *userdata);
+
+/* Open an ISO image for reading. Returns NULL on failure. */
+NkIsoReader *nk_iso_reader_open(const char *iso_path);
+
+/* Close an open ISO reader. */
+void nk_iso_reader_close(NkIsoReader *reader);
+
+/* Resolve a path (e.g. "PSP_GAME/PARAM.SFO") to its extent LBA and size.
+ * If out_is_dir is non-NULL, sets whether it is a directory.
+ * Returns 0 on success, -1 if not found.
+ */
+int nk_iso_reader_lookup(NkIsoReader *reader, const char *path, uint32_t *out_lba, uint32_t *out_size, bool *out_is_dir);
+
+/* Read bytes from extent at lba + offset into dst.
+ * Returns bytes read, or -1 on error.
+ */
+int nk_iso_reader_read(NkIsoReader *reader, uint32_t lba, uint64_t offset, void *dst, uint32_t bytes);
+
+/* Return the directory entry at 0-based index in directory at dir_path.
+ * Returns 1 on success, 0 on end of directory, -1 on invalid / not a directory.
+ */
+int nk_iso_reader_list(NkIsoReader *reader, const char *dir_path, uint32_t index, NkIsoDirEntry *out_entry);
+
+/* Visit files recursively below PSP_GAME/SYSDIR and PSP_GAME/USRDIR. The
+ * walk skips KMODULE subtrees, bounds depth and directory count, and reports
+ * each member's complete ISO path. A callback returning false stops the walk. */
+NkIsoModuleWalkStatus nk_iso_reader_walk_module_tree(
+    NkIsoReader *reader, NkIsoModuleWalkCallback callback, void *userdata);
+
+/* Return volume ID of reader */
+const char *nk_iso_reader_volume_id(const NkIsoReader *reader);
+
+/* Return total file size in bytes */
+uint64_t nk_iso_reader_file_size(const NkIsoReader *reader);
+
+/* Read exactly `bytes` bytes at `offset` from the start of one image (a file or
+ * an ISO extent). Returns false when the range is not fully readable. */
+typedef bool (*NkElfImageRead)(void *context, uint64_t offset, void *dst,
+                               uint32_t bytes);
+
+/* The PSP ELF32/MIPS image layout rule (the shared definition; the Python mirror is
+ * tools/nk_core/iso_inspect.py _elf32_mips_layout_violation). `module` selects the
+ * guest-module entry rule (a PSP PRX needs a code segment, not an e_entry). Returns
+ * NULL when the image is usable, or the name of the first rule it breaks. */
+const char *nk_elf32_mips_layout_violation(NkElfImageRead read, void *context,
+                                           uint64_t image_size, bool module);
+const char *nk_iso_elf32_mips_layout_violation(NkIsoReader *reader, uint32_t lba,
+                                               uint32_t size, bool module);
+bool nk_iso_elf32_mips_layout_usable(NkIsoReader *reader, uint32_t lba,
+                                     uint32_t size, bool module);
+
+#ifndef NK_ISO_NO_PLAYER_EXTRAS
+typedef enum {
+    NK_ISO_EXEC_UNKNOWN = 0,
+    NK_ISO_EXEC_MIPS_ELF32,
+    NK_ISO_EXEC_PSP_ENCRYPTED,
+    NK_ISO_EXEC_SCE_WRAPPER,
+    NK_ISO_EXEC_EMPTY_OR_ZERO,
+    NK_ISO_EXEC_PBP
+} NkIsoExecutableKind;
+
+typedef enum {
+    NK_ISO_EXEC_SELECTION_NONE = 0,
+    NK_ISO_EXEC_SELECTION_EBOOT,
+    NK_ISO_EXEC_SELECTION_BOOT
+} NkIsoExecutableSelection;
+
+typedef struct {
+    NkIsoExecutableKind kind;
+    uint32_t size_bytes;
+    bool present;
+} NkIsoExecutableCandidate;
+
+typedef struct {
+    NkIsoExecutableCandidate eboot;
+    NkIsoExecutableCandidate boot;
+    NkIsoExecutableSelection selected;
+    char selected_path[16];
+    bool boot_fallback;
+} NkIsoExecutableReport;
+
+typedef struct {
+    char disc_id[NK_MAX_DISC_ID_LEN];
+    char title_name[NK_MAX_TITLE_LEN];
+    char disc_version[16];
+    char volume_id[33];
+    int64_t file_size_bytes;
+    bool is_supported;
+    bool param_sfo_parsed;
+    NkIsoExecutableReport executables;
+    char matched_title_id[65];
+    NkGameSupportStatus status;
+    char error_message[256];
+    /* Named format boundary (for example "PBP_PACKAGE_UNSUPPORTED") set beside
+       error_message when the input was identified as a file kind Nakagawa
+       cannot use. Empty for ordinary ISO errors, where the text is the result. */
+    char boundary_code[48];
+    /* The image's root holds a PSP_GAME folder record. A valid ISO9660 image
+       without one is a disc image of something other than a PSP game. */
+    bool has_psp_game_folder;
+    /* The DISC_ID exactly as PARAM.SFO carries it (1 to 31 printable ASCII
+       characters), kept for display and diagnostics. */
+    char sfo_disc_id[NK_MAX_DISC_ID_LEN];
+    /* A disc whose own ID is not a retail ID (a beta, a prototype, an SDK
+       placeholder): disc_id is then the key nk_non_retail_disc_key derived from
+       identity_sha256, the digest of its PARAM.SFO and main executable. */
+    bool non_retail;
+    char identity_sha256[65];
+} NkIsoMetadata;
+
+/* SHA-256 (FIPS 180-4), shared by the disc identity below and the package and
+ * profile identities in nk_title_manifest.c. */
+typedef struct {
+    uint32_t state[8];
+    uint64_t bit_count;
+    uint8_t block[64];
+    size_t block_len;
+} NkSha256;
+void nk_sha256_init(NkSha256 *ctx);
+void nk_sha256_update(NkSha256 *ctx, const uint8_t *data, size_t len);
+void nk_sha256_finish(NkSha256 *ctx, uint8_t digest[32]);
+
+/* Library keys of non-retail discs start with this letter. Retail disc IDs
+ * start with U or N and the project's synthetic IDs with TEST, so a key that
+ * starts with it was always derived from a disc's contents, and the player
+ * labels the disc "Beta / unofficial". The rule and the derivation are
+ * disc_id_library_key and non_retail_disc_key in tools/nk_core/iso_inspect.py;
+ * the two tiers give every disc the same key. */
+#define NK_NON_RETAIL_KEY_PREFIX 'X'
+
+/* Writes the nine-character key of a non-retail disc for its identity digest:
+ * the prefix, then the first eight digest bytes (big-endian) modulo
+ * 26^3 * 10^5 as three letters and five digits. */
+void nk_non_retail_disc_key(const uint8_t digest[32], char out_key[10]);
+
+/* True for a library key nk_non_retail_disc_key made. */
+bool nk_disc_id_is_non_retail_key(const char *disc_id);
+
+/* Inspect a raw PSP ISO9660 disc image directly.
+ * Parses PVD, locates PSP_GAME/PARAM.SFO, extracts metadata,
+ * and matches against the generated native title catalog.
+ */
+NkResult nk_iso_inspect(const char *iso_path, NkIsoMetadata *out_meta);
+
+/* Parse an in-memory PARAM.SFO buffer and extract metadata.
+ * Returns true if valid, false if malformed or duplicate conflict.
+ */
+bool nk_iso_parse_sfo_buffer(const uint8_t *sfo, size_t sfo_size, NkIsoMetadata *meta);
+
+/* Classify PSP_GAME/SYSDIR/EBOOT.BIN and BOOT.BIN using bounded reads from
+ * the ISO. A validated plaintext MIPS ELF32 is selected for analysis; BOOT.BIN
+ * is selected only when EBOOT.BIN is encrypted or zero-filled and BOOT.BIN is
+ * plaintext ELF. */
+NkResult nk_iso_classify_executables(const char *iso_path,
+                                     NkIsoExecutableReport *out_report);
+
+/* Extract a file from an ISO9660 disc image to the host filesystem.
+ * disc_rel_path: path inside ISO (e.g. "PSP_GAME/PARAM.SFO" or "PSP_GAME/ICON0.PNG")
+ * host_dest_path: destination file path on host
+ */
+NkResult nk_iso_extract_file(const char *iso_path, const char *disc_rel_path, const char *host_dest_path);
+
+/* Progress callback used by the first-time setup staging route. The callback
+ * is invoked while a selected file is copied and once more after that file is
+ * closed successfully. Returning false aborts the walk with NK_ERROR_CANCELLED.
+ * `bytes_complete` and `bytes_total` are cumulative across the selected
+ * EBOOT.BIN and the configured loose-content roots found in the ISO. */
+typedef bool (*NkIsoProgressCallback)(const char *relative_path,
+                                      uint64_t bytes_complete,
+                                      uint64_t bytes_total,
+                                      size_t files_complete,
+                                      size_t total_files,
+                                      void *userdata);
+
+/* Extract EBOOT.BIN and any configured loose-content roots found below
+ * PSP_GAME/USRDIR into a caller-owned staging root. Each root is a validated
+ * relative path and is also the destination path below host_root. The ISO is
+ * walked from its own directory records; no host-side directory listing or
+ * external extractor is involved. */
+NkResult nk_iso_extract_game(const char *iso_path, const char *host_root,
+                             const char *const *loose_content_roots,
+                             size_t loose_content_root_count,
+                             NkIsoProgressCallback progress, void *userdata);
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* NK_ISO_H */

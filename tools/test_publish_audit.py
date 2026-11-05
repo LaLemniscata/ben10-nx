@@ -1,0 +1,2577 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+import json
+from pathlib import Path, PurePath
+import re
+import subprocess
+import sys
+import tempfile
+import hashlib
+import os
+import random
+import unittest
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import publication_policy
+import publish_audit
+from nk_core.git_isolation import isolated_git_env, run_git
+
+LF = bytes([10])
+CRLF = bytes([13, 10])
+NUL = bytes([0])
+BOM = bytes([0xEF, 0xBB, 0xBF])
+UTF16LE = bytes([0xFF, 0xFE])
+UTF16BE = bytes([0xFE, 0xFF])
+
+
+
+def hermetic_policy(repo: Path, include_paths, exclude_paths=(), exclude_globs=()) -> tuple[Path, Path]:
+    """Write a valid canonical policy + matching export for a hermetic fixture repo.
+
+    The publication gate fails closed: it refuses to run without a policy, and it
+    rejects any path the policy does not classify. Hermetic fixtures therefore have
+    to declare their own tiny policy, exactly as the real repository does. Returns
+    (policy_path, export_path) for passing to audit_entries().
+    """
+    import publication_policy
+
+    document = {
+        "name": "hermetic-test-profile",
+        "profile_version": "2.0.0",
+        "min_tool_version": "0.4.0",
+        "build_mode": "PUBLIC_SAFE=1",
+        "default_disposition": "REJECT",
+        "exclude_prefixes": [],
+        "exclude_globs": list(exclude_globs),
+        "exclude_paths": list(exclude_paths),
+        "include_paths": sorted(set(include_paths)),
+    }
+    policy_path = repo / "_hermetic_policy.json"
+    policy_path.write_text(json.dumps(document), encoding="utf-8", newline="\n")
+    export_path = repo / "_hermetic_export.json"
+    export_path.write_text(
+        json.dumps({"profile": document["name"],
+                    "policy_sha256": publication_policy.canonical_digest(document)}) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return policy_path, export_path
+
+
+class TestPublishAudit(unittest.TestCase):
+    def test_scratch_git_setup_ignores_inherited_git_dir(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            root = Path(tmp_dir_raw).resolve()
+            scratch = root / "scratch"
+            sacrificial = root / "sacrificial"
+            bootstrap_env = {
+                key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+            }
+            run_git(["init", "-q", str(scratch)], cwd=root, check=True, capture_output=True, env=bootstrap_env)
+            run_git(["init", "-q", str(sacrificial)], cwd=root, check=True, capture_output=True, env=bootstrap_env)
+            config_path = sacrificial / ".git" / "config"
+            before = config_path.read_bytes()
+
+            with mock.patch.dict(os.environ, {"GIT_DIR": str(sacrificial / ".git")}):
+                env = isolated_git_env(root=scratch)
+                run_git(
+                    ["config", "user.name", "Test"],
+                    cwd=scratch,
+                    check=True,
+                    capture_output=True,
+                    env=env,
+                )
+                run_git(
+                    ["config", "user.email", "test@example.com"],
+                    cwd=scratch,
+                    check=True,
+                    capture_output=True,
+                    env=env,
+                )
+
+            after = config_path.read_bytes()
+            self.assertEqual(after, before)
+            self.assertNotIn(b"[user]", after)
+
+    def test_isolated_git_env_drops_repository_selectors_and_config(self):
+        selectors = {
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_DIR",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_INDEX_FILE",
+            "GIT_NAMESPACE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_PREFIX",
+            "GIT_QUARANTINE_PATH",
+            "GIT_SHALLOW_FILE",
+            "GIT_WORK_TREE",
+        }
+        base = {name: "ambient" for name in selectors}
+        base.update({
+            "GIT_CONFIG": "ambient",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "user.name",
+            "GIT_CONFIG_VALUE_0": "Ambient",
+            "GIT_AUTHOR_NAME": "Ambient Author",
+        })
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            root = Path(tmp_dir_raw).resolve() / "scratch"
+            root.mkdir()
+            env = isolated_git_env(base, root=root)
+        for name in selectors - {"GIT_CEILING_DIRECTORIES"}:
+            self.assertNotIn(name, env)
+        self.assertNotIn("GIT_CONFIG", env)
+        # The caller's config entries (user.name=Ambient) are gone; the three left are the
+        # tool's own, which keep auto gc and auto maintenance off, and any detach foreground,
+        # so no detached maintenance outlives a command.
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "3")
+        self.assertEqual(env["GIT_CONFIG_KEY_0"], "gc.auto")
+        self.assertEqual(env["GIT_CONFIG_VALUE_0"], "0")
+        self.assertEqual(env["GIT_CONFIG_KEY_1"], "maintenance.auto")
+        self.assertEqual(env["GIT_CONFIG_VALUE_1"], "false")
+        self.assertEqual(env["GIT_CONFIG_KEY_2"], "gc.autoDetach")
+        self.assertEqual(env["GIT_CONFIG_VALUE_2"], "false")
+        self.assertNotIn("GIT_CONFIG_KEY_3", env)
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(env["GIT_AUTHOR_NAME"], "Nakagawa Recomp Tests")
+        self.assertEqual(env["GIT_COMMITTER_EMAIL"], "tests@nakagawa-recomp.invalid")
+        self.assertEqual(Path(env["GIT_CEILING_DIRECTORIES"]).resolve(), root.parent)
+
+    def test_isolated_git_env_keeps_only_the_index_of_the_inspected_repository(self):
+        """The caller's GIT_INDEX_FILE is kept for its own repository and dropped for any other."""
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            tmp_dir = Path(tmp_dir_raw).resolve()
+            inspected = tmp_dir / "inspected"
+            other = tmp_dir / "other"
+            for repo in (inspected, other):
+                repo.mkdir()
+                run_git(["init", "-q"], repo, check=True)
+            staged_index = str(tmp_dir / "staged-index")
+            env = isolated_git_env(
+                {"GIT_DIR": str(inspected / ".git"), "GIT_INDEX_FILE": staged_index},
+                root=inspected,
+            )
+            self.assertEqual(env["GIT_INDEX_FILE"], staged_index)
+            self.assertNotIn("GIT_DIR", env)
+            env = isolated_git_env(
+                {"GIT_DIR": str(other / ".git"), "GIT_INDEX_FILE": staged_index},
+                root=inspected,
+            )
+            self.assertNotIn("GIT_INDEX_FILE", env)
+
+    def test_forbidden_private_paths_and_formats(self):
+        self.assertIsNotNone(publish_audit._forbidden_path("place_game_here/EBOOT.elf"))
+        self.assertIsNotNone(publish_audit._forbidden_path("notes/EBOOT.BIN.dec.h"))
+        self.assertIsNotNone(publish_audit._forbidden_path("build/hst/hst_recomp_0.c"))
+        self.assertIsNotNone(
+            publish_audit._forbidden_path("OpenGrip_For_Inspiration/functions.csv")
+        )
+        self.assertIsNotNone(
+            publish_audit._forbidden_path("docs/symbol_ref/functions.csv")
+        )
+        self.assertIsNotNone(publish_audit._forbidden_path("assets/game.iso"))
+        self.assertIsNotNone(publish_audit._forbidden_path("tools/vfpu_words.txt"))
+        self.assertIsNotNone(publish_audit._forbidden_path("tools/reference_hashes.json"))
+        self.assertIsNone(publish_audit._forbidden_path("assets/vfpu/table.dat"))
+
+    def test_forbidden_local_symbol_reference(self):
+        # functions.csv is a local-only symbol reference and must be rejected anywhere
+        for path in (
+            "functions.csv",
+            "Functions.csv",
+            "docs/functions.csv",
+            "tools/functions.csv",
+            "sub/dir/functions.csv",
+            "docs/symbol_ref/functions.csv",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNotNone(publish_audit._forbidden_path(path))
+        self.assertEqual(
+            publish_audit._forbidden_path("functions.csv"),
+            "local-only symbol reference",
+        )
+        self.assertEqual(
+            publish_audit._forbidden_path("sub/dir/functions.csv"),
+            "local-only symbol reference",
+        )
+        self.assertEqual(
+            publish_audit._forbidden_path("docs/symbol_ref/functions.csv"),
+            "local-only symbol reference",
+        )
+        # Unrelated public CSV files remain allowed under normal publication policy
+        for path in (
+            "docs/metrics.csv",
+            "fixtures/table.csv",
+            "tools/report.csv",
+            "assets/symbols_public.csv",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(publish_audit._forbidden_path(path))
+
+        # Even when force-staged against .gitignore, functions.csv fails the index audit
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            run_git(["init"], cwd=repo, check=True, capture_output=True)
+            (repo / ".gitignore").write_text("functions.csv\n", encoding="utf-8", newline="\n")
+            (repo / "functions.csv").write_text("nid,name\n0x1234,test_fn\n", encoding="utf-8", newline="\n")
+            run_git(["add", "-f", "functions.csv"], cwd=repo, check=True, capture_output=True)
+            entries = publish_audit._get_git_entries(tracked_only=True, repo_root=repo)
+            self.assertTrue(any(e.path == "functions.csv" for e in entries))
+            policy_path, export_path = hermetic_policy(repo, ["functions.csv"])
+            findings = publish_audit.audit_entries(
+                entries, repo_root=repo, policy_path=policy_path, export_path=export_path
+            )
+            path_findings = [f for f in findings if f.code == "PATH" and f.path == "functions.csv"]
+            self.assertTrue(path_findings)
+            self.assertEqual(path_findings[0].detail, "local-only symbol reference")
+
+    def test_prohibited_extension_passes_only_as_a_pinned_approved_binary(self):
+        # Project-authored PSPDEV build output may carry a guest-executable
+        # suffix, but only as a reviewed release-manifest binary with matching bytes.
+        rel = "fixtures/profile_zero/prebuilt/profile_zero_guest.prx"
+        reason = publish_audit._forbidden_path(rel)
+        self.assertIsNotNone(reason)
+        pinned = "ab" * 32
+        comp = {"disposition": "approved_binary", "hashes": {"sha256": pinned}}
+        self.assertTrue(publish_audit._approved_binary_matches(
+            reason, "approved_binary", comp, pinned))
+        # A different file under the approved name is still a finding.
+        self.assertFalse(publish_audit._approved_binary_matches(
+            reason, "approved_binary", comp, "cd" * 32))
+        # No manifest approval, or no pinned hash, keeps the finding.
+        self.assertFalse(publish_audit._approved_binary_matches(reason, "included", comp, pinned))
+        self.assertFalse(publish_audit._approved_binary_matches(
+            reason, "approved_binary", {"disposition": "approved_binary"}, pinned))
+        # Only the extension rule can be approved; private-path rules never are.
+        self.assertFalse(publish_audit._approved_binary_matches(
+            "private/generated path", "approved_binary", comp, pinned))
+
+    def test_local_only_keystore_path_class_fails_closed(self):
+        # A key file can never be committed or packaged, under
+        # any directory, whatever it is called.
+        for path in (
+            "assets/psp-keyfile.json",
+            "keys/psp-keyfile.json",
+            "docs/example_keystore.json",
+            "tools/backup.keys",
+            "my_key_file",
+            "keys.json",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNotNone(publish_audit._forbidden_path(path))
+        # Outside the forbidden-prefix class, the key-file class names itself.
+        self.assertEqual(
+            publish_audit._forbidden_path("assets/psp-keyfile.json"),
+            "local-only key file",
+        )
+        self.assertEqual(
+            publish_audit._forbidden_path("docs/example_keystore.json"),
+            "local-only key file",
+        )
+        # Engine sources and docs may carry the vocabulary without being key files.
+        for path in (
+            "src/core/nk_psp_keystore.c",
+            "src/core/nk_psp_keystore.h",
+            "tools/nk_core/decrypt_boundary.py",
+            "docs/SETUP.md",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(publish_audit._forbidden_path(path))
+
+    def test_keystore_content_class_covers_any_data_file(self):
+        # A loadable KeyStore always names its format; tracked under any
+        # non-source name it would ship key material, so it fails closed.
+        keystores = '{\n  "format": "nakagawa-psp-keystore-1",\n  "entries": {}\n}\n'
+        self.assertTrue(publish_audit.is_keystore_content("assets/notes.json", keystores))
+        self.assertTrue(publish_audit.is_keystore_content("assets/backup.dat", keystores))
+        # Source and prose files may name the format without carrying keys.
+        self.assertFalse(publish_audit.is_keystore_content("src/core/nk_psp_keystore.c", keystores))
+        self.assertFalse(publish_audit.is_keystore_content("tools/test_psp_decrypt.py", keystores))
+        self.assertFalse(publish_audit.is_keystore_content("docs/SETUP.md", keystores))
+        # Unrelated data without the marker stays allowed.
+        self.assertFalse(publish_audit.is_keystore_content("assets/manifest.json", '{"id": "x"}\n'))
+
+    def test_direct_private_key_assignment_is_detected_without_storing_the_value(self):
+        source = "VKEY = bytes.fromhex('0123456789abcdef' * 2)\n"
+        self.assertEqual(publish_audit.private_key_assignment_lines(source, "test.py"), [])
+        literal = "VKEY = bytes.fromhex('" + ("01" * 16) + "')\n"
+        self.assertEqual(publish_audit.private_key_assignment_lines(literal, "test.py"), [1])
+
+    def test_unrelated_literal_is_allowed_while_key_named_is_detected(self):
+        # Non-key variable name with 16-byte value must NOT trigger
+        non_key = "lut_row = bytes.fromhex('" + ("01" * 16) + "')\n"
+        self.assertEqual(publish_audit.private_key_assignment_lines(non_key, "test.py"), [])
+
+        # Key vocabulary names must trigger
+        for name in ("key", "kirk_key_1", "amctrl_key", "pgd_key", "decrypt_key", "KIRK_IV", "vkey", "seed", "secret", "token"):
+            source = f"{name} = bytes.fromhex('" + ("01" * 16) + "')\n"
+            self.assertEqual(publish_audit.private_key_assignment_lines(source, "test.py"), [1], f"Failed to match {name}")
+
+    def test_c_key_material_byte_array_and_hex_detection(self):
+        # Positive C byte array fixture under kirk-named variable
+        c_kirk = (
+            "static const uint8_t kirk_key[16] = {\n"
+            "    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,\n"
+            "    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10\n"
+            "};\n"
+        )
+        self.assertEqual(publish_audit.private_key_assignment_lines(c_kirk, "src/kirk.c"), [1])
+
+        # Acceptance test: identical byte array under unrelated variable name must NOT fail
+        c_lut = (
+            "static const uint8_t lut_row[16] = {\n"
+            "    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,\n"
+            "    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10\n"
+            "};\n"
+        )
+        self.assertEqual(publish_audit.private_key_assignment_lines(c_lut, "src/lut.c"), [])
+
+        # Non-16-length array under kirk name must NOT trigger
+        c_kirk_table = "static const uint8_t kirk_table[4] = { 0x01, 0x02, 0x03, 0x04 };\n"
+        self.assertEqual(publish_audit.private_key_assignment_lines(c_kirk_table, "src/kirk.c"), [])
+
+        # Positive C contiguous hex fixture
+        c_hex_pos = 'const char *amctrl_key = "0123456789abcdef0123456789abcdef";\n'
+        self.assertEqual(publish_audit.private_key_assignment_lines(c_hex_pos, "src/amctrl.h"), [1])
+
+        # Negative C contiguous hex fixture
+        c_hex_neg = 'const char *checksum = "0123456789abcdef0123456789abcdef";\n'
+        self.assertEqual(publish_audit.private_key_assignment_lines(c_hex_neg, "src/amctrl.h"), [])
+
+        # Positive C macro #define fixture
+        c_macro_pos = '#define PGD_KEY "0123456789abcdef0123456789abcdef"\n'
+        self.assertEqual(publish_audit.private_key_assignment_lines(c_macro_pos, "src/pgd.h"), [1])
+
+        # Negative C macro #define fixture
+        c_macro_neg = '#define TABLE_DIGEST "0123456789abcdef0123456789abcdef"\n'
+        self.assertEqual(publish_audit.private_key_assignment_lines(c_macro_neg, "src/pgd.h"), [])
+
+    def test_only_the_reviewed_game_key_table_may_hold_key_literals(self):
+        # Policy: one exact path carries the public game
+        # tables; the same bytes anywhere else still fail.
+        c_key = "static const u8 key_D91613F0[] = {%s};" % ", ".join(
+            "0x%02X" % i for i in range(16))
+        self.assertEqual(publish_audit.PUBLIC_GAME_KEY_TABLE_PATHS,
+                         frozenset({"src/core/nk_psp_builtin_keys.c"}))
+        self.assertEqual(publish_audit.private_key_literal_lines(
+            "src/core/nk_psp_builtin_keys.c", c_key), [])
+        for other in ("src/core/nk_psp_builtin_keys.h", "src/core/nk_psp_prx.c",
+                      "src/core/copy/nk_psp_builtin_keys.c", "nk_psp_builtin_keys.c"):
+            self.assertEqual(publish_audit.private_key_literal_lines(other, c_key), [1], other)
+
+    def test_json_key_material_detection(self):
+        # Positive JSON 32-hex string
+        json_pos_hex = '{\n  "kirk_key": "0123456789abcdef0123456789abcdef"\n}\n'
+        self.assertEqual(publish_audit.private_key_assignment_lines(json_pos_hex, "keys.json"), [2])
+
+        # Negative JSON 32-hex string
+        json_neg_hex = '{\n  "checksum": "0123456789abcdef0123456789abcdef"\n}\n'
+        self.assertEqual(publish_audit.private_key_assignment_lines(json_neg_hex, "data.json"), [])
+
+        # Positive JSON byte array
+        json_pos_arr = '{\n  "amctrl_seed": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]\n}\n'
+        self.assertEqual(publish_audit.private_key_assignment_lines(json_pos_arr, "keys.json"), [2])
+
+        # Negative JSON byte array
+        json_neg_arr = '{\n  "lut_array": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]\n}\n'
+        self.assertEqual(publish_audit.private_key_assignment_lines(json_neg_arr, "data.json"), [])
+
+    def test_py_key_material_byte_array_detection(self):
+        # Positive Python list of 16 ints
+        py_list_pos = "kirk_seed = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10]\n"
+        self.assertEqual(publish_audit.private_key_assignment_lines(py_list_pos, "test.py"), [1])
+
+        # Negative Python list of 16 ints
+        py_list_neg = "lut_row = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10]\n"
+        self.assertEqual(publish_audit.private_key_assignment_lines(py_list_neg, "test.py"), [])
+
+        # Positive Python bytes([16 ints])
+        py_bytes_pos = "token_bytes = bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])\n"
+        self.assertEqual(publish_audit.private_key_assignment_lines(py_bytes_pos, "test.py"), [1])
+
+        # Negative Python bytes([16 ints])
+        py_bytes_neg = "normal_bytes = bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])\n"
+        self.assertEqual(publish_audit.private_key_assignment_lines(py_bytes_neg, "test.py"), [])
+
+    def test_action_pin_rule(self):
+        self.assertIsNotNone(
+            publish_audit.FULL_SHA_ACTION.fullmatch(
+                "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+            )
+        )
+        self.assertIsNone(publish_audit.FULL_SHA_ACTION.fullmatch("actions/checkout@v6"))
+
+    def test_action_pin_reads_only_uses_keys(self):
+        text = (
+            "    permissions:\n"
+            "      statuses: write\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@v6\n"
+            "        uses: owner/action@de0fac2e4500dabe0009e67214ff5f5447ce83dd\n"
+        )
+        self.assertEqual(
+            [match.group(1) for match in publish_audit.ACTION_USE.finditer(text)],
+            ["actions/checkout@v6", "owner/action@de0fac2e4500dabe0009e67214ff5f5447ce83dd"],
+        )
+
+    def test_filename_collisions_case_and_unicode(self):
+        paths = ["docs/README.md", "docs/readme.md"]
+        findings = publish_audit.check_collisions(paths)
+        self.assertTrue(any(f.code == "COLLISION_CASE" for f in findings))
+
+    def test_dangerous_unicode_path_characters(self):
+        bidi_path = "docs/guide_\u202e_override.md"
+        findings = publish_audit.check_collisions([bidi_path])
+        self.assertTrue(any(f.code == "PATH_DANGEROUS_UNICODE" for f in findings))
+
+    def test_windows_reserved_device_names_and_trailing_characters(self):
+        reserved_path = "docs/CON.txt"
+        findings = publish_audit.check_collisions([reserved_path])
+        self.assertTrue(any(f.code == "FILENAME_RESERVED" for f in findings))
+
+        trailing_dot_path = "docs/guide.md."
+        findings_dot = publish_audit.check_collisions([trailing_dot_path])
+        self.assertTrue(any(f.code == "FILENAME_TRAILING" for f in findings_dot))
+
+    def test_cross_platform_local_paths(self):
+        slash = chr(92)
+        windows_text = "path = " + "C:" + slash + "Us" + "ers" + slash + "alice" + slash + "repo\n"
+        self.assertTrue(bool(publish_audit.WINDOWS_USER_PATH.search(windows_text)))
+
+        mac_text = "path = '/Us" + "ers/john/secret.txt'\n"
+        self.assertTrue(bool(publish_audit.MAC_USER_PATH.search(mac_text)))
+
+        wsl_text = "path = '/mnt/c/Us" + "ers/alice/repo'\n"
+        self.assertTrue(bool(publish_audit.WSL_USER_PATH.search(wsl_text)))
+
+        unc_text = "path = '\\\\" + "server\\share\\data'\n"
+        self.assertTrue(bool(publish_audit.UNC_PATH.search(unc_text)))
+
+    def test_onedrive_and_temp_local_paths(self):
+        slash = chr(92)
+        onedrive_text = "backup_dir = '/Us" + "ers/john/One" + "Drive - Company/data'\n"
+        self.assertTrue(bool(publish_audit.ONEDRIVE_PATH.search(onedrive_text)))
+
+        temp_text = "tmp = 'C:" + slash + "Windows" + slash + "Te" + "mp" + slash + "scratch.txt'\n"
+        self.assertTrue(bool(publish_audit.TEMP_PATH.search(temp_text)))
+
+    def test_audit_entries_and_manifest_report(self):
+        entries = [
+            publish_audit.GitEntry("100644", "abc1234", "0", "LICENSE", "file"),
+            publish_audit.GitEntry("160000", "def5678", "0", "third_party/submodule", "gitlink"),
+        ]
+        findings = publish_audit.audit_entries(entries)
+        report = publish_audit.generate_manifest_report(entries, findings)
+        self.assertIn("status", report)
+        self.assertEqual(report["total_files"], 2)
+        self.assertIn("meta", report)
+        self.assertIn("aggregate_manifest_sha256", report["meta"])
+        self.assertTrue(any(f.code == "GITLINK" for f in findings))
+
+    def test_csv_audit_manifest_export(self):
+        entries = [
+            publish_audit.GitEntry("100644", "abc1234", "0", "LICENSE", "file"),
+        ]
+        findings = publish_audit.audit_entries(entries)
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            publish_audit.export_csv_manifest_report(entries, findings, tmp_path)
+            text = tmp_path.read_text(encoding="utf-8")
+            self.assertIn("path,mode,working_mode,index_sha,size,sha256,kind,text_binary,magic", text)
+            self.assertIn("LICENSE", text)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def test_secret_scan_redaction_fixture(self):
+        sentinel_secret = "SUPER_SECRET_SENTINEL_TOKEN_12345"
+        leaks_data = [
+            {
+                "RuleID": "generic-api-key",
+                "File": "config/secret.json",
+                "StartLine": 4,
+                "Secret": sentinel_secret,
+            }
+        ]
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False, encoding="utf-8") as tmp:
+            json.dump(leaks_data, tmp)
+            tmp_path = Path(tmp.name)
+        try:
+            findings = publish_audit.parse_secret_scan_report(tmp_path)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].code, "SECRET_SCAN_LEAK")
+            self.assertNotIn(sentinel_secret, findings[0].detail)
+            self.assertNotIn(sentinel_secret[:10], findings[0].detail)
+
+            entries = [publish_audit.GitEntry("100644", "abc", "0", "config/secret.json", "file")]
+            report = publish_audit.generate_manifest_report(entries, findings, secret_scan_report=tmp_path)
+            report_str = json.dumps(report)
+            self.assertNotIn(sentinel_secret, report_str)
+
+            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp_csv:
+                csv_path = Path(tmp_csv.name)
+            try:
+                publish_audit.export_csv_manifest_report(entries, findings, csv_path)
+                csv_text = csv_path.read_text(encoding="utf-8")
+                self.assertNotIn(sentinel_secret, csv_text)
+            finally:
+                csv_path.unlink(missing_ok=True)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def test_symlink_containment_path_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            tmp_dir = Path(tmp_dir_raw).resolve()
+            repo = tmp_dir / "repo"
+            repo_private = tmp_dir / "repo-private"
+            repo.mkdir()
+            repo_private.mkdir()
+
+            secret_file = repo_private / "secret.txt"
+            secret_file.write_text("secret", encoding="utf-8", newline="\n")
+
+            symlink_file = repo / "link.txt"
+            try:
+                symlink_file.symlink_to(secret_file)
+            except (OSError, NotImplementedError):
+                self.skipTest("Symlinks not supported on this platform/privilege level")
+
+            entries = [publish_audit.GitEntry("120000", "sha", "0", "link.txt", "symlink")]
+            findings = publish_audit.audit_entries(entries, repo_root=repo, is_candidate_root=True)
+            self.assertTrue(any(f.code == "SYMLINK_ESCAPE" for f in findings))
+
+    def test_symlink_relative_escape_rejection(self):
+        entries = [publish_audit.GitEntry("120000", "sha", "0", "docs/link_escape.txt", "symlink")]
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            docs_dir = repo / "docs"
+            docs_dir.mkdir()
+            symlink_file = docs_dir / "link_escape.txt"
+            try:
+                symlink_file.symlink_to(Path("../../outside.txt"))
+            except (OSError, NotImplementedError):
+                self.skipTest("Symlinks not supported on this platform/privilege level")
+
+            findings = publish_audit.audit_entries(entries, repo_root=repo, is_candidate_root=True)
+            self.assertTrue(any(f.code == "SYMLINK_ESCAPE" for f in findings))
+
+    def test_git_lfs_pointer_recognition_and_manifest_classification(self):
+        lfs_pointer = (
+            "version https://git-lfs.github.com/spec/v1\n"
+            "oid sha256:d363cec75fecfafd1511e370e48c748c30199c694b83a4026be34d799b192917\n"
+            "size 4316284\n"
+        )
+        self.assertTrue(publish_audit.is_git_lfs_pointer(lfs_pointer))
+
+        regular_text = (
+            "This file references version https://git-lfs.github.com/spec/v1 in documentation.\n"
+            "It is not an LFS pointer.\n"
+        )
+        self.assertFalse(publish_audit.is_git_lfs_pointer(regular_text))
+
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            (repo / "LICENSE").write_text("LICENSE", encoding="utf-8", newline="\n")
+            (repo / "NOTICE.md").write_text("NOTICE", encoding="utf-8", newline="\n")
+            (repo / "README.md").write_text("README", encoding="utf-8", newline="\n")
+            (repo / "AGENTS.md").write_text("AGENTS", encoding="utf-8", newline="\n")
+
+            lfs_file = repo / "asset.bin"
+            lfs_file.write_text(lfs_pointer, encoding="utf-8", newline="\n")
+
+            entries = [
+                publish_audit.GitEntry("100644", "", "0", "asset.bin", "lfs_pointer")
+            ]
+            report = publish_audit.generate_manifest_report(entries, [], repo_root=repo, is_candidate_root=True)
+            self.assertEqual(report["summary"]["lfs_pointers"], 1)
+
+    def test_lfs_attribute_mismatch_detection(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            (repo / ".gitattributes").write_text("*.dat filter=lfs diff=lfs merge=lfs -text\n", encoding="utf-8", newline="\n")
+            (repo / "data.dat").write_text("Not an LFS pointer content\n", encoding="utf-8", newline="\n")
+
+            entries = [publish_audit.GitEntry("100644", "", "0", "data.dat", "file")]
+            findings = publish_audit.audit_entries(entries, repo_root=repo, is_candidate_root=True)
+            self.assertTrue(any(f.code == "LFS_MISMATCH" for f in findings))
+
+    def test_lfs_attribute_policy_follows_selected_content_source(self):
+        # .gitattributes decides LFS findings, so it must be read
+        # from the SAME content source as the audited bytes. An index-vs-worktree
+        # divergence in .gitattributes must change the verdict exactly when the
+        # selected source changes, never silently.
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            run_git(["init"], cwd=repo, check=True, capture_output=True)
+
+            for name in ("LICENSE", "NOTICE.md", "README.md", "AGENTS.md"):
+                (repo / name).write_text(name + "\n", encoding="utf-8", newline="\n")
+            (repo / ".gitattributes").write_text(
+                "*.dat filter=lfs diff=lfs merge=lfs -text\n", encoding="utf-8", newline="\n"
+            )
+            (repo / "data.dat").write_text("Not an LFS pointer content\n", encoding="utf-8", newline="\n")
+            run_git(["add", "-A"], cwd=repo, check=True, capture_output=True)
+
+            # Index declares LFS; an unstaged worktree edit removes the policy.
+            (repo / ".gitattributes").write_text(
+                "# unstaged policy removal\n", encoding="utf-8", newline="\n"
+            )
+
+            entries_index = publish_audit._get_git_entries(
+                tracked_only=True, repo_root=repo, content_source=publish_audit.CONTENT_INDEX
+            )
+            findings_index = publish_audit.audit_entries(
+                entries_index, repo_root=repo, content_source=publish_audit.CONTENT_INDEX
+            )
+            self.assertTrue(
+                any(f.code == "LFS_MISMATCH" for f in findings_index),
+                "index-source audit must use the staged .gitattributes even when the worktree drops it",
+            )
+            entries_worktree = publish_audit._get_git_entries(
+                tracked_only=True, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE
+            )
+            findings_worktree = publish_audit.audit_entries(
+                entries_worktree, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE
+            )
+            self.assertFalse(
+                any(f.code == "LFS_MISMATCH" for f in findings_worktree),
+                "worktree-source audit must not inherit the staged LFS policy",
+            )
+
+            # Reverse: stage the empty policy and leave the LFS policy only in
+            # the (unstaged) worktree.
+            run_git(
+                ["add", ".gitattributes"], cwd=repo, check=True, capture_output=True
+            )
+            (repo / ".gitattributes").write_text(
+                "*.dat filter=lfs diff=lfs merge=lfs -text\n", encoding="utf-8", newline="\n"
+            )
+
+            entries_index = publish_audit._get_git_entries(
+                tracked_only=True, repo_root=repo, content_source=publish_audit.CONTENT_INDEX
+            )
+            findings_index = publish_audit.audit_entries(
+                entries_index, repo_root=repo, content_source=publish_audit.CONTENT_INDEX
+            )
+            self.assertFalse(
+                any(f.code == "LFS_MISMATCH" for f in findings_index),
+                "index-source audit must ignore an unstaged worktree LFS declaration",
+            )
+            entries_worktree = publish_audit._get_git_entries(
+                tracked_only=True, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE
+            )
+            findings_worktree = publish_audit.audit_entries(
+                entries_worktree, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE
+            )
+            self.assertTrue(
+                any(f.code == "LFS_MISMATCH" for f in findings_worktree),
+                "worktree-source audit must use the worktree .gitattributes",
+            )
+
+    def test_gitattributes_invalid_utf8_fails_closed(self):
+        # A declared attribute policy that cannot be parsed must fail closed
+        # with an explicit finding, never be skipped as "no LFS policy".
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            run_git(["init"], cwd=repo, check=True, capture_output=True)
+
+            for name in ("LICENSE", "NOTICE.md", "README.md", "AGENTS.md"):
+                (repo / name).write_text(name + "\n", encoding="utf-8", newline="\n")
+            (repo / ".gitattributes").write_bytes(b"*.dat filter=lfs \xff\xfe -text\n")
+            (repo / "data.dat").write_text("content\n", encoding="utf-8", newline="\n")
+            run_git(["add", "-A"], cwd=repo, check=True, capture_output=True)
+
+            entries = publish_audit._get_git_entries(tracked_only=True, repo_root=repo)
+            findings = publish_audit.audit_entries(entries, repo_root=repo)
+            self.assertTrue(
+                any(f.code == "GITATTRIBUTES_UNREADABLE" for f in findings),
+                "undeclared-utf8 attribute policy must fail closed, not silently pass",
+            )
+
+    def test_lfs_attribute_requires_exact_filter_lfs_token(self):
+        # ``subfilter=lfs`` is a different attribute; only an exact
+        # ``filter=lfs`` token declares Git LFS. A substring match would create
+        # false LFS findings.
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            (repo / ".gitattributes").write_text(
+                "*.dat subfilter=lfs merge=lfs -text\n", encoding="utf-8", newline="\n"
+            )
+            (repo / "data.dat").write_text("Not an LFS pointer content\n", encoding="utf-8", newline="\n")
+
+            entries = [publish_audit.GitEntry("100644", "", "0", "data.dat", "file")]
+            findings = publish_audit.audit_entries(entries, repo_root=repo, is_candidate_root=True)
+            self.assertFalse(
+                any(f.code == "LFS_MISMATCH" for f in findings),
+                "subfilter=lfs must not be treated as a Git LFS declaration",
+            )
+
+    def test_public_scope_unresolved_asset_rejection(self):
+        manifest_path = publish_audit.ROOT / "assets" / "release_manifest.json"
+        entries = [
+            publish_audit.GitEntry("100644", "hash1", "0", "font/jpn0.pgf", "file"),
+        ]
+        findings = publish_audit.audit_entries(entries, manifest_path=manifest_path, public_scope=True)
+        self.assertTrue(any(f.code == "UNRESOLVED_PUBLIC" for f in findings))
+
+    def test_spirv_and_magic_binary_detection(self):
+        kind_spirv = publish_audit._magic_kind(b"\x07\x23\x02\x03\x00\x00\x00\x00")
+        self.assertEqual(kind_spirv, "SPIR-V shader bytecode")
+
+        kind_elf = publish_audit._magic_kind(b"\x7fELF\x02\x01\x01\x00")
+        self.assertEqual(kind_elf, "ELF executable")
+
+        kind_png = publish_audit._magic_kind(b"\x89PNG\r\n\x1a\n\x00\x00")
+        self.assertEqual(kind_png, "PNG image")
+
+    def test_unknown_renamed_binary_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            unknown_bin = repo / "data.unknown"
+            unknown_bin.write_bytes(b"\x00\xfe\xdc\xba\x98\x76\x54\x32\x10\xff\xee\xdd")
+
+            entries = [publish_audit.GitEntry("100644", "", "0", "data.unknown", "file")]
+            findings = publish_audit.audit_entries(entries, repo_root=repo, exhaustive=True, is_candidate_root=True)
+            self.assertTrue(any(f.code == "MAGIC_UNKNOWN" for f in findings))
+
+    def test_manifest_ingestion_malformed_and_duplicate_path(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            malformed_json = repo / "bad_manifest.json"
+            malformed_json.write_text("{ invalid json }", encoding="utf-8", newline="\n")
+
+            findings = publish_audit.audit_entries([], manifest_path=malformed_json)
+            self.assertTrue(any(f.code == "MANIFEST_ERROR" for f in findings))
+
+            dup_json = repo / "dup_manifest.json"
+            dup_data = {
+                "components": [
+                    {"id": "c1", "source_path": "src/rt/core.c", "license": "MIT"},
+                    {"id": "c2", "source_path": "src/rt/core.c", "license": "GPL-2.0-or-later"},
+                ]
+            }
+            dup_json.write_text(json.dumps(dup_data), encoding="utf-8", newline="\n")
+            findings_dup = publish_audit.audit_entries([], manifest_path=dup_json)
+            self.assertTrue(any(f.code == "MANIFEST_DUPLICATE_PATH" for f in findings_dup))
+
+    def test_manifest_orphan_path_detection(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            orphan_json = repo / "orphan_manifest.json"
+            orphan_data = {
+                "components": [
+                    {"id": "orphan1", "source_path": "non_existent_file.c", "license": "MIT"},
+                ]
+            }
+            orphan_json.write_text(json.dumps(orphan_data), encoding="utf-8", newline="\n")
+
+            entries = [publish_audit.GitEntry("100644", "", "0", "LICENSE", "file")]
+            findings = publish_audit.audit_entries(entries, manifest_path=orphan_json, repo_root=repo, is_candidate_root=True)
+            self.assertTrue(any(f.code == "MANIFEST_ORPHAN_PATH" for f in findings))
+
+    def test_spdx_required_skips_byte_exact_import_trees(self):
+        # Byte-exact FFmpeg n4.4 imports under src/rt/atrac3p/ must not be
+        # forced to gain SPDX headers: editing them breaks the recorded
+        # upstream blob identity (see PROVENANCE.md). Project-authored wrappers
+        # and the rest of src/ still require SPDX.
+        self.assertFalse(publish_audit._spdx_required("src/rt/atrac3p/libavcodec/atrac.c"))
+        self.assertFalse(publish_audit._spdx_required("src/rt/atrac3p/libavutil/mem.c"))
+        self.assertFalse(publish_audit._spdx_required("src/rt/atrac3p/libavcodec/vlc.h"))
+        self.assertTrue(publish_audit._spdx_required("src/rt/atrac3p/atrac3p_api.c"))
+        self.assertTrue(publish_audit._spdx_required("tests/native/atrac3p_selftest.c"))
+        self.assertTrue(publish_audit._spdx_required("src/rt/recomp.c"))
+        self.assertTrue(publish_audit._spdx_required("tools/codegen.py"))
+
+    def test_spdx_required_skips_only_the_byte_exact_minimp3_header(self):
+        # minimp3 is vendored byte-identical (src/rt/minimp3/PROVENANCE.md) and keeps its own
+        # CC0 notice instead of an SPDX line. The exemption is that one file: the project's
+        # wrapper and anything else added beside the header still need SPDX.
+        self.assertFalse(publish_audit._spdx_required("src/rt/minimp3/minimp3.h"))
+        self.assertTrue(publish_audit._spdx_required("src/rt/minimp3/minimp3_ex.h"))
+        self.assertTrue(publish_audit._spdx_required("src/rt/minimp3/wrapper.c"))
+        self.assertTrue(publish_audit._spdx_required("src/rt/mp3_bridge.c"))
+        self.assertTrue(publish_audit._spdx_required("src/rt/mp3_bridge.h"))
+
+    def _spdx_provenance_findings(self, source_path, source_bytes, classification, license_id=None):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            ledger_path = "assets/public_provenance_ledger.json"
+            source_file = repo / source_path
+            source_file.parent.mkdir(parents=True, exist_ok=True)
+            source_file.write_bytes(source_bytes)
+            source_record = {
+                "path": source_path,
+                "classification": classification,
+                "evidence": {"license": license_id} if license_id else {"source": "test"},
+                "sha256": hashlib.sha256(source_bytes).hexdigest(),
+            }
+            ledger_record = {
+                "path": ledger_path,
+                "classification": "reviewed_configuration",
+                "evidence": {"source": "test"},
+                "sha256": "unused-for-self-record",
+            }
+            ledger_bytes = json.dumps({"entries": [source_record, ledger_record]}).encode("utf-8")
+            ledger_file = repo / ledger_path
+            ledger_file.parent.mkdir(parents=True, exist_ok=True)
+            ledger_file.write_bytes(ledger_bytes)
+            policy_file, _ = hermetic_policy(repo, [source_path, ledger_path])
+            policy = publication_policy.load_policy(policy_file)
+            entries = [
+                publish_audit.GitEntry("100644", "", "0", source_path, "file"),
+                publish_audit.GitEntry("100644", "", "0", ledger_path, "file"),
+            ]
+            return publish_audit._provenance_ledger_findings(
+                policy,
+                entries,
+                {},
+                publish_audit.CONTENT_WORKTREE,
+                repo,
+                None,
+                self_consistency=True,
+            )
+
+    def test_provenance_audit_requires_project_license_for_project_authored_source(self):
+        cases = (
+            ("src/project.c", b"/* SPDX-License-Identifier: GPL-2.0-or-later */\nint project;\n"),
+            ("src/project.tsx", b"// SPDX-License-Identifier: GPL-2.0-or-later\nint project;\n"),
+            ("CMakeLists.txt", b"# SPDX-License-Identifier: GPL-2.0-or-later\nproject(test)\n"),
+            ("fixtures/Makefile", b"# SPDX-License-Identifier: GPL-2.0-or-later\ntest:\n\ttrue\n"),
+        )
+        for source_path, source_bytes in cases:
+            with self.subTest(source_path=source_path):
+                findings = self._spdx_provenance_findings(
+                    source_path,
+                    source_bytes,
+                    "project_authored_attested",
+                )
+                self.assertTrue(any(f.code == "SPDX_PROJECT_LICENSE" for f in findings), findings)
+
+    def test_provenance_audit_preserves_inherited_spdx_lineage(self):
+        cases = ("src/rt/mpeg.c", "src/ref/interp.cpp")
+        for source_path in cases:
+            with self.subTest(source_path=source_path):
+                valid = b"/* SPDX-License-Identifier: GPL-2.0-or-later */\nint inherited;\n"
+                valid_findings = self._spdx_provenance_findings(
+                    source_path, valid, "upstream_derived", "GPL-2.0-or-later"
+                )
+                self.assertFalse(any(f.code == "SPDX_UPSTREAM_LINEAGE" for f in valid_findings), valid_findings)
+
+                removed = b"int inherited;\n"
+                findings = self._spdx_provenance_findings(
+                    source_path, removed, "upstream_derived", "GPL-2.0-or-later"
+                )
+                self.assertTrue(any(f.code == "SPDX_UPSTREAM_LINEAGE" for f in findings), findings)
+
+    def test_provenance_audit_preserves_byte_exact_upstream_spdx_lineage(self):
+        source_path = "src/rt/atrac3p/libavcodec/avcodec.h"
+        valid = b"/* SPDX-License-Identifier: LGPL-2.1-or-later */\nint imported;\n"
+        valid_findings = self._spdx_provenance_findings(
+            source_path, valid, "upstream_derived", "LGPL-2.1-or-later"
+        )
+        self.assertFalse(any(f.code == "SPDX_UPSTREAM_LINEAGE" for f in valid_findings), valid_findings)
+
+        removed = b"int imported;\n"
+        findings = self._spdx_provenance_findings(
+            source_path, removed, "upstream_derived", "LGPL-2.1-or-later"
+        )
+        self.assertTrue(any(f.code == "SPDX_UPSTREAM_LINEAGE" for f in findings), findings)
+
+    def test_provenance_audit_preserves_clay_header_byte_identity(self):
+        upstream_header = b"// VERSION: 0.14\n\n/* upstream header without an SPDX identifier */\n"
+        findings = self._spdx_provenance_findings(
+            "third_party/clay/clay.h", upstream_header, "upstream_derived", "Zlib"
+        )
+        self.assertFalse(any(f.code == "SPDX_UPSTREAM_LINEAGE" for f in findings), findings)
+
+        stb_findings = self._spdx_provenance_findings(
+            "third_party/stb/stb_image.h", upstream_header, "upstream_derived", "Unlicense"
+        )
+        self.assertFalse(any(f.code == "SPDX_UPSTREAM_LINEAGE" for f in stb_findings), stb_findings)
+
+        sibling_findings = self._spdx_provenance_findings(
+            "third_party/clay/other.h", upstream_header, "upstream_derived", "Zlib"
+        )
+        self.assertTrue(
+            any(f.code == "SPDX_UPSTREAM_LINEAGE" for f in sibling_findings),
+            sibling_findings,
+        )
+
+    def test_provenance_audit_preserves_monocypher_byte_identity(self):
+        header = b"// Monocypher version __git__\n//\n" + b"//\n" * 7 + b"// SPDX-License-Identifier: BSD-2-Clause OR CC0-1.0\n"
+        findings = self._spdx_provenance_findings(
+            "third_party/monocypher/monocypher.c", header, "upstream_derived", "BSD-2-Clause OR CC0-1.0"
+        )
+        self.assertFalse(any(f.code == "SPDX_UPSTREAM_LINEAGE" for f in findings), findings)
+
+        sibling_findings = self._spdx_provenance_findings(
+            "third_party/monocypher/other.c", header, "upstream_derived", "BSD-2-Clause OR CC0-1.0"
+        )
+        self.assertTrue(
+            any(f.code == "SPDX_UPSTREAM_LINEAGE" for f in sibling_findings),
+            sibling_findings,
+        )
+
+    def _lineage_provenance_findings(
+        self,
+        source_path: str,
+        source_bytes: bytes,
+        classification: str,
+        exceptions: dict | None = None,
+        license_id: str | None = "GPL-3.0-or-later",
+    ):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            ledger_path = "assets/public_provenance_ledger.json"
+            source_file = repo / source_path
+            source_file.parent.mkdir(parents=True, exist_ok=True)
+            source_file.write_bytes(source_bytes)
+            source_record = {
+                "path": source_path,
+                "classification": classification,
+                "evidence": {"license": license_id} if license_id else {"source": "test"},
+                "sha256": hashlib.sha256(source_bytes).hexdigest(),
+            }
+            ledger_record = {
+                "path": ledger_path,
+                "classification": "reviewed_configuration",
+                "evidence": {"source": "test"},
+                "sha256": "unused-for-self-record",
+            }
+            ledger_bytes = json.dumps({"entries": [source_record, ledger_record]}).encode("utf-8")
+            ledger_file = repo / ledger_path
+            ledger_file.parent.mkdir(parents=True, exist_ok=True)
+            ledger_file.write_bytes(ledger_bytes)
+            policy_file, _ = hermetic_policy(repo, [source_path, ledger_path])
+            policy = publication_policy.load_policy(policy_file)
+            entries = [
+                publish_audit.GitEntry("100644", "", "0", source_path, "file"),
+                publish_audit.GitEntry("100644", "", "0", ledger_path, "file"),
+            ]
+            return publish_audit._provenance_ledger_findings(
+                policy,
+                entries,
+                {},
+                publish_audit.CONTENT_WORKTREE,
+                repo,
+                None,
+                self_consistency=True,
+                lineage_exceptions=exceptions,
+            )
+
+    def test_lineage_contradiction_detected_for_synthetic_derived_header(self):
+        cases = (
+            (
+                "src/synthetic.c",
+                b"/* SPDX-License-Identifier: GPL-3.0-or-later */\n// Derived from PPSSPP (GPL-2.0-or-later)\nint x;\n",
+                "project_authored_attested",
+                "GPL-3.0-or-later",
+            ),
+            (
+                "src/synthetic_port.c",
+                b"/* SPDX-License-Identifier: GPL-3.0-or-later */\n// Ported from JPCSP\nint x;\n",
+                "project_authored_attested",
+                "GPL-3.0-or-later",
+            ),
+            (
+                "tools/synthetic_tool.py",
+                b"# SPDX-License-Identifier: GPL-3.0-or-later\n# Based on sal063/PSP-recompilation-project\nx = 1\n",
+                "project_authored_attested",
+                "GPL-3.0-or-later",
+            ),
+            (
+                "src/rt/synthetic_indep.c",
+                b"/* SPDX-License-Identifier: GPL-2.0-or-later */\n// Clean-room implementation\nint x;\n",
+                "upstream_derived",
+                "GPL-2.0-or-later",
+            ),
+            (
+                "src/rt/synthetic_indep2.c",
+                b"/* SPDX-License-Identifier: GPL-2.0-or-later */\n// Independently authored implementation\nint x;\n",
+                "upstream_derived",
+                "GPL-2.0-or-later",
+            ),
+        )
+        for source_path, source_bytes, classification, license_id in cases:
+            with self.subTest(source_path=source_path):
+                findings = self._lineage_provenance_findings(
+                    source_path,
+                    source_bytes,
+                    classification,
+                    exceptions={},
+                    license_id=license_id,
+                )
+                self.assertTrue(
+                    any(f.code == "LINEAGE_CONTRADICTION" for f in findings),
+                    f"Expected LINEAGE_CONTRADICTION for {source_path}, got: {findings}",
+                )
+
+    def test_lineage_contradiction_excepted_passes(self):
+        source_path = "src/synthetic.c"
+        source_bytes = (
+            b"/* SPDX-License-Identifier: GPL-3.0-or-later */\n"
+            b"// Derived from PPSSPP (GPL-2.0-or-later)\nint x;\n"
+        )
+        exceptions = {
+            source_path: {
+                "issue": "#342",
+                "reason": "synthetic test exception for tracking issue #342",
+            }
+        }
+        findings = self._lineage_provenance_findings(
+            source_path,
+            source_bytes,
+            "project_authored_attested",
+            exceptions=exceptions,
+        )
+        self.assertFalse(
+            any(f.code in ("LINEAGE_CONTRADICTION", "LINEAGE_CONTRADICTION_STALE") for f in findings),
+            findings,
+        )
+
+    def test_lineage_contradiction_stale_exception_fails(self):
+        source_path = "src/synthetic_clean.c"
+        source_bytes = (
+            b"/* SPDX-License-Identifier: GPL-3.0-or-later */\n"
+            b"// Project-authored clean implementation.\nint x;\n"
+        )
+        exceptions = {
+            source_path: {
+                "issue": "#342",
+                "reason": "stale exception that should fail because header has no contradiction",
+            }
+        }
+        findings = self._lineage_provenance_findings(
+            source_path,
+            source_bytes,
+            "project_authored_attested",
+            exceptions=exceptions,
+        )
+        self.assertTrue(
+            any(f.code == "LINEAGE_CONTRADICTION_STALE" for f in findings),
+            f"Expected LINEAGE_CONTRADICTION_STALE for {source_path}, got: {findings}",
+        )
+
+    def test_lineage_exception_invalid_missing_fields(self):
+        source_path = "src/synthetic.c"
+        source_bytes = (
+            b"/* SPDX-License-Identifier: GPL-3.0-or-later */\n"
+            b"// Derived from PPSSPP (GPL-2.0-or-later)\nint x;\n"
+        )
+        exceptions = {
+            source_path: {
+                "issue": "",
+                "reason": "",
+            }
+        }
+        findings = self._lineage_provenance_findings(
+            source_path,
+            source_bytes,
+            "project_authored_attested",
+            exceptions=exceptions,
+        )
+        self.assertTrue(
+            any(f.code == "LINEAGE_EXCEPTION_INVALID" for f in findings),
+            f"Expected LINEAGE_EXCEPTION_INVALID, got: {findings}",
+        )
+
+    def test_checked_in_lineage_exceptions_structure_and_active_entries(self):
+        self.assertIn("src/rt/evf.h", publish_audit.LINEAGE_CONTRADICTION_EXCEPTIONS)
+        self.assertIn("tools/gen_nidnames.py", publish_audit.LINEAGE_CONTRADICTION_EXCEPTIONS)
+        self.assertNotIn("tools/test_funcdiff_cmp.py", publish_audit.LINEAGE_CONTRADICTION_EXCEPTIONS)
+        self.assertNotIn("tools/test_nidseq.py", publish_audit.LINEAGE_CONTRADICTION_EXCEPTIONS)
+
+        for path, info in publish_audit.LINEAGE_CONTRADICTION_EXCEPTIONS.items():
+            with self.subTest(path=path):
+                self.assertIsInstance(info, dict)
+                self.assertIn("issue", info)
+                self.assertIn("reason", info)
+                self.assertTrue(str(info["issue"]).endswith("342"))
+                self.assertTrue(len(str(info["reason"])) > 0)
+
+    def test_retired_lineage_exceptions_have_clean_headers(self):
+        root = Path(__file__).resolve().parents[1]
+        for retired_path in ("tools/test_funcdiff_cmp.py", "tools/test_nidseq.py"):
+            with self.subTest(path=retired_path):
+                content = (root / retired_path).read_bytes()
+                findings = publish_audit._spdx_provenance_findings(
+                    retired_path,
+                    {"classification": "project_authored_attested"},
+                    content,
+                )
+                self.assertEqual(findings, [], f"SPDX findings for {retired_path}: {findings}")
+                contra_findings, was_contradiction = publish_audit._lineage_contradiction_findings(
+                    retired_path,
+                    {"classification": "project_authored_attested"},
+                    content,
+                    exceptions={},
+                )
+                self.assertFalse(was_contradiction, f"Unexpected contradiction for {retired_path}")
+                self.assertEqual(contra_findings, [], f"Contradiction findings for {retired_path}: {contra_findings}")
+
+    def test_deterministic_report_output_and_aggregate_sha(self):
+        entries = [
+            publish_audit.GitEntry("100644", "abc1234", "0", "LICENSE", "file"),
+            publish_audit.GitEntry("100644", "def5678", "0", "README.md", "file"),
+        ]
+        findings = publish_audit.audit_entries(entries)
+        report1 = publish_audit.generate_manifest_report(entries, findings)
+        report2 = publish_audit.generate_manifest_report(entries, findings)
+
+        self.assertEqual(
+            report1["meta"]["aggregate_manifest_sha256"],
+            report2["meta"]["aggregate_manifest_sha256"],
+        )
+        self.assertGreater(len(report1["meta"]["aggregate_manifest_sha256"]), 0)
+
+    def test_publish_audit_and_test_suite_do_not_self_trigger(self):
+        repo_root = publish_audit.ROOT
+        entries = publish_audit._get_git_entries(tracked_only=True, repo_root=repo_root)
+        pub_entries = [e for e in entries if e.path in ("tools/publish_audit.py", "tools/test_publish_audit.py")]
+        self.assertEqual(len(pub_entries), 2)
+        findings = publish_audit.audit_entries(pub_entries, repo_root=repo_root)
+        self.assertEqual(findings, [], f"publish_audit self-triggered findings on its own source: {findings}")
+
+    def test_synthetic_scanner_copy_with_injected_path_fails(self):
+        repo_root = publish_audit.ROOT
+        pub_code = (repo_root / "tools" / "publish_audit.py").read_text(encoding="utf-8")
+        slash = chr(92)
+        injected_code = pub_code + "\n# Injected private path literal\nBAD_PATH = 'C:" + slash + "Us" + "ers" + slash + "alice" + slash + "secret'\n"
+
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            tmp_dir = Path(tmp_dir_raw).resolve()
+            fake_scanner = tmp_dir / "publish_audit_copy.py"
+            fake_scanner.write_text(injected_code, encoding="utf-8", newline="\n")
+
+            entries = [publish_audit.GitEntry("100644", "", "0", "publish_audit_copy.py", "file")]
+            findings = publish_audit.audit_entries(entries, repo_root=tmp_dir, is_candidate_root=True)
+            self.assertTrue(any(f.code == "LOCAL_PATH" for f in findings))
+
+    def test_candidate_scan_skips_vcs_metadata_dirs(self):
+        # A materialized candidate may itself be a fresh Git repository (e.g.
+        # build_public_export.py git-inits the export); its .git internals are
+        # scaffolding and must not surface as unknown binaries.
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            (repo / "src").mkdir(parents=True)
+            (repo / "src" / "core.c").write_text("# SPDX-License-Identifier: GPL-2.0-or-later\nint x;\n", encoding="utf-8", newline="\n")
+            (repo / "LICENSE").write_text("LICENSE", encoding="utf-8", newline="\n")
+            (repo / "NOTICE.md").write_text("NOTICE", encoding="utf-8", newline="\n")
+            (repo / "README.md").write_text("README", encoding="utf-8", newline="\n")
+            (repo / "AGENTS.md").write_text("AGENTS", encoding="utf-8", newline="\n")
+            run_git(["init"], cwd=repo, check=True, capture_output=True)
+            run_git(["add", "."], cwd=repo, check=True, capture_output=True)
+            run_git(["commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+            entries = publish_audit._get_filesystem_entries(repo)
+            paths = [e.path for e in entries]
+            self.assertFalse(any(p.startswith(".git/") or p == ".git" for p in paths))
+            findings = publish_audit.audit_entries(entries, repo_root=repo, is_candidate_root=True)
+            self.assertFalse(any(f.code == "MAGIC_UNKNOWN" for f in findings))
+
+    @staticmethod
+    def _short_name(path: Path) -> str | None:
+        """The directory's real 8.3 alias, or None when the volume made none.
+
+        GetShortPathNameW is the authority: it returns the aliased path when one
+        exists and the input unchanged when the volume has 8.3 creation
+        disabled. Parsing `dir /x` was tried and is wrong -- the `/b` bare
+        format omits the short-name column entirely, so every lookup silently
+        reported None and the alias case was never exercised.
+        """
+        if os.name != "nt":
+            return None
+        import ctypes
+
+        get_short = ctypes.windll.kernel32.GetShortPathNameW
+        get_short.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+        get_short.restype = ctypes.c_uint
+        buffer = ctypes.create_unicode_buffer(1024)
+        written = get_short(str(path), buffer, len(buffer))
+        if written == 0 or written >= len(buffer):
+            return None
+        alias = PurePath(buffer.value).name
+        return alias or None
+
+    def _make_junction(self, link: Path, target: Path) -> bool:
+        """Create an NTFS junction; junctions need no elevation on Windows."""
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return created.returncode == 0
+
+    @unittest.skipUnless(
+        os.name == "nt" and hasattr(os.path, "isjunction"),
+        "NTFS junction regression requires Windows junction support",
+    )
+    def test_candidate_scan_prunes_ntfs_junctions(self):
+        # A junction is not reported by Path.is_symlink(), so a candidate scan
+        # that only prunes symlinks descends through the junction and hashes
+        # file content that lives outside the candidate root. Containment is a
+        # property of where content physically is, not of what Git recorded.
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            temp_root = Path(tmp_dir_raw).resolve()
+            repo = temp_root / "repo"
+            outside = temp_root / "outside"
+            repo.mkdir()
+            outside.mkdir()
+            (repo / "inside.txt").write_text("inside", encoding="utf-8")
+            (outside / "sentinel.txt").write_text("outside", encoding="utf-8")
+
+            junction = repo / "linked"
+            if not self._make_junction(junction, outside):
+                self.skipTest("cannot create NTFS junction")
+
+            self.assertFalse(junction.is_symlink())
+            self.assertTrue(os.path.isjunction(junction))
+            self.assertEqual(publish_audit._filesystem_link_on_path(junction), junction)
+
+            entries = publish_audit._get_filesystem_entries(repo)
+            paths = [entry.path for entry in entries]
+            self.assertIn("inside.txt", paths)
+            self.assertIn("linked", paths)
+            self.assertNotIn("linked/sentinel.txt", paths, f"scan crossed junction: {paths}")
+
+            run_git(["init"], cwd=repo, capture_output=True, check=True)
+            git_entries = publish_audit._get_git_entries(
+                tracked_only=False,
+                repo_root=repo,
+                content_source=publish_audit.CONTENT_WORKTREE,
+            )
+            git_paths = [entry.path for entry in git_entries]
+            self.assertIn("inside.txt", git_paths)
+            self.assertIn("linked", git_paths)
+            self.assertNotIn("linked/sentinel.txt", git_paths, f"git scan crossed junction: {git_paths}")
+
+            root_junction = temp_root / "root-linked"
+            if self._make_junction(root_junction, repo):
+                with self.assertRaisesRegex(RuntimeError, "candidate root must not be a filesystem link"):
+                    publish_audit._get_filesystem_entries(root_junction)
+
+    @unittest.skipUnless(
+        os.name == "nt" and hasattr(os.path, "isjunction"),
+        "NTFS junction regression requires Windows junction support",
+    )
+    def test_tracked_file_below_junction_is_flagged_not_read(self):
+        # Git for Windows happily tracks a regular file below a junction. The
+        # entry therefore stays enumerated (Git owns that truth), but the audit
+        # must never read its bytes through the junction: the working-tree blob
+        # is the link target, which flags the entry instead of smuggling
+        # out-of-root content into the candidate blob set.
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            temp_root = Path(tmp_dir_raw).resolve()
+            repo = temp_root / "repo"
+            outside = temp_root / "outside"
+            repo.mkdir()
+            outside.mkdir()
+            (repo / "inside.txt").write_text("inside", encoding="utf-8")
+            (outside / "sentinel.txt").write_text("outside", encoding="utf-8")
+
+            junction = repo / "linked"
+            if not self._make_junction(junction, outside):
+                self.skipTest("cannot create NTFS junction")
+
+            run_git(["init"], cwd=repo, capture_output=True, check=True)
+            run_git(["add", "-A"], cwd=repo, check=True, capture_output=True)
+
+            entries = publish_audit._get_git_entries(
+                tracked_only=True,
+                repo_root=repo,
+                content_source=publish_audit.CONTENT_WORKTREE,
+            )
+            by_path = {entry.path: entry for entry in entries}
+            self.assertIn("linked/sentinel.txt", by_path)
+            smuggled = by_path["linked/sentinel.txt"]
+            self.assertEqual(smuggled.working_mode, "120000", "tracked junction descendant must be flagged as a link")
+
+            # A worktree audit must not follow the junction off the volume: the
+            # bytes out there are not tracked content. It must also not fall
+            # back to the junction's own target, which is an absolute host path
+            # Git never stores -- returning that recorded its length and
+            # SHA-256 as the entry's audited bytes. The refusal is generic.
+            content, worktree_error = publish_audit.read_worktree_blobs(
+                [smuggled], repo_root=repo)["linked/sentinel.txt"]
+            self.assertNotEqual(content, b"outside",
+                                "audit read out-of-root bytes through a junction")
+            self.assertIsNone(content, "a junction target must not become audited bytes")
+            self.assertIsNotNone(worktree_error)
+            self.assertNotIn(str(outside), worktree_error)
+
+            # An index audit is the opposite case, and refusing to read here
+            # would be the more dangerous behaviour. `git add -A` walked the
+            # junction and hashed the out-of-root file *into the index*, so
+            # those bytes are staged for publication. The audit must therefore
+            # read exactly the indexed blob, so every content scanner inspects
+            # what would actually be published, and flag the junction
+            # separately -- rather than substitute a refusal and leave the
+            # staged bytes unscanned.
+            staged = run_git(
+                ["cat-file", "-p", ":linked/sentinel.txt"],
+                cwd=repo, capture_output=True, check=True,
+            ).stdout
+            self.assertEqual(staged, b"outside", "precondition: git staged the smuggled bytes")
+
+            index_blob, index_err = publish_audit.read_indexed_blob(smuggled, repo_root=repo)
+            self.assertIsNone(index_err)
+            self.assertEqual(index_blob, staged, "index mode must read the indexed blob")
+            batch_blobs = publish_audit.read_indexed_blobs_batch([smuggled], repo_root=repo)
+            self.assertEqual(batch_blobs["linked/sentinel.txt"][0], staged,
+                             "batch index mode must read the indexed blob")
+
+            index_entries = publish_audit._get_git_entries(
+                tracked_only=True, repo_root=repo,
+                content_source=publish_audit.CONTENT_INDEX,
+            )
+            findings = publish_audit.audit_entries(index_entries, repo_root=repo)
+            smuggled_findings = {f.code for f in findings if f.path == "linked/sentinel.txt"}
+            self.assertIn("WORKTREE_LINK", smuggled_findings,
+                          "the junction descendant must be reported, not silently read")
+            # Proof the scanners actually saw the staged bytes: this finding can
+            # only come from inspecting the newline-less content itself.
+            self.assertIn("TEXT_FINAL_NEWLINE", smuggled_findings)
+            for finding in findings:
+                self.assertNotIn(str(outside), finding.detail,
+                                 "no finding may render the junction's host target")
+
+    @unittest.skipUnless(
+        os.name == "nt" and hasattr(os.path, "isjunction"),
+        "NTFS junction regression requires Windows junction support",
+    )
+    def test_junction_target_is_never_rendered_or_returned_as_content(self):
+        """A junction's absolute host target must not reach bytes or findings.
+
+        A candidate containing a junction into a private directory would
+        otherwise print that local path into audit and CI logs: the target was
+        returned as the entry's bytes and interpolated into the SYMLINK_ESCAPE
+        detail, which both non-JSON CLIs render verbatim.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            temp_root = Path(tmp_dir_raw).resolve()
+            candidate = temp_root / "candidate"
+            private = temp_root / "private-inputs"
+            candidate.mkdir()
+            private.mkdir()
+            (private / "secret.txt").write_text("secret", encoding="utf-8")
+
+            junction = candidate / "linked"
+            if not self._make_junction(junction, private):
+                self.skipTest("cannot create NTFS junction")
+
+            entry = publish_audit.GitEntry("120000", "", "0", "linked", "symlink")
+            content, error = publish_audit.read_candidate_file(entry, candidate)
+            self.assertIsNone(content, "a junction target must not become entry content")
+            self.assertIsNotNone(error)
+            self.assertNotIn(str(private), error)
+            self.assertNotIn("private-inputs", error)
+
+            # The worktree reader is a separate path to the same leak: it takes
+            # the ancestor junction's readlink() and records that host path's
+            # length and SHA-256 as the entry's audited bytes. Redacting only
+            # the candidate reader left this one open.
+            descendant = publish_audit.GitEntry(
+                "100644", "", "0", "linked/secret.txt", "file", working_mode="120000")
+            blobs = publish_audit.read_worktree_blobs([descendant], repo_root=candidate)
+            worktree_content, worktree_error = blobs["linked/secret.txt"]
+            self.assertIsNone(worktree_content,
+                              "a junction target must not become worktree content")
+            self.assertIsNotNone(worktree_error)
+            self.assertNotIn(str(private), worktree_error)
+            self.assertNotIn("private-inputs", worktree_error)
+
+            findings = publish_audit.audit_entries(
+                [entry], repo_root=candidate, is_candidate_root=True
+            )
+            self.assertTrue(findings, "the junction must still produce findings")
+            for finding in findings:
+                self.assertNotIn(str(private), finding.detail)
+                self.assertNotIn("private-inputs", finding.detail)
+
+            # A real symlink is the contrasting case: its target text is the
+            # blob Git stores, so it stays readable and stays analysed.
+            link = candidate / "plain.txt"
+            try:
+                link.symlink_to(private / "secret.txt")
+            except (OSError, NotImplementedError):
+                return
+            plain = publish_audit.GitEntry("120000", "", "0", "plain.txt", "symlink")
+            text, text_error = publish_audit.read_candidate_file(plain, candidate)
+            self.assertIsNone(text_error)
+            self.assertIsNotNone(text)
+            escapes = publish_audit.audit_entries(
+                [plain], repo_root=candidate, is_candidate_root=True
+            )
+            self.assertTrue(any(f.code == "SYMLINK_ESCAPE" for f in escapes),
+                            "an escaping symlink must still be reported")
+            for finding in escapes:
+                self.assertNotIn(str(private), finding.detail,
+                                 "the escape finding must not render the host target")
+
+    @unittest.skipUnless(
+        os.name == "nt" and hasattr(os.path, "isjunction"),
+        "NTFS junction regression requires Windows junction support",
+    )
+    def test_8_3_alias_junction_is_flagged_and_refused(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            temp_root = Path(tmp_dir_raw).resolve()
+            repo = temp_root / "repo"
+            outside = temp_root / "outside"
+            repo.mkdir()
+            outside.mkdir()
+            (outside / "secret.txt").write_text("secret", encoding="utf-8")
+
+            junction = repo / "long_junction_dir"
+            if not self._make_junction(junction, outside):
+                self.skipTest("cannot create NTFS junction")
+
+            self.assertIsNotNone(publish_audit._filesystem_link_on_path(junction / "secret.txt", repo))
+            self.assertFalse(publish_audit._is_contained_in_root(junction / "secret.txt", repo))
+
+            # 8.3 alias creation is a per-volume setting and is commonly
+            # disabled. Assuming the alias is "LONG_J~1" tests a path that does
+            # not exist, which realpath then leaves lexically inside the root --
+            # so the assertion failed on exactly the volumes that have no alias
+            # capable of escaping. Ask the filesystem for the real short name
+            # and skip the alias case when the volume created none.
+            short_name = self._short_name(junction)
+            if short_name is None or short_name.casefold() == junction.name.casefold():
+                self.skipTest("volume did not create an 8.3 alias for the junction")
+            short_alias = repo / short_name
+            self.assertTrue(short_alias.exists(), f"expected alias {short_name} to exist")
+            self.assertFalse(publish_audit._is_contained_in_root(short_alias / "secret.txt", repo))
+
+    @unittest.skipUnless(
+        os.name == "nt" and hasattr(os.path, "isjunction"),
+        "NTFS junction regression requires Windows junction support",
+    )
+    def test_ancestor_junction_containment(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            temp_root = Path(tmp_dir_raw).resolve()
+            real_repo = temp_root / "real_repo"
+            real_repo.mkdir()
+            (real_repo / "inside.txt").write_text("inside", encoding="utf-8")
+            outside = temp_root / "outside"
+            outside.mkdir()
+            (outside / "secret.txt").write_text("outside", encoding="utf-8")
+
+            ancestor_junc = temp_root / "ancestor_junc"
+            if not self._make_junction(ancestor_junc, real_repo):
+                self.skipTest("cannot create NTFS junction")
+
+            out_junc = real_repo / "out_junc"
+            if not self._make_junction(out_junc, outside):
+                self.skipTest("cannot create NTFS junction")
+
+            self.assertTrue(publish_audit._is_contained_in_root(ancestor_junc / "inside.txt", ancestor_junc))
+            self.assertFalse(publish_audit._is_contained_in_root(ancestor_junc / "out_junc" / "secret.txt", ancestor_junc))
+
+    def test_link_boundary_rejects_lexical_escape(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            root = Path(tmp_dir_raw).resolve()
+            with self.assertRaisesRegex(RuntimeError, "audit path escapes root"):
+                publish_audit._filesystem_link_on_path(root.parent / "outside.txt", root)
+
+    def test_candidate_scan_skips_gitignored_untracked_scaffolding(self):
+        # Contributor tooling leaves gitignored scaffolding in a materialized
+        # candidate (e.g. .ruff_cache/ after running pre-commit). The candidate
+        # walk must honor the tree's own .gitignore for untracked files instead
+        # of reporting their binary internals as unknown.
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            (repo / "src").mkdir(parents=True)
+            (repo / "src" / "core.c").write_text("# SPDX-License-Identifier: GPL-2.0-or-later\nint x;\n", encoding="utf-8", newline="\n")
+            (repo / "LICENSE").write_text("LICENSE", encoding="utf-8", newline="\n")
+            (repo / "NOTICE.md").write_text("NOTICE", encoding="utf-8", newline="\n")
+            (repo / "README.md").write_text("README", encoding="utf-8", newline="\n")
+            (repo / "AGENTS.md").write_text("AGENTS", encoding="utf-8", newline="\n")
+            (repo / ".gitignore").write_text(".ruff_cache/\n", encoding="utf-8", newline="\n")
+            (repo / ".ruff_cache").mkdir()
+            (repo / ".ruff_cache" / "bin.dat").write_bytes(b"\x00\x01\x02\x03binary-cache-data")
+            run_git(["init"], cwd=repo, check=True, capture_output=True)
+            run_git(["add", "."], cwd=repo, check=True, capture_output=True)
+            run_git(["commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+            # .ruff_cache is untracked; a fresh run of the scan must prune it.
+            self.assertNotIn(".gitignore", run_git(["status", "--porcelain"], cwd=repo, capture_output=True, text=True).stdout)
+
+            entries = publish_audit._get_filesystem_entries(repo)
+            paths = [e.path for e in entries]
+            self.assertIn("src/core.c", paths)
+            self.assertFalse(any(p.startswith(".ruff_cache/") for p in paths), f"gitignored cache leaked: {paths}")
+            findings = publish_audit.audit_entries(entries, repo_root=repo, is_candidate_root=True)
+            self.assertFalse(any(f.code == "MAGIC_UNKNOWN" for f in findings))
+
+    def test_candidate_scan_keeps_gitignored_tracked_files(self):
+        # A tracked file that happens to match a .gitignore pattern must never
+        # be pruned from the candidate walk.
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            (repo / "LICENSE").write_text("LICENSE", encoding="utf-8", newline="\n")
+            (repo / "NOTICE.md").write_text("NOTICE", encoding="utf-8", newline="\n")
+            (repo / "README.md").write_text("README", encoding="utf-8", newline="\n")
+            (repo / "AGENTS.md").write_text("AGENTS", encoding="utf-8", newline="\n")
+            (repo / ".gitignore").write_text("*.tmp\n", encoding="utf-8", newline="\n")
+            (repo / "note.tmp").write_text("tracked despite pattern", encoding="utf-8", newline="\n")
+            run_git(["init"], cwd=repo, check=True, capture_output=True)
+            # git add . would skip note.tmp (matches *.tmp); a force-add is how
+            # a tracked file that matches an ignore pattern legitimately exists.
+            run_git(["add", "."], cwd=repo, check=True, capture_output=True)
+            run_git(["add", "-f", "note.tmp"], cwd=repo, check=True, capture_output=True)
+            run_git(["commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+            entries = publish_audit._get_filesystem_entries(repo)
+            paths = [e.path for e in entries]
+            self.assertIn("note.tmp", paths)
+
+    def test_manifest_orphan_skips_public_scope_excluded_components(self):
+        # A manifest component declared public_scope_included: False is
+        # legitimately absent from a public-scope candidate; absence must not
+        # be reported as an orphan. Outside public-scope auditing it still is.
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            (repo / "LICENSE").write_text("LICENSE", encoding="utf-8", newline="\n")
+            (repo / "NOTICE.md").write_text("NOTICE", encoding="utf-8", newline="\n")
+            (repo / "README.md").write_text("README", encoding="utf-8", newline="\n")
+            (repo / "AGENTS.md").write_text("AGENTS", encoding="utf-8", newline="\n")
+            manifest = repo / "m.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "components": [
+                            {
+                                "id": "font",
+                                "source_path": "font/jpn0.pgf",
+                                "type": "asset",
+                                "presence": "tracked_file",
+                                "public_scope_included": False,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+                newline="\n",
+            )
+            entries = [publish_audit.GitEntry("100644", "", "0", "LICENSE", "file")]
+            # The manifest component is declared public_scope_included: False but the
+            # policy here does NOT exclude it, so its absence is still an orphan
+            # outside public-scope auditing. (A policy-excluded path is exempt in
+            # every mode -- that case is covered by
+            # test_manifest_orphan_skips_policy_excluded_components below.)
+            policy_path, export_path = hermetic_policy(repo, ["LICENSE"])
+            findings_public = publish_audit.audit_entries(
+                entries, manifest_path=manifest, public_scope=True, repo_root=repo, is_candidate_root=True,
+                policy_path=policy_path, export_path=export_path,
+            )
+            self.assertFalse(any(f.code == "MANIFEST_ORPHAN_PATH" for f in findings_public))
+            findings_private = publish_audit.audit_entries(
+                entries, manifest_path=manifest, public_scope=False, repo_root=repo, is_candidate_root=True,
+                policy_path=policy_path, export_path=export_path,
+            )
+            self.assertTrue(any(f.code == "MANIFEST_ORPHAN_PATH" for f in findings_private))
+
+            # A path the canonical policy excludes is expected to be absent in every
+            # mode; its absence is compliance, not an orphan.
+            excl_policy, excl_export = hermetic_policy(
+                repo, ["LICENSE"], exclude_paths=["font/jpn0.pgf"]
+            )
+            findings_excluded = publish_audit.audit_entries(
+                entries, manifest_path=manifest, public_scope=False, repo_root=repo, is_candidate_root=True,
+                policy_path=excl_policy, export_path=excl_export,
+            )
+            self.assertFalse(any(f.code == "MANIFEST_ORPHAN_PATH" for f in findings_excluded))
+
+    def test_hermetic_git_index_vs_working_tree_contract(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            run_git(["init"], cwd=repo, check=True, capture_output=True)
+
+            slash = chr(92)
+            safe_content = "# SPDX-License-Identifier: GPL-2.0-or-later\n# Safe tracked file\n"
+            unsafe_content = "# SPDX-License-Identifier: GPL-2.0-or-later\nSECRET_DIR = 'C:" + slash + "Us" + "ers" + slash + "alice" + slash + "data'\n"
+
+            target_file = repo / "src" / "core.py"
+            (repo / "src").mkdir(parents=True)
+            (repo / "LICENSE").write_text("LICENSE", encoding="utf-8", newline="\n")
+            (repo / "NOTICE.md").write_text("NOTICE", encoding="utf-8", newline="\n")
+            (repo / "README.md").write_text("README", encoding="utf-8", newline="\n")
+            (repo / "AGENTS.md").write_text("AGENTS", encoding="utf-8", newline="\n")
+
+            # --- Case 1: Index is SAFE, Working tree on disk is UNSAFE (unstaged edit) ---
+            target_file.write_text(safe_content, encoding="utf-8", newline="\n")
+            run_git(["add", "src/core.py"], cwd=repo, check=True)
+            safe_sha = run_git(["ls-files", "-s", "src/core.py"], cwd=repo, capture_output=True, text=True, check=True).stdout.split()[1]
+
+            # Modify working tree to be UNSAFE without staging
+            target_file.write_text(unsafe_content, encoding="utf-8", newline="\n")
+
+            entries_git = publish_audit._get_git_entries(tracked_only=True, repo_root=repo)
+            self.assertEqual(len(entries_git), 1)
+            self.assertEqual(entries_git[0].sha, safe_sha)
+
+            policy_path, export_path = hermetic_policy(repo, ["src/core.py"])
+            findings_index = publish_audit.audit_entries(
+                entries_git, repo_root=repo, policy_path=policy_path, export_path=export_path
+            )
+            self.assertEqual(findings_index, [], "Index audit must pass when indexed blob is safe, ignoring unstaged unsafe working tree edits")
+
+            # --- Case 2: Index is UNSAFE, Working tree on disk is SAFE ---
+            target_file.write_text(unsafe_content, encoding="utf-8", newline="\n")
+            run_git(["add", "src/core.py"], cwd=repo, check=True)
+            unsafe_sha = run_git(["ls-files", "-s", "src/core.py"], cwd=repo, capture_output=True, text=True, check=True).stdout.split()[1]
+
+            # Revert working tree on disk to be SAFE (unstaged)
+            target_file.write_text(safe_content, encoding="utf-8", newline="\n")
+
+            entries_unsafe_index = publish_audit._get_git_entries(tracked_only=True, repo_root=repo)
+            self.assertEqual(entries_unsafe_index[0].sha, unsafe_sha)
+
+            findings_unsafe_index = publish_audit.audit_entries(entries_unsafe_index, repo_root=repo)
+            self.assertTrue(any(f.code == "LOCAL_PATH" for f in findings_unsafe_index), "Index audit must fail when indexed blob is unsafe, even if working tree file was edited back to safe")
+
+            # --- Case 3: Staged UNSAFE vs Unstaged SAFE ---
+            # Verified above: staged object is unsafe_sha, working tree is safe, audit_entries catches unsafe_sha.
+
+            # --- Case 4: Index-only / deleted working-tree file ---
+            target_file.unlink()
+            entries_deleted_disk = publish_audit._get_git_entries(tracked_only=True, repo_root=repo)
+            self.assertEqual(entries_deleted_disk[0].sha, unsafe_sha)
+            findings_deleted_disk = publish_audit.audit_entries(entries_deleted_disk, repo_root=repo)
+            self.assertTrue(any(f.code == "LOCAL_PATH" for f in findings_deleted_disk), "Index audit reads deleted file blob cleanly via git cat-file")
+
+            # --- Case 5: Materialized Candidate-Root Disk Semantics ---
+            target_file.write_text(unsafe_content, encoding="utf-8", newline="\n")
+            entries_candidate = publish_audit._get_filesystem_entries(repo)
+            findings_candidate = publish_audit.audit_entries(entries_candidate, repo_root=repo, is_candidate_root=True)
+            self.assertTrue(any(f.code == "LOCAL_PATH" for f in findings_candidate), "Candidate-root mode audits disk content directly")
+
+
+# A tracked file whose *working-tree* bytes carry a publication finding while its staged
+# blob stays clean. This is the exact shape that let `nk_manager.ps1 -Action Verify`
+# report every gate PASS while the publication audit read different bytes: the audit
+# enumerated paths from the Git index and then read each path's staged blob, so an
+# unstaged edit was invisible to it.
+SAFE_SOURCE = "# SPDX-License-Identifier: GPL-2.0-or-later\n# Safe tracked file\n"
+UNSAFE_SOURCE = (
+    "# SPDX-License-Identifier: GPL-2.0-or-later\n"
+    "SECRET_DIR = 'C:" + chr(92) + "Us" + "ers" + chr(92) + "alice" + chr(92) + "data'\n"
+)
+
+
+def _make_publication_fixture_repo(repo: Path) -> Path:
+    """Build a minimal hermetic repo that a clean publication audit passes."""
+    run_git(["init"], cwd=repo, check=True, capture_output=True)
+
+    for name, body in (
+        ("LICENSE", "LICENSE"),
+        ("NOTICE.md", "NOTICE"),
+        ("README.md", "README"),
+        ("AGENTS.md", "AGENTS"),
+    ):
+        # Final newline and explicit LF: the fixture claims to be a tree a clean
+        # audit passes, and the text-hygiene check is part of "clean".
+        (repo / name).write_text(body + "\n", encoding="utf-8", newline="\n")
+
+    # main() defaults --manifest to <root>/assets/release_manifest.json and reports a
+    # MANIFEST_ERROR when it is absent, so the fixture needs an empty but valid one.
+    (repo / "assets").mkdir()
+    (repo / "assets" / "release_manifest.json").write_text('{"components": []}\n', encoding="utf-8", newline="\n")
+
+    target = repo / "src" / "core.py"
+    (repo / "src").mkdir()
+    target.write_text(SAFE_SOURCE, encoding="utf-8", newline="\n")
+
+    # The gate fails closed without a canonical policy, and rejects any path the
+    # policy does not classify, so a fixture that is meant to pass has to declare
+    # its own policy and a matching generated export -- exactly as the real
+    # repository does.
+    import publication_policy
+
+    tracked = ["LICENSE", "NOTICE.md", "README.md", "AGENTS.md",
+               "assets/release_manifest.json", "src/core.py",
+               "assets/public_source_profile.json", "PUBLIC_EXPORT.json"]
+    document = {
+        "name": "hermetic-test-profile",
+        "profile_version": "2.0.0",
+        "min_tool_version": "0.4.0",
+        "build_mode": "PUBLIC_SAFE=1",
+        "default_disposition": "REJECT",
+        "exclude_prefixes": [],
+        "exclude_globs": [],
+        "exclude_paths": [],
+        "include_paths": sorted(tracked),
+    }
+    (repo / "assets" / "public_source_profile.json").write_text(
+        json.dumps(document) + "\n", encoding="utf-8", newline="\n")
+    (repo / "PUBLIC_EXPORT.json").write_text(
+        json.dumps({"profile": document["name"],
+                    "policy_sha256": publication_policy.canonical_digest(document)}) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    run_git(["add", "-A"], cwd=repo, check=True, capture_output=True)
+    return target
+
+
+def _verify_suite_audit_invocations() -> list[list[str]]:
+    """Extract the publish_audit argument lists that -Action Verify actually runs.
+
+    Parsed out of nk_manager.ps1 rather than restated here, so that dropping or
+    weakening a content source in the manager fails this test instead of leaving the
+    regression asserting a command line the canonical gate no longer uses.
+    """
+    manager = (publish_audit.ROOT / "nk_manager.ps1").read_text(encoding="utf-8")
+    start = manager.index("function Invoke-VerifySuite")
+    rest = manager.find("\n    function ", start)
+    body = manager[start : rest if rest != -1 else len(manager)]
+
+    invocations = []
+    for raw_args in re.findall(r"python\s+tools/publish_audit\.py([^\r\n|]*)", body):
+        invocations.append(raw_args.split())
+    return invocations
+
+
+class TestVerifyWorktreeTruth(unittest.TestCase):
+    def test_committed_tree_source_reads_materialized_commit_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            _make_publication_fixture_repo(repo)
+            run_git(["commit", "-qm", "fixture"], cwd=repo, check=True)
+
+            materialized, tree = publish_audit._materialize_committed_tree("HEAD", repo)
+            try:
+                entries = publish_audit._get_filesystem_entries(materialized)
+                findings = publish_audit.audit_entries(
+                    entries,
+                    manifest_path=materialized / "assets" / "release_manifest.json",
+                    repo_root=materialized,
+                    content_source=publish_audit.CONTENT_COMMITTED,
+                    policy_path=materialized / "assets" / "public_source_profile.json",
+                    export_path=materialized / "PUBLIC_EXPORT.json",
+                    expected_tree_sha=tree,
+                    committed_tree_ref="HEAD",
+                    tree_repo_root=repo,
+                )
+                self.assertFalse(
+                    [f for f in findings if f.code == "UNREADABLE"],
+                    "committed-tree audits must read the materialized commit bytes",
+                )
+                self.assertFalse(
+                    [f for f in findings if f.code.startswith("POLICY_TREE_")],
+                    "committed-tree audit must bind to the exact commit tree",
+                )
+            finally:
+                import shutil
+                shutil.rmtree(materialized, ignore_errors=True)
+
+    def test_worktree_source_sees_unstaged_edit_that_index_source_ignores(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            target = _make_publication_fixture_repo(repo)
+
+            # Staged blob stays clean; only the bytes on disk carry the finding.
+            target.write_text(UNSAFE_SOURCE, encoding="utf-8", newline="\n")
+
+            index_entries = publish_audit._get_git_entries(
+                tracked_only=True, repo_root=repo, content_source=publish_audit.CONTENT_INDEX
+            )
+            index_findings = publish_audit.audit_entries(
+                index_entries, repo_root=repo, content_source=publish_audit.CONTENT_INDEX
+            )
+            self.assertEqual(
+                [f for f in index_findings if f.code == "LOCAL_PATH"],
+                [],
+                "index content source must keep ignoring unstaged edits (pre-commit contract)",
+            )
+
+            worktree_entries = publish_audit._get_git_entries(
+                tracked_only=True, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE
+            )
+            worktree_findings = publish_audit.audit_entries(
+                worktree_entries, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE
+            )
+            self.assertTrue(
+                any(f.code == "LOCAL_PATH" and f.path == "src/core.py" for f in worktree_findings),
+                "worktree content source must read the bytes currently on disk",
+            )
+
+    def test_worktree_source_falls_back_to_index_blob_for_deleted_file(self):
+        """Deleting a tracked file must not clear a finding its staged blob still carries."""
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            target = _make_publication_fixture_repo(repo)
+
+            target.write_text(UNSAFE_SOURCE, encoding="utf-8", newline="\n")
+            run_git(["add", "src/core.py"], cwd=repo, check=True, capture_output=True)
+            target.unlink()
+
+            entries = publish_audit._get_git_entries(
+                tracked_only=True, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE
+            )
+            findings = publish_audit.audit_entries(
+                entries, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE
+            )
+            self.assertTrue(
+                any(f.code == "LOCAL_PATH" for f in findings),
+                "worktree mode must fall back to the staged blob when the path is gone from disk",
+            )
+
+    def test_report_meta_records_which_bytes_were_audited(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            _make_publication_fixture_repo(repo)
+            entries = publish_audit._get_git_entries(tracked_only=True, repo_root=repo)
+
+            for source in (publish_audit.CONTENT_INDEX, publish_audit.CONTENT_WORKTREE):
+                report = publish_audit.generate_manifest_report(
+                    entries, [], repo_root=repo, content_source=source
+                )
+                self.assertEqual(report["meta"]["content_source"], source)
+
+            candidate = publish_audit.generate_manifest_report(
+                entries, [], repo_root=repo, is_candidate_root=True
+            )
+            self.assertEqual(candidate["meta"]["content_source"], publish_audit.CONTENT_CANDIDATE)
+
+    def test_verify_suite_audit_invocations_cover_both_content_sources(self):
+        invocations = _verify_suite_audit_invocations()
+        self.assertTrue(invocations, "Invoke-VerifySuite must still run tools/publish_audit.py")
+        self.assertTrue(
+            any("--worktree" in args for args in invocations),
+            "Verify must audit working-tree bytes, not only staged blobs",
+        )
+        self.assertTrue(
+            any("--worktree" not in args for args in invocations),
+            "Verify must still audit the staged blobs a commit would publish",
+        )
+
+    def test_canonical_verify_audit_fails_on_unstaged_publication_finding(self):
+        """Run the manager's own audit command lines against a tree with an unstaged finding.
+
+        Executes tools/publish_audit.py's main() the way -Action Verify invokes it, so a
+        regression that drops --worktree from nk_manager.ps1 makes this fail rather than
+        leaving a green Verify describing bytes nobody checked.
+        """
+        invocations = _verify_suite_audit_invocations()
+        self.assertTrue(invocations)
+
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            target = _make_publication_fixture_repo(repo)
+
+            with mock.patch.object(publish_audit, "ROOT", repo):
+                # A clean tree stays green on every content source Verify uses.
+                clean_codes = [publish_audit.main(list(args)) for args in invocations]
+                self.assertEqual(
+                    clean_codes,
+                    [0] * len(invocations),
+                    f"clean fixture tree must pass every Verify audit invocation: {clean_codes}",
+                )
+
+                # Unstaged tracked edit carrying a publication finding.
+                target.write_text(UNSAFE_SOURCE, encoding="utf-8", newline="\n")
+                unstaged_codes = [publish_audit.main(list(args)) for args in invocations]
+                self.assertTrue(
+                    any(code != 0 for code in unstaged_codes),
+                    "an unstaged publication finding must break the canonical Verify audit",
+                )
+
+                # Staging it keeps it caught: the normal commit-bound workflow is unchanged.
+                run_git(["add", "src/core.py"], cwd=repo, check=True, capture_output=True)
+                staged_codes = [publish_audit.main(list(args)) for args in invocations]
+                self.assertTrue(
+                    any(code != 0 for code in staged_codes),
+                    "a staged publication finding must still break the canonical Verify audit",
+                )
+
+                # Reverting on disk *and* in the index returns the gate to green.
+                target.write_text(SAFE_SOURCE, encoding="utf-8", newline="\n")
+                run_git(["add", "src/core.py"], cwd=repo, check=True, capture_output=True)
+                restored_codes = [publish_audit.main(list(args)) for args in invocations]
+                self.assertEqual(
+                    restored_codes,
+                    [0] * len(invocations),
+                    f"reverted tree must return to green: {restored_codes}",
+                )
+
+    def test_worktree_and_candidate_root_are_mutually_exclusive(self):
+        self.assertEqual(publish_audit.main(["--worktree", "--candidate-root", str(publish_audit.ROOT)]), 2)
+
+
+class TextHygieneTests(unittest.TestCase):
+    """Encoding and line-ending drift must be named, not discovered as hash noise.
+
+    `.gitattributes` normalises on commit, so the index is clean by construction
+    and these findings fire almost entirely in worktree audits. That is the case
+    that matters: a CRLF-polluted checkout makes every touched file's content
+    hash disagree with the provenance ledger, and the resulting wall of
+    PROVENANCE_CONTENT_MISMATCH says nothing about the actual cause. This
+    happened, and cost real time, which is why the diagnosis is now a check.
+    """
+
+    def _codes(self, data: bytes, path: str = "sample.txt"):
+        return [f.code for f in publish_audit.check_text_hygiene({path: (data, None)})]
+
+    def test_clean_lf_text_is_silent(self):
+        self.assertEqual(self._codes(b"line one" + LF + b"line two" + LF), [])
+
+    def test_crlf_is_reported(self):
+        self.assertEqual(self._codes(b"a" + CRLF + b"b" + CRLF), ["TEXT_LINE_ENDING_CRLF"])
+
+    def test_utf8_bom_is_reported(self):
+        self.assertEqual(self._codes(BOM + b"line" + LF), ["TEXT_ENCODING_BOM"])
+
+    def test_utf16_both_endiannesses_are_reported(self):
+        self.assertEqual(self._codes(UTF16LE + b"l" + NUL), ["TEXT_ENCODING_UTF16"])
+        self.assertEqual(self._codes(UTF16BE + NUL + b"l"), ["TEXT_ENCODING_UTF16"])
+
+    def test_missing_final_newline_is_reported(self):
+        self.assertEqual(self._codes(b"one" + LF + b"two"), ["TEXT_FINAL_NEWLINE"])
+
+    def test_exact_clay_upstream_license_keeps_its_byte_identity(self):
+        path = "third_party/clay/LICENSE.md"
+        data = (publish_audit.ROOT / path).read_bytes()
+        self.assertEqual(
+            hashlib.sha256(data).hexdigest(),
+            "5dd30f9f52093076b7574458f5efb8242fe6cbbd4669d4a2914e7616810d0df8",
+        )
+        self.assertNotIn("TEXT_FINAL_NEWLINE", self._codes(data, path=path))
+        self.assertIn("TEXT_FINAL_NEWLINE", self._codes(data + b" ", path=path))
+
+    def test_binary_content_is_never_reported(self):
+        # NUL-bearing data is binary; CRLF inside it is not a line-ending defect.
+        self.assertEqual(self._codes(NUL + b"payload" + CRLF), [])
+
+    def test_exempt_binary_suffix_is_skipped(self):
+        self.assertEqual(self._codes(b"a" + CRLF + b"b", path="assets/x.dat"), [])
+
+    def test_presentation_clip_is_binary_but_its_text_neighbours_are_not(self):
+        # Bytes that are neither UTF-8 nor NUL-bearing: governed text would report them, an .mp4 clip does not.
+        clip = b"ftypisom" + bytes(range(0x80, 0x100))
+        self.assertEqual(self._codes(clip, path="docs/media/clip.mp4"), [])
+        self.assertEqual(self._codes(clip, path="docs/media/clip.mp4.txt"), ["TEXT_ENCODING_UNDECODABLE"])
+        self.assertEqual(self._codes(b"a" + CRLF + b"b" + CRLF, path="docs/media/clip.md"), ["TEXT_LINE_ENDING_CRLF"])
+
+    def test_empty_file_is_silent(self):
+        self.assertEqual(self._codes(b""), [])
+
+    def test_utf16_candidate_fails_with_and_without_exhaustive_candidate_tree(self):
+        """Candidate text hygiene must run whether the manifest gate is requested or not."""
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            target = _make_publication_fixture_repo(repo)
+            user_path = "C:" + chr(92) + "Users" + chr(92) + "alice" + chr(92) + "candidate" + chr(92) + "secret.txt"
+            target.write_bytes(("# UTF-16 candidate path\\npath = " + user_path + "\\n").encode("utf-16-le"))
+            target.write_bytes(UTF16LE + target.read_bytes())
+
+            with mock.patch.object(publish_audit, "ROOT", repo):
+                normal_result = publish_audit.main(["--candidate-root", str(repo)])
+                exhaustive_result = publish_audit.main(["--candidate-root", str(repo), "--candidate-tree"])
+
+            self.assertEqual(normal_result, 1, "candidate mode must inspect text hygiene without --candidate-tree")
+            self.assertEqual(exhaustive_result, 1, "candidate mode must inspect text hygiene with --candidate-tree")
+
+    def test_crlf_is_reported_in_index_worktree_candidate_and_committed_modes(self):
+        """The same CRLF fixture must fail every content-source route."""
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            target = _make_publication_fixture_repo(repo)
+            user_path = "C:" + chr(92) + "Users" + chr(92) + "alice" + chr(92) + "candidate" + chr(92) + "secret.txt"
+            crlf_source = (
+                "# SPDX-License-Identifier: GPL-2.0-or-later\r\n"
+                "path = '" + user_path + "'\r\n"
+            ).encode("utf-8")
+            target.write_bytes(crlf_source)
+            run_git(
+                ["-c", "core.autocrlf=false", "add", "src/core.py"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            policy_path = repo / "assets" / "public_source_profile.json"
+            export_path = repo / "PUBLIC_EXPORT.json"
+
+            index_entries = publish_audit._get_git_entries(
+                tracked_only=True, repo_root=repo, content_source=publish_audit.CONTENT_INDEX
+            )
+            index_findings = publish_audit.audit_entries(
+                index_entries,
+                repo_root=repo,
+                content_source=publish_audit.CONTENT_INDEX,
+                policy_path=policy_path,
+                export_path=export_path,
+            )
+            self.assertTrue(any(
+                f.code == "TEXT_LINE_ENDING_CRLF" and f.path == "src/core.py"
+                for f in index_findings
+            ))
+
+            worktree_entries = publish_audit._get_git_entries(
+                tracked_only=True, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE
+            )
+            worktree_findings = publish_audit.audit_entries(
+                worktree_entries,
+                repo_root=repo,
+                content_source=publish_audit.CONTENT_WORKTREE,
+                policy_path=policy_path,
+                export_path=export_path,
+            )
+            self.assertTrue(any(
+                f.code == "TEXT_LINE_ENDING_CRLF" and f.path == "src/core.py"
+                for f in worktree_findings
+            ))
+
+            candidate_entries = publish_audit._get_filesystem_entries(repo)
+            candidate_findings = publish_audit.audit_entries(
+                candidate_entries,
+                repo_root=repo,
+                is_candidate_root=True,
+                policy_path=policy_path,
+                export_path=export_path,
+            )
+            self.assertTrue(any(
+                f.code == "TEXT_LINE_ENDING_CRLF" and f.path == "src/core.py"
+                for f in candidate_findings
+            ))
+
+            run_git(
+                ["-c", "core.autocrlf=false", "commit", "-qm", "crlf fixture"],
+                cwd=repo,
+                check=True,
+            )
+            materialized, tree = publish_audit._materialize_committed_tree("HEAD", repo)
+            try:
+                committed_entries = publish_audit._get_filesystem_entries(materialized)
+                committed_findings = publish_audit.audit_entries(
+                    committed_entries,
+                    manifest_path=materialized / "assets" / "release_manifest.json",
+                    repo_root=materialized,
+                    content_source=publish_audit.CONTENT_COMMITTED,
+                    policy_path=policy_path,
+                    export_path=materialized / "PUBLIC_EXPORT.json",
+                    expected_tree_sha=tree,
+                    committed_tree_ref="HEAD",
+                    tree_repo_root=repo,
+                )
+                self.assertTrue(any(
+                    f.code == "TEXT_LINE_ENDING_CRLF" and f.path == "src/core.py"
+                    for f in committed_findings
+                ))
+            finally:
+                import shutil
+                shutil.rmtree(materialized, ignore_errors=True)
+
+    def test_undecodable_text_suffix_is_a_finding(self):
+        """Invalid UTF-8 in a text-suffixed path must not fall through as binary."""
+        self.assertEqual(
+            self._codes(b"valid prefix" + bytes([0xFF]) + b"\\n", path="src/invalid.txt"),
+            ["TEXT_ENCODING_UNDECODABLE"],
+        )
+
+    def test_real_tracked_binary_asset_is_not_flagged(self):
+        raw = subprocess.run(
+            ["git", "show", ":assets/vfpu/vfpu_log2_lut.dat"],
+            cwd=publish_audit.ROOT, capture_output=True,
+        ).stdout
+        if not raw:
+            self.skipTest("binary LUT unavailable in this checkout")
+        self.assertEqual(self._codes(raw, path="assets/vfpu/vfpu_log2_lut.dat"), [])
+
+
+class CanonicalWriterTests(unittest.TestCase):
+    """Canonical generated text must be byte-identical on every host.
+
+    Windows Python translates "
+" to CRLF in text mode unless newline is given
+    explicitly, so a writer without it produces different bytes -- and a
+    different SHA-256 -- depending on which host an agent happens to run from.
+    Every writer that emits canonical or hash-participating text therefore pins
+    the newline.
+    """
+
+    CANONICAL_WRITERS = (
+        "tools/public_export.py",
+        "tools/provenance_attest_verify.py",
+        "tools/shader_embed.py",
+        "tools/generate_sbom.py",
+        "tools/build_public_export.py",
+        "tools/publish_audit.py",
+    )
+
+    def test_canonical_writers_pin_the_newline(self):
+        pattern = re.compile(r'\.write_text\(((?:[^()]|\([^()]*\))*)\)', re.S)
+        for rel in self.CANONICAL_WRITERS:
+            source = (publish_audit.ROOT / rel).read_text(encoding="utf-8")
+            for match in pattern.finditer(source):
+                args = match.group(1)
+                if "encoding=" not in args:
+                    continue
+                with self.subTest(path=rel, call=args[:60]):
+                    self.assertIn("newline=", args,
+                                  "%s writes canonical text without pinning newline; on Windows "
+                                  "this silently emits CRLF and changes the SHA-256" % rel)
+
+    def test_same_logical_text_yields_the_same_bytes_and_digest(self):
+        # The host-independence invariant, exercised directly: an explicit LF
+        # writer must produce identical bytes to an explicit binary writer, on
+        # any platform this test runs on.
+        text = "alpha" + chr(10) + "beta" + chr(10)
+        with tempfile.TemporaryDirectory() as tmp:
+            explicit = Path(tmp) / "explicit.txt"
+            binary = Path(tmp) / "binary.txt"
+            explicit.write_text(text, encoding="utf-8", newline=chr(10))
+            binary.write_bytes(text.encode("utf-8"))
+            self.assertEqual(explicit.read_bytes(), binary.read_bytes())
+            self.assertEqual(
+                hashlib.sha256(explicit.read_bytes()).hexdigest(),
+                hashlib.sha256(binary.read_bytes()).hexdigest(),
+            )
+            self.assertNotIn(CRLF, explicit.read_bytes())
+
+    def test_host_default_writer_would_differ_on_windows(self):
+        # Pins *why* the rule exists rather than only that it is followed: on a
+        # host whose linesep is CRLF, an unpinned writer diverges. Asserted
+        # conditionally so the test states the same fact on every platform.
+        with tempfile.TemporaryDirectory() as tmp:
+            unpinned = Path(tmp) / "unpinned.txt"
+            unpinned.write_text("a" + chr(10), encoding="utf-8")  # deliberately unpinned:
+            # this call is the defect under test and must NOT be "fixed"
+            produced = unpinned.read_bytes()
+            if os.linesep == chr(13) + chr(10):
+                self.assertIn(CRLF, produced,
+                              "expected host newline translation to be observable here")
+            else:
+                self.assertEqual(produced, b"a" + LF)
+
+
+class TestPrivateRootDetection(unittest.TestCase):
+    def test_configured_private_root_triggers_local_path(self):
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            target = _make_publication_fixture_repo(repo)
+
+            # Update fixture policy to declare private_roots
+            policy_file = repo / "assets" / "public_source_profile.json"
+            policy_doc = json.loads(policy_file.read_text(encoding="utf-8"))
+            policy_doc["private_roots"] = ["C:" + "/nk", "C:" + "\\nk"]
+            policy_file.write_text(json.dumps(policy_doc) + "\n", encoding="utf-8", newline="\n")
+
+            export_file = repo / "PUBLIC_EXPORT.json"
+            export_file.write_text(
+                json.dumps({
+                    "profile": policy_doc["name"],
+                    "policy_sha256": publication_policy.canonical_digest(policy_doc),
+                }) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            run_git(["add", "-A"], cwd=repo, check=True, capture_output=True)
+
+            # 1. Clean file: passes
+            entries = publish_audit._get_git_entries(
+                tracked_only=True, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE
+            )
+            findings = publish_audit.audit_entries(
+                entries, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE,
+                policy_path=policy_file, export_path=export_file,
+            )
+            self.assertFalse(any(f.code == "LOCAL_PATH" for f in findings))
+
+            # 2. Add private root to target in worktree
+            target.write_text(
+                "# SPDX-License-Identifier: GPL-2.0-or-later\n"
+                "# path: " + "C:" + "/nk/main/tools\n",
+                encoding="utf-8", newline="\n",
+            )
+            findings_worktree = publish_audit.audit_entries(
+                entries, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE,
+                policy_path=policy_file, export_path=export_file,
+            )
+            self.assertTrue(any(f.code == "LOCAL_PATH" for f in findings_worktree))
+            self.assertTrue(any(("contains configured private root '" + "C:" + "/nk'") in f.detail for f in findings_worktree))
+
+            # 3. Add to index (staged)
+            run_git(["add", "src/core.py"], cwd=repo, check=True, capture_output=True)
+            index_entries = publish_audit._get_git_entries(
+                tracked_only=True, repo_root=repo, content_source=publish_audit.CONTENT_INDEX
+            )
+            findings_index = publish_audit.audit_entries(
+                index_entries, repo_root=repo, content_source=publish_audit.CONTENT_INDEX,
+                policy_path=policy_file, export_path=export_file,
+            )
+            self.assertTrue(any(f.code == "LOCAL_PATH" for f in findings_index))
+
+            # 4. Candidate root mode
+            candidate_entries = publish_audit._get_filesystem_entries(repo)
+            findings_candidate = publish_audit.audit_entries(
+                candidate_entries, repo_root=repo, is_candidate_root=True,
+                policy_path=policy_file, export_path=export_file,
+            )
+            self.assertTrue(any(f.code == "LOCAL_PATH" for f in findings_candidate))
+
+            # 5. Backslash form
+            target.write_text(
+                "# SPDX-License-Identifier: GPL-2.0-or-later\n"
+                "# path: " + "C:" + "\\" + "nk\\" + "worktrees\n",
+                encoding="utf-8", newline="\n",
+            )
+            findings_bs = publish_audit.audit_entries(
+                entries, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE,
+                policy_path=policy_file, export_path=export_file,
+            )
+            self.assertTrue(any(f.code == "LOCAL_PATH" for f in findings_bs))
+            self.assertTrue(any(("contains configured private root '" + "C:" + "\\" + "\\nk'") in f.detail for f in findings_bs))
+
+    def test_clean_repo_contains_no_configured_private_roots(self):
+        policy = publication_policy.load_policy(publish_audit.ROOT / "assets" / "public_source_profile.json")
+        self.assertTrue(len(policy.private_roots) > 0)
+        entries = publish_audit._get_git_entries(
+            tracked_only=True, repo_root=publish_audit.ROOT, content_source=publish_audit.CONTENT_WORKTREE
+        )
+        content_map = publish_audit.read_worktree_blobs(entries, publish_audit.ROOT)
+        violations = []
+        for entry in entries:
+            if entry.path == "assets/public_source_profile.json":
+                continue
+            raw_bytes, _ = content_map.get(entry.path, (None, None))
+            if not raw_bytes:
+                continue
+            text = publish_audit._decode_text_safe(raw_bytes)
+            if not text:
+                continue
+            text_lower = text.lower()
+            for root in policy.private_roots:
+                if root.lower() in text_lower:
+                    violations.append((entry.path, root))
+        self.assertEqual(violations, [], f"Tracked files contain configured private roots: {violations}")
+
+    def test_out_of_band_private_root_boundary_matching(self):
+        """Finding 1 (O-01): out-of-band private root boundary lookahead."""
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            policy_file, export_file = hermetic_policy(repo, ["src/doc.md"])
+            doc = repo / "src" / "doc.md"
+            doc.parent.mkdir(parents=True, exist_ok=True)
+            entries = [publish_audit.GitEntry("100644", "", "0", "src/doc.md", "file")]
+
+            test_root = "C:/secret_workspace"
+
+            # 1. Matching shapes: `<root>`, `<root>/sub`, `<root>\sub`, `` `<root>` ``
+            matching_texts = [
+                f"# Reference: {test_root}\n",
+                f"# Reference: {test_root}/sub/file.txt\n",
+                f"# Reference: {test_root.replace('/', chr(92))}" + chr(92) + "sub" + chr(92) + "file.txt\n",
+                f"# Reference: `{test_root}`\n",
+            ]
+            for text in matching_texts:
+                with self.subTest(text=text):
+                    doc.write_text(text, encoding="utf-8", newline="\n")
+                    findings = publish_audit.audit_entries(
+                        entries, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE,
+                        policy_path=policy_file, export_path=export_file,
+                        extra_private_roots=[test_root],
+                    )
+                    self.assertTrue(
+                        any(f.code == "LOCAL_PATH" and "out-of-band private root" in f.detail for f in findings),
+                        f"Expected violation for {text!r}, got: {findings}",
+                    )
+
+            # 2. Non-matching shapes: `<root>epler`, `<root>-old`
+            non_matching_texts = [
+                f"# Word beginning with root: {test_root}epler\n",
+                f"# Word beginning with root: {test_root}-old\n",
+            ]
+            for text in non_matching_texts:
+                with self.subTest(text=text):
+                    doc.write_text(text, encoding="utf-8", newline="\n")
+                    findings = publish_audit.audit_entries(
+                        entries, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE,
+                        policy_path=policy_file, export_path=export_file,
+                        extra_private_roots=[test_root],
+                    )
+                    self.assertFalse(
+                        any(f.code == "LOCAL_PATH" and "out-of-band private root" in f.detail for f in findings),
+                        f"Expected no violation for {text!r}, got: {findings}",
+                    )
+
+    def test_out_of_band_private_root_env_and_mode_support(self):
+        """Finding 1 (O-01): environment variable and index/worktree mode verification."""
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            policy_file, export_file = hermetic_policy(repo, ["src/app.py"])
+            app = repo / "src" / "app.py"
+            app.parent.mkdir(parents=True, exist_ok=True)
+            app.write_text("# SPDX-License-Identifier: GPL-2.0-or-later\n# C:/my_private_dir/main\n", encoding="utf-8", newline="\n")
+            entries = [publish_audit.GitEntry("100644", "", "0", "src/app.py", "file")]
+
+            # When env is unset, audit reports zero out-of-band findings
+            findings_unset = publish_audit.audit_entries(
+                entries, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE,
+                policy_path=policy_file, export_path=export_file,
+            )
+            self.assertFalse(any("out-of-band private root" in f.detail for f in findings_unset))
+
+            # When env is set, audit reports LOCAL_PATH in both index and worktree modes
+            with mock.patch.dict(os.environ, {"PUBLISH_AUDIT_PRIVATE_ROOTS": "C:/my_private_dir"}):
+                # Worktree mode
+                findings_wt = publish_audit.audit_entries(
+                    entries, repo_root=repo, content_source=publish_audit.CONTENT_WORKTREE,
+                    policy_path=policy_file, export_path=export_file,
+                )
+                self.assertTrue(any(f.code == "LOCAL_PATH" and "out-of-band private root" in f.detail for f in findings_wt))
+
+    def test_debt_budgets_pass_on_current_repo(self):
+        """Finding 11 (O-11): all current debt surfaces meet non-increasing budgets."""
+        findings = publish_audit._debt_budget_findings(publish_audit.ROOT)
+        self.assertEqual(findings, [], f"Debt budget findings on current repo: {findings}")
+
+    def test_debt_markers_skip_only_the_byte_exact_minimp3_header(self):
+        # Upstream's own markers in the vendored header are not project debt; a marker in the
+        # project's wrapper beside it still counts.
+        marker = "TO" + "DO"
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw)
+            (repo / "src/rt/minimp3").mkdir(parents=True)
+            line = f"/* {marker} */" + chr(10)
+            (repo / "src/rt/minimp3/minimp3.h").write_text(line * 50, encoding="utf-8")
+            (repo / "src/rt/mp3_bridge.c").write_text(line * 50, encoding="utf-8")
+            only_header = publish_audit._debt_budget_findings(repo, paths=["src/rt/minimp3/minimp3.h"])
+            self.assertFalse([f for f in only_header if "debt marker" in f.detail])
+            with_wrapper = publish_audit._debt_budget_findings(
+                repo, paths=["src/rt/minimp3/minimp3.h", "src/rt/mp3_bridge.c"])
+            self.assertTrue([f for f in with_wrapper if "debt marker" in f.detail])
+
+    def test_debt_budgets_fail_on_ruff_increase(self):
+        """Finding 11 (O-11): Ruff rule-family growth fails the debt gate."""
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            repo = Path(tmp_dir_raw).resolve()
+            (repo / "pyproject.toml").write_text("[tool.ruff.lint]\nselect = ['E9', 'F63', 'F7', 'F82', 'F811']\n", encoding="utf-8")
+
+            findings = publish_audit._debt_budget_findings(repo, paths=[])
+            debt_codes = {f.code for f in findings}
+            self.assertIn("DEBT_BUDGET", debt_codes)
+            details = " ".join(f.detail for f in findings)
+            self.assertIn("Ruff select rule families count 5 exceeds debt ceiling 4", details)
+
+    def test_workspace_topology_conformance(self):
+        """Finding 9 (O-04): workspace topology conforms to CANONICAL_TREES.md."""
+        ws_root = publish_audit.ROOT.parent
+        if not (ws_root / "CANONICAL_TREES.md").is_file():
+            self.skipTest("Parent directory is not Nakagawa workspace (running in isolated CI)")
+
+        allowed_prefixes = ("archive/", "reports/", "artifacts/", "audit-mutants/", "private/campaign-builds/")
+
+        proc = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=publish_audit.ROOT, capture_output=True, text=True)
+        registered_worktrees = {publish_audit.ROOT.resolve(), (ws_root / "private" / "nakagawa-recomp-history-private").resolve()}
+        for line in proc.stdout.splitlines():
+            if line.startswith("worktree "):
+                registered_worktrees.add(Path(line.split(" ", 1)[1].strip()).resolve())
+
+        stray_audits = []
+        for pat in ("*/tools/publish_audit.py", "*/*/tools/publish_audit.py"):
+            for p in ws_root.glob(pat):
+                rel = p.relative_to(ws_root).as_posix()
+                if any(wt in p.parents or wt == p.parent for wt in registered_worktrees):
+                    continue
+                if any(rel.startswith(prefix) for prefix in allowed_prefixes):
+                    continue
+                stray_audits.append(rel)
+
+        self.assertEqual(stray_audits, [], f"Found non-canonical policy engine(s) under workspace root: {stray_audits}")
+
+
+class GeneratedEmbeddingSpdxTests(unittest.TestCase):
+    def test_exempt_embeddings_match_the_shader_contract_and_their_sources_carry_lineage(self) -> None:
+        import shader_embed
+        gpu = Path(publish_audit.ROOT) / "src" / "rt" / "gpu_sdl3vk"
+        contract = {
+            (gpu / embedded).relative_to(publish_audit.ROOT).as_posix():
+                (gpu / source).relative_to(publish_audit.ROOT).as_posix()
+            for _stage, source, embedded in shader_embed.SHADERS
+        }
+        self.assertEqual(publish_audit.SPDX_GENERATED_EMBEDDING_SOURCES, contract)
+        for source in contract.values():
+            head = (Path(publish_audit.ROOT) / source).read_text(encoding="utf-8").splitlines()[:8]
+            self.assertTrue(any("SPDX-License-Identifier:" in line for line in head), source)
+
+
+class RetailDiscIdTests(unittest.TestCase):
+    """A game's disc id is not game data: the audit leaves it alone.
+
+    Titles and retail disc ids may appear in documentation, comments, tests and
+    tools (AGENTS.md, Hard limits), so the audit has no finding for them.
+    """
+
+    UMD = "UL" + "US" + "55555"
+    PSN = "NP" + "UH" + "54321"
+
+    def test_synthetic_id_registries_are_well_formed(self) -> None:
+        from nk_core import synthetic_disc_ids as ids
+
+        catalog = set(ids.SYNTHETIC_DISC_IDS.values())
+        self.assertFalse(catalog & ids.SYNTHETIC_TEST_DISC_IDS)
+        for disc_id in sorted(catalog | ids.SYNTHETIC_TEST_DISC_IDS):
+            with self.subTest(disc_id=disc_id):
+                self.assertIsNone(ids.RETAIL_DISC_ID.search(disc_id))
+                self.assertRegex(disc_id, r"^TEST[0-9]{5}$")
+
+    def test_retail_disc_id_pattern_matches_every_written_form(self) -> None:
+        from nk_core.synthetic_disc_ids import RETAIL_DISC_ID
+
+        for text in (self.UMD, f"{self.UMD[:4]}-{self.UMD[4:]}", f"build_{self.UMD.lower()}.log",
+                     f"{self.UMD[:4]} {self.UMD[4:]}", f"{self.PSN[:4]}_{self.PSN[4:]}"):
+            with self.subTest(text=text):
+                self.assertIsNotNone(RETAIL_DISC_ID.search(text))
+        for text in ("X" + self.UMD, self.UMD + "0", "TEST80001", "ABCD12345"):
+            with self.subTest(text=text):
+                self.assertIsNone(RETAIL_DISC_ID.search(text))
+
+    def test_audit_does_not_report_a_disc_id_in_a_tracked_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir_raw:
+            tmp_dir = Path(tmp_dir_raw).resolve()
+            (tmp_dir / "doc.md").write_text(
+                f"Tested with {self.UMD} and {self.PSN}.\n", encoding="utf-8", newline="\n")
+            entries = [publish_audit.GitEntry("100644", "", "0", "doc.md", "file")]
+            findings = publish_audit.audit_entries(entries, repo_root=tmp_dir, is_candidate_root=True)
+        self.assertEqual([f for f in findings if f.code == "RETAIL_DISC_ID"], [])
+
+
+class IndexEntryProbeTests(unittest.TestCase):
+    """The LFS-pointer probe reads staged blobs in one batch and keeps per-entry verdicts."""
+
+    POINTER = (
+        "version https://git-lfs.github.com/spec/v1\n"
+        "oid sha256:d363cec75fecfafd1511e370e48c748c30199c694b83a4026be34d799b192917\n"
+        "size 4316284\n"
+    )
+
+    def repository(self) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name).resolve()
+        run_git(["init", "-q"], cwd=repo, check=True, capture_output=True)
+        run_git(["config", "user.name", "Test"], cwd=repo, check=True, capture_output=True)
+        run_git(["config", "user.email", "test@example.com"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def kinds(self, repo: Path, content_source: str) -> dict[tuple[str, str], str]:
+        entries = publish_audit._get_git_entries(
+            tracked_only=True, repo_root=repo, content_source=content_source)
+        return {(entry.path, entry.stage): entry.kind for entry in entries}
+
+    def test_index_probe_reads_staged_blobs_without_a_git_process_per_file(self):
+        repo = self.repository()
+        (repo / "pointer.bin").write_text(self.POINTER, encoding="utf-8", newline="\n")
+        (repo / "plain.txt").write_text("plain\n", encoding="utf-8", newline="\n")
+        run_git(["add", "-A"], cwd=repo, check=True, capture_output=True)
+        # Unstaged edits swap the two, so each source must read its own bytes.
+        (repo / "pointer.bin").write_text("no longer a pointer\n", encoding="utf-8", newline="\n")
+        (repo / "plain.txt").write_text(self.POINTER, encoding="utf-8", newline="\n")
+
+        per_file = mock.Mock(side_effect=AssertionError("one git process per indexed file"))
+        with mock.patch.object(publish_audit, "read_indexed_blob", per_file):
+            index = self.kinds(repo, publish_audit.CONTENT_INDEX)
+        self.assertEqual(index, {("plain.txt", "0"): "file", ("pointer.bin", "0"): "lfs_pointer"})
+        per_file.assert_not_called()
+        self.assertEqual(self.kinds(repo, publish_audit.CONTENT_WORKTREE),
+                         {("plain.txt", "0"): "lfs_pointer", ("pointer.bin", "0"): "file"})
+
+    def test_unmerged_index_judges_each_stage_by_its_own_blob(self):
+        repo = self.repository()
+        (repo / "asset.dat").write_text("base\n", encoding="utf-8", newline="\n")
+        run_git(["add", "-A"], cwd=repo, check=True, capture_output=True)
+        run_git(["commit", "-qm", "base"], cwd=repo, check=True, capture_output=True)
+        run_git(["checkout", "-qb", "side"], cwd=repo, check=True, capture_output=True)
+        (repo / "asset.dat").write_text("side\n", encoding="utf-8", newline="\n")
+        run_git(["commit", "-qam", "side"], cwd=repo, check=True, capture_output=True)
+        run_git(["checkout", "-q", "-"], cwd=repo, check=True, capture_output=True)
+        (repo / "asset.dat").write_text(self.POINTER, encoding="utf-8", newline="\n")
+        run_git(["commit", "-qam", "pointer"], cwd=repo, check=True, capture_output=True)
+        merge = run_git(["merge", "-q", "side"], cwd=repo, capture_output=True)
+        self.assertNotEqual(merge.returncode, 0, "the fixture needs a conflicted index")
+
+        self.assertEqual(self.kinds(repo, publish_audit.CONTENT_INDEX), {
+            ("asset.dat", "1"): "file",
+            ("asset.dat", "2"): "lfs_pointer",
+            ("asset.dat", "3"): "file",
+        })
+
+
+class BinaryHeuristicTests(unittest.TestCase):
+    """The control-byte count must equal the per-character rule it replaced."""
+
+    @staticmethod
+    def character_rule(data: bytes) -> bool:
+        if b"\x00" in data:
+            return True
+        try:
+            decoded = data.decode("utf-8")
+            if not decoded:
+                return False
+            non_printable = sum(1 for ch in decoded if ord(ch) < 32 and ch not in "\t\n\r")
+            return (non_printable / len(decoded)) > 0.05
+        except UnicodeDecodeError:
+            return True
+
+    def test_matches_the_character_rule(self):
+        rng = random.Random(1291)
+        alphabet = ["a", "Z", " ", "\t", "\n", "\r", "\x01", "\x1b", "\x1f", "\x7f",
+                    "é", "日", "\U0001f600", " "]
+        samples = [b"", b"\x00", b"plain text\n", "\x1b[0m\n".encode()]
+        for _ in range(3000):
+            length = rng.randrange(1, 120)
+            if rng.random() < 0.25:
+                samples.append(bytes(rng.randrange(256) for _ in range(length)))
+            else:
+                samples.append("".join(rng.choice(alphabet) for _ in range(length)).encode("utf-8"))
+        # Ratios on both sides of the 5% threshold, counted in characters, not bytes.
+        for controls in range(0, 8):
+            for wide in (0, 40):
+                samples.append(("\x01" * controls + "日" * wide + "x" * (100 - controls - wide))
+                               .encode("utf-8"))
+        flagged = 0
+        for data in samples:
+            expected = self.character_rule(data)
+            flagged += expected
+            self.assertEqual(publish_audit._is_binary_bytes(data), expected, repr(data[:40]))
+        self.assertTrue(0 < flagged < len(samples), "the samples must exercise both verdicts")
+
+
+class AndroidTreeMetadataTests(unittest.TestCase):
+    """#360: the Android host target's Gradle, Java, XML and properties files are
+    project sources, so their notice metadata is project-authored rather than
+    "unclassified". Publication itself is still the policy's decision: the
+    metadata never makes a path public."""
+
+    PATHS = (
+        "android/app/build.gradle.kts",
+        "android/app/deps.cmake",
+        "android/app/src/main/AndroidManifest.xml",
+        "android/app/src/main/java/io/github/jstar269/nakagawa/TitleActivity.java",
+        "android/app/src/main/res/values/strings.xml",
+        "android/gradle.properties",
+        "android/gradle/wrapper/gradle-wrapper.properties",
+    )
+
+    def test_android_sources_are_project_authored(self):
+        for path in self.PATHS:
+            with self.subTest(path=path):
+                prov, _lic, _notice, _gen, disp, public = publish_audit._default_provenance(path, None)
+                self.assertEqual(prov, "project_authored")
+                self.assertEqual(disp, "included")
+                self.assertFalse(public, "metadata alone must never make a path public")
+
+    def test_unknown_top_level_files_stay_unclassified(self):
+        prov, *_rest = publish_audit._default_provenance("elsewhere/app/build.gradle.kts", None)
+        self.assertEqual(prov, "unclassified")
+
+
+if __name__ == "__main__":
+    unittest.main()

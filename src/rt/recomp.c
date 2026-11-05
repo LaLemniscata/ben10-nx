@@ -1,0 +1,3003 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025-2026 the psp-recomp authors
+// Copyright (C) 2026 the Nakagawa Recomp authors
+// Derived from sal063/PSP-recompilation-project (GPL-2.0-or-later)
+// Modified by Nakagawa Recomp contributors, 2026-08-10.
+// See NOTICE.md for upstream lineage and modification provenance.
+// Derived from PPSSPP (https://github.com/hrydgard/ppsspp), GPL-2.0-or-later
+// Copyright (c) 2012- PPSSPP Project and contributors
+
+/*
+ * Core services the generated C calls into:
+ *   - guest memory: sr_mem_init() and sr_load_segment() set up the PSP address space
+ *     and copy the program in;
+ *   - the guest heap behind sr_newlib_malloc/free/memalign/realloc, a free-list
+ *     allocator in its own region of guest RAM;
+ *   - instruction helpers too large to emit inline: unaligned loads and stores
+ *     (sr_lwl/lwr/swl/swr), break and raw syscall traps, and the VFPU's approximate
+ *     math (sin, cos, exp2, log2, rcp, sqrt, rsqrt, asin);
+ *   - the function table: sr_register() and sr_lookup() map a guest address to its
+ *     translated C function;
+ *   - dispatch: dispatch(), dispatch_call() and dispatch_tail_step() run a guest
+ *     address, falling back to the interpreter floor (guest_interp.c) only inside
+ *     analyzer-owned spans, and stop the run with a named error otherwise
+ *     (AGENTS.md section 7 has the contract);
+ *   - diagnostics: the guest-PC profiler, dispatch-miss and stack-census reports, and
+ *     the trace files.
+ */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <string.h>
+#include "recomp.h"
+#include "nested_frames.h"
+#include "dispatch_table.h"   /* guest code-address table + primitives (issue #45) */
+#include "guest_interp.h"     /* executable-span interpreter floor (issue #116) */
+#include "title_config.h"     /* generic title-binding accessors; no title identity here */
+#include "strbuf.h"
+#include "flight_recorder.h"
+
+uint8_t *g_mem = NULL;
+int sr_hit_hle = 0;
+int g_sr_heap_watch = 0;
+extern CpuState *s_cpu;
+
+#include <time.h>
+extern uint64_t SDL_GetTicksNS(void);
+
+#define PROF_HASH_SIZE 131072
+typedef struct {
+    uint32_t pc;
+    uint64_t call_count;
+    uint64_t block_count;
+    uint64_t duration_ns;
+    uint8_t used;
+} SrProfEntry;
+
+SrProfEntry g_prof_table[PROF_HASH_SIZE];
+int g_prof_enabled = 0;
+static uint64_t g_prof_lookup_drops = 0;
+
+static inline SrProfEntry *prof_lookup(uint32_t pc) {
+    uint32_t h = (pc * 2654435761u) & (PROF_HASH_SIZE - 1);
+    for (int i = 0; i < 64; i++) {
+        uint32_t idx = (h + i) & (PROF_HASH_SIZE - 1);
+        if (g_prof_table[idx].used && g_prof_table[idx].pc == pc) {
+            return &g_prof_table[idx];
+        }
+        if (!g_prof_table[idx].used) {
+            g_prof_table[idx].used = 1;
+            g_prof_table[idx].pc = pc;
+            return &g_prof_table[idx];
+        }
+    }
+    g_prof_lookup_drops++;
+    return NULL;
+}
+
+#ifdef SR_PROFILER_SELFTEST
+static SrProfEntry *prof_find(uint32_t pc) {
+    uint32_t h = (pc * 2654435761u) & (PROF_HASH_SIZE - 1);
+    for (int i = 0; i < 64; i++) {
+        uint32_t idx = (h + i) & (PROF_HASH_SIZE - 1);
+        if (!g_prof_table[idx].used) return NULL;
+        if (g_prof_table[idx].pc == pc) return &g_prof_table[idx];
+    }
+    return NULL;
+}
+#endif
+
+void sr_profile_init(void) {
+    memset(g_prof_table, 0, sizeof(g_prof_table));
+    g_prof_lookup_drops = 0;
+    const char *e = getenv("SR_PROFILE");
+    g_prof_enabled = (e != NULL && strcmp(e, "0") != 0) || ((g_sr_debug & 0x04) != 0);
+    if (g_prof_enabled) {
+        fprintf(stderr, "[profiler] Hot-path profiling enabled (SR_PROFILE=1 or SR_DEBUG & 0x04)\n");
+        atexit(sr_profile_dump);
+    }
+}
+
+void sr_profile_dump(void) {
+    if (!g_prof_enabled) return;
+    fprintf(stderr, "--- PERF_PROFILE ---\n");
+    fprintf(stderr, "timestamp:%llu\n", (unsigned long long)time(NULL));
+    for (int i = 0; i < PROF_HASH_SIZE; i++) {
+        if (g_prof_table[i].used) {
+            if (g_prof_table[i].call_count > 0 || g_prof_table[i].block_count > 0) {
+                fprintf(stderr, "pc=0x%08" PRIx32 " calls=%llu blocks=%llu duration_ns=%llu\n",
+                        g_prof_table[i].pc,
+                        (unsigned long long)g_prof_table[i].call_count,
+                        (unsigned long long)g_prof_table[i].block_count,
+                        (unsigned long long)g_prof_table[i].duration_ns);
+            }
+        }
+    }
+    fprintf(stderr, "lookup_drops:%llu\n", (unsigned long long)g_prof_lookup_drops);
+    fprintf(stderr, "--- END_PERF_PROFILE ---\n");
+    fflush(stderr);
+}
+
+void sr_profile_block(uint32_t target_pc) {
+    SrProfEntry *entry = prof_lookup(target_pc);
+    if (entry) {
+        entry->block_count++;
+    }
+}
+
+#ifdef SR_PROFILER_SELFTEST
+void sr_profile_test_reset(void) {
+    memset(g_prof_table, 0, sizeof(g_prof_table));
+    g_prof_lookup_drops = 0;
+}
+
+uint64_t sr_profile_test_block_count(uint32_t pc) {
+    SrProfEntry *entry = prof_find(pc);
+    return entry ? entry->block_count : 0;
+}
+
+uint64_t sr_profile_test_lookup_drops(void) {
+    return g_prof_lookup_drops;
+}
+#endif
+
+
+/* Count-leading-zeros portable fallback. We use __builtin_clz where available
+ * (GCC/Clang per the standard build), but emit a slow loop otherwise so the
+ * codebase compiles cleanly under MSVC if a build-port ever wants that. */
+static inline int sr_clz32(uint32_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return x ? __builtin_clz(x) : 32;
+#else
+    if (!x) return 32;
+    int n = 0;
+    while ((x & 0x80000000u) == 0u) { x <<= 1; n++; }
+    return n;
+#endif
+}
+
+/* Circular dispatch trace buffer — last 32 dispatches before _exit or any crash. */
+#define DISPATCH_TRACE_SIZE 32
+struct { uint32_t target; uint32_t pc; uint32_t ra; uint32_t uid; uint32_t used; }
+    g_dtrace[DISPATCH_TRACE_SIZE];
+int g_dtrace_idx = 0;
+
+static void dump_dispatch_trace(void) {
+    fprintf(stderr, "--- dispatch trace (last %d) ---\n", DISPATCH_TRACE_SIZE);
+    for (int i = 0; i < DISPATCH_TRACE_SIZE; i++) {
+        int idx = (g_dtrace_idx + DISPATCH_TRACE_SIZE - 1 - i) % DISPATCH_TRACE_SIZE;
+        /* Skip only never-written slots. A recorded target of 0 is a real event -- a
+         * null/indirect dispatch -- and must be printable, not mistaken for an empty
+         * record (issue #45). */
+        if (!g_dtrace[idx].used) continue;
+        fprintf(stderr, "  [%2d] tgt=0x%08" PRIx32 " pc=0x%08" PRIx32 " ra=0x%08" PRIx32 " uid=0x%" PRIx32,
+                i, g_dtrace[idx].target, g_dtrace[idx].pc,
+                g_dtrace[idx].ra, g_dtrace[idx].uid);
+        /* Names only when a symbol map was built in (sr_guest_symbols_register). */
+        char tgt_name[160], ra_name[160];
+        sr_guest_symbol_label(g_dtrace[idx].target, tgt_name, sizeof tgt_name);
+        sr_guest_symbol_label(g_dtrace[idx].ra, ra_name, sizeof ra_name);
+        if (tgt_name[0]) fprintf(stderr, " tgt_sym=%s", tgt_name);
+        if (ra_name[0]) fprintf(stderr, " ra_sym=%s", ra_name);
+        fputc('\n', stderr);
+    }
+    fprintf(stderr, "--- end dispatch trace ---\n");
+    fflush(stderr);
+}
+
+/* Out-of-range (wild guest pointer) access recorder. Bounds-safe MEM_* drops these; with
+ * SR_OORLOG set, log the first distinct store addresses so a dropped game flag-write can be
+ * found (a masked divergence). Reads are counted only. */
+unsigned long g_oor_reads = 0, g_oor_writes = 0;
+void sr_oor(uint32_t a, uint32_t v, int store) {
+    static int logging = -1;
+    if (logging < 0) logging = getenv("SR_OORLOG") ? 1 : 0;
+    if (store) {
+        g_oor_writes++;
+        if (logging) {
+            static uint32_t seen[64]; static int n = 0; int known = 0;
+            for (int i = 0; i < n; i++) if (seen[i] == a) { known = 1; break; }
+            if (!known && n < 64) { seen[n++] = a;
+                fprintf(stderr, "OOR store [0x%08" PRIx32 "] = 0x%08" PRIx32 "\n", a, v); }
+        }
+    } else g_oor_reads++;
+}
+
+#define SR_VRAM_LOW  0x04000000u  /* guest VRAM/eDRAM base, below user RAM */
+#define SR_RAM_SIZE  0x04000000u  /* 64 MB user RAM at 0x08000000 */
+
+#ifdef SR_NAN_TRAP
+/* SR_NAN_TRAP_CONTEXT=1: after each NAN_TRAP report, the registers a reader needs to find the
+ * instruction's inputs in guest memory (return address, value and argument registers, two
+ * saved registers, f12) and the four words each of v0 and a0..a3 points at when that span is
+ * readable. A quaternion slerp whose vasin reports a NaN has its two input quaternions behind
+ * a1 and v0 at that point. Reads the scheduler's current CpuState; nothing outside guest
+ * execution prints. */
+static void sr_nan_trap_print_floats(const float *v, int n) {
+    for (int i = 0; i < n; i++) {
+        uint32_t bits; memcpy(&bits, &v[i], sizeof(bits));
+        if (i) fputc(',', stderr);
+        if ((bits & 0x7FFFFFFFu) == 0x7F800000u) fputs((bits & 0x80000000u) ? "-inf" : "inf", stderr);
+        else if ((bits & 0x7F800000u) == 0x7F800000u) fputs("nan", stderr);
+        else fprintf(stderr, "%.9g", (double)v[i]);
+    }
+}
+static void sr_nan_trap_dump_context(void) {
+    const CpuState *c = s_cpu;
+    if (!c) return;
+    fprintf(stderr, "NAN_TRAP_CTX ra=0x%08x v0=0x%08x a0=0x%08x a1=0x%08x a2=0x%08x a3=0x%08x "
+            "t0=0x%08x s0=0x%08x s1=0x%08x f12=%.9g\n",
+            c->r[31], c->r[2], c->r[4], c->r[5], c->r[6], c->r[7], c->r[8], c->r[16], c->r[17],
+            (double)c->f[12]);
+    static const struct { const char *name; int reg; } ptrs[] = {
+        { "v0", 2 }, { "a0", 4 }, { "a1", 5 }, { "a2", 6 }, { "a3", 7 },
+    };
+    for (size_t i = 0; i < sizeof(ptrs) / sizeof(ptrs[0]); i++) {
+        uint32_t a = c->r[ptrs[i].reg];
+        if ((a & 3u) != 0u || !sr_guest_span_readable_current(a, 16u)) continue;
+        float v[4]; memcpy(v, SR_HOST(a), sizeof(v));
+        fprintf(stderr, "NAN_TRAP_CTX %s@0x%08x=[", ptrs[i].name, a);
+        sr_nan_trap_print_floats(v, 4);
+        fputs("]\n", stderr);
+    }
+}
+#endif
+
+void sr_mem_init(void) {
+#ifdef SR_NAN_TRAP
+    sr_nan_trap_context_hook = sr_nan_trap_dump_context;
+#endif
+    if (!g_mem) {
+        /* Arena covers guest physical [0, 0x0c000000). RAM at 0x08000000, VRAM at 0x04000000.
+         * We set g_mem to the guest RAM base (SR_RAM_BASE) so guest 0x08000000 maps to g_mem. */
+        uint8_t *arena = (uint8_t *)calloc(0x0c000000u, 1);
+        if (!arena) {
+            fprintf(stderr, "sr_mem_init: out of memory\n");
+            abort();
+        }
+        g_mem = arena + 0x08000000u;
+        g_sr_heap_watch = getenv("SR_HEAP_WATCH") ? 1 : 0;
+        if (g_sr_heap_watch) {
+            fprintf(stderr,
+                "HEAP_WATCH: tracking first writes to dynamically freed allocator headers\n");
+        }
+    }
+}
+
+static uint32_t g_loaded_end = 0;   /* highest guest address written by the loader */
+
+uint32_t sr_loaded_end(void) { return g_loaded_end; }
+
+/* The lowest address the host loader wrote: with sr_loaded_end() it bounds the main
+ * module's image, the range sceKernelGetModuleIdByAddress resolves to the main module. */
+static uint32_t g_loaded_base = UINT32_MAX;
+uint32_t sr_loaded_base(void) { return g_loaded_base; }
+
+/* Seeds only the end: the loader's allocation floor for a program LoadExec boots. The base
+ * stays UINT32_MAX until the host loader writes a segment, so no host-loaded main image
+ * exists; the booted program is a module record and resolves through the module table. */
+void sr_loaded_end_set(uint32_t end) {
+    g_loaded_end = end;
+}
+
+void sr_mem_reset(void) {
+    sr_mem_init();
+    /* g_mem points at guest RAM 0x08000000 inside the full physical arena. */
+    memset(g_mem - 0x08000000u, 0, 0x0c000000u);
+    g_loaded_end = 0u;
+    g_loaded_base = UINT32_MAX;
+    sr_exec_span_reset();
+}
+
+void sr_load_segment(uint32_t vaddr, const void *data, uint32_t len) {
+    sr_mem_init();
+    /* Bounds-check against the 192 MB guest arena. A malformed ELF or a loader that
+     * computes len from attacker-controlled fields could otherwise memcpy past the
+     * end of the host allocation. The allocator reserves [0, 0x0C000000) physical;
+     * after the SR_RAM_BASE offset (g_mem points at 0x08000000) the lowest legal
+     * load is 0x04000000 (VRAM/eDRAM region) and the highest is just below
+     * 0x0C000000. Reject anything that would write outside that space. */
+    uint32_t end_vaddr = vaddr + len;
+    if (len == 0u) return;
+    /* u32 arithmetic overflow guard: vaddr + len must be >= vaddr for a well-formed seg */
+    if (end_vaddr < vaddr) {
+        fprintf(stderr, "sr_load_segment: vaddr=0x%08" PRIx32 " len=0x%08" PRIx32 " wraps the u32 range — refusing\n",
+                vaddr, len);
+        abort();
+    }
+    /* Validate the complete physical span, not just its two endpoints.  The
+     * SR_PHYS aliasing model means independently checking start/end can accept
+     * a span that crosses an alias boundary and is much larger than the host
+     * allocation. */
+    if (!sr_guest_span_writable(vaddr, len)) {
+        fprintf(stderr, "sr_load_segment: vaddr=0x%08" PRIx32 " len=0x%08" PRIx32 " end=0x%08" PRIx32 " outside guest arena — refusing\n",
+                vaddr, len, end_vaddr);
+        abort();
+    }
+    fprintf(stderr, "sr_load_segment: vaddr=0x%08" PRIx32 " len=0x%08" PRIx32 " SR_HOST=0x%p\n", vaddr, len, SR_HOST(vaddr));
+    memcpy(SR_HOST(vaddr), data, len);
+    if (vaddr + len > g_loaded_end) g_loaded_end = vaddr + len;
+    if (vaddr < g_loaded_base) g_loaded_base = vaddr;
+}
+
+/* Newlib malloc/free backing store (guest addresses 0x00010738 / 0x000104e0 in
+ * tools/codegen.py's custom stubs). Per-block header at (payload - 8):
+ *   +0: while free, the guest address of the next free block (0 = list end).
+ *       While allocated, unused.
+ *   +4: total block size (header + payload, always a multiple of 16) with bit0 set
+ *       while allocated and clear while free.
+ * A long play session that streams and discards similarly-sized assets would
+ * otherwise exhaust the arena via monotonic bump growth with no reuse; the free
+ * list lets freed blocks satisfy later allocations of the same or smaller size. */
+/* Arena placement: 32 MB in the top of the flat guest arena, disjoint from the compiled
+ * image, user partition, VRAM, thread stacks, and interrupt stack. The previous 16 MB
+ * placement could silently alias guest VRAM once the allocation grew past its boundary.
+ * SR_PHYS masks this whole range into the calloc-zeroed arena. */
+#define SR_HEAP_BASE UINT32_C(0x0a000008)
+#define SR_HEAP_END  UINT32_C(0x0c000000)  /* exclusive: end of the guest arena */
+/* The nested host->guest call frames (src/rt/nested_frames.c) reserve 1 MiB of
+ * kernel RAM, far below this heap.  Pin the ordering so moving either region
+ * cannot silently alias the other. */
+_Static_assert(SR_NESTED_FRAME_END <= SR_HEAP_BASE,
+               "the reserved nested-frame region must end at or below the guest heap arena");
+static uint32_t s_heap_bump_ptr = SR_HEAP_BASE;
+static const uint32_t s_heap_bump_end = SR_HEAP_END;
+static uint32_t s_heap_free_list = 0u;
+static uint32_t s_heap_fail_count = 0u;
+
+/* One bit per possible 16-byte block-header position.  A range check alone is
+ * insufficient: an interior/foreign pointer can still land inside the arena,
+ * and interpreting its payload as (next,size) poisons the free list. */
+#define SR_HEAP_HEADER_SLOTS (((SR_HEAP_END - SR_HEAP_BASE) + 15u) / 16u)
+static uint8_t s_heap_header_bits[(SR_HEAP_HEADER_SLOTS + 7u) / 8u];
+static uint8_t s_heap_free_bits[(SR_HEAP_HEADER_SLOTS + 7u) / 8u];
+static uint8_t s_heap_watch_reported_bits[(SR_HEAP_HEADER_SLOTS + 7u) / 8u];
+static unsigned s_heap_watch_report_count = 0;
+static int s_heap_internal_write = 0;
+
+static int sr_heap_header_slot(uint32_t hdr, uint32_t *slot) {
+    if (hdr < SR_HEAP_BASE || hdr >= SR_HEAP_END) return 0;
+    uint32_t delta = hdr - SR_HEAP_BASE;
+    if ((delta & 15u) != 0u) return 0;
+    *slot = delta >> 4;
+    return *slot < SR_HEAP_HEADER_SLOTS;
+}
+
+static void sr_heap_mark_header(uint32_t hdr) {
+    uint32_t slot;
+    if (sr_heap_header_slot(hdr, &slot))
+        s_heap_header_bits[slot >> 3] |= (uint8_t)(1u << (slot & 7u));
+}
+
+static int sr_heap_is_header(uint32_t hdr) {
+    uint32_t slot;
+    return sr_heap_header_slot(hdr, &slot) &&
+        (s_heap_header_bits[slot >> 3] & (uint8_t)(1u << (slot & 7u))) != 0u;
+}
+
+/* Validate one free-list node without trusting its fields for host pointer
+ * arithmetic. The footer is part of the free-block contract; checking it
+ * catches stale or overlapping metadata before allocation follows its link. */
+static int sr_heap_free_node_valid(uint32_t hdr, uint32_t *size_out, uint32_t *next_out) {
+    if (!sr_heap_is_header(hdr) || hdr < SR_HEAP_BASE || hdr >= s_heap_bump_ptr) return 0;
+    uint32_t sizeflags = MEM_R32(hdr + 4u);
+    uint32_t size = sizeflags & ~1u;
+    if ((sizeflags & 1u) != 0u || size < 16u || (size & 15u) != 0u) return 0;
+    uint32_t end = hdr + size;
+    if (end < hdr || end > s_heap_bump_ptr || MEM_R32(end - 4u) != size) return 0;
+    uint32_t next = MEM_R32(hdr + 0u);
+    if (next != 0u && (next < SR_HEAP_BASE || next >= s_heap_bump_ptr ||
+                       !sr_heap_is_header(next) || next == hdr)) return 0;
+    if (size_out) *size_out = size;
+    if (next_out) *next_out = next;
+    return 1;
+}
+
+/* The free list is guest-visible metadata and can be damaged by a foreign
+ * pointer write. Validate every reachable node and use Brent's cycle walk so a
+ * cycle cannot spin allocation forever. The interval check rejects a link into
+ * another node's payload, which would otherwise create overlapping free blocks
+ * even though both addresses happen to be marked headers. This runs on every
+ * allocation, so each node is read and validated once: the earlier Floyd walk
+ * validated each node about three times and was ~17% of a measured title's busy
+ * thread during play (#1296). */
+static int sr_heap_free_list_valid(void) {
+    uint32_t cur = s_heap_free_list, prev = 0u, prev_size = 0u;
+    uint32_t tortoise = cur, power = 1u, steps = 0u;
+    while (cur != 0u) {
+        uint32_t size, next;
+        if (!sr_heap_free_node_valid(cur, &size, &next)) return 0;
+        if (prev != 0u) {
+            uint64_t prev_end = (uint64_t)prev + prev_size;
+            uint64_t cur_end = (uint64_t)cur + size;
+            if (((uint64_t)cur > prev && (uint64_t)cur < prev_end) ||
+                ((uint64_t)prev > cur && (uint64_t)prev < cur_end)) return 0;
+        }
+        if (next != 0u && next == tortoise) return 0;
+        if (++steps == power) {
+            tortoise = next;
+            power <<= 1;
+            steps = 0u;
+        }
+        prev = cur;
+        prev_size = size;
+        cur = next;
+    }
+    return 1;
+}
+
+static void sr_heap_set_free_state(uint32_t hdr, int is_free) {
+    if (!g_sr_heap_watch) return;
+    uint32_t slot;
+    if (!sr_heap_header_slot(hdr, &slot)) return;
+    uint8_t mask = (uint8_t)(1u << (slot & 7u));
+    if (is_free) {
+        s_heap_free_bits[slot >> 3] |= mask;
+        /* A later allocation/free cycle is a new lifetime and deserves a fresh report. */
+        s_heap_watch_reported_bits[slot >> 3] &= (uint8_t)~mask;
+    } else {
+        s_heap_free_bits[slot >> 3] &= (uint8_t)~mask;
+        s_heap_watch_reported_bits[slot >> 3] &= (uint8_t)~mask;
+    }
+}
+
+static int sr_heap_is_unreported_free(uint32_t hdr, uint32_t *slot_out) {
+    uint32_t slot;
+    if (!sr_heap_header_slot(hdr, &slot)) return 0;
+    uint8_t mask = (uint8_t)(1u << (slot & 7u));
+    if ((s_heap_free_bits[slot >> 3] & mask) == 0u ||
+        (s_heap_watch_reported_bits[slot >> 3] & mask) != 0u) {
+        return 0;
+    }
+    if (slot_out) *slot_out = slot;
+    return 1;
+}
+
+static void sr_heap_note_write_impl(
+    uint32_t addr, uint32_t width, uint32_t value, uint32_t pc, int bulk
+) {
+    if (!g_sr_heap_watch || s_heap_internal_write || width == 0u ||
+        s_heap_watch_report_count >= 128u) {
+        return;
+    }
+    uint64_t start = (uint32_t)SR_PHYS(addr);
+    uint64_t end = start + width;
+    if (end <= SR_HEAP_BASE || start >= SR_HEAP_END) return;
+
+    uint64_t clipped = start > SR_HEAP_BASE ? start : SR_HEAP_BASE;
+    uint32_t delta = (uint32_t)(clipped - SR_HEAP_BASE);
+    uint32_t hdr = SR_HEAP_BASE + ((delta >> 4) << 4);
+    if ((uint64_t)hdr + 8u <= start) hdr += 16u;
+    for (; (uint64_t)hdr < end && hdr < SR_HEAP_END; hdr += 16u) {
+        uint32_t slot;
+        if ((uint64_t)hdr + 8u <= start || !sr_heap_is_unreported_free(hdr, &slot)) continue;
+        s_heap_watch_reported_bits[slot >> 3] |= (uint8_t)(1u << (slot & 7u));
+        s_heap_watch_report_count++;
+        uint32_t effective_pc = pc ? pc : (s_cpu ? s_cpu->pc : 0u);
+        uint32_t ra = s_cpu ? s_cpu->r[31] : 0u;
+        fprintf(stderr,
+            "HEAP_HEADER_%sWRITE: header=0x%08" PRIx32 " old_next=0x%08" PRIx32 " old_size=0x%08" PRIx32 " "
+            "write_addr=0x%08" PRIx32 " width=0x%" PRIx32 " value=0x%08" PRIx32 " pc=0x%08" PRIx32 " ra=0x%08" PRIx32 " uid=0x%" PRIx32 "\n",
+            bulk ? "BULK_" : "", hdr, MEM_R32(hdr), MEM_R32(hdr + 4u),
+            addr, width, value, effective_pc, ra, sched_current_uid());
+        fflush(stderr);
+        return;  /* one provenance record per write operation is enough */
+    }
+}
+
+void sr_heap_note_write(uint32_t addr, uint32_t width, uint32_t value, uint32_t pc) {
+    sr_heap_note_write_impl(addr, width, value, pc, 0);
+}
+
+void sr_heap_note_bulk_write(uint32_t addr, uint32_t width, uint32_t pc) {
+    sr_heap_note_write_impl(addr, width, 0u, pc, 1);
+}
+
+typedef struct {
+    uint32_t allocated_blocks, free_blocks;
+    uint64_t allocated_bytes, free_bytes;
+    uint32_t largest_free;
+    uint32_t largest_addr[8], largest_size[8];
+    int metadata_valid;
+    /* When the linear walk breaks: the smashed header and the block just below it
+     * (the prime overrun suspect), so a failure dump names the culprit directly. */
+    uint32_t bad_hdr, bad_word0, bad_word4;
+    uint32_t bad_prev_hdr, bad_prev_size;
+    int bad_prev_allocated;
+} SrHeapStats;
+
+/* Walk the allocator's contiguous block headers without trusting the free-list
+ * links.  This runs only on allocation failure, where a compact state summary is
+ * far more useful than a bare bump pointer for distinguishing a real live-set
+ * overflow from external fragmentation or damaged metadata. */
+static SrHeapStats sr_heap_stats(void) {
+    SrHeapStats st = {0};
+    st.metadata_valid = 1;
+    uint32_t prev = 0u, prev_sizeflags = 0u;
+    for (uint32_t cur = SR_HEAP_BASE; cur < s_heap_bump_ptr; ) {
+        uint32_t sizeflags = MEM_R32(cur + 4u);
+        uint32_t size = sizeflags & ~1u;
+        if (size < 16u || (size & 15u) != 0u ||
+            cur + size < cur || cur + size > s_heap_bump_ptr) {
+            st.metadata_valid = 0;
+            st.bad_hdr = cur;
+            st.bad_word0 = MEM_R32(cur + 0u);
+            st.bad_word4 = sizeflags;
+            st.bad_prev_hdr = prev;
+            st.bad_prev_size = prev_sizeflags & ~1u;
+            st.bad_prev_allocated = (int)(prev_sizeflags & 1u);
+            break;
+        }
+        prev = cur;
+        prev_sizeflags = sizeflags;
+        if (sizeflags & 1u) {
+            st.allocated_blocks++;
+            st.allocated_bytes += size;
+            for (unsigned i = 0; i < 8; ++i) {
+                if (size <= st.largest_size[i]) continue;
+                for (unsigned j = 7; j > i; --j) {
+                    st.largest_size[j] = st.largest_size[j - 1];
+                    st.largest_addr[j] = st.largest_addr[j - 1];
+                }
+                st.largest_size[i] = size;
+                st.largest_addr[i] = cur;
+                break;
+            }
+        } else {
+            st.free_blocks++;
+            st.free_bytes += size;
+            if (size > st.largest_free) st.largest_free = size;
+        }
+        cur += size;
+    }
+    if (st.metadata_valid && !sr_heap_free_list_valid()) {
+        st.metadata_valid = 0;
+        st.bad_hdr = s_heap_free_list;
+        if (s_heap_free_list != 0u && sr_heap_is_header(s_heap_free_list)) {
+            st.bad_word0 = MEM_R32(s_heap_free_list + 0u);
+            st.bad_word4 = MEM_R32(s_heap_free_list + 4u);
+        }
+    }
+    return st;
+}
+
+static void sr_heap_dump_failure(uint32_t requested) {
+    SrHeapStats st = sr_heap_stats();
+    fprintf(stderr,
+        "HEAP_STATE: request=0x%" PRIx32 " carved=0x%" PRIx32 " live=%" PRIu32 "/0x%llx free=%" PRIu32 "/0x%llx "
+        "largest_free=0x%" PRIx32 " metadata=%s\n",
+        requested, s_heap_bump_ptr - SR_HEAP_BASE,
+        st.allocated_blocks, (unsigned long long)st.allocated_bytes,
+        st.free_blocks, (unsigned long long)st.free_bytes,
+        st.largest_free, st.metadata_valid ? "valid" : "INVALID");
+    if (!st.metadata_valid) {
+        fprintf(stderr,
+            "HEAP_SMASH: header=0x%08" PRIx32 " words=0x%08" PRIx32 "/0x%08" PRIx32 " prev=0x%08" PRIx32 " prev_size=0x%" PRIx32 " "
+            "prev_state=%s (prev payload 0x%08" PRIx32 "..0x%08" PRIx32 " is the prime overrun suspect)\n",
+            st.bad_hdr, st.bad_word0, st.bad_word4,
+            st.bad_prev_hdr, st.bad_prev_size,
+            st.bad_prev_allocated ? "live" : "free",
+            st.bad_prev_hdr + 8u, st.bad_prev_hdr + st.bad_prev_size);
+    }
+    if (getenv("SR_HEAP_DIAG")) {
+        for (unsigned i = 0; i < 8 && st.largest_size[i] != 0u; ++i) {
+            fprintf(stderr, "HEAP_LIVE[%u]: payload=0x%08" PRIx32 " size=0x%" PRIx32 "\n",
+                i, st.largest_addr[i] + 8u, st.largest_size[i]);
+        }
+    }
+}
+
+static int sr_heap_allocation_size(uint32_t size, uint32_t *alloc_out) {
+    uint64_t payload = size ? size : 1u;
+    uint64_t total = (payload + 8u + 15u) & ~15ull;
+    if (total > 0xffffffffull) return 0;
+    *alloc_out = (uint32_t)total;
+    return 1;
+}
+
+/* Clear a slot's "this is a live allocator header" bit.  Called when a block is
+ * absorbed by a coalescing merge and its header becomes interior payload, so a
+ * later foreign/stale pointer to that address is not mistaken for a real block. */
+static void sr_heap_unmark_header(uint32_t hdr) {
+    uint32_t slot;
+    if (sr_heap_header_slot(hdr, &slot))
+        s_heap_header_bits[slot >> 3] &= (uint8_t)~(1u << (slot & 7u));
+}
+
+/* Remove one block from the singly-linked free list.  O(list length), which
+ * coalescing keeps small; used when a forward neighbor is absorbed by a merge. */
+static void sr_heap_freelist_unlink(uint32_t target) {
+    uint32_t prev = 0u, cur = s_heap_free_list;
+    while (cur != 0u) {
+        uint32_t next = MEM_R32(cur + 0u);
+        if (cur == target) {
+            if (prev == 0u) s_heap_free_list = next;
+            else {
+                s_heap_internal_write++;
+                MEM_W32(prev + 0u, next);
+                s_heap_internal_write--;
+            }
+            return;
+        }
+        prev = cur;
+        cur = next;
+    }
+}
+
+/* Publish [hdr, hdr+size) as free, coalescing with the physically adjacent free
+ * neighbours (Knuth boundary tags).  Every free block carries a FOOTER -- its size
+ * repeated at hdr+size-4 -- so the following block can locate a free predecessor.
+ * Each candidate merge is validated three ways: the neighbour address is a live
+ * allocator header (bitmap), the sizes make the blocks exactly physically
+ * adjacent, and the neighbour's allocation bit is clear.  A stray footer-shaped
+ * word inside an allocated neighbour's payload therefore cannot trigger a bad
+ * merge.  Absorbed metadata words are zeroed so the merged block keeps free()'s
+ * clean-payload guarantee.  The caller must have marked hdr and prepared its
+ * payload.  Because merging keeps the free list short, the first-fit allocation
+ * scan stays O(small) instead of degrading with fragmentation. */
+static void sr_heap_free_block(uint32_t hdr, uint32_t size) {
+    /* Forward: absorb the next physical block if it is a valid free block. */
+    uint32_t next_hdr = hdr + size;
+    if (next_hdr < s_heap_bump_ptr && sr_heap_is_header(next_hdr)) {
+        uint32_t nsf = MEM_R32(next_hdr + 4u);
+        uint32_t nsize = nsf & ~1u;
+        if ((nsf & 1u) == 0u && nsize >= 16u && (nsize & 15u) == 0u &&
+            next_hdr + nsize > next_hdr && next_hdr + nsize <= s_heap_bump_ptr) {
+            sr_heap_freelist_unlink(next_hdr);
+            sr_heap_set_free_state(next_hdr, 0);
+            sr_heap_unmark_header(next_hdr);
+            s_heap_internal_write++;
+            MEM_W32(next_hdr + 0u, 0u);   /* old header words become interior payload */
+            MEM_W32(next_hdr + 4u, 0u);
+            s_heap_internal_write--;
+            size += nsize;
+        }
+    }
+    /* Backward: fold into the previous physical block if it is a valid free block,
+     * located via its footer.  The predecessor is already linked, so grow it in
+     * place and leave it where it sits in the list. */
+    if (hdr > SR_HEAP_BASE) {
+        uint32_t pfoot = MEM_R32(hdr - 4u);
+        if (pfoot >= 16u && (pfoot & 15u) == 0u && pfoot <= hdr - SR_HEAP_BASE) {
+            uint32_t prev_hdr = hdr - pfoot;
+            if (sr_heap_is_header(prev_hdr)) {
+                uint32_t psf = MEM_R32(prev_hdr + 4u);
+                if ((psf & 1u) == 0u && (psf & ~1u) == pfoot && prev_hdr + pfoot == hdr) {
+                    sr_heap_set_free_state(hdr, 0);
+                    sr_heap_unmark_header(hdr);
+                    size += pfoot;
+                    s_heap_internal_write++;
+                    MEM_W32(hdr - 4u, 0u);   /* predecessor's old footer -> interior */
+                    MEM_W32(hdr + 0u, 0u);   /* this block's old header -> interior  */
+                    MEM_W32(hdr + 4u, 0u);
+                    MEM_W32(prev_hdr + 4u, size);
+                    MEM_W32(prev_hdr + size - 4u, size);
+                    s_heap_internal_write--;
+                    return;
+                }
+            }
+        }
+    }
+    /* No predecessor merge: publish [hdr, hdr+size) as a fresh free-list head. */
+    s_heap_internal_write++;
+    MEM_W32(hdr + 4u, size);
+    MEM_W32(hdr + size - 4u, size);
+    MEM_W32(hdr + 0u, s_heap_free_list);
+    s_heap_internal_write--;
+    s_heap_free_list = hdr;
+    sr_heap_set_free_state(hdr, 1);
+}
+
+/* Insert one already-partitioned block into the host free list.  Callers write
+ * and mark the header before exposing the block as free so SR_HEAP_WATCH does
+ * not mistake allocator-owned metadata initialization for a guest overwrite. */
+static void sr_heap_link_free_block(uint32_t hdr, uint32_t size, int clear_payload) {
+    sr_heap_mark_header(hdr);
+    if (clear_payload) {
+        for (uint32_t off = 8u; off < size; off += 4u) MEM_W32(hdr + off, 0u);
+    }
+    sr_heap_free_block(hdr, size);
+}
+
+uint32_t sr_newlib_malloc(uint32_t size, uint32_t guest_ra) {
+    static int trace_on = -1;
+    if (trace_on < 0) trace_on = getenv("SR_ALLOC_TRACE") ? 1 : 0;
+    if (size == 0u) size = 1u;
+    uint32_t alloc;
+    if (!sr_heap_allocation_size(size, &alloc)) return 0u;
+
+    /* Reuse defaults ON (see sr_newlib_free below for the root cause that used to
+     * gate it off and the fix that made it safe: an arena-membership check on the
+     * pointer passed to free). Set SR_HEAP_REUSE_OFF to opt back out for A/B
+     * comparison against the old bump-only behavior. */
+    static int reuse_on = -1;
+    if (reuse_on < 0) reuse_on = getenv("SR_HEAP_REUSE_OFF") ? 0 : 1;
+
+    if (reuse_on && s_heap_free_list != 0u && !sr_heap_free_list_valid()) {
+        static int corrupt_list_n = 0;
+        if (corrupt_list_n++ < 8)
+            fprintf(stderr,
+                "HEAP_FREE_LIST_CORRUPT: quarantining invalid/cyclic list head=0x%08" PRIx32 "\n",
+                s_heap_free_list);
+        s_heap_free_list = 0u;
+    }
+
+    uint32_t prev = 0u, cur = reuse_on ? s_heap_free_list : 0u;
+    while (cur != 0u) {
+        if (!sr_heap_is_header(cur) || cur >= s_heap_bump_ptr) {
+            static int corrupt_list_n = 0;
+            if (corrupt_list_n++ < 8)
+                fprintf(stderr, "HEAP_FREE_LIST_CORRUPT: header=0x%08" PRIx32 "; quarantining list\n", cur);
+            s_heap_free_list = 0u;
+            break;
+        }
+        uint32_t block_size = MEM_R32(cur + 4u);
+        uint32_t next = MEM_R32(cur + 0u);
+        if ((block_size & 1u) != 0u || block_size < 16u || (block_size & 15u) != 0u ||
+            cur + block_size < cur || cur + block_size > s_heap_bump_ptr ||
+            (next != 0u && (!sr_heap_is_header(next) || next >= s_heap_bump_ptr))) {
+            static int corrupt_block_n = 0;
+            if (corrupt_block_n++ < 8)
+                fprintf(stderr,
+                    "HEAP_FREE_LIST_CORRUPT: header=0x%08" PRIx32 " size=0x%" PRIx32 " next=0x%08" PRIx32 "; quarantining list\n",
+                    cur, block_size, next);
+            s_heap_free_list = 0u;
+            break;
+        }
+        if (block_size >= alloc) {
+            sr_heap_set_free_state(cur, 0);
+            if (prev == 0u) s_heap_free_list = next;
+            else {
+                s_heap_internal_write++;
+                MEM_W32(prev + 0u, next);
+                s_heap_internal_write--;
+            }
+
+            /* The boundary-tag footer at cur+block_size-4 exists only while the
+             * block is free; from here it is ordinary guest payload. Clear it at
+             * the free->allocated transition. On the split path below the
+             * remainder writes a fresh footer over this same word, but on an exact
+             * fit (remainder 0) nothing else would, and the guest's allocation
+             * would end with the block size instead of zero. Every allocation and
+             * block size is 16-aligned, so remainder is 0 or >= 16 -- exact fit is
+             * the only case that reaches the guest, but clearing unconditionally
+             * keeps the invariant independent of that arithmetic. */
+            s_heap_internal_write++;
+            MEM_W32(cur + block_size - 4u, 0u);
+            s_heap_internal_write--;
+
+            uint32_t remainder = block_size - alloc;
+            /* A freed block keeps its last occupant's bytes (sr_newlib_free). Clear the
+             * part this allocation takes, so a reused block starts as clean as a fresh one;
+             * a split-off remainder is cleared when it is handed out in turn. */
+            {
+                uint32_t used = remainder >= 16u ? alloc : block_size;
+                for (uint32_t off = 8u; off < used; off += 4u) MEM_W32(cur + off, 0u);
+            }
+            if (remainder >= 16u) {
+                MEM_W32(cur + 4u, alloc | 1u);
+                uint32_t new_block = cur + alloc;
+                sr_heap_mark_header(new_block);
+                /* Coalesces the split tail with a following free block if any. */
+                sr_heap_free_block(new_block, remainder);
+            } else {
+                MEM_W32(cur + 4u, block_size | 1u);
+            }
+            uint32_t result = cur + 8u;
+            if (trace_on) fprintf(stderr,
+                "ALLOC_RET: size=0x%" PRIx32 " ptr=0x%08" PRIx32 " source=reuse block=0x%" PRIx32 " "
+                "callsite=0x%08" PRIx32 " ra=0x%08" PRIx32 " uid=0x%" PRIx32 "\n",
+                size, result, MEM_R32(cur + 4u) & ~1u,
+                guest_ra >= 8u ? guest_ra - 8u : 0u, guest_ra, sched_current_uid());
+            return result;
+        }
+        prev = cur;
+        cur = next;
+    }
+
+    if (size >= s_heap_bump_end - SR_HEAP_BASE || s_heap_bump_ptr + alloc > s_heap_bump_end ||
+        s_heap_bump_ptr + alloc < s_heap_bump_ptr) {
+        if (s_heap_fail_count++ <= 10) {
+            fprintf(stderr,
+                "HEAP_ALLOC: fail (NULL) size=0x%" PRIx32 " bump_ptr=0x%08" PRIx32 " free_list=0x%08" PRIx32 "\n",
+                size, s_heap_bump_ptr, s_heap_free_list);
+            sr_heap_dump_failure(size);
+        }
+        return 0u;
+    }
+    uint32_t ptr = s_heap_bump_ptr;
+    s_heap_bump_ptr += alloc;
+    sr_heap_mark_header(ptr);
+    MEM_W32(ptr + 0u, 0u);
+    MEM_W32(ptr + 4u, alloc | 1u);
+    uint32_t result = ptr + 8u;
+    if (trace_on) fprintf(stderr,
+        "ALLOC_RET: size=0x%" PRIx32 " ptr=0x%08" PRIx32 " source=bump block=0x%" PRIx32 " "
+        "callsite=0x%08" PRIx32 " ra=0x%08" PRIx32 " uid=0x%" PRIx32 "\n",
+        size, result, alloc,
+        guest_ra >= 8u ? guest_ra - 8u : 0u, guest_ra, sched_current_uid());
+    return result;
+}
+
+void sr_newlib_free(uint32_t ptr, uint32_t guest_ra) {
+    if (ptr == 0u) return;
+    static int reuse_on = -1;
+    if (reuse_on < 0) reuse_on = getenv("SR_HEAP_REUSE_OFF") ? 0 : 1;
+    if (!reuse_on) return;   /* matches the arena's original no-op-free behavior exactly */
+    uint32_t hdr = ptr - 8u;
+    /* Arena-membership check: reject any pointer this allocator never handed out.
+     * ROOT CAUSE (previously misdiagnosed as an "INIT_ARRAY/constructor ordering"
+     * race -- that theory was checked and refuted, nothing at runtime legitimately
+     * writes 0x3070c0 except this function): some guest free() call path was
+     * passing a foreign/non-heap pointer that happened to land near 0x3070c0, a
+     * static C++ vtable region baked into the image as link-time rodata. Without
+     * this check, the zero-fill loop below trusted that address's in-place
+     * "size|flags" word and wiped out the vtable, and every subsequent object
+     * whose vptr pointed into it null-faulted on dispatch forever. Confirmed via
+     * live A/B repro: baseline (reuse off) healthy for 65s; reuse on without this
+     * check produced NULL_CALLs within seconds. Bounding hdr to [SR_HEAP_BASE,
+     * s_heap_bump_ptr) -- the range this allocator has actually carved out --
+     * makes foreign frees a safe no-op instead of arena corruption. */
+    if (hdr < SR_HEAP_BASE || hdr >= s_heap_bump_ptr || !sr_heap_is_header(hdr)) {
+        /* NOT rare in practice -- live testing shows this path firing tens of
+         * thousands of times per run (mostly small non-pointer values like 1,
+         * 0xff, 0xcf that were never real heap allocations), so it's gated behind
+         * SR_HEAP_DIAG rather than logged unconditionally. The generated allocator
+         * bridge now forwards the guest return address, which makes the rejecting
+         * free call site and owning thread visible without changing free semantics. */
+        static int diag_on = -1;
+        if (diag_on < 0) diag_on = getenv("SR_HEAP_DIAG") ? 1 : 0;
+        if (diag_on) fprintf(stderr,
+            "ALLOC_FREE_REJECT: foreign/interior ptr=0x%08" PRIx32 " hdr=0x%08" PRIx32 " "
+            "(not an owned block in [0x%08" PRIx32 ",0x%08" PRIx32 ")) "
+            "callsite=0x%08" PRIx32 " ra=0x%08" PRIx32 " uid=0x%" PRIx32 "\n",
+            ptr, hdr, (uint32_t)SR_HEAP_BASE, s_heap_bump_ptr,
+            guest_ra >= 8u ? guest_ra - 8u : 0u, guest_ra, sched_current_uid());
+        return;
+    }
+    uint32_t sizeflags = MEM_R32(hdr + 4u);
+    if ((sizeflags & 1u) == 0u) return;   /* double-free or foreign pointer: ignore, don't corrupt the list */
+    {
+        static int trace_on = -1;
+        if (trace_on < 0) trace_on = getenv("SR_ALLOC_TRACE") ? 1 : 0;
+        if (trace_on) fprintf(stderr,
+            "ALLOC_FREE: ptr=0x%08" PRIx32 " hdr=0x%08" PRIx32 " block=0x%" PRIx32 " "
+            "callsite=0x%08" PRIx32 " ra=0x%08" PRIx32 " uid=0x%" PRIx32 "\n",
+            ptr, hdr, sizeflags & ~1u,
+            guest_ra >= 8u ? guest_ra - 8u : 0u, guest_ra, sched_current_uid());
+    }
+    /* The payload keeps its bytes until the block is handed out again. newlib's free on
+     * the PSP overwrites only the first two payload words, with free-list links that are
+     * never null, so a guest that reads an object it has just freed reads its old fields.
+     * Hot Shots Tennis does so at the end of every match (a model's texture-animation
+     * channel still names a freed mesh group), and zeroed fields made that read a null
+     * pointer. A reused allocation still starts zeroed: sr_newlib_malloc and the
+     * in-place growth in sr_newlib_realloc clear the bytes they hand back. */
+    sr_heap_free_block(hdr, sizeflags & ~1u);
+}
+
+uint32_t sr_newlib_memalign(uint32_t alignment, uint32_t size, uint32_t guest_ra) {
+    /* The retail newlib path delegates alignments no stricter than malloc's
+     * native 16-byte payload alignment directly to _malloc_r. */
+    if (alignment <= 16u) return sr_newlib_malloc(size, guest_ra);
+    if ((alignment & (alignment - 1u)) != 0u) return 0u;
+
+    uint64_t raw_request = (uint64_t)size + alignment;
+    if (raw_request > 0xffffffffull) return 0u;
+    uint32_t raw_payload = sr_newlib_malloc((uint32_t)raw_request, guest_ra);
+    if (raw_payload == 0u) return 0u;
+
+    uint32_t raw_hdr = raw_payload - 8u;
+    uint32_t raw_total = MEM_R32(raw_hdr + 4u) & ~1u;
+    uint64_t aligned_payload64 =
+        ((uint64_t)raw_payload + alignment - 1u) & ~((uint64_t)alignment - 1u);
+    uint32_t wanted_total;
+    if (!sr_heap_allocation_size(size, &wanted_total) ||
+        aligned_payload64 > 0xffffffffull) {
+        sr_newlib_free(raw_payload, guest_ra);
+        return 0u;
+    }
+
+    uint32_t aligned_payload = (uint32_t)aligned_payload64;
+    uint32_t aligned_hdr = aligned_payload - 8u;
+    uint32_t leading = aligned_hdr - raw_hdr;
+    uint64_t alloc_end64 = (uint64_t)aligned_hdr + wanted_total;
+    uint64_t raw_end64 = (uint64_t)raw_hdr + raw_total;
+    if ((leading != 0u && leading < 16u) || alloc_end64 > raw_end64) {
+        sr_newlib_free(raw_payload, guest_ra);
+        return 0u;
+    }
+
+    uint32_t trailing = (uint32_t)(raw_end64 - alloc_end64);
+    sr_heap_mark_header(aligned_hdr);
+    MEM_W32(aligned_hdr + 0u, 0u);
+    MEM_W32(aligned_hdr + 4u, wanted_total | 1u);
+    sr_heap_set_free_state(aligned_hdr, 0);
+
+    if (leading != 0u) sr_heap_link_free_block(raw_hdr, leading, 1);
+    if (trailing != 0u)
+        sr_heap_link_free_block(aligned_hdr + wanted_total, trailing, 1);
+    return aligned_payload;
+}
+
+uint32_t sr_newlib_realloc(uint32_t ptr, uint32_t size, uint32_t guest_ra) {
+    if (ptr == 0u) return sr_newlib_malloc(size, guest_ra);
+    if (size == 0u) {
+        sr_newlib_free(ptr, guest_ra);
+        return 0u;
+    }
+
+    uint32_t hdr = ptr - 8u;
+    if (hdr < SR_HEAP_BASE || hdr >= s_heap_bump_ptr || !sr_heap_is_header(hdr))
+        return 0u;
+    uint32_t sizeflags = MEM_R32(hdr + 4u);
+    uint32_t old_total = sizeflags & ~1u;
+    if ((sizeflags & 1u) == 0u || old_total < 16u || (old_total & 15u) != 0u ||
+        hdr + old_total < hdr || hdr + old_total > s_heap_bump_ptr) {
+        return 0u;
+    }
+
+    uint32_t wanted_total;
+    if (!sr_heap_allocation_size(size, &wanted_total)) return 0u;
+    if (wanted_total <= old_total) {
+        uint32_t trailing = old_total - wanted_total;
+        if (trailing >= 16u) {
+            MEM_W32(hdr + 4u, wanted_total | 1u);
+            sr_heap_link_free_block(hdr + wanted_total, trailing, 1);
+        }
+        return ptr;
+    }
+
+    /* Check if the physically adjacent successor block is free and offers enough space to grow in-place. */
+    uint32_t next_hdr = hdr + old_total;
+    if (next_hdr < s_heap_bump_ptr && sr_heap_is_header(next_hdr)) {
+        uint32_t nsf = MEM_R32(next_hdr + 4u);
+        uint32_t nsize = nsf & ~1u;
+        if ((nsf & 1u) == 0u && nsize >= 16u && (nsize & 15u) == 0u &&
+            next_hdr + nsize > next_hdr && next_hdr + nsize <= s_heap_bump_ptr) {
+            uint32_t combined = old_total + nsize;
+            if (combined >= wanted_total) {
+                sr_heap_freelist_unlink(next_hdr);
+                sr_heap_set_free_state(next_hdr, 0);
+                sr_heap_unmark_header(next_hdr);
+                s_heap_internal_write++;
+                MEM_W32(next_hdr + 0u, 0u);
+                MEM_W32(next_hdr + 4u, 0u);
+                s_heap_internal_write--;
+
+                uint32_t trailing = combined - wanted_total;
+                /* The absorbed successor still holds its last occupant's bytes; the
+                 * grown part of the allocation starts clean. */
+                {
+                    uint32_t grown_end = hdr + (trailing >= 16u ? wanted_total : combined);
+                    for (uint32_t a = next_hdr + 8u; a < grown_end; a += 4u) MEM_W32(a, 0u);
+                }
+                if (trailing >= 16u) {
+                    MEM_W32(hdr + 4u, wanted_total | 1u);
+                    sr_heap_link_free_block(hdr + wanted_total, trailing, 1);
+                } else {
+                    MEM_W32(hdr + 4u, combined | 1u);
+                }
+                return ptr;
+            }
+        }
+    }
+
+    uint32_t replacement = sr_newlib_malloc(size, guest_ra);
+    if (replacement == 0u) return 0u;  /* realloc leaves the old allocation intact */
+    uint32_t copy_size = old_total - 8u;
+    if (copy_size > size) copy_size = size;
+    uint32_t off = 0u;
+    for (; off + 4u <= copy_size; off += 4u)
+        MEM_W32(replacement + off, MEM_R32(ptr + off));
+    for (; off < copy_size; ++off)
+        MEM_W8(replacement + off, MEM_R8(ptr + off));
+    sr_newlib_free(ptr, guest_ra);
+    return replacement;
+}
+
+/* Unaligned word access. Little-endian merge, identical to PPSSPP's interpreter. */
+uint32_t sr_lwl(uint32_t rtv, uint32_t addr) {
+    uint32_t shift = (addr & 3) * 8;
+    uint32_t mem = sr_r32(addr & ~3u);
+    return (rtv & (0x00ffffffu >> shift)) | (mem << (24 - shift));
+}
+uint32_t sr_lwr(uint32_t rtv, uint32_t addr) {
+    uint32_t shift = (addr & 3) * 8;
+    uint32_t mem = sr_r32(addr & ~3u);
+    return (rtv & (0xffffff00u << (24 - shift))) | (mem >> shift);
+}
+void sr_swl_pc(uint32_t addr, uint32_t rtv, uint32_t pc) {
+    uint32_t shift = (addr & 3) * 8;
+    uint32_t mem = sr_r32(addr & ~3u);
+    sr_w32_pc(addr & ~3u, (rtv >> (24 - shift)) | (mem & (0xffffff00u << shift)), pc);
+}
+void sr_swr_pc(uint32_t addr, uint32_t rtv, uint32_t pc) {
+    uint32_t shift = (addr & 3) * 8;
+    uint32_t mem = sr_r32(addr & ~3u);
+    sr_w32_pc(addr & ~3u, (rtv << shift) | (mem & (0x00ffffffu >> (24 - shift))), pc);
+}
+void sr_swl(uint32_t addr, uint32_t rtv) { sr_swl_pc(addr, rtv, 0u); }
+void sr_swr(uint32_t addr, uint32_t rtv) { sr_swr_pc(addr, rtv, 0u); }
+
+void sr_break(CpuState *s, uint32_t code, uint32_t pc) {
+    (void)s;
+    /* PSP uses BREAK for assertions; log/report and continue, or abort if fatal.
+     * This is a controlled compatibility approximation, not full PSP BREAK exception emulation. */
+    fprintf(stderr, "[recomp/cpu] BREAK 0x%" PRIx32 " encountered at pc=0x%08" PRIx32 "\n", code, pc);
+    const char *fatal = getenv("SR_BREAK_FATAL");
+    if (fatal && fatal[0] != '\0' && strcmp(fatal, "0") != 0) {
+        fprintf(stderr, "Fatal error: SR_BREAK_FATAL is set; aborting.\n");
+        sr_flight_fatal(SR_FLIGHT_KIND_FATAL_BREAK, pc, code, 0u);
+        abort();
+    }
+}
+
+#ifndef SR_GATE_BUILD
+void sr_raw_syscall(CpuState *s, uint32_t code, uint32_t pc) {
+    (void)s;
+    /* Production behavior: unsupported raw MIPS syscall is explicit/fatal/diagnostic. */
+    fprintf(stderr, "Fatal error: unsupported raw MIPS syscall 0x%" PRIx32 " at pc=0x%08" PRIx32 "\n", code, pc);
+    sr_flight_fatal(SR_FLIGHT_KIND_FATAL_RAW_SYSCALL, pc, code, 0u);
+    abort();
+}
+#endif
+
+
+uint32_t sr_bitrev(uint32_t x) {
+    x = ((x >> 1) & 0x55555555) | ((x << 1) & 0xaaaaaaaa);
+    x = ((x >> 2) & 0x33333333) | ((x << 2) & 0xcccccccc);
+    x = ((x >> 4) & 0x0f0f0f0f) | ((x << 4) & 0xf0f0f0f0);
+    x = ((x >> 8) & 0x00ff00ff) | ((x << 8) & 0xff00ff00);
+    return (x >> 16) | (x << 16);
+}
+
+/* ---- VFPU transcendental kernels ----
+ * Derived from PPSSPP's table-based kernels: the kernel structure and the
+ * assets/vfpu/ tables originate upstream (assets/vfpu/PROVENANCE.json). The
+ * expressions below are not claimed to be verbatim ports; bit-level behaviour is
+ * judged against the hardware oracle (fixtures/vfpu_oracle,
+ * docs/HARDWARE_ORACLE.md), not against upstream. */
+
+#include <math.h>
+
+/* The lookup tables are owned by vfpu_tables.c: loaded once with exact-length,
+ * EOF, SHA-256 and value-domain validation, then published atomically (#187). */
+#include "vfpu_tables.h"
+
+static uint32_t sr_exp2_approx(uint32_t x) {
+    if (x == 0x00800000u) return 0x00800000u;
+    uint32_t a = sr_exp2_lut65536[x >> 16];
+    x &= 0x0000FFFFu;
+    uint32_t b = (uint32_t)(((2977151143ull * x) >> 23) + ((1032119999ull * (x * x)) >> 46));
+    return (a + (uint32_t)(((uint64_t)(a + (1u << 23)) * (uint64_t)b) >> 32)) & 0xFFFFFFFCu;
+}
+
+static uint32_t sr_exp2_fixed(uint32_t x) {
+    if (x == 0u) return 0u;
+    if (x == 0x00800000u) return 0x00800000u;
+    uint32_t A = sr_exp2_approx(x & 0xFFFFFFC0u);
+    uint32_t B = sr_exp2_approx((x + 64) & 0xFFFFFFC0u);
+    uint64_t a = ((uint64_t)A << 4) + (uint64_t)sr_exp2_lut[x >> 6][0] - 64u;
+    uint64_t b = ((uint64_t)B << 4) + (uint64_t)sr_exp2_lut[x >> 6][1] - 64u;
+    uint32_t y = (uint32_t)((a + (((b - a) * (x & 63)) >> 6)) >> 4);
+    y &= 0xFFFFFFFCu;
+    return y;
+}
+
+float sr_vfpu_exp2(float x) {
+    sr_vfpu_load();
+    int32_t bits;
+    memcpy(&bits, &x, 4);
+    if ((bits & 0x7FFFFFFF) <= 0x007FFFFF) return 1.0f;
+    if (x != x) { bits = 0x7F800001; memcpy(&x, &bits, 4); return x; }
+    if (x <= -126.0f) return 0.0f;
+    if (x >= 128.0f) { bits = 0x7F800000; memcpy(&x, &bits, 4); return x; }
+    /* Everything from here on is positive finite; cast through uint32_t for
+     * the bitwise masks below (the original int32_t arithmetic with &= was UB). */
+    uint32_t mant_q23 = (uint32_t)((int32_t)((float)(int32_t)(x * 8388608.0f)));
+    if (x < 0.0f) mant_q23 -= 1u;
+    uint32_t exp_part  = (uint32_t)(0x3F800000u + (mant_q23 & 0xFF800000u) + sr_exp2_fixed(mant_q23 & 0x007FFFFFu));
+    bits = (int32_t)exp_part;
+    memcpy(&x, &bits, 4);
+    return x;
+}
+
+static uint32_t sr_sin_quantum(uint32_t x) {
+    return x < (1u << 22) ? 1u : 1u << (32 - 22 - sr_clz32(x));
+}
+static uint32_t sr_sin_truncate_bits(uint32_t x) {
+    return x & (0u - sr_sin_quantum(x));
+}
+
+static uint32_t sr_sin_fixed(uint32_t arg) {
+    if (arg == 0u) return 0u;
+    if (arg == 0x00800000u) return 0x10000000u;
+    uint32_t L = sr_sin_lut8192[(arg >> 13) + 0];
+    uint32_t H = sr_sin_lut8192[(arg >> 13) + 1];
+    uint32_t A = L + (((H - L) * (((arg >> 6) & 127) + 0)) >> 7);
+    uint32_t B = L + (((H - L) * (((arg >> 6) & 127) + 1)) >> 7);
+    uint64_t a = ((uint64_t)A << 5) +
+        (uint64_t)(int64_t)sr_sin_lut_delta[arg >> 6][0] * sr_sin_quantum(A);
+    uint64_t b = ((uint64_t)B << 5) +
+        (uint64_t)(int64_t)sr_sin_lut_delta[arg >> 6][1] * sr_sin_quantum(B);
+    uint32_t v = (uint32_t)(((a * (64 - (arg & 63)) + b * (arg & 63)) >> 6) >> 5);
+    v = sr_sin_truncate_bits(v);
+    /* The exception table is a compact sorted set, not a direct lookup.  Its interval
+     * bounds are reconstructed from a linear estimate plus signed table deltas. */
+    uint32_t lo = ((169u * ((arg >> 7) + 0)) >> 7) +
+        (uint32_t)(int32_t)sr_sin_lut_interval_delta[(arg >> 7) + 0] + 16384u;
+    uint32_t hi = ((169u * ((arg >> 7) + 1)) >> 7) +
+        (uint32_t)(int32_t)sr_sin_lut_interval_delta[(arg >> 7) + 1] + 16384u;
+    /* Defense in depth: validated deltas keep lo/hi <= exceptions length, so
+     * every m = (lo+hi)/2 < hi stays in bounds; clamp hi to keep the search
+     * read safe even if a corrupt table slips through (#187). */
+    if (hi > SR_VFPU_SIN_EXCEPTIONS_BYTES) hi = SR_VFPU_SIN_EXCEPTIONS_BYTES;
+    while (lo < hi) {
+        uint32_t m = (lo + hi) / 2;
+        uint32_t b8 = sr_sin_lut_exceptions[m];
+        uint32_t e = (arg & ~127u) + (b8 & 127u);
+        if (e == arg) {
+            v += sr_sin_quantum(v) * (b8 >> 7 ? UINT32_MAX : 1u);
+            break;
+        }
+        if (e < arg) lo = m + 1;
+        else hi = m;
+    }
+    return v;
+}
+
+float sr_vfpu_sin(float x) {
+    sr_vfpu_load();
+    uint32_t bits; memcpy(&bits, &x, 4);
+    uint32_t sign=bits&0x80000000u, exponent=(bits>>23)&0xFFu;
+    uint32_t significand=(bits&0x007FFFFFu)|0x00800000u;
+    if(exponent==0xFFu){bits=sign^0x7F800001u;memcpy(&x,&bits,4);return x;}
+    if(exponent<0x7Fu){
+        if(exponent<0x7Fu-23u)significand=0u;else significand>>=(0x7F-exponent);
+    }else if(exponent>0x7Fu){
+        if(exponent-0x7Fu>=25u&&exponent-0x7Fu<32u)significand=0u;
+        else if((exponent&0x9Fu)==0x9Fu)significand=0u;
+        else significand<<=((exponent-0x7Fu)&31);
+    }
+    sign^=(significand<<7)&0x80000000u;
+    significand&=0x00FFFFFFu;
+    if(significand>0x00800000u)significand=0x01000000u-significand;
+    float out=(float)(int32_t)sr_sin_fixed(significand)*3.7252902984619140625e-9f;
+    return sign?-out:out;
+}
+
+float sr_vfpu_cos(float x) {
+    sr_vfpu_load();
+    uint32_t bits;memcpy(&bits,&x,4);bits&=0x7FFFFFFFu;
+    uint32_t sign=0,exponent=(bits>>23)&0xFFu;
+    uint32_t significand=(bits&0x007FFFFFu)|0x00800000u;
+    if(exponent==0xFFu){bits=0x7F800001u;memcpy(&x,&bits,4);return x;}
+    if(exponent<0x7Fu){
+        if(exponent<0x7Fu-23u)significand=0u;else significand>>=(0x7F-exponent);
+    }else if(exponent>0x7Fu){
+        if(exponent-0x7Fu>=25u&&exponent-0x7Fu<32u)significand=0u;
+        else if((exponent&0x9Fu)==0x9Fu)significand=0u;
+        else significand<<=((exponent-0x7Fu)&31);
+    }
+    sign^=(significand<<7)&0x80000000u;
+    significand&=0x00FFFFFFu;
+    if(significand>=0x00800000u){significand=0x01000000u-significand;sign^=0x80000000u;}
+    float out=(float)(int32_t)sr_sin_fixed(0x00800000u-significand)*3.7252902984619140625e-9f;
+    return sign?-out:out;
+}
+
+static uint32_t sr_rcp_approx(uint32_t i){
+    return 0x3E800000u+((uint32_t)((1ull<<47)/((1ull<<23)+i))&~3u);
+}
+
+float sr_vfpu_rcp(float x) {
+    sr_vfpu_load();
+    uint32_t bits;memcpy(&bits,&x,4);
+    uint32_t s=bits&0x80000000u,e=bits&0x7F800000u,i=bits&0x007FFFFFu;
+    if((bits&0x7FFFFFFFu)>0x7E800000u){
+        bits=(e==0x7F800000u&&i?s^0x7F800001u:s);memcpy(&x,&bits,4);return x;
+    }
+    if(e==0u){bits=s^0x7F800000u;memcpy(&x,&bits,4);return x;}
+    uint32_t A=sr_rcp_approx(i&~63u),B=sr_rcp_approx((i+64)&~63u);
+    uint64_t a=((uint64_t)A<<6)+(uint64_t)(int64_t)sr_rcp_lut[i>>6][0]*4u;
+    uint64_t b=((uint64_t)B<<6)+(uint64_t)(int64_t)sr_rcp_lut[i>>6][1]*4u;
+    uint32_t v=(uint32_t)((a+(((b-a)*(i&63))>>6))>>6)&~3u;
+    bits=s+(0x3F800000u-e)+v;memcpy(&x,&bits,4);return x;
+}
+
+static uint32_t sr_isqrt23(uint32_t x){
+    uint64_t t=(uint64_t)x<<23,m=0x4000000000000000ull,y=0;
+    while(m){uint64_t b=y|m;y>>=1;if(t>=b){t-=b;y|=m;}m>>=2;}return (uint32_t)y;
+}
+static uint32_t sr_sqrt_fixed(uint32_t x){
+    uint32_t lo=(x+0)&~63u,hi=(x+64)&~63u;
+    lo=lo>=0x00400000u?4u*lo:0x00800000u+2u*lo;
+    hi=hi>=0x00400000u?4u*hi:0x00800000u+2u*hi;
+    uint32_t A=0x3F000000u+sr_isqrt23(lo),B=0x3F000000u+sr_isqrt23(hi);
+    uint64_t a=((uint64_t)A<<4)+(uint64_t)(int64_t)sr_sqrt_lut[x>>6][0];
+    uint64_t b=((uint64_t)B<<4)+(uint64_t)(int64_t)sr_sqrt_lut[x>>6][1];
+    return ((uint32_t)((a+(((b-a)*(x&63))>>6))>>4))&~3u;
+}
+float sr_vfpu_sqrt(float x){
+    sr_vfpu_load();uint32_t bits;memcpy(&bits,&x,4);
+    if((bits&0x7FFFFFFFu)<=0x007FFFFFu)return 0.0f;
+    if(bits>>31){bits=0x7F800001u;memcpy(&x,&bits,4);return x;}
+    if((bits>>23)==255u){bits=0x7F800000u+((bits&0x007FFFFFu)!=0u);memcpy(&x,&bits,4);return x;}
+    int32_t exponent=(int32_t)(bits>>23)-127;
+    uint32_t index=((bits+0x00800000u)>>1)&0x007FFFFFu;
+    bits=sr_sqrt_fixed(index);bits+=(uint32_t)(exponent>>1)<<23;
+    memcpy(&x,&bits,4);return x;
+}
+static uint32_t sr_rsqrt_floor22(uint32_t x){
+    uint64_t t=(uint64_t)x<<22,m=0x4000000000000000ull,y=0;
+    while(m){uint64_t b=y|m;y>>=1;if(t>=b){t-=b;y|=m;}m>>=2;}
+    y=(1ull<<44)/y;
+    if(((y*y)>>3)*x>(1ull<<63)-3ull*(((y&7)==6)<<21))--y;
+    return (uint32_t)y;
+}
+static uint32_t sr_rsqrt_fixed(uint32_t x){
+    uint32_t lo=(x+0)&~63u,hi=(x+64)&~63u;
+    lo=lo>=0x00400000u?2u*lo:0x00400000u+lo;
+    hi=hi>=0x00400000u?2u*hi:0x00400000u+hi;
+    uint32_t A=0x3E800000u+4u*sr_rsqrt_floor22(lo),B=0x3E800000u+4u*sr_rsqrt_floor22(hi);
+    uint64_t a=((uint64_t)A<<4)+(uint64_t)(int64_t)sr_rsqrt_lut[x>>6][0];
+    uint64_t b=((uint64_t)B<<4)+(uint64_t)(int64_t)sr_rsqrt_lut[x>>6][1];
+    return ((uint32_t)((a+(((b-a)*(x&63))>>6))>>4))&~3u;
+}
+float sr_vfpu_rsqrt(float x){
+    sr_vfpu_load();uint32_t bits;memcpy(&bits,&x,4);
+    if((bits&0x7FFFFFFFu)<=0x007FFFFFu){bits=0x7F800000u|(bits&0x80000000u);memcpy(&x,&bits,4);return x;}
+    if(bits>>31){bits=0xFF800001u;memcpy(&x,&bits,4);return x;}
+    if((bits>>23)==255u){bits=(bits&0x007FFFFFu)?0x7F800001u:0u;memcpy(&x,&bits,4);return x;}
+    int32_t exponent=(int32_t)(bits>>23)-127;
+    uint32_t index=((bits+0x00800000u)>>1)&0x007FFFFFu;
+    bits=sr_rsqrt_fixed(index);bits-=(uint32_t)(exponent>>1)<<23;
+    memcpy(&x,&bits,4);return x;
+}
+
+static uint32_t sr_asin_quantum(uint32_t x){return x<(1u<<23)?1u:1u<<(32-23-sr_clz32(x));}
+static uint32_t sr_asin_truncate(uint32_t x){return x&(0u-sr_asin_quantum(x));}
+static uint32_t sr_asin_approx(uint32_t x){
+    const int32_t *C=sr_asin_lut65536[x>>16];x&=0xFFFFu;
+    return sr_asin_truncate((uint32_t)((((((int64_t)C[2]*x)>>16)+C[1])*x>>16)+C[0]));
+}
+static uint32_t sr_asin_fixed(uint32_t x){
+    if(x==0)return 0;
+    if(x==(1u<<23))return 1u<<30;
+    uint32_t ret=sr_asin_approx(x),index=sr_asin_lut_indices[x/21u];
+    /* Defense in depth: validated tables bound every index below the deltas
+     * entry count; a corrupt value must not become an OOB read (#187). */
+    if(index>=SR_VFPU_ASIN_DELTAS_ENTRIES)index=0;
+    uint64_t deltas=sr_asin_lut_deltas[index];
+    return ret+(3u-(uint32_t)((deltas>>(3u*(x%21u)))&7u))*sr_asin_quantum(ret);
+}
+float sr_vfpu_asin(float x){
+    sr_vfpu_load();uint32_t bits;memcpy(&bits,&x,4);uint32_t sign=bits&0x80000000u;
+    bits&=0x7FFFFFFFu;if(bits>0x3F800000u){bits=0x7F800001u^sign;memcpy(&x,&bits,4);return x;}
+    memcpy(&x,&bits,4);bits=sr_asin_fixed((uint32_t)(int32_t)(x*8388608.0f));
+    x=(float)(int32_t)bits*9.31322574615478515625e-10f;return sign?-x:x;
+}
+
+/* x is a mantissa offset in [0, 0x800000]: sr_vfpu_log2's upper knot (i+64)&~63 reaches the
+ * end point 0x800000 (log2 2) for mantissas from 0x7FFFC0 up, FLT_MAX among them. On a knot
+ * (x & 0xFFFF == 0) the next entry and the quadratic term carry zero weight, so the value is
+ * the knot's own entry; returning it reads nothing past the 129- and 128-entry tables (#326). */
+static uint32_t sr_log2_approx(uint32_t x){
+    if(!(x&0xFFFFu))return sr_log2_lut65536[x>>16];
+    uint32_t a=sr_log2_lut65536[(x>>16)+0],b=sr_log2_lut65536[(x>>16)+1];
+    uint32_t c=sr_log2_lut65536_quadratic[x>>16];x&=0xFFFFu;
+    uint64_t ret=(uint64_t)a*(0x10000u-x)+(uint64_t)b*x;
+    ret+=((uint64_t)c*x*(0x10000u-x))>>40;return (uint32_t)(ret>>16);
+}
+float sr_vfpu_log2(float x){
+    sr_vfpu_load();uint32_t bits;memcpy(&bits,&x,4);
+    if((bits&0x7FFFFFFFu)<=0x007FFFFFu){bits=0xFF800000u;memcpy(&x,&bits,4);return x;}
+    if(bits&0x80000000u){bits=0x7F800001u;memcpy(&x,&bits,4);return x;}
+    if((bits>>23)==255u){bits=0x7F800000u+((bits&0x007FFFFFu)!=0u);memcpy(&x,&bits,4);return x;}
+    uint32_t e=(bits&0x7F800000u)-0x3F800000u,i=bits&0x007FFFFFu;
+    if((e>>31)&&i>=0x007FFE00u){
+        float c=(float)((int32_t)(~e)>>23);return i<0x007FFEF7u?-3.05175781e-05f-c:-0.0f-c;
+    }
+    int d=e<0x01000000u?0:8-sr_clz32(e)-(int)(e>>31);uint32_t q=1u<<d;
+    uint32_t A=sr_log2_approx(i&~63u)&(0u-q),B=sr_log2_approx((i+64)&~63u)&(0u-q);
+    uint64_t a=((uint64_t)A<<6)+((uint64_t)sr_log2_lut[d][i>>6][0]-80ull)*q;
+    uint64_t b=((uint64_t)B<<6)+((uint64_t)sr_log2_lut[d][i>>6][1]-80ull)*q;
+    uint32_t v=(uint32_t)((a+(((b-a)*(i&63))>>6))>>6);v&=0u-q;
+    bits=e^(2u*v);return (float)(int32_t)bits*1.1920928955078125e-7f;
+}
+
+/* ---- VFPU prefix application (ports of PPSSPP ApplyPrefixST / ApplyPrefixD) ---- */
+
+static const float SR_VFPU_CONST[8] = {0.0f, 1.0f, 2.0f, 0.5f, 3.0f, 1.0f / 3.0f, 0.25f, 1.0f / 6.0f};
+
+void sr_vread(float *r, const CpuState *s, const uint8_t *idx, int n, uint32_t prefix) {
+    if (n > 4) n = 4;  /* vector lanes are at most 4; the codegen always passes <=4 */
+    /* Initial lane load */
+    for (int i = 0; i < n; i++)
+        r[i] = s->v[idx[i]];
+    if (prefix == 0xe4)  /* identity */
+        return;
+    /* orig[] shadows r[] so aliasing-style swizzle reads see the pre-modification value. */
+    /* PPSSPP ApplyPrefixST defines out-of-width swizzles as the caller-supplied
+     * invalid value (zero for ordinary ops).  Leaving these lanes uninitialized made
+     * scalar compares depend on native stack contents and caused codegen/interpreter
+     * divergence under legal prefix state. */
+    float orig[4] = {0.0f,0.0f,0.0f,0.0f};
+    for (int i = 0; i < n; i++)
+        orig[i] = r[i];
+    for (int i = 0; i < n; i++) {
+        int regnum = (prefix >> (i * 2)) & 3;
+        int absbit = (prefix >> (8 + i)) & 1;
+        int constant = (prefix >> (12 + i)) & 1;
+        int negate = (prefix >> (16 + i)) & 1;
+        if (!constant) {
+            r[i] = orig[regnum];
+        } else {
+            r[i] = SR_VFPU_CONST[regnum + (absbit << 2)];
+        }
+        /* Sign/absmask the float via a memcpy round-trip -- avoids the UB of casting
+         * a float* to uint32_t* (strict-aliasing). The single-step xor with the sign
+         * bit and AND with the abs mask is the same operation PPSSPP performs via
+         * its FloatBits union. */
+        {
+            uint32_t bits;
+            memcpy(&bits, &r[i], sizeof(bits));
+            if (!constant && absbit)
+                bits &= 0x7FFFFFFFu;
+            if (negate)
+                bits ^= 0x80000000u;
+            memcpy(&r[i], &bits, sizeof(r[i]));
+        }
+    }
+}
+
+static float sr_clamp(float x, float lo, float hi) {
+    return x < lo ? lo : (x > hi ? hi : x);
+}
+
+void sr_vwrite(CpuState *s, const uint8_t *idx, float *d, int n, uint32_t dprefix) {
+    if (dprefix) {
+        for (int i = 0; i < n; i++) {
+            int sat = (dprefix >> (i * 2)) & 3;
+            if (sat == 1)
+                d[i] = sr_clamp(d[i], 0.0f, 1.0f);
+            else if (sat == 3)
+                d[i] = sr_clamp(d[i], -1.0f, 1.0f);
+        }
+    }
+    for (int i = 0; i < n; i++)
+        if (!((dprefix >> (8 + i)) & 1))  /* write mask */
+            s->v[idx[i]] = d[i];
+}
+
+/* ---- dispatch table (issue #45) ----
+ *
+ * The data structure and its lock-free primitives live in dispatch_table.h so the exact
+ * production logic can be exercised host-neutrally (tests/native/dispatch_selftest.c). This file
+ * owns the single live instance and the external sr_register/sr_lookup entry points that
+ * the generated chunks and dispatch() call.
+ *
+ * Occupancy is carried in a dedicated `state` field there, independent of the key, so guest
+ * code address 0 -- a real function on this zero-based image -- registers and resolves like
+ * any other address. The previous `addr == 0` empty-slot sentinel (and the `addr != 0` L1
+ * guard) made sr_lookup(0) impossible; see the header and the selftest. Making 0
+ * representable does NOT make a *computed* transfer to 0 execute f_00000000: jr/jalr with
+ * a target of 0 is a null code pointer and stops at the transfer, before dispatch is
+ * entered (#1375, sr_null_code_pointer). Only static transfers reach address 0 here. */
+
+static SrDispatchTable g_dtab;
+
+/* Per-process counter of sr_register() calls. The generated main recomp.c compares
+ * this against the expected function count emitted by codegen.py at compile time
+ * to catch missing-chunk silent failures: if a chunk file's .o is missing from
+ * the link (e.g. Makefile wildcard drift), its sr_register_chunk_N() never
+ * executes and the count drops below the expected total. */
+static uint32_t s_register_count = 0;
+
+void sr_register(uint32_t addr, RecompFn fn) {
+    sr_dtab_register(&g_dtab, addr, (uintptr_t)fn);
+    s_register_count++;
+}
+
+uint32_t sr_register_count(void) { return s_register_count; }
+
+RecompFn sr_lookup(uint32_t addr) {
+    /* A bound runtime-placed module is the only authority for its image range
+     * (src/rt/guest_interp.c): a static registration at the same address belongs
+     * to some other image and must never run there. */
+    int in_bound_module = 0;
+    RecompFn module_fn = sr_module_code_lookup(addr, &in_bound_module);
+    if (in_bound_module) return module_fn;
+    RecompFn fn = (RecompFn)sr_dtab_lookup(&g_dtab, addr);
+    return fn && sr_exec_span_owns_fetch(addr) ? fn : NULL;
+}
+
+/* Registered once from sr_register_all() before any guest thread runs; read-only after. */
+static const SrGuestSymbol *s_guest_symbols;
+static uint32_t s_guest_symbol_count;
+
+void sr_guest_symbols_register(const SrGuestSymbol *table, uint32_t count) {
+    s_guest_symbols = table;
+    s_guest_symbol_count = count;
+}
+
+const SrGuestSymbol *sr_guest_symbol_at(uint32_t pc) {
+    return sr_guest_symbol_find(s_guest_symbols, s_guest_symbol_count, pc);
+}
+
+const char *sr_guest_symbol_label(uint32_t pc, char *buf, size_t len) {
+    return sr_guest_symbol_format(sr_guest_symbol_at(pc), pc, buf, len);
+}
+
+#if defined(SR_STACK_CENSUS_ENABLED)
+static int sr_aot_return_is_nonlocal(void);
+
+/* The stack census is enabled only by the opt-in codegen flag. The expected
+ * address vector is generated, sorted, and immutable for the process lifetime;
+ * binary search keeps the diagnostic path bounded even for large images. */
+static atomic_flag s_stack_census_lock = ATOMIC_FLAG_INIT;
+static const uint32_t *s_stack_census_expected;
+static unsigned char *s_stack_census_observed_expected;
+static uint32_t s_stack_census_expected_count;
+static uint32_t s_stack_census_unobserved;
+static uint64_t s_stack_census_entries;
+static uint64_t s_stack_census_returns;
+static uint64_t s_stack_census_excluded;
+static uint64_t s_stack_census_unexpected;
+static uint64_t s_stack_census_mismatches;
+static uint32_t s_stack_census_first_mismatch_entry;
+static uint32_t s_stack_census_first_mismatch_expected_sp;
+static uint32_t s_stack_census_first_mismatch_actual_sp;
+static uint32_t s_stack_census_first_mismatch_flow;
+static int s_stack_census_has_mismatch;
+static int s_stack_census_invalid_expected;
+static int s_stack_census_tracking_unavailable;
+static int s_stack_census_unobserved_known;
+static int s_stack_census_armed;
+static int s_stack_census_atexit_registered;
+static int s_stack_census_reported;
+
+static void sr_stack_census_lock(void) {
+    while (atomic_flag_test_and_set_explicit(
+        &s_stack_census_lock, memory_order_acquire)) {
+    }
+}
+
+static void sr_stack_census_unlock(void) {
+    atomic_flag_clear_explicit(&s_stack_census_lock, memory_order_release);
+}
+
+static int sr_stack_census_expected_matches(const uint32_t *entries,
+                                           uint32_t count) {
+    if (count != s_stack_census_expected_count
+        || (count != 0u && (entries == NULL || s_stack_census_expected == NULL))) {
+        return 0;
+    }
+    for (uint32_t i = 0u; i < count; i++) {
+        if (entries[i] != s_stack_census_expected[i]) return 0;
+    }
+    return 1;
+}
+
+static uint32_t sr_stack_census_expected_index(uint32_t entry) {
+    uint32_t lo = 0u;
+    uint32_t hi = s_stack_census_expected_count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2u;
+        uint32_t value = s_stack_census_expected[mid];
+        if (value < entry) lo = mid + 1u;
+        else hi = mid;
+    }
+    return lo < s_stack_census_expected_count
+        && s_stack_census_expected[lo] == entry ? lo : UINT32_MAX;
+}
+
+void sr_stack_census_begin(const uint32_t *expected_entries, uint32_t expected_count) {
+    sr_stack_census_lock();
+    if (s_stack_census_armed) {
+        /* Generated registration can run once per cosim case. Preserve the
+         * accumulated observations; a changed entry set is uncertainty, not
+         * permission to silently restart the census. */
+        if (!sr_stack_census_expected_matches(expected_entries, expected_count)) {
+            s_stack_census_invalid_expected = 1;
+        }
+        sr_stack_census_unlock();
+        return;
+    }
+    s_stack_census_expected = expected_entries;
+    s_stack_census_expected_count = expected_count;
+    s_stack_census_observed_expected = NULL;
+    s_stack_census_unobserved = expected_count;
+    s_stack_census_unobserved_known = 1;
+    s_stack_census_entries = 0u;
+    s_stack_census_returns = 0u;
+    s_stack_census_excluded = 0u;
+    s_stack_census_unexpected = 0u;
+    s_stack_census_mismatches = 0u;
+    s_stack_census_has_mismatch = 0;
+    s_stack_census_invalid_expected =
+        (expected_count != 0u && expected_entries == NULL);
+    for (uint32_t i = 0u; !s_stack_census_invalid_expected && i < expected_count; i++) {
+        if ((expected_entries[i] & 3u) != 0u
+            || (i != 0u && expected_entries[i - 1u] >= expected_entries[i])) {
+            s_stack_census_invalid_expected = 1;
+        }
+    }
+    if (s_stack_census_invalid_expected) {
+        s_stack_census_unobserved_known = 0;
+    } else if (expected_count != 0u) {
+        s_stack_census_observed_expected = calloc(
+            expected_count, sizeof(*s_stack_census_observed_expected));
+        if (s_stack_census_observed_expected == NULL) {
+            s_stack_census_tracking_unavailable = 1;
+            s_stack_census_unobserved_known = 0;
+        }
+    }
+    s_stack_census_armed = 1;
+    s_stack_census_reported = 0;
+    int register_atexit = !s_stack_census_atexit_registered;
+    sr_stack_census_unlock();
+
+    if (register_atexit && atexit(sr_stack_census_report) == 0) {
+        sr_stack_census_lock();
+        s_stack_census_atexit_registered = 1;
+        sr_stack_census_unlock();
+    } else if (register_atexit) {
+        sr_stack_census_lock();
+        s_stack_census_invalid_expected = 1;
+        sr_stack_census_unlock();
+    }
+}
+
+void sr_stack_census_enter(uint32_t entry) {
+    sr_stack_census_lock();
+    if (s_stack_census_armed) {
+        s_stack_census_entries++;
+        uint32_t expected_index = s_stack_census_invalid_expected
+            ? UINT32_MAX : sr_stack_census_expected_index(entry);
+        if (expected_index == UINT32_MAX) {
+            s_stack_census_unexpected++;
+        } else if (!s_stack_census_tracking_unavailable
+                   && s_stack_census_observed_expected[expected_index] == 0u) {
+            s_stack_census_observed_expected[expected_index] = 1u;
+            s_stack_census_unobserved--;
+        }
+    }
+    sr_stack_census_unlock();
+}
+
+void sr_stack_census_exit(uint32_t entry, uint32_t expected_sp,
+                          uint32_t actual_sp, uint32_t flow_kind) {
+    sr_stack_census_lock();
+    if (s_stack_census_armed) {
+        /* `unexpected` is counted once per invocation, at enter. */
+        s_stack_census_returns++;
+        if (flow_kind != 0u || sr_aot_return_is_nonlocal()) {
+            /* Exception/ERET/fatal exits, and a guest return past its caller with the
+             * frames it passes through, do not have a proven ordinary return
+             * contract. Preserve that uncertainty as PARTIAL, never PASS. */
+            s_stack_census_excluded++;
+        } else if (expected_sp != actual_sp) {
+            if (!s_stack_census_has_mismatch) {
+                s_stack_census_has_mismatch = 1;
+                s_stack_census_first_mismatch_entry = entry;
+                s_stack_census_first_mismatch_expected_sp = expected_sp;
+                s_stack_census_first_mismatch_actual_sp = actual_sp;
+                s_stack_census_first_mismatch_flow = flow_kind;
+            }
+            s_stack_census_mismatches++;
+        }
+    }
+    sr_stack_census_unlock();
+}
+
+static SrStackCensusStatus sr_stack_census_status_locked(void) {
+    if (!s_stack_census_armed
+        || (s_stack_census_entries == 0u && s_stack_census_returns == 0u)) {
+        return SR_STACK_CENSUS_NOT_OBSERVED;
+    } else if (s_stack_census_mismatches != 0u) {
+        return SR_STACK_CENSUS_FAILED;
+    } else if (s_stack_census_invalid_expected
+        || s_stack_census_tracking_unavailable
+        || !s_stack_census_unobserved_known
+        || s_stack_census_unobserved != 0u
+        || s_stack_census_unexpected != 0u
+        || s_stack_census_excluded != 0u
+        || s_stack_census_entries != s_stack_census_returns) {
+        return SR_STACK_CENSUS_PARTIAL;
+    }
+    return SR_STACK_CENSUS_COMPLETE;
+}
+
+void sr_stack_census_snapshot(SrStackCensusSummary *summary) {
+    if (summary == NULL) return;
+    sr_stack_census_lock();
+    summary->status = sr_stack_census_status_locked();
+    summary->unobserved = s_stack_census_unobserved;
+    summary->unobserved_known = s_stack_census_unobserved_known;
+    summary->entries = s_stack_census_entries;
+    summary->returns = s_stack_census_returns;
+    summary->excluded = s_stack_census_excluded;
+    summary->unexpected = s_stack_census_unexpected;
+    summary->mismatches = s_stack_census_mismatches;
+    summary->first_mismatch_entry = s_stack_census_first_mismatch_entry;
+    summary->first_mismatch_expected_sp = s_stack_census_first_mismatch_expected_sp;
+    summary->first_mismatch_actual_sp = s_stack_census_first_mismatch_actual_sp;
+    summary->first_mismatch_flow = s_stack_census_first_mismatch_flow;
+    summary->has_mismatch = s_stack_census_has_mismatch;
+    sr_stack_census_unlock();
+}
+
+SrStackCensusStatus sr_stack_census_status(void) {
+    SrStackCensusSummary summary;
+    sr_stack_census_snapshot(&summary);
+    return summary.status;
+}
+
+void sr_stack_census_report(void) {
+    uint64_t entries, returns, excluded, unexpected, mismatches;
+    uint32_t unobserved;
+    uint32_t mismatch_entry, mismatch_expected_sp, mismatch_actual_sp, mismatch_flow;
+    int has_mismatch, unobserved_known;
+    SrStackCensusStatus status;
+    sr_stack_census_lock();
+    if (!s_stack_census_armed || s_stack_census_reported) {
+        sr_stack_census_unlock();
+        return;
+    }
+    s_stack_census_reported = 1;
+    unobserved = s_stack_census_unobserved;
+    unobserved_known = s_stack_census_unobserved_known;
+    entries = s_stack_census_entries;
+    returns = s_stack_census_returns;
+    excluded = s_stack_census_excluded;
+    unexpected = s_stack_census_unexpected;
+    mismatches = s_stack_census_mismatches;
+    has_mismatch = s_stack_census_has_mismatch;
+    mismatch_entry = s_stack_census_first_mismatch_entry;
+    mismatch_expected_sp = s_stack_census_first_mismatch_expected_sp;
+    mismatch_actual_sp = s_stack_census_first_mismatch_actual_sp;
+    mismatch_flow = s_stack_census_first_mismatch_flow;
+    status = sr_stack_census_status_locked();
+    sr_stack_census_unlock();
+
+    const char *name = status == SR_STACK_CENSUS_COMPLETE ? "COMPLETE"
+        : status == SR_STACK_CENSUS_PARTIAL ? "PARTIAL"
+        : status == SR_STACK_CENSUS_FAILED ? "FAILED" : "NOT_OBSERVED";
+    fprintf(stderr,
+        "STACK_CENSUS status=%s entries=%llu returns=%llu excluded=%llu "
+        "unexpected=%llu mismatches=%llu unobserved=",
+        name, (unsigned long long)entries, (unsigned long long)returns,
+        (unsigned long long)excluded, (unsigned long long)unexpected,
+        (unsigned long long)mismatches);
+    if (unobserved_known) {
+        fprintf(stderr, "%u\n", unobserved);
+    } else {
+        fprintf(stderr, "unknown\n");
+    }
+    fflush(stderr);
+    if (has_mismatch) {
+        fprintf(stderr,
+            "STACK_CENSUS first_mismatch entry=0x%08x expected_sp=0x%08x "
+            "actual_sp=0x%08x flow=%u\n",
+            mismatch_entry, mismatch_expected_sp, mismatch_actual_sp, mismatch_flow);
+        fflush(stderr);
+    }
+}
+#endif
+
+#define MISS_HASH_SIZE 128
+typedef struct { uint32_t target; uint32_t pc; uint32_t ra; } DispatchMissEntry;
+static DispatchMissEntry g_miss_table[MISS_HASH_SIZE];
+static int g_miss_count = 0;
+
+static void dump_dispatch_misses(void) {
+    if (g_miss_count == 0) return;
+    fprintf(stderr, "\n--- UNIQUE DISPATCH MISSES SUMMARY (%d entries) ---\n", g_miss_count);
+    for (int i = 0; i < MISS_HASH_SIZE; i++) {
+        if (g_miss_table[i].target != 0) {
+            fprintf(stderr, "  target=0x%08" PRIx32 " pc=0x%08" PRIx32 " ra=0x%08" PRIx32 "\n",
+                    g_miss_table[i].target, g_miss_table[i].pc, g_miss_table[i].ra);
+        }
+    }
+    fprintf(stderr, "--- END UNIQUE DISPATCH MISSES SUMMARY ---\n\n");
+    fflush(stderr);
+}
+
+/* TD-27 stale redirect (see src/rt/stale_code.h "Dispatch hook"): run the
+ * guest bytes through the existing single-step interpreter instead of a
+ * stale registered AOT body, until return to the caller. Shared by the
+ * AOT-hit redirect below and the ordinary miss path so both tiers handle
+ * the interpreter result identically (AOT_HANDOFF/CALL_RETURN return;
+ * EXCEPTION/ERET clear flow and recurse; any reject propagates to the
+ * fail-closed wrapper). */
+/* How dispatch_call_aot completes the TAIL chain (#855) of the body it ran. */
+#define SR_DRAIN_SEGMENT 0  /* a computed step: only its direct successors (see recomp.h) */
+#define SR_DRAIN_CHAIN 1    /* a public dispatch or CALL: the whole chain */
+
+static int dispatch_try_with_boundary(
+    CpuState *s,
+    uint32_t target,
+    const SrGuestInterpCallBoundary *call_boundary,
+    int drain);
+
+static const char *dispatch_semantic_boundary_name(SrGuestInterpResult result) {
+    switch (result) {
+    case SR_GUEST_INTERP_HOST_STACK_EXHAUSTED: return "host-fiber-stack-exhausted";
+    case SR_GUEST_INTERP_HOST_STACK_BOUNDS_UNAVAILABLE:
+        return "host-fiber-stack-bounds-unavailable";
+    case SR_GUEST_INTERP_NOT_EXECUTABLE: return "target-not-executable";
+    case SR_GUEST_INTERP_MISALIGNED_PC: return "misaligned-control-target";
+    case SR_GUEST_INTERP_FETCH_BOUNDARY: return "incomplete-executable-span";
+    case SR_GUEST_INTERP_UNSUPPORTED: return "unsupported-interpreter-form";
+    case SR_GUEST_INTERP_MEMORY_FAULT: return "invalid-guest-memory-access";
+    case SR_GUEST_INTERP_MISALIGNED_DATA: return "misaligned-guest-memory-access";
+    case SR_GUEST_INTERP_FLOW_FATAL: return "invalid-control-flow";
+    case SR_GUEST_INTERP_NULL_CODE_POINTER: return "null-code-pointer";
+    default: return "interpreter-rejection";
+    }
+}
+
+/* A guest CALL into an AOT body is a nested native C call, so the host stack grows with the
+ * guest call depth (TAIL transfers do not nest: see the TAIL protocol in recomp.h, #855).
+ * Stop adding frames while 128 KiB remain: 64 KiB for the frame that is
+ * about to be entered (generated functions carry no local arrays, so their frames are
+ * small; the deepest measured runtime chain, the ATRAC3+ decoder on a malformed frame
+ * with its logging, used under 20 KiB) and 64 KiB for the boundary report and the
+ * unwind back to the scheduler. Measured on the production 64 MiB fiber by the
+ * dispatch-isolation selftest, which records the remaining bytes at the stop. */
+#define SR_DISPATCH_STACK_SAFETY_MARGIN ((size_t)128u << 10)
+
+/* The one host-stack measurement: 0 with the remaining bytes when another frame fits (0 bytes
+ * when the scheduler is off and there is nothing to bound), or the named boundary's result. */
+static int dispatch_host_stack_measure(size_t *remaining_out) {
+    size_t remaining = 0;
+    *remaining_out = 0;
+    if (!sr_sched_on) return 0;
+    if (!sr_dispatch_host_stack_remaining || !sr_dispatch_host_stack_remaining(&remaining))
+        return SR_GUEST_INTERP_HOST_STACK_BOUNDS_UNAVAILABLE;
+    if (remaining < SR_DISPATCH_STACK_SAFETY_MARGIN)
+        return SR_GUEST_INTERP_HOST_STACK_EXHAUSTED;
+    *remaining_out = remaining;
+    return 0;
+}
+
+static int dispatch_host_stack_preflight(void) {
+    size_t remaining;
+    return dispatch_host_stack_measure(&remaining);
+}
+
+static const char *dispatch_validated_boundary_name(const char *boundary) {
+    if (!boundary || !boundary[0]) return "interpreter-rejection";
+    /* The player accepts only [a-z0-9-] names; never write one it would drop. */
+    for (const char *c = boundary; *c; c++) {
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '-')) {
+            return "interpreter-rejection";
+        }
+    }
+    return boundary;
+}
+
+/* Every semantic stop names the public issue that tracks lifting it, so the event
+ * line keeps one shape for every parser. */
+static void dispatch_record_semantic_stop_issue(const char *boundary, unsigned issue) {
+    const char *path = getenv("SR_BOOT_EVENT_FILE");
+    if (!path || !path[0] || !boundary || !boundary[0]) return;
+    boundary = dispatch_validated_boundary_name(boundary);
+    FILE *events = fopen(path, "ab");
+    if (!events) return;
+    fprintf(events,
+            "BOOT_EVENT phase=stop reason=semantic-boundary boundary=%s issue=%u\n",
+            boundary, issue);
+    fclose(events);
+}
+
+static void dispatch_record_semantic_stop(const char *boundary) {
+    dispatch_record_semantic_stop_issue(boundary, 308u);
+}
+
+static void dispatch_report_host_stack_boundary(int result) {
+    const char *boundary = dispatch_semantic_boundary_name((SrGuestInterpResult)result);
+    if (result == SR_GUEST_INTERP_HOST_STACK_EXHAUSTED) {
+        fprintf(stderr,
+                "SEMANTIC_BOUNDARY: %s; guest execution exceeded the runtime's host "
+                "fiber stack budget and stopped; this call depth is not supported yet.\n",
+                boundary);
+    } else {
+        fprintf(stderr,
+                "SEMANTIC_BOUNDARY: %s; guest execution stopped because the runtime "
+                "could not verify its host fiber stack bounds; this path is not "
+                "supported yet.\n",
+                boundary);
+    }
+    fflush(stderr);
+    /* TAIL transfers no longer consume host stack (#855); this boundary now bounds guest
+     * CALL depth, dispatched or direct (sr_host_stack_entry_slow), and interpreter<->AOT
+     * crossings, which still nest. */
+    dispatch_record_semantic_stop_issue(boundary, 855u);
+}
+
+/* A generated body that makes direct calls found its frame outside sr_host_stack_window
+ * (SR_HOST_STACK_CHECK, recomp.h): take the dispatcher's measurement. Exhausted or unknown
+ * bounds stop exactly as a dispatched transfer does. Otherwise refill the window so the frames
+ * that still leave the reserve pass without asking.
+ *
+ * `here - remaining` is the stack's low end as seen from this function's frame, and this
+ * function always reaches the measurement through the same frames: a frame below `low` would
+ * have measured under the margin here, so the window never passes a frame the measurement
+ * would stop, and the frame that asked always lies inside the refilled window. The window's
+ * top is the running stack's own high end (or, when that is unknown, the asking frame), never
+ * an estimate, so a frame on another live stack cannot fall inside it. A fiber switch
+ * therefore costs one call here, at the first checked entry after it. */
+__attribute__((noinline, cold))
+void sr_host_stack_entry_slow(uint32_t entry, uintptr_t frame) {
+    size_t remaining;
+    int result = dispatch_host_stack_measure(&remaining);
+    if (result < 0) {
+        dispatch_report_host_stack_boundary(result);
+        sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, entry, 0u, 0u);
+        fflush(stderr);
+        exit(1);
+    }
+    if (remaining == 0) return;   /* scheduler off: no bound, and nothing cached */
+    uintptr_t here = (uintptr_t)__builtin_frame_address(0);
+    uintptr_t low = here - remaining + SR_DISPATCH_STACK_SAFETY_MARGIN;
+    uintptr_t top = frame;
+    uintptr_t stack_top;
+    if (sr_dispatch_host_stack_top && sr_dispatch_host_stack_top(&stack_top) && stack_top > top)
+        top = stack_top;
+    sr_host_stack_window.low = low;
+    sr_host_stack_window.span = top - low;
+}
+
+/* Computed transfers and guest address 0 (#1375).
+ *
+ * A jr/jalr whose target register holds 0 is a null code pointer, on every image. On a
+ * zero-based image the module's offset-0 function also has guest address 0, but a guest
+ * can only reach it through a static transfer (j/jal, a branch, the module entry), never
+ * through a pointer: tools/codegen.py refuses a zero-based relocatable module whose
+ * relocations take the address of its offset 0, so no code pointer to it can exist. The
+ * check therefore sits at the computed transfer itself (the generated jr/jalr sites call
+ * sr_null_code_pointer, the interpreter returns SR_GUEST_INTERP_NULL_CODE_POINTER), before
+ * its link write and delay slot, and the dispatch table and dispatch core stay keyed on
+ * the address alone. On hardware the fetch from address 0 faults; here the run stops. */
+static void dispatch_record_null_code_pointer(void) {
+    fprintf(stderr, "  SEMANTIC_BOUNDARY: null-code-pointer; see #1375\n");
+    dispatch_record_semantic_stop_issue("null-code-pointer", 1375u);
+    dump_dispatch_trace();
+}
+
+static void dispatch_report_null_code_pointer(const CpuState *s, uint32_t transfer_pc) {
+    fprintf(stderr,
+            "NULL_CODE_POINTER: computed transfer at 0x%08" PRIx32 " targets 0x00000000 "
+            "ra=0x%08" PRIx32 " sp=0x%08" PRIx32 " uid=0x%" PRIx32 "\n",
+            transfer_pc, s->r[31], s->r[29], sched_current_uid());
+    dispatch_record_null_code_pointer();
+}
+
+/* A dispatch target that a normalization below would turn into address 0 (#1375): the
+ * kernel-RAM rebase (0x08000000), a segment strip of a kernel-segment alias, or a late
+ * import resolving to such an alias. Each is address 0 with offset or segment bits set,
+ * which the PSP faults on as it does on 0, and on a zero-based image the offset-0 function
+ * would otherwise run in its place. The report names the original target. */
+static int dispatch_report_normalized_null(const CpuState *s, uint32_t target,
+                                           const char *normalization) {
+    fprintf(stderr,
+            "NULL_CODE_POINTER: dispatch to 0x%08" PRIx32 " normalizes (%s) to 0x00000000; "
+            "pc=0x%08" PRIx32 " ra=0x%08" PRIx32 " sp=0x%08" PRIx32 " uid=0x%" PRIx32 "\n",
+            target, normalization, s->pc, s->r[31], s->r[29], sched_current_uid());
+    dispatch_record_null_code_pointer();
+    return SR_GUEST_INTERP_NULL_CODE_POINTER;
+}
+
+/* A dispatch to address 0 on an image with no code there (dispatch_try_with_boundary).
+ * The dispatch carries no transfer pc; s->pc is only what the caller last wrote. */
+static void dispatch_report_null_dispatch(const CpuState *s) {
+    fprintf(stderr,
+            "NULL_CODE_POINTER: dispatch to 0x00000000, where no code is registered; "
+            "pc=0x%08" PRIx32 " ra=0x%08" PRIx32 " sp=0x%08" PRIx32 " uid=0x%" PRIx32 "\n",
+            s->pc, s->r[31], s->r[29], sched_current_uid());
+    dispatch_record_null_code_pointer();
+}
+
+void sr_null_code_pointer(CpuState *s, uint32_t transfer_pc) {
+    dispatch_report_null_code_pointer(s, transfer_pc);
+    sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, 0u, transfer_pc, 0u);
+    fflush(stderr);
+    exit(1);
+}
+
+/* SR_NULL_PAGE_GUARD (recomp.h). `function` is the translated body that made the access:
+ * a load carries no guest pc, and s->pc is only as fresh as the last return. */
+void sr_null_data_pointer(uint32_t address, const char *function) {
+    fprintf(stderr,
+            "NULL_DATA_POINTER: %s accessed guest 0x%08" PRIx32 ", below the PSP's first mapped "
+            "address ra=0x%08" PRIx32 " sp=0x%08" PRIx32 " uid=0x%" PRIx32 "\n",
+            function, address, s_cpu ? s_cpu->r[31] : 0u, s_cpu ? s_cpu->r[29] : 0u,
+            sched_current_uid());
+    fprintf(stderr, "  SEMANTIC_BOUNDARY: null-data-pointer; see #363\n");
+    dispatch_record_semantic_stop_issue("null-data-pointer", 363u);
+    dump_dispatch_trace();
+    sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, 0u, address, 0u);
+    fflush(stderr);
+    exit(1);
+}
+
+void sr_null_return_address(CpuState *s) {
+    fprintf(stderr,
+            "NULL_CODE_POINTER: jr $ra returns to 0x00000000 sp=0x%08" PRIx32 " uid=0x%" PRIx32
+            " (generated code; the dispatch trace below names the function)\n",
+            s->r[29], sched_current_uid());
+    dispatch_record_null_code_pointer();
+    sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, 0u, 0u, 0u);
+    fflush(stderr);
+    exit(1);
+}
+
+/* A guest-held code pointer of 0 that reaches a host entry (#1375): a thread created with
+ * entry 0, or a callback registered with function 0. The kernel accepts both today
+ * (unmeasured on the PSP); the fault comes when the entry is fetched, so the stop sits at
+ * the entry, before guest state changes. A loader-known entry is not a code pointer and
+ * never comes here: a zero-based image's module_start at offset 0 runs like any address. */
+void sr_null_code_entry(CpuState *s, const char *owner) {
+    fprintf(stderr,
+            "NULL_CODE_POINTER: %s entry 0x00000000 ra=0x%08" PRIx32 " sp=0x%08" PRIx32
+            " uid=0x%" PRIx32 "\n",
+            owner && owner[0] ? owner : "guest", s->r[31], s->r[29], sched_current_uid());
+    dispatch_record_null_code_pointer();
+    sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, 0u, 0u, 0u);
+    fflush(stderr);
+    exit(1);
+}
+
+/* SR_HOST_RETURN_PC must never name code (recomp.h). */
+_Static_assert(SR_HOST_RETURN_PC != 0u && (SR_HOST_RETURN_PC & 3u) == 0u,
+               "SR_HOST_RETURN_PC is a nonzero, word-aligned return address");
+_Static_assert((SR_HOST_RETURN_PC & SR_DISPATCH_VFPU_MASK) != SR_DISPATCH_VFPU_TAG,
+               "SR_HOST_RETURN_PC lies outside the VFPU fallback tag window");
+_Static_assert(SR_PHYS(SR_HOST_RETURN_PC) >= 0x0C000000u,
+               "no dispatch normalization maps SR_HOST_RETURN_PC into the guest arena");
+
+/* SR_CODE_CAPTURE=<folder> (#1933): a game may copy code into its BSS or heap and call it, and
+ * no translation covers that code. When such a call stops as not-executable, write the bytes
+ * around the target to the folder (the title's private folder) for tools/code_capture.py, whose
+ * translation a later build binds only while memory holds the same code. The stop itself is
+ * unchanged: this adds one line naming the capture. The window reaches up to
+ * SR_CODE_CAPTURE_REACH bytes on each side of the target over main RAM that no executable span
+ * and no bound module owns. The file format is documented in tools/code_capture.py. */
+#define SR_CODE_CAPTURE_REACH 0x10000u
+#define SR_CODE_CAPTURE_HEADER 32u
+static char s_code_capture_last[64];   /* the last capture's file name (the self-test reads it) */
+
+static int code_capture_word_free(uint32_t address) {
+    return address >= SR_RAM_BASE && SR_PHYS(address) == address && sr_inrange_n(address, 4u) &&
+           !sr_exec_span_owns_fetch(address) && sr_module_code_fetch_authority(address) < 0;
+}
+
+static void code_capture_put32(unsigned char *out, uint32_t value) {
+    for (unsigned b = 0; b < 4u; b++) out[b] = (unsigned char)(value >> (8u * b));
+}
+
+static void code_capture_note(uint32_t target, uint32_t pc, uint32_t ra) {
+    const char *folder = getenv("SR_CODE_CAPTURE");
+    if (!folder || !folder[0]) return;
+    if ((target & 3u) != 0u || !code_capture_word_free(target)) {
+        fprintf(stderr, "  CODE_CAPTURE: none; 0x%08" PRIx32 " is not unowned main RAM\n", target);
+        return;
+    }
+    uint32_t lo = target, hi = target + 4u;
+    while (target - lo < SR_CODE_CAPTURE_REACH && code_capture_word_free(lo - 4u)) lo -= 4u;
+    while (hi - target < SR_CODE_CAPTURE_REACH && hi != 0u && code_capture_word_free(hi)) hi += 4u;
+    uint32_t size = hi - lo;
+    unsigned char *file = (unsigned char *)malloc(SR_CODE_CAPTURE_HEADER + (size_t)size);
+    if (!file || !sr_guest_copy_in(file + SR_CODE_CAPTURE_HEADER, lo, size)) {
+        free(file);
+        fprintf(stderr, "  CODE_CAPTURE: failed; cannot read [0x%08" PRIx32 ",0x%08" PRIx32 ")\n",
+                lo, hi);
+        return;
+    }
+    memcpy(file, "NKCODE01", 8u);
+    const uint32_t fields[6] = { lo, size, target, pc, ra, 0u };
+    for (unsigned i = 0; i < 6u; i++) code_capture_put32(file + 8u + 4u * i, fields[i]);
+    snprintf(s_code_capture_last, sizeof s_code_capture_last,
+             "code_capture_%08" PRIx32 "_%016" PRIx64 ".nkcap", target,
+             sr_module_code_fnv1a64(file + SR_CODE_CAPTURE_HEADER, size));
+    char path[4096], partial[4096 + 8];
+    int written = 0, exists = 0;
+    if ((size_t)snprintf(path, sizeof path, "%s/%s", folder, s_code_capture_last) < sizeof path) {
+        FILE *old = fopen(path, "rb");
+        if (old) {
+            exists = 1;
+            fclose(old);
+        } else {
+            snprintf(partial, sizeof partial, "%s.part", path);
+            FILE *out = fopen(partial, "wb");
+            if (out) {
+                written = fwrite(file, 1u, SR_CODE_CAPTURE_HEADER + (size_t)size, out) ==
+                          SR_CODE_CAPTURE_HEADER + (size_t)size;
+                written = (fclose(out) == 0) && written && rename(partial, path) == 0;
+                if (!written) remove(partial);
+            }
+        }
+    }
+    free(file);
+    if (exists || written)
+        fprintf(stderr, "  CODE_CAPTURE: %s %s [0x%08" PRIx32 ",0x%08" PRIx32 ") target=0x%08" PRIx32
+                "; translate it with tools/code_capture.py (#1933)\n",
+                exists ? "already holds" : "wrote", s_code_capture_last, lo, hi, target);
+    else
+        fprintf(stderr, "  CODE_CAPTURE: failed; cannot write %s to the SR_CODE_CAPTURE folder\n",
+                s_code_capture_last);
+}
+
+static int dispatch_run_interp(
+    CpuState *s,
+    uint32_t target,
+    const SrGuestInterpCallBoundary *call_boundary,
+    int drain) {
+    SrGuestInterpFault fault;
+    SrGuestInterpResult interp_result = call_boundary
+        ? sr_guest_interp_run_with_boundary(s, target, call_boundary, &fault)
+        : sr_guest_interp_run(s, target, &fault);
+    if (interp_result == SR_GUEST_INTERP_AOT_HANDOFF ||
+        interp_result == SR_GUEST_INTERP_CALL_RETURN) {
+        return (int)interp_result;
+    }
+    if (interp_result == SR_GUEST_INTERP_EXCEPTION ||
+        interp_result == SR_GUEST_INTERP_ERET) {
+        uint32_t flow_target = s->flow_target;
+        sr_cpu_clear_flow(s);
+        return dispatch_try_with_boundary(s, flow_target, call_boundary, drain);
+    }
+    if (interp_result == SR_GUEST_INTERP_NULL_CODE_POINTER) {
+        dispatch_report_null_code_pointer(s, fault.pc);
+        return (int)interp_result;
+    }
+    fprintf(stderr,
+            "  INTERP_REJECT: target=0x%08" PRIx32 " result=%s fault_pc=0x%08" PRIx32 " "
+            "opcode=%s0x%08" PRIx32 " address=0x%08" PRIx32 "\n",
+            target, sr_guest_interp_result_name(interp_result), fault.pc,
+            fault.opcode_valid ? "" : "unavailable/", fault.opcode, fault.address);
+    fprintf(stderr, "  SEMANTIC_BOUNDARY: %s; in the works: #308\n",
+            dispatch_semantic_boundary_name(interp_result));
+    if (interp_result == SR_GUEST_INTERP_NOT_EXECUTABLE) code_capture_note(fault.pc, s->pc, s->r[31]);
+    dispatch_record_semantic_stop(dispatch_semantic_boundary_name(interp_result));
+    dump_dispatch_trace();
+    return (int)interp_result;
+}
+
+SrAotReturnBoundary *sr_aot_return_boundary_top;
+static SrAotReturnBoundary *sr_aot_return_boundaries;
+static size_t sr_aot_return_boundary_depth;
+static size_t sr_aot_return_boundary_capacity;
+static size_t sr_aot_return_boundary_floor;
+
+void sr_aot_return_boundaries_reset(void) {
+#ifdef SR_VERIFY
+    sr_verify_abandon("boundary-reset");
+#endif
+    sr_aot_return_boundary_depth = 0u;
+    sr_aot_return_boundary_top = NULL;
+    sr_aot_return_boundary_floor = 0u;
+}
+
+void sr_aot_return_boundary_stack_swap(SrAotReturnBoundaryStack *other) {
+    if (!other) return;
+#ifdef SR_VERIFY
+    sr_verify_note_preempt("stack-swap");
+#endif
+    SrAotReturnBoundaryStack active = {
+        sr_aot_return_boundaries,
+        sr_aot_return_boundary_depth,
+        sr_aot_return_boundary_capacity,
+        sr_aot_return_boundary_floor,
+        sr_aot_return_boundary_top,
+    };
+    sr_aot_return_boundaries = other->boundaries;
+    sr_aot_return_boundary_depth = other->depth;
+    sr_aot_return_boundary_capacity = other->capacity;
+    sr_aot_return_boundary_floor = other->floor;
+    sr_aot_return_boundary_top = other->top;
+    *other = active;
+}
+
+void sr_aot_return_boundary_stack_destroy(SrAotReturnBoundaryStack *stack) {
+    if (!stack) return;
+    if (stack->boundaries && stack->boundaries == sr_aot_return_boundaries) {
+        fprintf(stderr,
+                "SEMANTIC_BOUNDARY: AOT_RETURN_STACK_LIFETIME: refused to free the active boundary stack\n");
+        return;
+    }
+    free(stack->boundaries);
+    memset(stack, 0, sizeof(*stack));
+}
+
+void sr_aot_return_boundary_scope_begin(SrAotReturnBoundaryScope *scope) {
+    if (!scope) return;
+#ifdef SR_VERIFY
+    sr_verify_note_preempt("callback-or-interrupt");
+#endif
+    scope->depth = sr_aot_return_boundary_depth;
+    scope->previous_floor = sr_aot_return_boundary_floor;
+    sr_aot_return_boundary_floor = sr_aot_return_boundary_depth;
+}
+
+int sr_aot_return_boundary_scope_end(CpuState *s,
+                                     const SrAotReturnBoundaryScope *scope,
+                                     const char *owner) {
+    if (!scope) return 0;
+    const int corrupt = sr_aot_return_boundary_depth != scope->depth ||
+                        sr_aot_return_boundary_floor != scope->depth;
+    if (corrupt) {
+        const uint32_t call_pc = s ? s->pc : 0u;
+        fprintf(stderr,
+                "SEMANTIC_BOUNDARY: AOT_RETURN_SCOPE_CORRUPT: %s changed the interrupted "
+                "return-boundary depth (expected %zu, got %zu)\n",
+                owner && owner[0] ? owner : "guest callback/interrupt",
+                scope->depth, sr_aot_return_boundary_depth);
+        if (s) {
+            s->flow_kind = SR_FLOW_FATAL;
+            s->flow_target = call_pc;
+            sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, call_pc, 0u, 0u);
+        }
+    }
+    if (scope->depth <= sr_aot_return_boundary_capacity) {
+        sr_aot_return_boundary_depth = scope->depth;
+        sr_aot_return_boundary_top = scope->depth
+            ? &sr_aot_return_boundaries[scope->depth - 1u] : NULL;
+        sr_aot_return_boundary_floor = scope->previous_floor;
+    } else {
+        sr_aot_return_boundary_depth = 0u;
+        sr_aot_return_boundary_top = NULL;
+        sr_aot_return_boundary_floor = 0u;
+        if (s) {
+            const uint32_t call_pc = s->pc;
+            s->flow_kind = SR_FLOW_FATAL;
+            s->flow_target = call_pc;
+            sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, call_pc, 0u, 0u);
+        }
+        return 1;
+    }
+    return corrupt;
+}
+
+static void sr_aot_return_boundary_discard_to_floor(void) {
+    if (sr_aot_return_boundary_floor <= sr_aot_return_boundary_capacity) {
+        sr_aot_return_boundary_depth = sr_aot_return_boundary_floor;
+        sr_aot_return_boundary_top = sr_aot_return_boundary_depth
+            ? &sr_aot_return_boundaries[sr_aot_return_boundary_depth - 1u] : NULL;
+    } else {
+        sr_aot_return_boundary_depth = 0u;
+        sr_aot_return_boundary_top = NULL;
+        sr_aot_return_boundary_floor = 0u;
+    }
+}
+
+static int sr_aot_return_boundary_grow(CpuState *s, uint32_t call_pc,
+                                       uint32_t resume_pc) {
+    size_t next_capacity = sr_aot_return_boundary_capacity
+        ? sr_aot_return_boundary_capacity * 2u : 64u;
+    if (next_capacity < sr_aot_return_boundary_capacity ||
+        next_capacity > SIZE_MAX / sizeof *sr_aot_return_boundaries) {
+        goto failed;
+    }
+    SrAotReturnBoundary *grown = realloc(
+        sr_aot_return_boundaries, next_capacity * sizeof *sr_aot_return_boundaries);
+    if (grown == NULL) goto failed;
+
+    sr_aot_return_boundaries = grown;
+    sr_aot_return_boundary_capacity = next_capacity;
+    sr_aot_return_boundary_top = sr_aot_return_boundary_depth
+        ? &sr_aot_return_boundaries[sr_aot_return_boundary_depth - 1u] : NULL;
+    return 0;
+
+failed:
+    fprintf(stderr,
+            "SEMANTIC_BOUNDARY: AOT_RETURN_TRACKING_UNAVAILABLE: cannot grow the "
+            "linked-call boundary stack at 0x%08" PRIx32 "\n",
+            call_pc);
+    sr_aot_return_boundary_discard_to_floor();
+    s->flow_kind = SR_FLOW_FATAL;
+    s->flow_target = call_pc;
+    sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, call_pc, 0u, resume_pc);
+    return 1;
+}
+
+int sr_aot_return_boundary_begin(CpuState *s, uint32_t resume_pc,
+                                 uint32_t call_pc, uint32_t has_resume_pc) {
+    if (sr_aot_return_boundary_depth == sr_aot_return_boundary_capacity &&
+        sr_aot_return_boundary_grow(s, call_pc, resume_pc)) {
+        return 1;
+    }
+    SrAotReturnBoundary *boundary =
+        &sr_aot_return_boundaries[sr_aot_return_boundary_depth++];
+    boundary->state = s;
+    boundary->resume_pc = resume_pc;
+    boundary->has_resume_pc = has_resume_pc != 0u;
+    boundary->observed_target = 0u;
+    boundary->call_sp = s->r[29];
+    boundary->dispatch_owned = 0u;
+    boundary->unwinding = 0u;
+    boundary->resume_sp = 0u;
+    sr_aot_return_boundary_top = boundary;
+#ifdef SR_VERIFY
+    if (has_resume_pc && !sr_verify_suppress_direct) sr_verify_begin(s, 0u, call_pc, resume_pc);
+#endif
+    return 0;
+}
+
+/* Interpreted code the interpreter entered with no call boundary of its own -- a TAIL step
+ * out of a native body (dispatch_tail_step) -- returns into the native frames below it. A
+ * transfer that lands on the resume PC of the innermost live linked call is that call's
+ * return, exactly as the body's own `jr $ra` would have been: the native caller continues,
+ * so the interpreter must hand back rather than run the continuation itself and then have
+ * the caller run it again. For a host entry the resume PC is SR_HOST_RETURN_PC, which the
+ * interpreter could not even fetch. Returns that land deeper than the innermost live call
+ * stay with sr_aot_return_boundary_end (#1034). */
+int sr_aot_return_boundary_capture_resume(CpuState *s, uint32_t target) {
+    SrAotReturnBoundary *top = sr_aot_return_boundary_top;
+    if (sr_aot_return_boundary_depth <= sr_aot_return_boundary_floor || top == NULL ||
+        top->state != s || !top->has_resume_pc || top->resume_pc != target) {
+        return 0;
+    }
+    top->observed_target = UINT64_C(0x100000000) | target;
+    return 1;
+}
+
+/* A guest `jr $ra` that returns past its own caller (#1034). Hand-written routines do
+ * this: a branch-and-link into a block that restores the enclosing frame's $ra and $sp
+ * and returns straight to that frame's caller, so the linked call never resumes. When
+ * the target is the resume PC of a live enclosing linked call, the frames in between are
+ * abandoned and that call continues normally, as the PSP does. Only checked calls may lie
+ * in between, a direct body call or a generated dispatch_call_checked site: their generated
+ * callers return when the end check says so, where any other dispatch_call caller would run
+ * its own continuation. Never crosses a callback or interrupt floor. */
+#if defined(SR_STACK_CENSUS_ENABLED)
+/* True while a body returns other than structurally to its caller: its guest jr $ra
+ * targeted something other than the live linked call's resume, or a guest return past
+ * its caller is unwinding through it. */
+static int sr_aot_return_is_nonlocal(void) {
+    const SrAotReturnBoundary *top = sr_aot_return_boundary_top;
+    if (top == NULL) return 0;
+    if (top->unwinding) return 1;
+    return top->has_resume_pc && (top->observed_target >> 32) != 0u &&
+           (uint32_t)top->observed_target != top->resume_pc;
+}
+#endif
+
+static uint64_t s_aot_return_unwinds;
+
+uint64_t sr_aot_return_unwind_count(void) { return s_aot_return_unwinds; }
+
+static int sr_aot_return_boundary_unwind_to(CpuState *s, uint32_t target) {
+    const size_t depth = sr_aot_return_boundary_depth;
+    for (size_t index = depth; index > sr_aot_return_boundary_floor; index--) {
+        SrAotReturnBoundary *enclosing = &sr_aot_return_boundaries[index - 1u];
+        if (enclosing->state != s) return 0;
+        if (enclosing->has_resume_pc && enclosing->resume_pc == target) {
+            for (size_t abandoned = index; abandoned < depth; abandoned++)
+                sr_aot_return_boundaries[abandoned].unwinding = 1u;
+            enclosing->observed_target = UINT64_C(0x100000000) | target;
+            enclosing->unwinding = 2u;  /* the unwind ends here */
+            s_aot_return_unwinds++;
+            return 1;
+        }
+        if (enclosing->dispatch_owned) return 0;
+    }
+    return 0;
+}
+
+/* A guest `jr $ra` into the body of a live frame: longjmp. It reloads a frame's callee-saved
+ * registers, $sp and $ra from a jmp_buf and returns to the word after the setjmp call that
+ * filled it, a call that has long since returned, so no live linked call resumes there.
+ * The frame it returns into is running again inside the innermost live linked call whose
+ * callee entry $sp lies above the restored $sp; every call above that one is dead. Those
+ * are abandoned as sr_aot_return_boundary_unwind_to abandons them, and that call's own end
+ * runs the target as its continuation (sr_aot_return_boundary_end). The callee that
+ * returned must have left its own frame: a jump within it is not a return. Never crosses a
+ * callback or interrupt floor or an unchecked dispatch_call frame. A frame no linked call
+ * encloses (a thread's or callback's own entry function, which no resume PC follows) has no
+ * continuation to run in, so a longjmp into it stays the named mismatch stop. */
+static int sr_aot_return_boundary_resume_live_frame(CpuState *s,
+                                                    const SrAotReturnBoundary *returned,
+                                                    uint32_t target) {
+    const uint32_t sp = s->r[29];
+    if (returned->call_sp > sp) return 0;
+    const size_t depth = sr_aot_return_boundary_depth;
+    for (size_t index = depth; index > sr_aot_return_boundary_floor; index--) {
+        SrAotReturnBoundary *enclosing = &sr_aot_return_boundaries[index - 1u];
+        if (enclosing->state != s) return 0;
+        if (enclosing->call_sp > sp) {
+            if (!enclosing->has_resume_pc) return 0;
+            for (size_t abandoned = index; abandoned < depth; abandoned++)
+                sr_aot_return_boundaries[abandoned].unwinding = 1u;
+            enclosing->observed_target = UINT64_C(0x100000000) | target;
+            enclosing->unwinding = 3u;  /* its callee runs again from the target */
+            enclosing->resume_sp = sp;
+            s_aot_return_unwinds++;
+            return 1;
+        }
+        if (enclosing->dispatch_owned) return 0;
+    }
+    return 0;
+}
+
+int sr_aot_return_boundary_end(CpuState *s) {
+    if (sr_aot_return_boundary_depth <= sr_aot_return_boundary_floor) {
+        const uint32_t call_pc = s->pc;
+        if (sr_aot_return_boundary_floor != 0u) {
+            fprintf(stderr,
+                    "SEMANTIC_BOUNDARY: AOT_RETURN_SCOPE_POP: guest callback/interrupt "
+                    "attempted to pop an interrupted return boundary\n");
+        } else {
+            fprintf(stderr,
+                    "SEMANTIC_BOUNDARY: AOT_RETURN_TRACKING_CORRUPT: call at 0x%08" PRIx32
+                    " lost its host return boundary\n",
+                    call_pc);
+        }
+        sr_aot_return_boundary_discard_to_floor();
+        s->flow_kind = SR_FLOW_FATAL;
+        s->flow_target = call_pc;
+        sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, call_pc, 0u, 0u);
+        return 1;
+    }
+    SrAotReturnBoundary *boundary = sr_aot_return_boundary_top;
+    if (boundary == NULL ||
+        boundary != &sr_aot_return_boundaries[sr_aot_return_boundary_depth - 1u] ||
+        boundary->state != s) {
+        const uint32_t call_pc = s->pc;
+        fprintf(stderr,
+                "SEMANTIC_BOUNDARY: AOT_RETURN_TRACKING_CORRUPT: call at 0x%08" PRIx32
+                " lost its host return boundary\n",
+                call_pc);
+        sr_aot_return_boundary_discard_to_floor();
+        s->flow_kind = SR_FLOW_FATAL;
+        s->flow_target = call_pc;
+        sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, call_pc, 0u, 0u);
+        return 1;
+    }
+#ifdef SR_VERIFY
+    sr_verify_end(s, boundary);
+#endif
+    sr_aot_return_boundary_depth--;
+    sr_aot_return_boundary_top = sr_aot_return_boundary_depth
+        ? &sr_aot_return_boundaries[sr_aot_return_boundary_depth - 1u] : NULL;
+
+    /* A fatal mismatch found in a nested direct call must return through every
+     * generated caller without executing its guest continuation. */
+    if (s->flow_kind == SR_FLOW_FATAL) return 1;
+    /* A frame a guest return passed through: its caller returns without running its
+     * continuation (sr_aot_return_boundary_unwind_to). */
+    if (boundary->unwinding == 1u) return 1;
+    if (boundary->unwinding == 2u) {
+        /* The enclosing call the guest returned to: its callee's structural return
+         * would have restored the callee's entry $sp, so the unwind restores it too. */
+        s->r[29] = boundary->call_sp;
+        return 0;
+    }
+    if (boundary->unwinding == 3u) {
+        /* The live frame a longjmp returned into (sr_aot_return_boundary_resume_live_frame).
+         * Its native body was abandoned mid-way, so the rest of the frame runs as this call's
+         * continuation, from the target with the $sp the guest restored, until it returns to
+         * this call's resume PC. The interpreter floor runs it: a callable native body at the
+         * target would restore an entry $sp the frame never had; the native calls it makes
+         * run natively as usual. */
+        /* `boundary` was popped: the continuation's own calls reuse (and may move) its slot,
+         * so everything it needs is read now. */
+        const uint32_t target = (uint32_t)boundary->observed_target;
+        const uint32_t resume_pc = boundary->resume_pc;
+        const SrGuestInterpCallBoundary call = { .resume_pc = resume_pc };
+        /* A host wrapper of an abandoned body (the stack census) may have restored its own
+         * entry $sp on the way out; the frame runs on the $sp the guest restored. */
+        s->r[29] = boundary->resume_sp;
+        /* Generated code does not maintain s->pc; the interpreter's is its own. */
+        const uint32_t native_pc = s->pc;
+        const int result = dispatch_run_interp(s, target, &call, SR_DRAIN_CHAIN);
+        if (result >= 0 && s->flow_kind == SR_FLOW_NONE) s->pc = native_pc;
+        if (result < 0 && s->flow_kind != SR_FLOW_FATAL) {
+            s->flow_kind = SR_FLOW_FATAL;
+            s->flow_target = target;
+            sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, resume_pc - 8u, target, resume_pc);
+        }
+        return s->flow_kind == SR_FLOW_FATAL;
+    }
+    if (!boundary->has_resume_pc || s->flow_kind != SR_FLOW_NONE ||
+        boundary->observed_target == 0u) {
+        return 0;
+    }
+
+    const uint32_t actual_target = (uint32_t)boundary->observed_target;
+    if (actual_target == boundary->resume_pc) return 0;
+    if (!boundary->dispatch_owned && sr_aot_return_boundary_unwind_to(s, actual_target))
+        return 1;
+    if (!boundary->dispatch_owned &&
+        sr_aot_return_boundary_resume_live_frame(s, boundary, actual_target))
+        return 1;
+
+    if (boundary->resume_pc == SR_HOST_RETURN_PC) {
+        /* A host entry (dispatch_from_host) has no linked call site to name. */
+        fprintf(stderr,
+                "SEMANTIC_BOUNDARY: AOT_RETURN_TARGET_MISMATCH: a host-entered guest body "
+                "returned to 0x%08" PRIx32 " instead of the host; stopping\n",
+                actual_target);
+    } else {
+        fprintf(stderr,
+                "SEMANTIC_BOUNDARY: AOT_RETURN_TARGET_MISMATCH: linked call at 0x%08" PRIx32
+                " resumed at 0x%08" PRIx32 " but its guest jr $ra target was 0x%08" PRIx32
+                "; stopping before the AOT continuation\n",
+                boundary->resume_pc - 8u, boundary->resume_pc, actual_target);
+    }
+    dispatch_record_semantic_stop_issue("aot-return-target-mismatch", 1034u);
+    s->flow_kind = SR_FLOW_FATAL;
+    s->flow_target = actual_target;
+    sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, boundary->resume_pc - 8u,
+                    actual_target, boundary->resume_pc);
+    return 1;
+}
+
+static void dispatch_call_aot(RecompFn fn, CpuState *s, uint32_t target,
+                             const SrGuestInterpCallBoundary *call_boundary,
+                             int drain) {
+    /* A call begun at a checked generated site returns into the site's own boundary
+     * (dispatch_call_checked), whose caller honours a return elsewhere. */
+    const int owns_return_boundary = call_boundary != NULL
+        ? !call_boundary->site_boundary
+        : !(drain == SR_DRAIN_SEGMENT && sr_aot_return_boundary_top != NULL &&
+            sr_aot_return_boundary_top->state == s);
+    if (owns_return_boundary) {
+        const uint32_t call_pc = call_boundary != NULL
+            ? call_boundary->resume_pc - 8u : s->pc;
+#ifdef SR_VERIFY
+        sr_verify_suppress_direct = 1;   /* this boundary is reported below, with its target */
+#endif
+        const int begin_failed = sr_aot_return_boundary_begin(
+            s,
+            call_boundary != NULL ? call_boundary->resume_pc : 0u,
+            call_pc, call_boundary != NULL ? 1u : 0u);
+#ifdef SR_VERIFY
+        sr_verify_suppress_direct = 0;
+#endif
+        if (begin_failed) {
+            return;
+        }
+        sr_aot_return_boundary_top->dispatch_owned = 1u;
+    }
+#ifdef SR_VERIFY
+    /* A continuation is the rest of a call already under way, not a call to sample. */
+    if (call_boundary != NULL && !call_boundary->continuation)
+        sr_verify_begin(s, target, call_boundary->resume_pc - 8u, call_boundary->resume_pc);
+#endif
+    if (sr_perf_enabled) sr_perf_aot_begin(target);
+#ifdef SR_VERIFY
+    sr_verify_note_entry(target);
+#endif
+    int exec_previous = sr_exec_enter(SR_EXEC_TIER_AOT);
+    fn(s);
+    /* Complete the body's TAIL chain (#855) where the nested calls used to complete it:
+     * inside this span, and before dispatch_after_aot looks for
+     * exception flow a chained body may raise. A computed step (dispatch_tail_step) runs
+     * only its direct successors here, which used to nest inside its dispatch, and leaves
+     * the next computed transfer to the enclosing drain, so a chain never nests drains. */
+    if (sr_tail_transfer.pending) {
+        if (drain == SR_DRAIN_CHAIN) sr_tail_drain(s);
+        else sr_tail_drain_segment(s);
+    }
+    if (owns_return_boundary) (void)sr_aot_return_boundary_end(s);
+    sr_exec_leave(exec_previous);
+    if (sr_perf_enabled) sr_perf_aot_end();
+}
+
+static int dispatch_after_aot(
+    CpuState *s,
+    const SrGuestInterpCallBoundary *call_boundary,
+    int drain) {
+    if (s->flow_kind == SR_FLOW_EXCEPTION || s->flow_kind == SR_FLOW_ERET) {
+        uint32_t flow_target = s->flow_target;
+        sr_cpu_clear_flow(s);
+        return dispatch_try_with_boundary(s, flow_target, call_boundary, drain);
+    }
+    /* Fatal and currently unhandled flow kinds must not become a successful AOT
+     * handoff. Leave the metadata intact for the fail-closed caller boundary. */
+    if (s->flow_kind != SR_FLOW_NONE)
+        return SR_GUEST_INTERP_FLOW_FATAL;
+    return SR_GUEST_INTERP_AOT_HANDOFF;
+}
+
+static int dispatch_try_with_boundary(
+    CpuState *s,
+    uint32_t target,
+    const SrGuestInterpCallBoundary *call_boundary,
+    int drain) {
+    sr_tail_assert_empty("tail-transfer-live-at-dispatch");
+    /* The per-instruction VFPU fallback below adds no host frame (codegen keeps executing
+     * the owning native function), so the stack preflight runs only for transfers that can
+     * enter another translated body. */
+    if ((target & SR_DISPATCH_VFPU_MASK) != SR_DISPATCH_VFPU_TAG) {
+        int stack_result = dispatch_host_stack_preflight();
+        if (stack_result < 0) {
+            dispatch_report_host_stack_boundary(stack_result);
+            return stack_result;
+        }
+    }
+    /* Per-instruction VFPU fallback.  Codegen keeps executing the owning native C
+     * function after this returns, so no guest function boundary or host stack frame is
+     * introduced.  Keeping the interpreter entry here also gives all computed execution
+     * paths one authoritative fallback instead of duplicating decode logic in generated C. */
+    if ((target & SR_DISPATCH_VFPU_MASK) == SR_DISPATCH_VFPU_TAG) {
+        uint32_t pc=target&~SR_DISPATCH_VFPU_MASK;
+        uint32_t op=MEM_R32(pc);
+        uint64_t perf_started = sr_perf_now_ns();
+        int vfpu_result = sr_vfpu_interp(s,op);
+        if (perf_started) sr_perf_vfpu(op, perf_started, vfpu_result);
+        if (vfpu_result==SR_VFPU_OTHER) {
+            fprintf(stderr, "VFPU_FALLBACK_OTHER: pc=0x%08" PRIx32 " op=0x%08" PRIx32 " target=0x%08" PRIx32 " "
+                    "caller_pc=0x%08" PRIx32 " ra=0x%08" PRIx32 " sp=0x%08" PRIx32 " a0=0x%08" PRIx32 " a1=0x%08" PRIx32 " a2=0x%08" PRIx32 "\n",
+                    pc, op, target, s->pc, s->r[31], s->r[29], s->r[4], s->r[5], s->r[6]);
+            sr_unimplemented(pc,"VFPU runtime interpreter returned SR_VFPU_OTHER");
+        }
+        s->pc=pc+4;
+        return SR_GUEST_INTERP_AOT_HANDOFF;
+    }
+    /* Guest address 0 (#1375). Dispatch is keyed on `target` alone. s->pc is not lost-state
+     * evidence: generated code writes it only at returns and recorded tail transfers, and
+     * every host entry and interpreted transfer seeds it with the target it dispatches, so a
+     * zero s->pc here means only that the target is 0. Address 0 holds code only on a
+     * zero-based image: its offset-0 function is registered, or an analyzer-owned span
+     * covers it with no native body (an AOT gap, which the interpreter floor runs). A guest
+     * reaches that code only by a static transfer (a j/jal or branch, generated or
+     * interpreted) or as the module entry, which run it like any other address. With no
+     * code at address 0, a dispatch there is a null code pointer however it was formed (a
+     * host entry handed a null guest handler, for instance), and the run stops by name
+     * before any guest state changes. This replaces two `s->pc == 0` "collapsed thread"
+     * guards that silently terminated or exited the current thread and swallowed a static
+     * jal 0. */
+    if (target == 0u && !sr_lookup(0u) && !sr_exec_span_owns_fetch(0u)) {
+        dispatch_report_null_dispatch(s);
+        return SR_GUEST_INTERP_NULL_CODE_POINTER;
+    }
+    /* The every-100-dispatch sr_timeslice=0 resets that used to sit here (one for the
+     * worker thread, one for every other thread) were a defensive backstop against
+     * priority inversion. Removed per Phase 1.4 — pure dispatch overhead. The launcher
+     * demotion that replaced them is retired too (#363): pick_next is strict priority, and
+     * every thread keeps the priority its creator passed. */
+    SR_YIELD(s, s->pc);
+
+    /* Record every dispatch in circular trace buffer.
+     * The trace is circular by design (DISPATCH_TRACE_SIZE = 32); g_dtrace_idx wraps
+     * via `idx % DISPATCH_TRACE_SIZE`. To prevent the bare integer from overflowing on
+     * a pathologically long run and producing integer-undefined behaviour, mask back
+     * into range once it crosses INT_MAX. dump_dispatch_trace uses the same formula. */
+    {
+        int di = g_dtrace_idx % DISPATCH_TRACE_SIZE;
+        g_dtrace[di].target = target;
+        g_dtrace[di].pc = s->pc;
+        g_dtrace[di].ra = s->r[31];
+        g_dtrace[di].uid = sched_current_uid();
+        g_dtrace[di].used = 1u;
+        g_dtrace_idx++;
+        if (g_dtrace_idx >= (1 << 30)) g_dtrace_idx = (g_dtrace_idx & (DISPATCH_TRACE_SIZE - 1));
+    }
+
+    /* getenv() in a hot path walks the host env block every dispatch; cache it on the
+     * first call. The "-1 / 0 / 1" tristate is a common idiom that races if two
+     * fibers enter concurrently, but sr_hle_init runs single-threaded during boot
+     * so the initial probe is safe; subsequent dispatchers across fibers see the
+     * resolved value via atomic-ish visibility on Windows/x86 (TSO). */
+    static int s_displog = -1;
+    if (s_displog < 0) s_displog = getenv("SR_DISPLOG") ? 1 : 0;
+    if (s_displog)
+        fprintf(stderr, "DISPATCH 0x%08" PRIx32 " from 0x%08" PRIx32 " (ra=0x%08" PRIx32 ")\n", target, s->pc, s->r[31]);
+
+    /* Configured dispatch aliases.
+     *
+     * A computed call can land on an address codegen never registered separately -- a
+     * tail call entering a callee past its prologue, for instance -- while the callee's
+     * real entry IS registered. Where a title's configuration names that pair, enter the
+     * registered body instead of falling through to a miss.
+     *
+     * This invents no behavior: it runs an ordinary registered function, and if the
+     * aliased body is not registered either, the call falls through to the normal miss
+     * path unchanged. An unconfigured build has no aliases, so every such address stays
+     * an ordinary miss. Placed after the exact-hook loop so runtime policy hooks keep
+     * before the lookup fixups so an aliased target reaches the same code the direct
+     * target would. */
+    {
+        uint32_t alias_target = 0u;
+        if (sr_title_config_dispatch_alias(target, &alias_target)) {
+            RecompFn aliased = sr_lookup(alias_target);
+            if (aliased) {
+                dispatch_call_aot(aliased, s, alias_target, call_boundary, drain);
+                return dispatch_after_aot(s, call_boundary, drain);
+            }
+        }
+    }
+
+    RecompFn fn = sr_lookup(target);
+    /* PSP relocation base fallback: game vtable/data contain absolute code addresses
+     * offset by 0x08000000 (PSP user RAM base), but the recompiler loads the ELF at
+     * 0x00000000.  When sr_lookup(target) fails for an address in [0x08000000..0x0C000000),
+     * try the same address minus the PSP RAM base to find the recompiled function. */
+    if (!fn && target >= 0x08000000u && target < 0x0C000000u) {
+        if (target == 0x08000000u) return dispatch_report_normalized_null(s, target, "RELOC_FIXUP");
+        fn = sr_lookup(target - 0x08000000u);
+        if (fn) {
+            static int reloc_fixup_n = 0;
+            if (reloc_fixup_n < 20) {
+                fprintf(stderr, "RELOC_FIXUP: target 0x%08" PRIx32 " -> 0x%08" PRIx32 " (found recompiled fn)\n",
+                        target, target - 0x08000000u);
+                reloc_fixup_n++;
+            }
+            target = target - 0x08000000u;  /* use corrected target for logging */
+        }
+    }
+    /* MIPS segment-bit normalization. The game returns through `jr $ra` with cached/
+     * uncached kernel-segment addresses (kseg0 0x80000000..0x9FFFFFFF, kseg1
+     * 0xA0000000..0xBFFFFFFF) and 0xC0000000+ kernel-window targets. The recompiler
+     * maps all code to a flat image-relative (0-based) space, so strip the segment bits
+     * (SR_PHYS mask) before the lookup. Without this, those returns miss the table and the
+     * thread spins forever on "dispatch miss" (observed: the launcher thread never reaches
+     * sceDisplaySetFrameBuf, so no frame is ever presented -> black screen / watchdog). */
+    if (!fn) {
+        uint32_t phys = target & 0x1FFFFFFFu;
+        if (phys != target) {
+            if (phys == 0u) return dispatch_report_normalized_null(s, target, "KSEG_FIXUP");
+            fn = sr_lookup(phys);
+            if (fn) {
+                static int kseg_fixup_n = 0;
+                if (kseg_fixup_n < 20) {
+                    fprintf(stderr, "KSEG_FIXUP: target 0x%08" PRIx32 " -> 0x%08" PRIx32 " (found recompiled fn)\n",
+                            target, phys);
+                    kseg_fixup_n++;
+                }
+                target = phys;  /* use normalized target for logging */
+            }
+        }
+    }
+    /* Late-import bridge (Track B contract, sr_hle_resolve_late_import in hle.c).
+     * A miss that survives the reloc/kseg fixups above is usually a call into a
+     * runtime-loaded module (dynamic import stub, e.g. launcher pc 0x0000efec) whose
+     * export table was populated after static codegen. Ask the late-import registry:
+     *   - a rebased guest export address: resolve the current body for this call,
+     *     then continue on the normal hit path;
+     *   - SR_HLE_LATE_BUILTIN: the id is a built-in HLE handler — trap into sr_syscall
+     *     with the standard HLE return convention (v0 = result, pc = ra);
+     *   - 0: unresolved — fall through to the existing miss handling unchanged. */
+    if (!fn) {
+        uint32_t late = sr_hle_resolve_late_import(target);
+        if (late == SR_HLE_LATE_BUILTIN) {
+            static int late_hle_n = 0;
+            if (late_hle_n < 20) {
+                fprintf(stderr, "LATE_IMPORT_HLE: target=0x%08" PRIx32 " from pc=0x%08" PRIx32 " -> sr_syscall\n",
+                        target, s->pc);
+                late_hle_n++;
+            }
+            sr_hle_call(s, target);
+            return SR_GUEST_INTERP_AOT_HANDOFF;
+        }
+        if (late != 0 && late != target) {
+            /* Normalize the resolved export the same way direct targets are. */
+            uint32_t resolved = late;
+            fn = sr_lookup(resolved);
+            if (!fn && (resolved & 0x1FFFFFFFu) != resolved) {
+                resolved &= 0x1FFFFFFFu;
+                if (resolved == 0u)
+                    return dispatch_report_normalized_null(s, target, "late import");
+                fn = sr_lookup(resolved);
+            }
+            if (fn) {
+                /* The registry owns this binding's lifetime. A persistent table
+                 * alias would bypass unload and same-address reload (#593). */
+                static int late_resolve_n = 0;
+                if (late_resolve_n < 20) {
+                    fprintf(stderr, "LATE_IMPORT_RESOLVE: target=0x%08" PRIx32 " -> 0x%08" PRIx32 "\n",
+                            target, resolved);
+                    late_resolve_n++;
+                }
+                target = resolved;  /* use resolved target for logging below */
+            } else {
+                static int late_dangle_n = 0;
+                if (late_dangle_n < 20) {
+                    fprintf(stderr, "LATE_IMPORT_DANGLE: target=0x%08" PRIx32 " resolved to 0x%08" PRIx32 " "
+                            "but no recompiled body — falling through to miss path\n",
+                            target, late);
+                    late_dangle_n++;
+                }
+            }
+        }
+    }
+    if (fn) {
+        /* TD-27 stale redirect: the registered AOT body was translated from
+         * bytes the guest has since overwritten (see src/rt/stale_code.h).
+         * Run the live bytes through the interpreter instead of calling fn.
+         * Gate off, sr_stale_block_is_stale() is one cached-flag branch
+         * returning 0, so this stays exactly on the current path. */
+        if (sr_stale_block_is_stale(target)) {
+            sr_perf_interp_set_reason(SR_PERF_INTERP_STALE_BLOCK);
+            return dispatch_run_interp(s, target, call_boundary, drain);
+        }
+        uint64_t start_ns = 0;
+        SrProfEntry *prof_entry = NULL;
+        if (g_prof_enabled) {
+            prof_entry = prof_lookup(target);
+            if (prof_entry) {
+                prof_entry->call_count++;
+            }
+            start_ns = SDL_GetTicksNS();
+        }
+
+        if (s_displog) {
+            fprintf(stderr, "  -> calling fn %p for 0x%08" PRIx32 ", s->r[29]=0x%08" PRIx32 " sr_timeslice=%d\n",
+                    (void*)fn, target, s->r[29],
+                    atomic_load_explicit(&sr_timeslice, memory_order_relaxed));
+        }
+        dispatch_call_aot(fn, s, target, call_boundary, drain);
+
+        if (g_prof_enabled && prof_entry) {
+            prof_entry->duration_ns += (SDL_GetTicksNS() - start_ns);
+        }
+
+        if (s_displog) {
+            fprintf(stderr, "  <- returned from fn %p for 0x%08" PRIx32 ", s->r[29]=0x%08" PRIx32 " sr_timeslice=%d\n", (void*)fn, target, s->r[29], atomic_load_explicit(&sr_timeslice, memory_order_relaxed));
+        }
+    } else {
+        {
+            static int miss_dump_registered = 0;
+            if (!miss_dump_registered) {
+                miss_dump_registered = 1;
+                atexit(dump_dispatch_misses);
+            }
+            uint32_t h = (target * 2654435761u) & (MISS_HASH_SIZE - 1);
+            int found = 0;
+            for (int i = 0; i < 16; i++) {
+                uint32_t idx = (h + i) & (MISS_HASH_SIZE - 1);
+                if (g_miss_table[idx].target == target) { found = 1; break; }
+                if (g_miss_table[idx].target == 0 && g_miss_count < MISS_HASH_SIZE) {
+                    g_miss_table[idx].target = target;
+                    g_miss_table[idx].pc = s->pc;
+                    g_miss_table[idx].ra = s->r[31];
+                    g_miss_count++;
+                    fprintf(stderr, "DISPATCH_MISS_NEW[%d]: target=0x%08" PRIx32 " caller_pc=0x%08" PRIx32 " ra=0x%08" PRIx32 " uid=0x%" PRIx32 "\n",
+                            g_miss_count, target, s->pc, s->r[31], sched_current_uid());
+                    found = 1;
+                    break;
+                }
+            }
+            (void)found;
+        }
+        /* A valid executable miss is not a fabricated success. Only bytes inside an
+         * explicitly registered executable span may execute; the interpreter itself
+         * hands off at a registered AOT destination it reaches by an unlinked
+         * transfer (a linked one calls it and resumes). Every rejection leaves the rejected
+         * instruction's architectural effects unapplied and propagates to the public
+         * dispatch wrapper, which terminates instead of resuming native code as if the
+         * guest transfer had succeeded. */
+        sr_perf_interp_set_reason(SR_PERF_INTERP_DISPATCH_MISS);
+        return dispatch_run_interp(s, target, call_boundary, drain);
+    }
+    return dispatch_after_aot(s, call_boundary, drain);
+}
+
+static int dispatch_try(CpuState *s, uint32_t target) {
+    return dispatch_try_with_boundary(s, target, NULL, SR_DRAIN_CHAIN);
+}
+
+void dispatch_tail_step(CpuState *s, uint32_t target) {
+    if (dispatch_try_with_boundary(s, target, NULL, SR_DRAIN_SEGMENT) < 0) {
+        sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, target, 0u, 0u);
+        fflush(stderr);
+        exit(1);
+    }
+}
+
+static int dispatch_call_try_at(CpuState *s, uint32_t target, uint32_t resume_pc,
+                                uint8_t site_boundary) {
+    if ((resume_pc & 3u) != 0u) {
+        return SR_GUEST_INTERP_MISALIGNED_PC;
+    }
+    SrGuestInterpCallBoundary boundary = {
+        .resume_pc = resume_pc, .entry_sp = s->r[29], .owes_entry_sp = 1u,
+        .site_boundary = site_boundary };
+    return dispatch_try_with_boundary(s, target, &boundary, SR_DRAIN_CHAIN);
+}
+
+int dispatch_call_try(CpuState *s, uint32_t target, uint32_t resume_pc) {
+    return dispatch_call_try_at(s, target, resume_pc, 0u);
+}
+
+void dispatch(CpuState *s, uint32_t target) {
+    if (dispatch_try(s, target) < 0) {
+        sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, target, 0u, 0u);
+        fflush(stderr);
+        exit(1);
+    }
+}
+
+void dispatch_call(CpuState *s, uint32_t target, uint32_t resume_pc) {
+    if (dispatch_call_try(s, target, resume_pc) < 0) {
+        sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, target, resume_pc, 0u);
+        fflush(stderr);
+        exit(1);
+    }
+}
+
+/* A dispatch_call frame is otherwise a wall to a guest return past it: its caller runs its
+ * own continuation whatever the callee did. A generated call site honours the end check
+ * instead, as at a direct call, so the call gets the same boundary. Under it, native code
+ * run for the call -- a native callee, or the native body an interpreted callee hands its
+ * frame to -- returns into this boundary, and a return elsewhere (a longjmp) unwinds the
+ * frames between as it does natively (#1034, #1935). */
+int dispatch_call_checked(CpuState *s, uint32_t target, uint32_t resume_pc) {
+#ifdef SR_VERIFY
+    sr_verify_suppress_direct = 1;   /* sampled with its target where the callee is native */
+#endif
+    const int refused = sr_aot_return_boundary_begin(s, resume_pc, resume_pc - 8u, 1u);
+#ifdef SR_VERIFY
+    sr_verify_suppress_direct = 0;
+#endif
+    if (refused) return 1;
+    if (dispatch_call_try_at(s, target, resume_pc, 1u) < 0) {
+        sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, target, resume_pc, 0u);
+        fflush(stderr);
+        exit(1);
+    }
+    return sr_aot_return_boundary_end(s);
+}
+
+/* An interpreted linked call hands its live frame to a native body (the interpreter's AOT
+ * handoff). That body's chain ends in the call's return, so it is checked against the
+ * call's resume PC: under a checked site it returns into the site's boundary, which
+ * unwinds a return elsewhere; any other caller runs its own continuation, so the body gets
+ * a boundary of its own and a return elsewhere is the named #1034 stop. */
+int dispatch_call_continue(CpuState *s, uint32_t target, const SrGuestInterpCallBoundary *call) {
+    const SrGuestInterpCallBoundary rest = {
+        .resume_pc = call->resume_pc, .site_boundary = call->site_boundary,
+        .continuation = 1u };
+    if (dispatch_try_with_boundary(s, target, &rest, SR_DRAIN_CHAIN) < 0) {
+        sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, target, call->resume_pc, 0u);
+        fflush(stderr);
+        exit(1);
+    }
+    if (!call->site_boundary) return 0;
+    const SrAotReturnBoundary *site = sr_aot_return_boundary_top;
+    if (sr_aot_return_boundary_depth <= sr_aot_return_boundary_floor || site == NULL ||
+        site->state != s || !site->has_resume_pc || site->resume_pc != call->resume_pc) {
+        return 0;
+    }
+    return site->unwinding != 0u ||
+           ((site->observed_target >> 32) != 0u &&
+            (uint32_t)site->observed_target != call->resume_pc);
+}
+
+/* A host entry is a linked call that returns to the host (#1375, recomp.h). The AOT tier
+ * accepts the body's `jr $ra` to SR_HOST_RETURN_PC at its return boundary, and the
+ * interpreter returns at the call boundary instead of fetching from that address. A native
+ * body that returns anywhere else stops as the named #1034 mismatch. */
+void dispatch_from_host(CpuState *s, uint32_t entry) {
+    dispatch_call(s, entry, SR_HOST_RETURN_PC);
+}
+
+jmp_buf g_hle_jmp;
+int g_hle_depth = 0;
+
+void sr_hle_call(CpuState *s, uint32_t nid) {
+    sr_hit_hle = 1;
+    g_hle_depth++;
+    s->r[2] = sr_syscall(s, nid);
+    g_hle_depth--;
+    s->pc = s->r[31];
+}
+
+void sr_unimplemented(uint32_t pc, const char *reason) {
+    fprintf(stderr, "sr_unimplemented: function 0x%08" PRIx32 ": %s\n", pc, reason);
+    sr_flight_fatal(SR_FLIGHT_KIND_FATAL_UNIMPLEMENTED, pc, 0u, 0u);
+    abort();
+}
+
+/* ---- tracing ---- */
+
+static FILE *s_fp = NULL;
+/* Call-site gate for the per-instruction trace hooks (see recomp.h). Mirrors "s_fp != NULL":
+ * the generated code checks this inline and only calls sr_begin_impl/sr_end_impl when set. */
+int sr_trace_active = 0;
+static uint32_t s_r[32], s_fi[32], s_vi[128], s_hi, s_lo, s_fcr31, s_pc, s_op;
+static unsigned long long s_step = 0;
+
+int sr_trace_open(const char *path, const char *target, uint32_t start_pc) {
+    s_fp = fopen(path, "wb");
+    if (!s_fp) return -1;
+    fprintf(s_fp, "# psp-recomp trace v1 oracle=recomp target=%s start_pc=0x%08" PRIx32 "\n",
+            target ? target : "unknown", start_pc);
+    s_step = 0;
+    sr_trace_active = 1;
+    return 0;
+}
+
+void sr_trace_close(void) {
+    if (s_fp) { fflush(s_fp); fclose(s_fp); s_fp = NULL; }
+    sr_trace_active = 0;
+}
+
+void sr_begin_impl(CpuState *s, uint32_t pc, uint32_t op) {
+    if (!s_fp) return;
+    /* An armed SR_TRACE_PC window gates the snapshot, not the other way round: the
+     * gate costs one range compare per guest instruction and the snapshot runs only
+     * for in-window instructions. With no window this test is a single load. */
+    if (sr_trace_window_armed() && !sr_trace_window_begin_instruction(pc)) return;
+    memcpy(s_r, s->r, sizeof(s_r));
+    memcpy(s_fi, s->fi, sizeof(s_fi));
+    memcpy(s_vi, s->v, sizeof(s_vi));
+    s_hi = s->hi; s_lo = s->lo; s_fcr31 = s->fcr31;
+    s_pc = pc; s_op = op;
+}
+
+void sr_end_impl(CpuState *s, uint32_t mem_addr, int mem_size) {
+    if (!s_fp) return;
+    if (sr_trace_window_armed() && !sr_trace_window_begin_instruction(s_pc)) return;
+    char line[4096];
+    size_t n = 0;
+    n = sr_buf_append(line, sizeof(line), n, "%llu pc=0x%08" PRIx32 " op=0x%08" PRIx32,
+                      (unsigned long long)s_step, s_pc, s_op);
+    /* Emit the per-step register-write diff in the canonical TRACE_FORMAT.md order
+     * (r1..r31, hi, lo, f0..f31, fcr31, v0..v127) so the recompiled-code trace is
+     * byte-comparable with the reference interpreter's golden trace. Only registers
+     * whose value changed since sr_begin_impl are listed. */
+    for (int i = 1; i < 32; i++)
+        if (s_r[i] != s->r[i])
+            n = sr_buf_append(line, sizeof(line), n, " r%d=0x%08" PRIx32, i, s->r[i]);
+    if (s_hi != s->hi)
+        n = sr_buf_append(line, sizeof(line), n, " hi=0x%08" PRIx32, s->hi);
+    if (s_lo != s->lo)
+        n = sr_buf_append(line, sizeof(line), n, " lo=0x%08" PRIx32, s->lo);
+    for (int i = 0; i < 32; i++)
+        if (s_fi[i] != s->fi[i])
+            n = sr_buf_append(line, sizeof(line), n, " f%d=0x%08" PRIx32, i, s->fi[i]);
+    if (s_fcr31 != s->fcr31)
+        n = sr_buf_append(line, sizeof(line), n, " fcr31=0x%08" PRIx32, s->fcr31);
+    /* Compare and print the raw 32-bit register bits (the vi union view of the
+     * float VFPU file): comparing the s_vi snapshot against the float view
+     * converts through float, and passing a float to %x is undefined varargs
+     * behavior. */
+    for (int i = 0; i < 128; i++)
+        if (s_vi[i] != s->vi[i])
+            n = sr_buf_append(line, sizeof(line), n, " v%d=0x%08" PRIx32, i, s->vi[i]);
+    /* Memory-write tokens (ascending by address), matching the interpreter. */
+    if (mem_size == 1)
+        n = sr_buf_append(line, sizeof(line), n, " m8[0x%08" PRIx32 "]=0x%02x",
+                          mem_addr, MEM_R8(mem_addr));
+    else if (mem_size == 2)
+        n = sr_buf_append(line, sizeof(line), n, " m16[0x%08" PRIx32 "]=0x%04x",
+                          mem_addr, MEM_R16(mem_addr));
+    else if (mem_size == 4)
+        n = sr_buf_append(line, sizeof(line), n, " m32[0x%08" PRIx32 "]=0x%08" PRIx32,
+                          mem_addr, MEM_R32(mem_addr));
+    if (n >= sizeof(line)) n = sizeof(line) - 1;
+    if (sr_trace_window_armed()) {
+        /* A windowed record carries the canonical line plus the ABSOLUTE value of the
+         * registers the operator named, because the diff alone cannot show a value
+         * that was written before the window opened. */
+        const SrTraceWindowIndices *idx = sr_trace_window_indices();
+        char rec[2048];
+        size_t m = sr_buf_append(rec, sizeof(rec), 0, "%.*s", (int)n, line);
+        for (unsigned i = 0; idx && i < idx->vn; i++)
+            m = sr_buf_append(rec, sizeof(rec), m, " abs v%u=0x%08" PRIx32, idx->v[i], s->vi[idx->v[i]]);
+        for (unsigned i = 0; idx && i < idx->fn; i++)
+            m = sr_buf_append(rec, sizeof(rec), m, " abs f%u=0x%08" PRIx32, idx->f[i], s->fi[idx->f[i]]);
+        if (m >= sizeof(rec)) m = sizeof(rec) - 1;
+        rec[m] = '\0';
+        sr_trace_window_record(s_pc, rec);
+    } else {
+        line[n] = '\n';
+        fwrite(line, 1, n + 1, s_fp);
+    }
+    s_step++;
+    if (s_step > 50000000ULL) {
+        fprintf(stderr, "sr_end: trace exceeded 50M steps\n");
+        sr_trace_close();
+        abort();
+    }
+}

@@ -1,0 +1,272 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""A computed transfer must read its target register AT the transfer.
+
+MIPS executes a jump's delay slot AFTER the jump has already read its target
+register, so a slot that writes that register cannot redirect control.  Generated
+code used to read the register after emitting the slot, which silently redirected
+`jalr`/`jr $rs` whenever the slot aliased the target -- for example the ordinary
+`jr $t9` tail-call idiom preceded by a slot that reloads $t9.
+
+The defect was found by the AOT/interpreter cosimulation gate
+(``fixtures/cosim``, cell ``jrslot``), which executed the same source-owned guest
+bytes both ways and reported the two lanes entering different callees.  These
+tests pin the emission order so it cannot regress without an executable gate run.
+"""
+
+from pathlib import Path
+import sys
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+
+import codegen
+
+
+class FakeElf:
+    def __init__(self, words):
+        self.words = words
+
+    def read_at_vaddr(self, addr, size):
+        if size != 4 or addr not in self.words:
+            return None
+        return self.words[addr].to_bytes(4, "little")
+
+
+JR_RA = 0x03E00008
+NOP = 0x00000000
+
+
+def jr(rs):
+    return (rs & 0x1F) << 21 | 0x08
+
+
+def jalr(rd, rs):
+    return (rs & 0x1F) << 21 | (rd & 0x1F) << 11 | 0x09
+
+
+def addu(rd, rs, rt):
+    return (rs & 0x1F) << 21 | (rt & 0x1F) << 16 | (rd & 0x1F) << 11 | 0x21
+
+
+class TransferTargetTimingTests(unittest.TestCase):
+    """The target read must precede the delay slot in the emitted statements."""
+
+    def _emit(self, words, start=0x1000, end=0x1030, known=None):
+        elf = FakeElf(words)
+        known = known if known is not None else {start}
+        return "\n".join(codegen.emit_function(elf, start, [(start, end)], known))
+
+    def test_jalr_reads_target_before_its_delay_slot(self):
+        # jalr t9, t0  /  addu t0, t1, zero   -- the slot aliases the target.
+        text = self._emit(
+            {
+                0x1000: jalr(25, 8),
+                0x1004: addu(8, 9, 0),
+                0x1008: JR_RA,
+                0x100C: NOP,
+            }
+        )
+        capture = text.index("uint32_t _t = s->r[8];")
+        slot = text.index("s->r[8] = (s->r[9] + 0u);")
+        call = text.index("if (dispatch_call_checked(s, _t, 0x00001008u)) return;")
+        self.assertLess(capture, slot, "jalr target captured after its delay slot")
+        self.assertLess(slot, call, "delay slot emitted after the transfer")
+
+    def test_jalr_link_is_written_before_its_delay_slot(self):
+        # The link value is architecturally visible to the delay slot.
+        text = self._emit(
+            {
+                0x1000: jalr(31, 8),
+                0x1004: addu(8, 9, 0),
+                0x1008: JR_RA,
+                0x100C: NOP,
+            }
+        )
+        link = text.index("s->r[31] = 0x00001008u;")
+        slot = text.index("s->r[8] = (s->r[9] + 0u);")
+        self.assertLess(link, slot, "jalr link written after its delay slot")
+
+    def test_computed_jr_reads_target_before_its_delay_slot(self):
+        # jr t9 / addu t9, t1, zero -- the classic reload-in-slot tail call.
+        text = self._emit(
+            {
+                0x1000: jr(25),
+                0x1004: addu(25, 9, 0),
+                0x1008: JR_RA,
+                0x100C: NOP,
+            }
+        )
+        capture = text.index("uint32_t _t = s->r[25];")
+        slot = text.index("s->r[25] = (s->r[9] + 0u);")
+        call = text.index("sr_tail_record(s, _t, NULL,")
+        self.assertLess(capture, slot, "jr target captured after its delay slot")
+        self.assertLess(slot, call, "delay slot emitted after the transfer")
+
+    def test_jalr_aliasing_its_own_link_register_still_reaches_the_callee(self):
+        """`jalr $rX, $rX` -- the link write aliases the target register.
+
+        This needs no delay slot to go wrong. MIPS orders the transfer as
+        `temp <- GPR[rs]` and only THEN `GPR[rd] <- return_addr`, so a shared
+        register must still transfer to the callee. Generated code used to write
+        the link first and read the target afterwards, which turned the call into
+        a jump to its own return address -- an immediate infinite re-entry of the
+        instruction after the call.
+
+        The ordering assertion is on the emitted statements rather than on a
+        register value because that IS the defect: two statements in the wrong
+        order.
+        """
+        text = self._emit(
+            {
+                0x1000: jalr(8, 8),
+                0x1004: NOP,
+                0x1008: JR_RA,
+                0x100C: NOP,
+            }
+        )
+        capture = text.index("uint32_t _t = s->r[8];")
+        link = text.index("s->r[8] = 0x00001008u;")
+        call = text.index("if (dispatch_call_checked(s, _t, 0x00001008u)) return;")
+        self.assertLess(capture, link, "jalr read its target after writing the link")
+        self.assertLess(link, call)
+
+    def test_jalr_with_a_zero_link_register_writes_no_link(self):
+        """`jalr $zero, $rs` is the no-link form and must stay one.
+
+        $r0 is not writable, so emitting a link store for it would both be wrong
+        and desynchronise the two cosimulation lanes -- src/rt/guest_interp.c
+        reports `link_register = -1` for exactly this encoding. The target
+        capture must still precede the delay slot -- which is why this case also
+        fails before the fix -- and no link statement may appear at all.
+        """
+        text = self._emit(
+            {
+                0x1000: jalr(0, 8),
+                0x1004: addu(8, 9, 0),
+                0x1008: JR_RA,
+                0x100C: NOP,
+            }
+        )
+        capture = text.index("uint32_t _t = s->r[8];")
+        slot = text.index("s->r[8] = (s->r[9] + 0u);")
+        self.assertLess(capture, slot, "jalr target captured after its delay slot")
+        self.assertNotIn("s->r[0] = 0x00001008u;", text)
+        self.assertNotIn("= 0x00001008u; sr_end", text)
+
+    def test_jr_ra_still_returns_to_the_host_without_a_dispatch(self):
+        """`jr $ra` IS the host return; it must not become a dispatch.
+
+        This is the structural boundary: the AOT frame model still turns a
+        `jr $ra` into a C return, while the caller checks the target against its
+        explicit resume PC.
+        """
+        text = self._emit({0x1000: JR_RA, 0x1004: NOP})
+        self.assertNotIn("dispatch(s, _t);", text)
+        self.assertNotIn("sr_tail_record(", text)
+        self.assertIn("s->r[29] = _sp_entry; return;", text)
+        self.assertIn("SR_AOT_RETURN_CAPTURE(s, _sr_return_target);", text)
+
+    def test_jr_ra_latches_live_target_before_its_delay_slot(self):
+        text = self._emit({
+            0x1000: JR_RA,
+            0x1004: addu(31, 8, 0),  # slot rewrites live $ra after the transfer
+        })
+        capture = text.index("uint32_t _sr_return_target = s->r[31];")
+        record = text.index("SR_AOT_RETURN_CAPTURE(s, _sr_return_target);")
+        slot = text.index("s->r[31] = (s->r[8] + 0u);")
+        self.assertLess(capture, record)
+        self.assertLess(record, slot, "jr $ra target recorded after its delay slot")
+
+    def test_transfer_instruction_is_reported_before_its_delay_slot(self):
+        """Trace order stays branch-then-slot, matching src/rt/guest_interp.c.
+
+        The cosim comparator diffs the two lanes' canonical instruction traces
+        line by line, so a reordering here would show up as a spurious divergence
+        on every computed transfer rather than as a real defect.
+        """
+        text = self._emit(
+            {
+                0x1000: jalr(25, 8),
+                0x1004: addu(8, 9, 0),
+                0x1008: JR_RA,
+                0x100C: NOP,
+            }
+        )
+        transfer_report = text.index("sr_begin(s, 0x00001000u")
+        slot_report = text.index("sr_begin(s, 0x00001004u")
+        self.assertLess(transfer_report, slot_report)
+
+
+class SelfLoopJumpTests(unittest.TestCase):
+    """A jump to its own address is a spin loop, not a call to itself.
+
+    `j <self>` with a delay slot used to be emitted as a native call to the same
+    function. Each iteration then nests one host frame, so a guest busy-wait
+    exhausts the fiber stack (a host stack overflow) instead of spinning. It must
+    stay an in-function backward edge with the usual preemption point."""
+
+    def _emit(self, words, start=0x1000, end=0x1008, known=None):
+        elf = FakeElf(words)
+        known = known if known is not None else {start}
+        return "\n".join(codegen.emit_function(elf, start, [(start, end)], known))
+
+    def test_self_jump_is_a_goto_not_a_native_call(self):
+        # 0x1000: j 0x1000 ; 0x1004: nop (delay slot)
+        j_self = (2 << 26) | ((0x1000 >> 2) & 0x03FFFFFF)
+        text = self._emit({0x1000: j_self, 0x1004: NOP})
+        self.assertNotIn("f_00001000(s)", text)
+        self.assertIn("SR_YIELD(s, 0x00001000u); goto L_00001000;", text)
+        self.assertIn("L_00001000: ;", text)
+
+    def test_self_jump_with_known_entry_is_still_a_loop(self):
+        # The same spin, with the entry registered as a callable target elsewhere.
+        j_self = (2 << 26) | ((0x1000 >> 2) & 0x03FFFFFF)
+        text = self._emit({0x1000: j_self, 0x1004: NOP}, known={0x1000, 0x1004})
+        self.assertNotIn("f_00001000(s)", text)
+        self.assertIn("goto L_00001000;", text)
+
+
+class NullCodePointerCheckTests(unittest.TestCase):
+    """#1375: a computed jr/jalr checks its latched target for null at the transfer.
+
+    The check follows the capture and precedes the link write and delay slot, so a null
+    pointer stops with no architectural effect of the transfer applied. Static transfers
+    and `jr $ra` returns carry no check: a static transfer to offset 0 of a zero-based
+    image is an ordinary one.
+    """
+
+    def _emit(self, words, start=0x1000, end=0x1030, known=None):
+        elf = FakeElf(words)
+        known = known if known is not None else {start}
+        return "\n".join(codegen.emit_function(elf, start, [(start, end)], known))
+
+    def test_jalr_checks_before_link_and_slot(self):
+        text = self._emit({0x1000: jalr(31, 8), 0x1004: addu(8, 9, 0),
+                           0x1008: JR_RA, 0x100C: NOP})
+        capture = text.index("uint32_t _t = s->r[8];")
+        check = text.index("SR_CODE_POINTER(s, _t, 0x00001000u);")
+        link = text.index("s->r[31] = 0x00001008u;")
+        slot = text.index("s->r[8] = (s->r[9] + 0u);")
+        self.assertLess(capture, check)
+        self.assertLess(check, link, "null check after the jalr link write")
+        self.assertLess(check, slot, "null check after the jalr delay slot")
+
+    def test_computed_jr_checks_before_its_slot(self):
+        text = self._emit({0x1000: jr(25), 0x1004: addu(25, 9, 0),
+                           0x1008: JR_RA, 0x100C: NOP})
+        check = text.index("SR_CODE_POINTER(s, _t, 0x00001000u);")
+        slot = text.index("s->r[25] = (s->r[9] + 0u);")
+        self.assertLess(text.index("uint32_t _t = s->r[25];"), check)
+        self.assertLess(check, slot, "null check after the jr delay slot")
+
+    def test_static_call_to_offset0_and_returns_carry_no_check(self):
+        text = self._emit({0x1000: 0x0C000000, 0x1004: NOP, 0x1008: JR_RA, 0x100C: NOP},
+                          known={0x0, 0x1000})
+        self.assertIn("f_00000000(s);", text)
+        self.assertNotIn("SR_CODE_POINTER", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

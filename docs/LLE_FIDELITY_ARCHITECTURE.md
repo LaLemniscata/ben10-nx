@@ -1,0 +1,243 @@
+# LLE Fidelity Architecture: Authentic Guest Execution Doctrine
+
+## 1. Architectural Doctrine & Guiding Principles
+
+The fundamental engineering priority for Nakagawa Recomp is:
+
+$$\text{CORRECTNESS / FIDELITY} > \text{ARCHITECTURAL CLEANLINESS} > \text{GENERALITY} > \text{SHORT-TERM EASE}$$
+
+### 1.1 The Primacy of Original Guest Execution
+
+Nakagawa Recomp is not a high-level API emulator that mimics game behavior by rewriting game systems in host C or C++. It is an **Ahead-of-Time (AOT) and fail-closed interpreter recompilation platform** whose core mission is to execute genuine PSP machine code faithfully on modern host hardware.
+
+Every component of the guest title—including executables, dynamic PRX libraries, vendor middleware, and math routines—should execute as compiled MIPS/Allegrex instructions wherever technically feasible.
+
+> **Note (CPU exception semantics):** EPC, Cause (BD and ExcCode) and BadVAddr are now hardware-measured for a user-mode `break`, a `break` in a branch delay slot, and a user-mode load from a kernel address (runs PSP-A1-01..PSP-A3-01; see [HARDWARE_ORACLE.md](HARDWARE_ORACLE.md)). Exception vector base, BEV/ERL behaviour, syscall and coprocessor-unusable exceptions, and handler entry/return remain unmeasured.
+>
+> **Note (data-access address errors):** the measured kernel-address AdEL is now raised by an actual load, not only by a direct call into the exception helper. Under the LLE gate, `sr_cpu_data_access_fault()` rejects a user-mode access at or above `0x80000000` and the interpreter enters the exception vector with BadVAddr set. This matters because the default accessors cannot express that outcome: `SR_PHYS()` masks every guest address with `0x1FFFFFFF`, so a kernel-segment address aliases onto the same host byte as its user-segment counterpart and the access silently succeeds. With the gate off that masking behaviour is unchanged. Alignment-driven AdEL/AdES is **synthetic**: it follows the MIPS32 architectural rule, and no probe has yet measured the PSP's EPC/BadVAddr for a misaligned access or for a store. Generated code does not yet consult this check — only the interpreter does.
+
+### 1.2 The Role of HLE
+
+High-Level Emulation (HLE) is **not** an architectural goal; it is a pragmatic boundary condition:
+
+- HLE is strictly restricted to generic PSP OS/kernel services and physical hardware boundaries that inherently require host implementation (e.g., thread scheduling via host fibers/threads, Vulkan command submission for the GE rasterizer, SDL3 audio stream buffering, and host filesystem I/O).
+- HLE must never be used as a shortcut to bypass difficult guest modules, skip setup steps, or avoid reverse-engineering complex guest state machines.
+- **Title-specific replacements, patches, bypasses, approximate host substitutes, and middleware reimpletations are last resorts.**
+
+---
+
+## 2. The Authentic Execution Pipeline
+
+The target end-to-end execution pipeline from raw user disc to running game is:
+
+```mermaid
+flowchart TD
+    ISO[PSP Game ISO you own] --> UMD[ISO9660 / UMD Disc Parser]
+    UMD --> DISC_DISC[Authentic Executable & Module Discovery]
+    DISC_DISC --> DECRYPT[Decrypted ELF & PRX Modules from Your Own Copy]
+    DECRYPT --> LOADER[Authentic PRX/ELF Loader & Dynamic Linker]
+    LOADER --> RELOC[Relocations, Imports, Exports & NID Resolution]
+    LOADER --> LIFECYCLE[Module Lifecycle: sceKernelStartModule & module_start]
+    LIFECYCLE --> GUEST_EXEC[Original Guest Recompiled & Interpreted Execution]
+    GUEST_EXEC --> FAITHFUL_OS[Faithful Generic PSP Kernel, Syscalls & Hardware]
+    FAITHFUL_OS --> HOST[Host Runtime: SDL3, Vulkan, Host Audio/Filesystem]
+```
+
+Under this architecture, Nakagawa does not cherry-pick convenient portions of the title and substitute the rest with native C code. The entire software stack authored by the game developers runs as intended on the virtualized PSP platform.
+
+---
+
+## 3. Subsystem Investigation: The True LLE Path
+
+### 3.1 Retail EBOOT and PRX Containers
+
+#### Container Formats Encountered
+
+PSP UMD disc images contain executables in two primary container formats:
+
+1. **`~PSP` Header (Encrypted / Compressed PRX):**
+   - Standard PRX container beginning with magic `~PSP` (`0x7E 0x50 0x53 0x50`).
+   - Contains load segment metadata, BSS sizes (offset `0x38`), total memory footprint, and an encrypted payload.
+2. **`~SCE` Header (SCE Signed Executable Container):**
+   - Wrapped container beginning with magic `~SCE` (`0x7E 0x53 0x43 0x45`).
+   - Wraps an encrypted inner container.
+
+#### Encrypted containers
+
+The player decrypts a UMD disc's encrypted executable and modules locally with built-in tables
+([#1494](https://github.com/Jstar269/nakagawa-recomp/pull/1494)). The player and CLI refuse an encrypted
+`~PSP`/`~SCE` executable or PRX that has no plain copy after that as `ENCRYPTED_EXECUTABLE`
+or `ENCRYPTED_MODULE`, and the analyzer requires plain ELF/PRX inputs. PGD-protected game data
+remains unsupported.
+
+---
+
+### 3.2 Dynamic PRX and Module Loading Machinery
+
+#### Module Loading Completeness Audit
+
+Genuine PSP games do not execute in a flat, monolithic binary space. They dynamically load and unload PRX modules using `sceKernelLoadModule` and `sceKernelStartModule`.
+
+To execute original middleware (`libfont.prx`, `scePsmf_library.prx`, `scePsmfP_library.prx`), Nakagawa's runtime module machinery must provide:
+
+1. **Dynamic Relocation Application:**
+   - Support for both Type-A (`SHT_PRX_RELOC = 0x700000A0`) and packed Type-B (`SHT_PRX_RELOC_PACKED = 0x700000A1`) relocations.
+   - Exact application of MIPS relocation types: `R_MIPS_16`, `R_MIPS_32`, `R_MIPS_26`, `R_MIPS_HI16`, `R_MIPS_LO16`, and `R_MIPS_GPREL16`.
+2. **Export and Import Table Resolution:**
+   - Accurate NID matching between exporting libraries and importing clients.
+   - Dynamic binding of stub jump tables (`stub_table`) to concrete guest addresses or HLE dispatch thunks.
+3. **Module Lifecycle Execution:**
+   - Invocation of `module_start` in a dedicated thread context with proper `argc` and `argv` pointer blocks.
+   - Return value propagation and module status tracking (`SCE_KERNEL_ERROR_ALREADY_STARTED`, etc.).
+
+#### Guest-Placed Modules (Current State)
+
+A module the title manifest declares with `"placement": "runtime"` is translated
+ahead of time without a load address and laid out only when the game loads it
+(#704):
+
+- **Build time.** `tools/prx_reloc_model.py` models every relocation site as a
+  function of the load base and is pinned to the runtime loader at several bases.
+  `tools/codegen.py --extra-elf=<module>@runtime` translates the module once in its
+  link space: every guest address of its image is `sr_m<k>_base + link`, an
+  immediate the loader relocates (LO16/HI16) is read from the loaded image, and the
+  module's functions are reachable only through its `SrModuleCode` descriptor,
+  which records the identity (size and SHA-256 digest) of the translated file.
+- **Load.** `sceKernelLoadModule` (and `sceKernelLoadModuleByID`, through the path
+  the descriptor was opened with) names its module by the full path: a relative
+  path resolves against the calling thread's current directory, as the PSP module
+  manager's own `sceIoOpen` does. It takes memory from the user partition with the
+  ordinary allocator -- the lowest free range that holds the image, as
+  `PSP_SMEM_Low` does -- relocates the image with the project PRX loader, clears its
+  BSS, binds the translation at that base and registers the module's exports. The
+  bound image is the only dispatch and fetch authority for its range.
+- **Lifecycle.** `module_start` and `module_stop` run with the module's own `$gp`;
+  `module_start` still runs as a nested call, while `module_stop` runs on a
+  scheduler-managed guest thread with copied `arglen`/`argp`. The stop thread uses
+  the synthetic scheduler defaults; nonzero stop options fail closed. Stop keeps the
+  image and export authority loaded. Unload unbinds dispatch/fetch authority and stale
+  code, unlinks exports and imports, and frees the image. PSP-3000 measurement #1106
+  shows module-owned waiters and kernel objects can survive unload, so they remain
+  intact; a ready/running continuation into the image is refused with a named
+  synthetic `NOT_IMPLEMENTED` result. `sceKernelSelfStopUnloadModule` runs the same
+  stop path and retires its caller's image only after the caller thread exits; its
+  accepted argument form is synthetic pending hardware measurement.
+- **Memory policy.** Nothing is reserved for modules at build time and modules need
+  not fit together; a main image must lie inside user memory, and a load the
+  partition cannot hold fails at run time with `SCE_KERNEL_ERROR_NO_MEMORY`.
+- **Named boundaries.** A module the build did not translate, a staged file that is
+  not the translated one, a module codegen could not translate (for example one
+  with GPREL16 relocations), a second live instance of one translation, and a load
+  option asking for another partition or High placement fail closed with
+  `SCE_KERNEL_ERROR_NOTIMP` and a `GUEST_MODULE_BOUNDARY` line.
+
+Remaining work on this path: `module_start` runs as a nested call on the caller's
+thread rather than in its own thread, module entry return values have no broader
+start-state policy beyond the stop status output, one translation binds one live
+image, `PSP_SMEM_High` and fixed `PSP_SMEM_Addr` module placement are not modelled,
+and the runtime's thread stacks and nested-call frames occupy a fixed region near
+the top of user memory instead of partition blocks, so the allocator neither
+counts nor avoids them. Package-local `sceKernelLoadExec` is limited to required,
+runtime-placed programs declared by the active title manifest; VSH and other launch
+variants remain outside that path.
+
+#### Why Guest PRXs Previously Failed
+
+In early Nakagawa development, executing `module_start` for `libfont.prx` and `psmf.prx` resulted in hangs on `sceKernelWaitSema`. This was an artifact of incomplete kernel synchronization emulation, not an inherent impossibility of running the code. Rather than fixing the underlying kernel semaphore and thread scheduling contracts, previous passes short-circuited `module_start`, wrote hardcoded compatibility flags into guest memory, and provided wholesale HLE stubs. Under the LLE doctrine, this short-circuit is recognized as technical debt to be systematically eliminated.
+
+---
+
+### 3.3 Font System: PGF Fidelity vs. TTF Approximation
+
+#### The Reality of `libfont.prx` and `sceFont`
+
+- `libfont.prx` is genuine PSP userland middleware developed by Sony. It implements the `sceFont` API (`sceFontNewLib`, `sceFontOpen`, `sceFontGetCharGlyphImage_Clip`, etc.).
+- When executing as guest code, `libfont.prx` parses Sony PGF (PlayStation Glyph Format) font containers, computes glyph layout metrics, processes kerning pairs, and rasterizes glyph alpha bitmaps using the PSP's Allegrex CPU and VFPU.
+
+#### Why Wholesale TTF / `stb_truetype` HLE Was Rejected
+
+1. **Glyph Metric Mismatches:** TrueType fonts (TTF/OTF) use different vector outline models, hinting instructions, and metric scalers than Sony's PGF rasterizer. Replacing PGF with standard TTF causes subtle differences in horizontal advances, character widths, and line heights.
+2. **Text Clipping and HUD Breakage:** In games with fixed UI text boxes (such as tournament brackets, player stat cards, and scoreboards in *Hot Shots Tennis*), metric differences can cause text strings to wrap prematurely, truncate, or overflow their allocated background boxes.
+3. **Baseline and Shadow Misalignments:** PSP games frequently render two font passes (a dark shadow offset by $(+1, +1)$ or $(+2, +2)$ pixels behind the main text). Inaccurate glyph rasterization leads to visible fringing and visual bugs.
+4. **Architectural Deviation:** Bypassing `libfont.prx` throws away thousands of lines of authentic PSP code in exchange for a host substitute.
+
+#### The Authentic PGF Path and Firmware Honesty
+
+- **ISO vs. Firmware Reality:** The PGF font files (`jpn0.pgf`, `ltn0.pgf`, etc.) are located in the PSP's internal `flash0:/font/` filesystem partition, **not** on the game UMD disc.
+- **Honest Prerequisite Discipline:** We do not sacrifice fidelity merely to claim "Program + ISO". If authentic rendering requires the genuine Sony PGF font, we state clearly:
+  $$\text{Nakagawa} + \text{Game ISO} + \text{User-Supplied Console Font (flash0)}$$
+- A non-authentic TTF replacement mode may exist solely as an optional, clearly labeled developer fallback, but it is **not** the architectural baseline.
+
+---
+
+### 3.4 PSMF Video Subsystem: Downward Dependency Boundary
+
+#### Original Middleware Execution
+
+PSMF (PlayStation Stream Media Format) multiplexes AVC/H.264 video and ATRAC3plus audio streams.
+
+- The player middleware (`scePsmf_library.prx`, `scePsmfP_library.prx`) manages presentation timestamps, stream demultiplexing, and ring buffer flow control.
+- Under LLE doctrine, these PRX modules must execute as original guest code.
+
+#### Defining the Lowest-Level Hardware Boundary
+
+Executing guest PSMF middleware does not require software-emulating an H.264 video decoder on the MIPS CPU.
+
+1. The guest PSMF modules call downward into low-level hardware abstraction libraries: `sceMpeg`, `sceVideocodec`, and `sceAudiocodec`.
+2. On physical hardware, `sceMpeg` delegates bitstream decoding to the PSP's dedicated Media Engine (ME) and AVC hardware decoder.
+3. Therefore, the **correct, natural HLE boundary** is at the `sceMpeg` / `sceVideocodec` interface:
+   - Guest PSMF middleware handles demuxing, buffering, and state transitions.
+   - Nakagawa's runtime intercepts raw compressed NAL packets at the `sceMpeg` boundary and dispatches them to host hardware decoders (Vulkan Video, DXVA2/Media Foundation, or ffmpeg/libavcodec).
+   - Audio packets (ATRAC3plus) are decoded via host audio libraries and fed back into guest ring buffers.
+
+#### Implemented Boundary Today (public source)
+
+The downward boundary exists in the current source, one layer below the player, and is exercised
+end to end by source-owned tests:
+
+- `src/rt/psmf_producer.c` reads a PSMF/MPEG-PS stream through a bounded byte source (ISO sector
+  read, loose VFS entry, or in-memory fixture), forms PSP-shaped access units (aud-delimited
+  pictures, ATRAC3plus frame records with the private-stream-1 sub-header), and hands them to
+  per-track compressed-access-unit queues with backpressure, bounded parsing, and fail-closed
+  malformed-input handling. Its H.264 boundary accepts both Annex-B start-code forms:
+  `00 00 01` and `00 00 00 01` (the latter keeps its leading zero in the first access unit).
+- The `scePsmfPlayer*` handlers remain host HLE for now: they own the guest control block and the
+  output contract, and drive that producer plus the host codecs (Media Foundation H.264 for
+  pictures, the project's ATRAC3plus decoder import for audio). A getter returns success only for
+  output a decoder actually produced; a compressed access unit is never presented as a decoded
+  frame or PCM block, and a track that runs dry reports `NO_MORE_DATA` rather than silence.
+- Evidence tiers: the access-unit, timestamp and queue contract is covered by
+  `tests/native/psmf_producer_selftest.c` against fixtures built byte-for-byte by that file (tier S), and
+  the decoder seam by `tests/native/psmf_media_selftest.c`, which constructs a baseline-profile H.264
+  stream whose every macroblock is `I_PCM` and checks the decoded picture deterministically. The
+  host-HLE player itself has no hardware-comparison measurement, so both getters carry the
+  `partial` status in `tools/hle_registry_meta.py` rather than `complete`.
+
+---
+
+### 3.5 Filesystem and Asset Storage: Guest Transparency
+
+#### Preserving PSP-Visible Filesystem Invariants
+
+Guest software is intimately aware of filesystem semantics. Any storage optimization (such as direct archive mounting) must remain strictly below the PSP kernel boundary.
+
+The guest MIPS program must observe:
+
+- **Canonical Paths:** Exact access through `disc0:/` or `host0:/` without virtual path remapping.
+- **Exact File Metadata:** Identical file sizes, directory enumeration order, and file timestamps.
+- **Strict Error Codes:** Returning genuine PSP error numbers (e.g., `SCE_ERROR_ERRNO_FILE_NOT_FOUND = 0x80010002`).
+- **Seek and Read Semantics:** Byte-accurate seek positions, EOF flags, and partial-read return values.
+
+#### Transparent Archive VFS
+
+Directly reading assets from the `data.xb` container without extracting 56,672 files to disk is fully compatible with LLE **if and only if** it is implemented as a transparent block driver in the runtime's disc I/O layer. The shipped archive-backed VFS is `src/rt/archive_vfs.c` ([`ARCHIVE_VFS.md`](ARCHIVE_VFS.md)). The guest continues calling `sceIoOpen("disc0:/PSP_GAME/USRDIR/data.xb", ...)` or standard file APIs, completely unaware that the host is streaming sectors directly from the container.
+
+---
+
+## 4. Multi-Title Scalability Principles
+
+Title profiles must describe titles, **not** implement compatibility workarounds:
+
+- **Valid Profile Data:** Primary disc ID, disc revision, executable paths (`SYSDIR/EBOOT.BIN`), required PRX module lists, known entry points, expected data hashes, and save directory names. Regional releases are treated as distinct binary targets unless proven identical.
+- **Prohibited Profile Fields:** Fields resembling `patch_x`, `fake_return_y`, `skip_module_start`, or `replace_lib_z`.
+- **Architectural Rule:** When a new game fails to run on Nakagawa, the failure must be treated as a bug in the generic CPU, compiler, kernel, or hardware emulation. Fixing the bug improves the platform for all PSP titles rather than creating a fragmented collection of game-specific hacks.

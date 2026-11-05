@@ -1,0 +1,606 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+"""Source-owned showcase art and disc-image regression checks."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+import zlib
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "fixtures" / "showcase"))
+sys.path.insert(0, str(ROOT / "tools"))
+
+import showcase
+from nk_core.iso_inspect import inspect_iso
+
+
+def minimal_elf() -> bytes:
+    header = bytearray(52)
+    header[:7] = b"\x7fELF\x01\x01\x01"
+    struct.pack_into("<HHIIIIIHHHHHH", header, 16,
+                     2, 8, 1, 0x08804000, 52, 0, 0, 52, 32, 1, 40, 0, 0)
+    program = struct.pack("<IIIIIIII", 1, 0x100, 0x08804000, 0x08804000,
+                          4, 0x100, 5, 0x1000)
+    return bytes(header) + program + bytes(0x100 - 84) + b"\x13\x37\x00\x00"
+
+
+SCENE = next(demo for demo in showcase.DEMOS if demo["disc_id"] == "TEST00007")
+BREAKOUT = next(demo for demo in showcase.DEMOS if demo["disc_id"] == "TEST00008")
+CAPTURE = b"P6\n1 1\n255\n\0\0\0"
+
+
+class ShowcasePauseLogTests(unittest.TestCase):
+    def test_pause_input_uses_script_start_not_latch_vblank(self) -> None:
+        output = (
+            "SR_PAUSE: entered source=script vcount=120 vbl=120 vtime_us=200000 "
+            "latency_us=10 quit_allowed=1 reason=none\n"
+            "SR_PAUSE: resumed vcount=120 vbl=120 vtime_us=200000 paused_ms=1500 "
+            "count=1 quit_allowed=1 reason=none\n"
+            "ctrl_latch: vcount=122 buttons 0x0000 -> 0x4000 lx=128 ly=128\n"
+            "ctrl_read: vcount=122 guest read scripted 0x4000 "
+            "(latched 1 samples since vblank 121)\n"
+            "ctrl_latch: vcount=126 buttons 0x4000 -> 0x0000 lx=128 ly=128\n"
+        )
+        showcase._check_pause_input(output, (121, 0x4000, 4), "synthetic")
+
+    def test_pause_log_key_values_parse_for_scheduler_and_audio_checks(self) -> None:
+        log = (
+            "SR_PAUSE: requested source=script vcount=120\n"
+            "SR_PAUSE: entered source=script vcount=120 vbl=120 vtime_us=200000 "
+            "latency_us=12000 quit_allowed=0 reason=savedata\n"
+            "SR_PAUSE: resumed vcount=120 vbl=120 vtime_us=200000 paused_ms=1500 "
+            "count=1 quit_allowed=0 reason=savedata\n"
+        )
+        parsed = showcase.parse_pause_lines(log)
+        self.assertEqual(parsed["requested"], [{"source": "script", "vcount": "120"}])
+        entered, resumed = parsed["entered"][0], parsed["resumed"][0]
+        self.assertEqual((entered["vcount"], entered["vbl"], entered["vtime_us"]),
+                         (resumed["vcount"], resumed["vbl"], resumed["vtime_us"]))
+        self.assertEqual((entered["quit_allowed"], entered["reason"]), ("0", "savedata"))
+        self.assertEqual(resumed["paused_ms"], "1500")
+
+    def test_pause_boundary_rejects_guest_input_or_ge_work_inside_window(self) -> None:
+        output = (
+            "SR_PAUSE: entered source=script vcount=120 vbl=120 vtime_us=200000 "
+            "latency_us=10 quit_allowed=1 reason=none\n"
+            "ctrl_latch: vcount=120 buttons 0x0000 -> 0x0000 lx=128 ly=128\n"
+            "SR_PAUSE: resumed vcount=120 vbl=120 vtime_us=200000 paused_ms=1500 "
+            "count=1 quit_allowed=1 reason=none\n"
+        )
+        with self.assertRaisesRegex(showcase.ShowcaseError, "latched guest input"):
+            showcase._pause_pair_frozen(output, "synthetic")
+
+    @staticmethod
+    def press_lines(latch: int, read: tuple[int, int, int] | None, release: int | None) -> str:
+        """The Cross press as the runtime logs it: latch, guest read (vcount, samples,
+        since), release."""
+        lines = f"ctrl_latch: vcount={latch} buttons 0x0000 -> 0x4000 lx=128 ly=128\n"
+        if read is not None:
+            lines += (f"ctrl_read: vcount={read[0]} guest read scripted 0x4000 "
+                      f"(latched {read[1]} samples since vblank {read[2]})\n")
+        if release is not None:
+            lines += f"ctrl_latch: vcount={release} buttons 0x4000 -> 0x0000 lx=128 ly=128\n"
+        return lines
+
+    @classmethod
+    def scheduler_pause_log(cls, resume_fields: str | None, exited: bool = True, *,
+                            before: str = "", inside: str = "", after: str | None = None,
+                            exit_vblanks: int = 180, pause_vcount: int = 120) -> str:
+        """Breakout's scheduler-pause route: entry at VCOUNT 120, the scripted Cross after it."""
+        resumed = "" if resume_fields is None else (
+            f"SR_PAUSE: resumed vcount={pause_vcount} vbl={pause_vcount} vtime_us=200000 "
+            f"{resume_fields} count=1 quit_allowed=1 reason=none\n")
+        exit_event = (
+            f"BOOT_EVENT phase=exit_at_vblank vblanks={exit_vblanks} (SR_EXIT_AT_VBLANK=180)\n"
+            if exited else "")
+        if after is None:
+            after = cls.press_lines(122, (122, 1, 121), 126)
+        return (
+            before +
+            f"SR_PAUSE: entered source=script vcount={pause_vcount} vbl={pause_vcount} "
+            "vtime_us=200000 latency_us=10 quit_allowed=1 reason=none\n"
+            + inside + resumed + after + exit_event
+        )
+
+    def test_scheduler_pause_is_judged_by_its_own_hold_record(self) -> None:
+        # A run that held the full 1500 ms but took 4.129 s against a 2.753 s unpaused
+        # baseline: the old wall-time difference (1.376 s < 1.4 s) failed it on an idle host.
+        showcase._check_pause_smoke(self.scheduler_pause_log("paused_ms=1500"), 4.129,
+                                    "synthetic")
+
+    def test_scheduler_pause_rejects_a_skipped_or_short_hold(self) -> None:
+        for held in ("paused_ms=0", "paused_ms=16", "paused_ms=1499"):
+            with self.subTest(held=held), \
+                    self.assertRaisesRegex(showcase.ShowcaseError,
+                                           "less than the requested 1500 ms"):
+                showcase._check_pause_smoke(self.scheduler_pause_log(held), 4.0, "synthetic")
+        with self.assertRaisesRegex(showcase.ShowcaseError, "carries no paused_ms"):
+            showcase._check_pause_smoke(self.scheduler_pause_log(""), 4.0, "synthetic")
+        with self.assertRaisesRegex(showcase.ShowcaseError, "entered/resumed pair"):
+            showcase._check_pause_smoke(self.scheduler_pause_log(None), 4.0, "synthetic")
+
+    def test_scheduler_pause_hold_must_fit_inside_the_run(self) -> None:
+        with self.assertRaisesRegex(showcase.ShowcaseError, "hold inside a 1.200 s run"):
+            showcase._check_pause_smoke(self.scheduler_pause_log("paused_ms=1500"), 1.2,
+                                        "synthetic")
+
+    def test_scheduler_pause_run_must_still_reach_its_exit_vcount(self) -> None:
+        with self.assertRaisesRegex(showcase.ShowcaseError, "SR_EXIT_AT_VBLANK completion"):
+            showcase._check_pause_smoke(
+                self.scheduler_pause_log("paused_ms=1500", exited=False), 4.0, "synthetic")
+        with self.assertRaisesRegex(showcase.ShowcaseError, "before its target 180"):
+            showcase._check_pause_smoke(
+                self.scheduler_pause_log("paused_ms=1500", exit_vblanks=179), 4.0, "synthetic")
+
+    def test_scheduler_pause_accepts_a_host_that_fell_behind(self) -> None:
+        # Each of these came from the WSL smoke with the host at 70-74% CPU: the guest read a
+        # frame or two late, a batch latched the press at 122, the exit stepped to 181.
+        for name, after, exit_vblanks in (
+                ("read a frame late", self.press_lines(121, (122, 2, 121), 125), 180),
+                ("read two frames late", self.press_lines(121, (123, 3, 121), 126), 180),
+                ("batched latch", self.press_lines(122, (123, 3, 122), 125), 180),
+                ("exit stepped past", self.press_lines(121, (121, 1, 121), 125), 181)):
+            with self.subTest(name):
+                showcase._check_pause_smoke(
+                    self.scheduler_pause_log("paused_ms=1500", after=after,
+                                             exit_vblanks=exit_vblanks), 4.2, "synthetic")
+        # VCOUNT stepped from 119 onto the press's row: the press was latched, then the pause
+        # was requested and entered at 121; the guest read the press after the resume.
+        showcase._check_pause_smoke(
+            self.scheduler_pause_log(
+                "paused_ms=1500", pause_vcount=121,
+                before="ctrl_latch: vcount=121 buttons 0x0000 -> 0x4000 lx=128 ly=128\n",
+                after="ctrl_read: vcount=122 guest read scripted 0x4000 "
+                      "(latched 2 samples since vblank 121)\n"
+                      "ctrl_latch: vcount=125 buttons 0x4000 -> 0x0000 lx=128 ly=128\n"),
+            4.36, "synthetic")
+
+    def test_scheduler_pause_input_keeps_its_exact_lower_bounds(self) -> None:
+        cases = (
+            ("a press latched before its row",
+             dict(before=self.press_lines(119, (119, 1, 119), None),
+                  after="ctrl_latch: vcount=123 buttons 0x4000 -> 0x0000 lx=128 ly=128\n"),
+             "latched the press at VCOUNT 119, before its row at 121"),
+            ("a press latched early after the resume",
+             dict(after=self.press_lines(120, (121, 1, 120), 124)),
+             "latched the press at VCOUNT 120, before its row at 121"),
+            ("a dropped press", dict(after=""), "never latched the scheduled press"),
+            ("another latch first after the resume",
+             dict(after="ctrl_latch: vcount=121 buttons 0x0000 -> 0x0008 lx=128 ly=128\n"
+                        + self.press_lines(122, (122, 1, 121), 126)),
+             "did not latch the scheduled press first after resume"),
+            ("a release before the row ended",
+             dict(after=self.press_lines(121, (121, 1, 121), 124)),
+             "released the press at VCOUNT 124, before its row ended at 125"),
+            ("a press never released", dict(after=self.press_lines(121, (122, 2, 121), None)),
+             "never released the scheduled press before exit"),
+            ("a pause entered before its trigger", dict(pause_vcount=119),
+             "entered at vcount 119, before its trigger 120"),
+            ("a latch during the pause",
+             dict(inside="ctrl_latch: vcount=121 buttons 0x0000 -> 0x4000 lx=128 ly=128\n"),
+             "latched guest input or closed a GE window while paused"),
+            ("a press never handed to the guest",
+             dict(after=self.press_lines(121, None, 125)),
+             "never handed the guest the scheduled press"),
+            ("a read of a segment begun before its row",
+             dict(after=self.press_lines(121, (121, 1, 120), 125)),
+             "does not match its latch"),
+            ("a release before the guest read the press",
+             dict(after="ctrl_latch: vcount=121 buttons 0x0000 -> 0x4000 lx=128 ly=128\n"
+                        "ctrl_latch: vcount=125 buttons 0x4000 -> 0x0000 lx=128 ly=128\n"
+                        "ctrl_read: vcount=126 guest read scripted 0x4000 "
+                        "(latched 4 samples since vblank 121)\n"),
+             "released the press before the guest was handed it"),
+        )
+        for name, fields, message in cases:
+            with self.subTest(name), self.assertRaisesRegex(showcase.ShowcaseError, message):
+                showcase._check_pause_smoke(
+                    self.scheduler_pause_log("paused_ms=1500", **fields), 4.2, "synthetic")
+
+    def test_user_pause_refusal_parses_without_an_entry(self) -> None:
+        output = "SR_PAUSE: refused reason=automation source=user vcount=60\n"
+        showcase._check_scripted_pause_refusal(output, "synthetic")
+        with self.assertRaisesRegex(showcase.ShowcaseError, "expected exactly one"):
+            showcase._check_scripted_pause_refusal(
+                "SR_PAUSE: requested source=user vcount=60\n", "synthetic")
+
+
+def scene_log(*windows: tuple[int, int]) -> str:
+    """A runtime log whose SR_GESTAT windows close at (vblank, tri3d) pairs."""
+    return "".join(
+        f"GESTAT f={frame} wall=10ms ge=4ms tri2d=0 tri3d={tri3d} spr2d=0 "
+        f"px2d=130560 px3d={4096 if tri3d else 0} mw=1/1/1\n"
+        for frame, tri3d in windows
+    ) + "ctrl_latch: vcount=12 buttons 0x0000 -> 0x4000\n"
+
+
+class ShowcaseFirstFrameCheckpointTests(unittest.TestCase):
+    """The checkpoint is the guest's first drawn frame, at whatever vblank it landed."""
+
+    def setUp(self) -> None:
+        self._temp = tempfile.TemporaryDirectory()
+        self.package = Path(self._temp.name)
+        self.log = self.package / "runtime.log"
+
+    def tearDown(self) -> None:
+        self._temp.cleanup()
+
+    def test_window_closed_past_the_multiple_is_the_checkpoint(self) -> None:
+        # A loaded host stepped VCOUNT 59 -> 61: the first window closes at 61 and its
+        # capture is snap_f00061.ppm. The smoke used to demand the literal "GESTAT f=60"
+        # and failed with "did not reach its first frame checkpoint" here.
+        (self.package / "snap_f00061.ppm").write_bytes(CAPTURE)
+        checkpoint, ppm = showcase.first_frame_checkpoint(
+            SCENE, scene_log((61, 12), (120, 12), (181, 12)), self.package, self.log)
+        self.assertEqual(checkpoint.frame, 61)
+        self.assertEqual(checkpoint.counters["tri3d"], 12)
+        self.assertEqual(ppm, self.package / "snap_f00061.ppm")
+
+    def test_slow_boot_moves_the_checkpoint_to_the_first_drawn_window(self) -> None:
+        # A starved host booted the guest late: its first flip came at vblank 55, so the
+        # window closing at 64 holds only the clear and the cube first appears in the
+        # window closing at 121. That window is the checkpoint, with its own capture.
+        (self.package / "snap_f00064.ppm").write_bytes(CAPTURE)
+        (self.package / "snap_f00121.ppm").write_bytes(CAPTURE)
+        checkpoint, ppm = showcase.first_frame_checkpoint(
+            SCENE, scene_log((64, 0), (121, 84), (180, 48)), self.package, self.log)
+        self.assertEqual(checkpoint.frame, 121)
+        self.assertEqual(ppm, self.package / "snap_f00121.ppm")
+
+    def test_no_drawn_window_within_the_budget_is_a_missed_checkpoint(self) -> None:
+        with self.assertRaisesRegex(
+                showcase.ShowcaseError,
+                r"TEST00007 did not reach its first frame checkpoint: no GE statistics window "
+                r"before vblank 180 drew tri3d and px3d \(windows closed at vblank: 60, 120\)"):
+            showcase.first_frame_checkpoint(SCENE, scene_log((60, 0), (120, 0)),
+                                            self.package, self.log)
+        with self.assertRaisesRegex(showcase.ShowcaseError,
+                                    r"TEST00008 did not reach .*spr2d and px2d .*vblank: none"):
+            showcase.first_frame_checkpoint(BREAKOUT, "BOOT_EVENT phase=init\n",
+                                            self.package, self.log)
+
+    def test_capture_must_be_the_checkpoint_window_s_own(self) -> None:
+        # A capture from another window (or an earlier run) is not this checkpoint's frame.
+        (self.package / "snap_f00120.ppm").write_bytes(CAPTURE)
+        with self.assertRaisesRegex(showcase.ShowcaseError,
+                                    r"no GE framebuffer capture .*\(vblank 61\)"):
+            showcase.first_frame_checkpoint(SCENE, scene_log((61, 12), (120, 12)),
+                                            self.package, self.log)
+
+    def test_duplicate_window_breaks_the_runtime_contract(self) -> None:
+        with self.assertRaisesRegex(showcase.ShowcaseError, "TEST00007 .*does not cross"):
+            showcase.first_frame_checkpoint(SCENE, scene_log((60, 12), (60, 0), (120, 12)),
+                                            self.package, self.log)
+
+    def test_every_demo_names_the_counters_its_frame_draws(self) -> None:
+        self.assertEqual(SCENE["frame_counters"], ("tri3d", "px3d"))
+        self.assertEqual(BREAKOUT["frame_counters"], ("spr2d", "px2d"))
+
+
+class ShowcaseScriptedPressTests(unittest.TestCase):
+    """A failed check that depends on a scripted press says whether the guest read it."""
+
+    def test_pad_script_rows_match_the_runtime_format(self) -> None:
+        self.assertEqual(showcase._padscript(showcase.CROSS_PRESS, showcase.START_PRESS),
+                         "12 4000 4\n240 0008 4\n")
+
+    def test_a_press_the_guest_read_is_named_with_its_read(self) -> None:
+        # Guest-time delivery holds the press until the guest reads it, so a late read is
+        # normal on a loaded host; what the message needs is that the read happened.
+        log = ("ctrl_latch: vcount=15 buttons 0x0000 -> 0x4000 lx=128 ly=128\n"
+               "ctrl_read: vcount=57 guest read scripted 0x4000 (latched 43 samples since vblank 15)\n")
+        self.assertEqual(
+            showcase.scripted_press_note(log, showcase.CROSS_PRESS),
+            " (the guest read the scripted press due at vblank 12 at vblank 57)")
+
+    def test_a_press_the_guest_never_read_says_so(self) -> None:
+        log = "ctrl_latch: vcount=120 buttons 0x0000 -> 0x0008 lx=128 ly=128\n"
+        self.assertEqual(
+            showcase.scripted_press_note(log, showcase.SAVE_START_PRESS),
+            " (the guest never read the scripted press due at vblank 120)")
+
+    def test_a_named_runtime_failure_reaches_the_smoke_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cwd = Path(temp)
+            log = ("ROUTE: pad script loaded\n"
+                   "ROUTE_FAIL: pad script segment 2 of 4: the guest did not read the controller "
+                   "while CROSS was held for 1800 vblanks\n")
+            failed = subprocess.CompletedProcess(["runtime"], 86, stdout=log)
+            with mock.patch.object(showcase.subprocess, "run", return_value=failed):
+                with self.assertRaisesRegex(
+                        showcase.ShowcaseError,
+                        r"TEST00007 runtime exited 86 \(pad script segment 2 of 4: the guest did not "
+                        r"read the controller while CROSS was held for 1800 vblanks\); see "):
+                    showcase._run_runtime(["runtime"], {}, cwd, cwd / "runtime.log",
+                                          "TEST00007 runtime")
+
+
+class ShowcaseRuntimeRunTests(unittest.TestCase):
+    def test_timeout_keeps_the_partial_log_and_names_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cwd = Path(temp)
+            log = cwd / "runtime.log"
+            expired = subprocess.TimeoutExpired(["runtime"], 15, output=b"GESTAT f=60 tri3d=1\n")
+            with mock.patch.object(showcase.subprocess, "run", side_effect=expired):
+                with self.assertRaisesRegex(showcase.ShowcaseError,
+                                            r"TEST00007 runtime exceeded the 15 second smoke window; see "):
+                    showcase._run_runtime(["runtime"], {}, cwd, log, "TEST00007 runtime")
+            self.assertEqual(log.read_text(encoding="utf-8"),
+                             "GESTAT f=60 tri3d=1\n\nSHOWCASE_SMOKE_TIMEOUT\n")
+
+    def test_captures_from_an_earlier_run_are_cleared_first(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cwd = Path(temp)
+            stale = cwd / "snap_f00060.ppm"
+            stale.write_bytes(b"old")
+            done = subprocess.CompletedProcess(["runtime"], 0, stdout="ok\n")
+            with mock.patch.object(showcase.subprocess, "run", return_value=done) as run:
+                output = showcase._run_runtime(["runtime"], {}, cwd, cwd / "runtime.log",
+                                               "TEST00007 runtime")
+            self.assertEqual(output, "ok\n")
+            self.assertFalse(stale.exists())
+            self.assertEqual(run.call_args.kwargs["timeout"], showcase.SMOKE_TIMEOUT_SECONDS)
+
+    def test_exit_budget_is_three_statistics_windows(self) -> None:
+        self.assertEqual(showcase.SMOKE_EXIT_VBLANK, 3 * showcase.WINDOW_VBLANKS)
+
+
+class ShowcaseImageTests(unittest.TestCase):
+    def test_framebuffer_metrics_require_visible_pixels(self) -> None:
+        background = bytes((16, 24, 32))
+        pixels = background + bytes((255, 0, 0)) + bytes((0, 255, 0)) + bytes((0, 0, 255))
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "frame.ppm"
+            path.write_bytes(b"P6\n2 2\n255\n" + pixels)
+            self.assertEqual(showcase._ppm_metrics(path, background), (4, 3))
+
+    def test_ppm_size_rejects_truncated_or_non_p6_captures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "frame.ppm"
+            path.write_bytes(b"P6\n2 1\n255\n" + bytes(6))
+            self.assertEqual(showcase._ppm_size(path), (2, 1))
+            path.write_bytes(b"P6\n2 1\n255\n" + bytes(5))
+            with self.assertRaises(showcase.ShowcaseError):
+                showcase._ppm_size(path)
+            path.write_bytes(b"P3\n2 1\n255\n" + bytes(6))
+            with self.assertRaises(showcase.ShowcaseError):
+                showcase._ppm_size(path)
+
+    def test_headless_capture_reads_presented_and_published_vblanks_in_the_window(self) -> None:
+        first, last = showcase.HEADLESS_CAPTURE_WINDOW
+        output = "\n".join([
+            f"HOST_PRESENT_SUBMITTED f={first - 1} buf=0x04000000 fmt=3 stride=512",
+            f"HOST_PRESENT_SUBMITTED f={first} buf=0x04000000 fmt=3 stride=512",
+            f"HOST_PRESENT_SUBMITTED f={last} buf=0x04000000 fmt=3 stride=512",
+            f"FBSNAP f={first} swapchain capture -> frame_v{first}.ppm (result=1)",
+            # A latched flip is reported at the next SetFrameBuf: the file name, not the
+            # report's own f=, names the presented vblank.
+            f"FBSNAP f={last + 1} swapchain capture -> frame_v{last}.ppm (result=1)",
+            f"FBSNAP f={last + 2} swapchain capture -> frame_v{last + 2}.ppm (result=-1)",
+        ])
+        presented = showcase._window_vblanks(r"^HOST_PRESENT_SUBMITTED f=(\d+) ", output)
+        published = showcase._window_vblanks(
+            r"^FBSNAP f=\d+ swapchain capture -> frame_v(\d+)\.ppm \(result=1\)$", output
+        )
+        self.assertEqual(presented, {first, last})
+        self.assertEqual(published, {first, last})
+
+    def test_headless_capture_sets_only_the_capture_window(self) -> None:
+        demo = showcase.DEMOS[0]
+        with tempfile.TemporaryDirectory() as temp:
+            package = Path(temp) / "packages" / str(demo["disc_id"])
+            package.mkdir(parents=True)
+            (package / "package.json").write_text(
+                '{"executable": {"path": "game.exe"}, "runtime": {"run_entry": "0x08804000"}}',
+                encoding="utf-8",
+            )
+            with mock.patch.object(showcase, "DEMO_ROOT", Path(temp)), \
+                    mock.patch.dict("os.environ", {"SR_FBSNAP": "4", "SR_FBDUMP": "9"}):
+                command, env, _ = showcase._headless_capture_command(demo, Path(temp) / "pad.txt")
+        first, last = showcase.HEADLESS_CAPTURE_WINDOW
+        self.assertEqual(command[-1], "--gui")
+        self.assertEqual(env["SR_VIDEO"], "offscreen")
+        self.assertEqual(env["SR_FBSNAP_WINDOWS"], f"{first}-{last}")
+        # Host-speed independence: guest-driven vblanks and no wall-clock output cap.
+        self.assertEqual(env["SR_NOVBPACE"], "1")
+        self.assertEqual(env["SR_FPS_CAP"], "0")
+        self.assertNotIn("SR_FBSNAP", env)
+        self.assertNotIn("SR_FBDUMP", env)
+
+    def test_headless_capture_pause_keeps_the_turbo_capture_route(self) -> None:
+        demo = showcase.DEMOS[0]
+        with tempfile.TemporaryDirectory() as temp:
+            package = Path(temp) / "packages" / str(demo["disc_id"])
+            package.mkdir(parents=True)
+            (package / "package.json").write_text(
+                '{"executable": {"path": "game.exe"}, "runtime": {"run_entry": "0x08804000"}}',
+                encoding="utf-8",
+            )
+            with mock.patch.object(showcase, "DEMO_ROOT", Path(temp)), \
+                    mock.patch.dict("os.environ", {"SR_FBSNAP": "4", "SR_FBDUMP": "9"}):
+                command, env, _ = showcase._headless_capture_command(
+                    demo, Path(temp) / "pad.txt", showcase.HEADLESS_PAUSE_SCRIPT)
+        self.assertEqual(command[-1], "--gui")
+        self.assertEqual(env["SR_NOVBPACE"], "1")
+        self.assertEqual(env["SR_PAUSE_SCRIPT"], "30:500")
+        self.assertEqual(env["SR_FBSNAP_WINDOWS"],
+                         f"{showcase.HEADLESS_CAPTURE_WINDOW[0]}-"
+                         f"{showcase.HEADLESS_CAPTURE_WINDOW[1]}")
+
+    def test_icon_png_is_deterministic_144_by_80_rgba(self) -> None:
+        palette = ((20, 40, 60), (80, 160, 200))
+        first = showcase.make_icon_png(palette)
+        second = showcase.make_icon_png(palette)
+        self.assertEqual(first, second)
+        self.assertTrue(first.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(struct.unpack_from(">II", first, 16), (144, 80))
+        offset = 8
+        raw = None
+        while offset < len(first):
+            size = struct.unpack_from(">I", first, offset)[0]
+            kind = first[offset + 4:offset + 8]
+            data = first[offset + 8:offset + 8 + size]
+            if kind == b"IDAT":
+                raw = zlib.decompress(data)
+            offset += size + 12
+        self.assertIsNotNone(raw)
+        self.assertEqual(len(raw), 80 * (1 + 144 * 4))
+
+    def test_generated_iso_has_psp_tree_and_stable_synthetic_identity(self) -> None:
+        elf = minimal_elf()
+        icon = showcase.make_icon_png(((10, 30, 50), (70, 150, 210)))
+        notice = b"PSPSDK three-clause BSD license test notice\n"
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "showcase.iso"
+            showcase.write_iso(path, "TEST00007", "Nakagawa 3D Showcase", icon, elf, notice)
+            first = path.read_bytes()
+            showcase.write_iso(path, "TEST00007", "Nakagawa 3D Showcase", icon, elf, notice)
+            self.assertEqual(path.read_bytes(), first)
+            metadata = inspect_iso(path)
+        self.assertEqual(metadata.disc_id, "TEST00007")
+        self.assertEqual(metadata.title, "Nakagawa 3D Showcase")
+
+    def test_iso_builder_rejects_non_elf_eboot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(showcase.ShowcaseError, "plaintext EBOOT"):
+                showcase.write_iso(Path(temp) / "bad.iso", "TEST00007", "Bad",
+                                   b"icon", b"not an ELF", b"notice")
+
+    def test_already_based_elf_is_rejected_instead_of_packaged_as_prx(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "showcase_scene_app.prx"
+            path.write_bytes(minimal_elf())
+            with self.assertRaisesRegex(showcase.ShowcaseError,
+                                        "not a final relocatable PSP PRX"):
+                showcase.validate_psp_prx(path, 0x08804000)
+
+    def test_stage_iso_writes_a_test00007_disc_without_pspdev(self) -> None:
+        """#308: the Windows staging smoke's disc needs no PSPDEV, only the display guest."""
+        with tempfile.TemporaryDirectory() as temp:
+            iso = showcase.stage_iso(Path(temp) / "disc")
+            self.assertEqual(iso.name, "TEST00007.iso")
+            metadata = inspect_iso(iso)
+        self.assertEqual(metadata.disc_id, "TEST00007")
+        self.assertEqual(metadata.title, "Nakagawa 3D Showcase")
+
+
+
+class ShowcasePrebuiltPrxTests(unittest.TestCase):
+    """The release route: PRXs from a PSPDEV host, packages on a host without PSPDEV."""
+
+    LICENSE = b"PSPSDK three-clause BSD license test notice\n"
+
+    def test_build_prx_writes_each_demo_prx_and_the_license(self) -> None:
+        built: list[str] = []
+
+        def fake_build_prx(demo: dict[str, object], out_dir: Path) -> Path:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            prx = out_dir / f"{demo['target']}.prx"
+            prx.write_bytes(minimal_elf() + str(demo["id"]).encode("ascii"))
+            built.append(str(demo["id"]))
+            return prx
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            out = root / "prx"
+            with mock.patch.object(showcase, "BUILD_ROOT", root / "build"), \
+                    mock.patch.object(showcase, "_check_pspdev") as check, \
+                    mock.patch.object(showcase, "_build_prx", side_effect=fake_build_prx), \
+                    mock.patch.object(showcase, "_check_prx_entry") as entry, \
+                    mock.patch.object(showcase, "_pspsdk_license", return_value=self.LICENSE):
+                self.assertEqual(showcase.main(["build-prx", "--out-dir", str(out)]), 0)
+            check.assert_called_once_with()
+            self.assertEqual(built, [str(demo["id"]) for demo in showcase.DEMOS])
+            self.assertEqual(entry.call_count, len(showcase.DEMOS))
+            self.assertEqual((out / showcase.PSPSDK_LICENSE_NAME).read_bytes(), self.LICENSE)
+            for demo in showcase.DEMOS:
+                self.assertEqual((out / f"{demo['target']}.prx").read_bytes(),
+                                 minimal_elf() + str(demo["id"]).encode("ascii"))
+
+    def _prebuilt(self, root: Path) -> Path:
+        prebuilt = root / "prx"
+        prebuilt.mkdir()
+        for demo in showcase.DEMOS:
+            (prebuilt / f"{demo['target']}.prx").write_bytes(
+                minimal_elf() + str(demo["disc_id"]).encode("ascii"))
+        (prebuilt / showcase.PSPSDK_LICENSE_NAME).write_bytes(self.LICENSE)
+        return prebuilt
+
+    def test_build_from_prebuilt_prxs_needs_no_pspdev(self) -> None:
+        packaged: list[list[str]] = []
+
+        def fake_package(command: list[str], **_: object) -> subprocess.CompletedProcess:
+            packaged.append(command)
+            out = Path(command[command.index("--output-dir") + 1])
+            (out / "package.json").write_text(
+                '{"format": "nakagawa-aot-package", "executable": {"path": "demo.exe"}}',
+                encoding="utf-8")
+            (out / "demo.exe").write_bytes(b"MZ")
+            return subprocess.CompletedProcess(command, 0)
+
+        refused = AssertionError("the prebuilt route must not reach PSPDEV")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prebuilt = self._prebuilt(root)
+            demos = root / "dist" / "bin" / "demos"
+            with mock.patch.object(showcase, "BUILD_ROOT", root / "showcase"), \
+                    mock.patch.object(showcase, "DEMO_ROOT", demos), \
+                    mock.patch.object(showcase, "_check_pspdev", side_effect=refused), \
+                    mock.patch.object(showcase, "_build_prx", side_effect=refused), \
+                    mock.patch.object(showcase, "_pspsdk_license", side_effect=refused), \
+                    mock.patch.object(showcase, "_check_prx_entry") as entry, \
+                    mock.patch.object(showcase, "_package_fingerprint", return_value="0" * 16), \
+                    mock.patch.object(showcase.subprocess, "run", side_effect=fake_package):
+                self.assertEqual(
+                    showcase.main(["build", "--prebuilt-prx-dir", str(prebuilt)]), 0)
+            self.assertEqual(entry.call_count, len(showcase.DEMOS))
+            self.assertEqual(len(packaged), len(showcase.DEMOS))
+            for demo, command in zip(showcase.DEMOS, packaged, strict=True):
+                staged = (root / "showcase" / str(demo["id"]) / "psp-build" /
+                          f"{demo['target']}.prx")
+                self.assertEqual(Path(command[command.index("--game-elf") + 1]), staged)
+                self.assertEqual(staged.read_bytes(), (prebuilt / staged.name).read_bytes())
+                disc = str(demo["disc_id"])
+                self.assertTrue((demos / "packages" / disc / "demo.exe").is_file())
+                self.assertEqual(inspect_iso(demos / "images" / f"{disc}.iso").disc_id, disc)
+            self.assertEqual(
+                (demos / "THIRD_PARTY_NOTICES" / showcase.PSPSDK_LICENSE_NAME).read_bytes(),
+                self.LICENSE)
+
+    def test_a_missing_prebuilt_prx_or_license_is_named(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prebuilt = self._prebuilt(root)
+            (prebuilt / f"{BREAKOUT['target']}.prx").unlink()
+            with self.assertRaisesRegex(showcase.ShowcaseError,
+                                        "prebuilt PRX for showcase-breakout-v1 is missing"):
+                showcase._prebuilt_prx(BREAKOUT, prebuilt, root / "stage")
+            (prebuilt / showcase.PSPSDK_LICENSE_NAME).write_bytes(b"")
+            with mock.patch.object(showcase, "_check_pspdev",
+                                   side_effect=AssertionError("no PSPDEV")):
+                with self.assertRaisesRegex(showcase.ShowcaseError,
+                                            "PSPSDK license notice is missing or empty"):
+                    showcase.build_all(prebuilt)
+
+    def test_the_command_line_pairs_each_option_with_its_action(self) -> None:
+        with mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit):
+                showcase.main(["build-prx"])
+            with self.assertRaises(SystemExit):
+                showcase.main(["smoke", "--prebuilt-prx-dir", "prx"])
+        with mock.patch.object(showcase, "build_all") as build:
+            self.assertEqual(showcase.main(["build"]), 0)
+            self.assertEqual(showcase.main(["build", "--prebuilt-prx-dir", "prx"]), 0)
+        self.assertEqual(build.call_args_list, [mock.call(None), mock.call(Path("prx"))])
+
+
+if __name__ == "__main__":
+    unittest.main()

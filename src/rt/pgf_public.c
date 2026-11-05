@@ -1,0 +1,1376 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 the Nakagawa Recomp authors
+
+/* Project-authored public PGF reader, specified in docs/cleanroom/PGF_SPEC.md. */
+
+#include "pgf_api.h"
+
+#include "recomp.h"
+#include "ge_shared.h"
+
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <wchar.h>
+#endif
+
+#define PGF_BASE_HEADER_SIZE 392u
+#define PGF_REV3_HEADER_SIZE 412u
+#define PGF_MAX_IMAGE_SIZE (16u * 1024u * 1024u)
+#define PGF_MAX_COUNT 1048576u
+#define PGF_MAX_SAMPLES 65536u
+#define PGF_MAX_GLYPH_EDGE 127u
+#define PGF_COMPOSITE_PARTS 3u
+/* A composite part whose code is 0 (and absent from the map) has no component. */
+#define PGF_COMPONENT_NONE UINT32_MAX
+#define PGF_FONT_INFO_SIZE 0x108u
+#define PGF_CHAR_INFO_SIZE 0x3cu
+#define PGF_GLYPH_IMAGE_SIZE 0x18u
+
+enum {
+    PGF_TABLE_DIMENSION = 0,
+    PGF_TABLE_X_ADJUSTMENT = 1,
+    PGF_TABLE_Y_ADJUSTMENT = 2,
+    PGF_TABLE_ADVANCE = 3,
+    PGF_TABLE_COUNT = 4
+};
+
+struct PGF {
+    uint8_t *image;
+    size_t size;
+    uint32_t revision;
+    uint32_t first_glyph;
+    uint32_t glyph_count;
+    uint32_t char_map_count;
+    uint32_t char_map_bits;
+    uint32_t char_pointer_bits;
+    uint32_t shadow_count;
+    uint8_t metric_counts[PGF_TABLE_COUNT];
+    size_t metric_offsets[PGF_TABLE_COUNT];
+    size_t shadow_map_offset;
+    /* Revision 3 with a 412-byte header: the first extension table's (start, length) code
+       ranges index the character map (PGF_SPEC.md 3.2); 0 ranges means a direct map. */
+    size_t subcharmap_offset;
+    uint32_t subcharmap_count;
+    size_t char_map_offset;
+    size_t char_pointer_offset;
+    size_t glyph_data_offset;
+    uint8_t file_name[64];
+};
+
+typedef struct PgfGlyph {
+    size_t record_offset;
+    size_t record_size;
+    size_t bitmap_offset;
+    uint32_t width;
+    uint32_t height;
+    int32_t bitmap_adjust_x;
+    int32_t bitmap_adjust_y;
+    uint32_t row_order;
+    uint32_t shadow_offset;
+    uint32_t shadow_id;
+    uint32_t shadow_row_order;
+    uint32_t composite;
+    uint32_t component[PGF_COMPOSITE_PARTS];
+    int32_t dimension_width;
+    int32_t dimension_height;
+    int32_t x_left;
+    int32_t x_center;
+    int32_t y_base;
+    int32_t y_top;
+    int32_t advance_x;
+    int32_t advance_y;
+} PgfGlyph;
+
+typedef struct PgfDirtySpan {
+    uint32_t address;
+    uint32_t size;
+} PgfDirtySpan;
+
+static uint16_t pgf_u16(const uint8_t *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t pgf_u32(const uint8_t *p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static int32_t pgf_i32(const uint8_t *p) {
+    uint32_t raw = pgf_u32(p);
+    int64_t value = raw <= INT32_MAX ? (int64_t)raw : (int64_t)raw - 4294967296LL;
+    return (int32_t)value;
+}
+
+static void pgf_put_u16(uint8_t *p, uint16_t value) {
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+}
+
+static void pgf_put_u32(uint8_t *p, uint32_t value) {
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+    p[2] = (uint8_t)(value >> 16);
+    p[3] = (uint8_t)(value >> 24);
+}
+
+static uint32_t pgf_get_bits(const uint8_t *bytes, size_t byte_count,
+                             uint64_t bit_offset, uint32_t bit_count,
+                             int *valid) {
+    uint64_t end_bit = bit_offset + bit_count;
+    uint64_t available_bits = (uint64_t)byte_count * 8u;
+    uint64_t first_byte;
+    uint32_t shift;
+    uint32_t bytes_needed;
+    uint64_t packed = 0;
+    uint32_t i;
+
+    if (valid) *valid = 0;
+    if (bit_count == 0 || bit_count > 32 || end_bit < bit_offset ||
+        end_bit > available_bits) {
+        return 0;
+    }
+    first_byte = bit_offset / 8u;
+    shift = (uint32_t)(bit_offset % 8u);
+    bytes_needed = (shift + bit_count + 7u) / 8u;
+    for (i = 0; i < bytes_needed; ++i) {
+        packed |= (uint64_t)bytes[(size_t)first_byte + i] << (8u * i);
+    }
+    packed >>= shift;
+    if (valid) *valid = 1;
+    return bit_count == 32 ? (uint32_t)packed :
+           (uint32_t)(packed & (((uint64_t)1u << bit_count) - 1u));
+}
+
+static int pgf_packed_size(uint32_t count, uint32_t bits, size_t *result) {
+    uint64_t total_bits = (uint64_t)count * bits;
+    uint64_t words = (total_bits + 31u) / 32u;
+    uint64_t bytes = words * 4u;
+    if (bytes > SIZE_MAX) return 0;
+    *result = (size_t)bytes;
+    return 1;
+}
+
+static int pgf_add_section(size_t *cursor, uint64_t length, size_t total_size,
+                           size_t *section_offset) {
+    if (length > SIZE_MAX || *cursor > total_size ||
+        (size_t)length > total_size - *cursor) {
+        return 0;
+    }
+    *section_offset = *cursor;
+    *cursor += (size_t)length;
+    return 1;
+}
+
+/* The character-map index of a code: code - firstGlyph for a direct map, or, when the
+   revision-3 subcharmap ranges are present, the code's position in those ranges laid end
+   to end in file order (a code in no range has no index). PGF_SPEC.md 3.2. */
+static int pgf_map_index(const PGF *p, uint32_t char_code, uint64_t *index) {
+    uint64_t base = 0u;
+    uint32_t i;
+    if (p->subcharmap_count == 0u) {
+        if (char_code < p->first_glyph) return 0;
+        *index = (uint64_t)char_code - p->first_glyph;
+        return 1;
+    }
+    for (i = 0; i < p->subcharmap_count; ++i) {
+        const uint8_t *range = p->image + p->subcharmap_offset + (size_t)i * 4u;
+        uint32_t start = pgf_u16(range);
+        uint32_t length = pgf_u16(range + 2u);
+        if (char_code >= start && char_code - start < length) {
+            *index = base + (char_code - start);
+            return 1;
+        }
+        base += length;
+    }
+    return 0;
+}
+
+static int pgf_map_entry(const PGF *p, uint32_t char_code, uint32_t *glyph_id) {
+    uint64_t index;
+    uint32_t value;
+    int valid;
+
+    if (!pgf_map_index(p, char_code, &index) || index >= p->char_map_count) return 0;
+    /* The map value is a glyph index: the all-ones sentinel, and any value at or above
+       the glyph (pointer) count, are lookup misses (PGF_SPEC.md 3.2). */
+    value = pgf_get_bits(p->image + p->char_map_offset,
+                         p->size - p->char_map_offset,
+                         (uint64_t)index * p->char_map_bits,
+                         p->char_map_bits, &valid);
+    if (!valid || value == (p->char_map_bits == 32 ? UINT32_MAX :
+                             (((uint32_t)1u << p->char_map_bits) - 1u)) ||
+        value >= p->glyph_count) {
+        return 0;
+    }
+    *glyph_id = value;
+    return 1;
+}
+
+static int pgf_pointer_entry(const PGF *p, uint32_t glyph_id, uint64_t *offset) {
+    uint32_t units;
+    int valid;
+    if (glyph_id >= p->glyph_count) return 0;
+    units = pgf_get_bits(p->image + p->char_pointer_offset,
+                         p->size - p->char_pointer_offset,
+                         (uint64_t)glyph_id * p->char_pointer_bits,
+                         p->char_pointer_bits, &valid);
+    if (!valid) return 0;
+    *offset = (uint64_t)units * 4u;
+    return 1;
+}
+
+static int32_t pgf_sign7(uint32_t value) {
+    value &= 0x7fu;
+    return value & 0x40u ? (int32_t)value - 128 : (int32_t)value;
+}
+
+static int pgf_table_pair(const PGF *p, unsigned table, uint32_t index,
+                          int32_t *first, int32_t *second) {
+    size_t entry;
+    if (table >= PGF_TABLE_COUNT) return 0;
+    if (index == UINT8_MAX) {
+        /* Index 255 is "no entry" whatever the table's count (a one-byte count never reaches
+         * it); console font files use it in shorter tables (PGF_SPEC.md 3.5). The zero pair is
+         * a project decision, unmeasured on PSP, and no table read is formed. */
+        *first = 0;
+        *second = 0;
+        return 1;
+    }
+    if (index >= p->metric_counts[table]) return 0;
+    entry = p->metric_offsets[table] + (size_t)index * 8u;
+    *first = pgf_i32(p->image + entry);
+    *second = pgf_i32(p->image + entry + 4u);
+    return 1;
+}
+
+static int pgf_primary_glyph(const PGF *p, uint32_t glyph_id, PgfGlyph *glyph) {
+    uint64_t relative;
+    uint64_t absolute64;
+    size_t absolute;
+    size_t available;
+    size_t cursor;
+    uint32_t flags;
+    uint32_t group;
+    uint32_t field;
+    int valid;
+    int64_t descender;
+
+    memset(glyph, 0, sizeof(*glyph));
+    if (!pgf_pointer_entry(p, glyph_id, &relative) ||
+        relative > p->size - p->glyph_data_offset) {
+        return 0;
+    }
+    absolute64 = (uint64_t)p->glyph_data_offset + relative;
+    if (absolute64 > SIZE_MAX || absolute64 > p->size) return 0;
+    absolute = (size_t)absolute64;
+    available = p->size - absolute;
+    if (available < 12u) return 0;
+
+    glyph->record_offset = absolute;
+    glyph->shadow_offset = pgf_get_bits(p->image + absolute, available, 0, 14, &valid);
+    if (!valid) return 0;
+    glyph->width = pgf_get_bits(p->image + absolute, available, 14, 7, &valid);
+    if (!valid) return 0;
+    glyph->height = pgf_get_bits(p->image + absolute, available, 21, 7, &valid);
+    if (!valid) return 0;
+    glyph->bitmap_adjust_x = pgf_sign7(pgf_get_bits(p->image + absolute, available,
+                                                    28, 7, &valid));
+    if (!valid) return 0;
+    glyph->bitmap_adjust_y = pgf_sign7(pgf_get_bits(p->image + absolute, available,
+                                                    35, 7, &valid));
+    if (!valid) return 0;
+    glyph->row_order = pgf_get_bits(p->image + absolute, available, 42, 2, &valid);
+    if (!valid) return 0;
+    /* Bits 44-47 say, for the dimension, X-adjustment, Y-adjustment and advance groups in
+       that order, whether the group is an 8-bit table index (1) or an inline pair (0)
+       (PGF_SPEC.md 3.5). Every console font record sets bit 47; an inline advance is
+       unmeasured and refused. */
+    flags = pgf_get_bits(p->image + absolute, available, 44, 4, &valid);
+    if (!valid || (flags & 8u) == 0u) return 0;
+    glyph->shadow_id = pgf_get_bits(p->image + absolute, available, 55, 9, &valid);
+    if (!valid) return 0;
+
+    cursor = absolute + 8u;
+    for (group = 0; group < 3u; ++group) {
+        unsigned table = group;
+        int32_t first;
+        int32_t second;
+        if ((flags & (1u << group)) != 0u) {
+            if (cursor >= p->size) return 0;
+            field = p->image[cursor++];
+            if (!pgf_table_pair(p, table, field, &first, &second)) return 0;
+        } else {
+            if (cursor > p->size || p->size - cursor < 8u) return 0;
+            first = pgf_i32(p->image + cursor);
+            second = pgf_i32(p->image + cursor + 4u);
+            cursor += 8u;
+        }
+        if (group == PGF_TABLE_DIMENSION) {
+            glyph->dimension_width = first;
+            glyph->dimension_height = second;
+        } else if (group == PGF_TABLE_X_ADJUSTMENT) {
+            glyph->x_left = first;
+            glyph->x_center = second;
+        } else {
+            glyph->y_base = first;
+            glyph->y_top = second;
+        }
+    }
+    if (cursor >= p->size) return 0;
+    field = p->image[cursor++];
+    if (!pgf_table_pair(p, PGF_TABLE_ADVANCE, field,
+                        &glyph->advance_x, &glyph->advance_y)) {
+        return 0;
+    }
+    glyph->record_size = cursor - absolute;
+    glyph->bitmap_offset = cursor;
+    descender = (int64_t)glyph->y_base - (int64_t)glyph->dimension_height;
+    if (descender < INT32_MIN || descender > INT32_MAX) return 0;
+    return 1;
+}
+
+static int pgf_checked_glyph(const PGF *p, uint32_t glyph_id, PgfGlyph *glyph,
+                             int allow_composite);
+
+/* Row order 3 carries three little-endian 16-bit character codes at the record's
+   bitmap offset instead of a bitmap. Each code resolves through the ordinary
+   character map to a leaf raster component; a code 0 that the map does not hold
+   names no component, and at least one part must name one. See PGF_SPEC.md 3.6. */
+static int pgf_resolve_composite(const PGF *p, PgfGlyph *glyph) {
+    unsigned part;
+    unsigned present = 0u;
+
+    if (glyph->bitmap_offset > p->size ||
+        p->size - glyph->bitmap_offset < PGF_COMPOSITE_PARTS * 2u) {
+        return 0;
+    }
+    for (part = 0; part < PGF_COMPOSITE_PARTS; ++part) {
+        PgfGlyph component;
+        uint32_t component_id;
+        uint32_t code = pgf_u16(p->image + glyph->bitmap_offset +
+                                (size_t)part * 2u);
+
+        if (!pgf_map_entry(p, code, &component_id)) {
+            if (code != 0u) return 0;
+            glyph->component[part] = PGF_COMPONENT_NONE;
+            continue;
+        }
+        if (!pgf_checked_glyph(p, component_id, &component, 0)) return 0;
+        if ((component.row_order != 1u && component.row_order != 2u) ||
+            component.width == 0u || component.height == 0u) {
+            return 0;
+        }
+        glyph->component[part] = component_id;
+        present++;
+    }
+    if (present == 0u) return 0;
+    glyph->composite = 1u;
+    return 1;
+}
+
+static int pgf_checked_glyph(const PGF *p, uint32_t glyph_id, PgfGlyph *glyph,
+                             int allow_composite) {
+    uint32_t shadow_code;
+    uint32_t mapped_glyph;
+    uint64_t target;
+    int valid;
+
+    if (!pgf_primary_glyph(p, glyph_id, glyph)) return 0;
+    if (glyph->shadow_id != 0u) {
+        if (glyph->shadow_id > p->shadow_count) return 0;
+
+        shadow_code = pgf_u16(p->image + p->shadow_map_offset +
+                              ((size_t)glyph->shadow_id - 1u) * 2u);
+        if (!pgf_map_entry(p, shadow_code, &mapped_glyph)) {
+            /* A shadow entry naming character 0, absent from the map, names no shadow glyph:
+             * console font files carry such entries (PGF_SPEC.md 3.3). The record is used with
+             * no shadow and no shadow record is read; any other unmapped code is refused. */
+            if (shadow_code != 0u) return 0;
+            glyph->shadow_row_order = 0u;
+        } else {
+            if (glyph->shadow_offset < glyph->record_size) return 0;
+            target = (uint64_t)glyph->record_offset + glyph->shadow_offset;
+            if (target < glyph->record_offset || target > p->size) return 0;
+            if (target == p->size) {
+                /* Project decision, unmeasured on PSP: treat an EOF target as an absent
+                 * optional prefix and keep the read bounded. */
+                glyph->shadow_row_order = 0u;
+            } else {
+                if (p->size - (size_t)target < 6u) return 0;
+                glyph->shadow_row_order = pgf_get_bits(p->image + (size_t)target,
+                                                        p->size - (size_t)target,
+                                                        42, 2, &valid);
+                if (!valid) return 0;
+            }
+        }
+    }
+    if (glyph->row_order != 3u) return 1;
+    /* A composite component is always a leaf raster record, so a self-reference,
+     * a mutual reference, or any longer cycle is refused here instead of
+     * followed, and this reader never recurses without bound. */
+    if (!allow_composite) return 0;
+    return pgf_resolve_composite(p, glyph);
+}
+
+static int pgf_parse_directory(PGF *p, PgfRefusal *refusal) {
+    const uint8_t *h = p->image;
+    int32_t revision;
+    int32_t version;
+    uint16_t header_size;
+    uint32_t pointer_count;
+    uint32_t char_map_bits;
+    uint32_t pointer_bits;
+    uint32_t shadow_bits;
+    uint32_t first;
+    uint32_t last;
+    uint32_t glyph_count;
+    uint32_t shadow_count;
+    uint16_t rev3_count_a = 0;
+    uint16_t rev3_count_b = 0;
+    size_t cursor;
+    size_t length;
+    unsigned i;
+    size_t table_offset;
+
+    /* The checks run in this order; tools/nk_core/fonts.py mirrors it. */
+    if (p->size > PGF_MAX_IMAGE_SIZE) {
+        *refusal = PGF_REFUSE_TOO_LARGE;
+        return 0;
+    }
+    if (p->size < PGF_BASE_HEADER_SIZE) {
+        *refusal = PGF_REFUSE_TRUNCATED;
+        return 0;
+    }
+    if (pgf_u16(h) != 0u) {
+        *refusal = PGF_REFUSE_HEADER_OFFSET;
+        return 0;
+    }
+    if (memcmp(h + 4u, "PGF0", 4u) != 0) {
+        *refusal = PGF_REFUSE_MAGIC;
+        return 0;
+    }
+    header_size = pgf_u16(h + 2u);
+    revision = pgf_i32(h + 8u);
+    version = pgf_i32(h + 12u);
+    if (revision < 0 || revision > 3 || version < 0) {
+        *refusal = PGF_REFUSE_REVISION;
+        return 0;
+    }
+    /* The revision-3 extension is identified by the declared header size, not by
+       the revision value, so a revision-3 file with no extension decodes on the
+       ordinary path while a 412-byte header still requires revision 3. */
+    if ((header_size != PGF_BASE_HEADER_SIZE && header_size != PGF_REV3_HEADER_SIZE) ||
+        (header_size == PGF_REV3_HEADER_SIZE && revision != 3)) {
+        *refusal = PGF_REFUSE_HEADER_SIZE;
+        return 0;
+    }
+    if (p->size < header_size) {
+        *refusal = PGF_REFUSE_TRUNCATED;
+        return 0;
+    }
+
+    p->revision = (uint32_t)revision;
+    p->char_map_count = pgf_u32(h + 0x10u);
+    pointer_count = pgf_u32(h + 0x14u);
+    char_map_bits = pgf_u32(h + 0x18u);
+    pointer_bits = pgf_u32(h + 0x1cu);
+    first = pgf_u16(h + 0xb6u);
+    last = pgf_u16(h + 0xb8u);
+    shadow_count = pgf_u32(h + 0x16cu);
+    shadow_bits = pgf_u32(h + 0x170u);
+    if (first > last) {
+        *refusal = PGF_REFUSE_GLYPH_RANGE;
+        return 0;
+    }
+    if ((uint64_t)p->char_map_count > (uint64_t)last - (uint64_t)first + 1u) {
+        *refusal = PGF_REFUSE_COUNTS;
+        return 0;
+    }
+    if (char_map_bits == 0u || char_map_bits > 32u ||
+        pointer_bits == 0u || pointer_bits > 32u ||
+        p->char_map_count > PGF_MAX_COUNT || pointer_count > PGF_MAX_COUNT ||
+        shadow_count > PGF_MAX_COUNT) {
+        *refusal = PGF_REFUSE_COUNTS;
+        return 0;
+    }
+    /* The character-pointer count is the glyph count. The inclusive code span
+       first..last may be wider than it: a sparse character map leaves codes absent,
+       so the span is not compared with the pointer count (PGF_SPEC.md 3.1, O-15). A
+       font with no pointers has no glyph to draw and is refused. */
+    glyph_count = pointer_count;
+    if (glyph_count == 0u) {
+        *refusal = PGF_REFUSE_NO_GLYPHS;
+        return 0;
+    }
+    if (glyph_count > PGF_MAX_COUNT ||
+        (shadow_count == 0u ? (shadow_bits != 0u && shadow_bits != 16u)
+                            : shadow_bits != 16u)) {
+        *refusal = PGF_REFUSE_COUNTS;
+        return 0;
+    }
+    p->first_glyph = first;
+    p->glyph_count = glyph_count;
+    p->char_map_bits = char_map_bits;
+    p->char_pointer_bits = pointer_bits;
+    p->shadow_count = shadow_count;
+    for (i = 0; i < PGF_TABLE_COUNT; ++i) p->metric_counts[i] = h[0x102u + i];
+
+    if (header_size == PGF_REV3_HEADER_SIZE) {
+        rev3_count_a = pgf_u16(h + 0x18cu);
+        rev3_count_b = pgf_u16(h + 0x194u);
+    }
+
+    cursor = header_size;
+    for (i = 0; i < PGF_TABLE_COUNT; ++i) {
+        if (!pgf_add_section(&cursor, (uint64_t)p->metric_counts[i] * 8u,
+                             p->size, &table_offset)) {
+            *refusal = PGF_REFUSE_TRUNCATED;
+            return 0;
+        }
+        p->metric_offsets[i] = table_offset;
+    }
+    if (!pgf_packed_size(shadow_count, shadow_bits, &length) ||
+        !pgf_add_section(&cursor, length, p->size, &p->shadow_map_offset)) {
+        *refusal = PGF_REFUSE_TRUNCATED;
+        return 0;
+    }
+    if (header_size == PGF_REV3_HEADER_SIZE) {
+        if (!pgf_add_section(&cursor, (uint64_t)rev3_count_a * 4u,
+                             p->size, &p->subcharmap_offset) ||
+            !pgf_add_section(&cursor, (uint64_t)rev3_count_b * 4u,
+                             p->size, &table_offset)) {
+            *refusal = PGF_REFUSE_TRUNCATED;
+            return 0;
+        }
+        p->subcharmap_count = rev3_count_a;
+    }
+    if (!pgf_packed_size(p->char_map_count, char_map_bits, &length) ||
+        !pgf_add_section(&cursor, length, p->size, &p->char_map_offset)) {
+        *refusal = PGF_REFUSE_TRUNCATED;
+        return 0;
+    }
+    if (!pgf_packed_size(pointer_count, pointer_bits, &length) ||
+        !pgf_add_section(&cursor, length, p->size, &p->char_pointer_offset)) {
+        *refusal = PGF_REFUSE_TRUNCATED;
+        return 0;
+    }
+    p->glyph_data_offset = cursor;
+    return 1;
+}
+
+/* Every rule the reader applies to an image, in order: the directory, then each glyph
+ * record with its shadow and composite references. Open and validation both run this, so
+ * a validator verdict is the reader's verdict. */
+static int pgf_check_image(PGF *p, PgfRefusal *refusal) {
+    uint32_t i;
+    *refusal = PGF_REFUSE_NONE;
+    if (!pgf_parse_directory(p, refusal)) return 0;
+    for (i = 0; i < p->glyph_count; ++i) {
+        PgfGlyph glyph;
+        if (!pgf_checked_glyph(p, i, &glyph, 1)) {
+            *refusal = PGF_REFUSE_GLYPH;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static PGF *pgf_open_owned(uint8_t *image, size_t size, const uint8_t *name,
+                           size_t name_length) {
+    PGF *p;
+    if (!image || size < PGF_BASE_HEADER_SIZE || size > PGF_MAX_IMAGE_SIZE) {
+        free(image);
+        return NULL;
+    }
+    p = (PGF *)calloc(1u, sizeof(*p));
+    if (!p) {
+        free(image);
+        return NULL;
+    }
+    p->image = image;
+    p->size = size;
+    if (name && name_length != 0u) {
+        if (name_length > sizeof(p->file_name) - 1u) {
+            name_length = sizeof(p->file_name) - 1u;
+        }
+        memcpy(p->file_name, name, name_length);
+    }
+    {
+        PgfRefusal refusal;
+        if (!pgf_check_image(p, &refusal)) goto fail;
+    }
+    return p;
+
+fail:
+    free(p->image);
+    free(p);
+    return NULL;
+}
+
+static PGF *pgf_read_stream(FILE *stream, const uint8_t *name, size_t name_length) {
+    long file_length;
+    size_t size;
+    size_t received;
+    uint8_t *image;
+    PGF *result;
+
+    if (!stream || fseek(stream, 0L, SEEK_END) != 0) return NULL;
+    file_length = ftell(stream);
+    if (file_length < (long)PGF_BASE_HEADER_SIZE ||
+        (uint64_t)file_length > PGF_MAX_IMAGE_SIZE ||
+        fseek(stream, 0L, SEEK_SET) != 0) {
+        return NULL;
+    }
+    size = (size_t)file_length;
+    image = (uint8_t *)malloc(size);
+    if (!image) return NULL;
+    received = fread(image, 1u, size, stream);
+    if (received != size || ferror(stream)) {
+        free(image);
+        return NULL;
+    }
+    result = pgf_open_owned(image, size, name, name_length);
+    return result;
+}
+
+static size_t pgf_narrow_basename(const char *path, const char **name) {
+    const char *component = path;
+    const char *cursor;
+    if (!path) {
+        *name = NULL;
+        return 0;
+    }
+    for (cursor = path; *cursor != '\0'; ++cursor) {
+        if (*cursor == '/' ||
+#ifdef _WIN32
+            *cursor == '\\' ||
+#endif
+            0) {
+            component = cursor + 1;
+        }
+    }
+    *name = component;
+    return strlen(component);
+}
+
+PGF *pgf_open(const char *path) {
+    const char *name;
+    size_t name_length;
+    FILE *stream;
+    PGF *result;
+    if (!path) return NULL;
+    name_length = pgf_narrow_basename(path, &name);
+    stream = fopen(path, "rb");
+    if (!stream) return NULL;
+    result = pgf_read_stream(stream, (const uint8_t *)name, name_length);
+    fclose(stream);
+    return result;
+}
+
+#ifdef _WIN32
+static uint32_t pgf_wide_scalar(const wchar_t *text, size_t *index) {
+    uint32_t first = (uint32_t)text[*index];
+    if (sizeof(wchar_t) == 2u && first >= 0xd800u && first <= 0xdbffu) {
+        uint32_t second = (uint32_t)text[*index + 1u];
+        if (second >= 0xdc00u && second <= 0xdfffu) {
+            ++*index;
+            return 0x10000u + ((first - 0xd800u) << 10) + (second - 0xdc00u);
+        }
+        return 0xfffdu;
+    }
+    if (sizeof(wchar_t) == 2u && first >= 0xdc00u && first <= 0xdfffu) return 0xfffdu;
+    if (first > 0x10ffffu || (first >= 0xd800u && first <= 0xdfffu)) return 0xfffdu;
+    return first;
+}
+
+static size_t pgf_wide_basename(const wchar_t *path, const wchar_t **name) {
+    const wchar_t *component = path;
+    const wchar_t *cursor;
+    if (!path) {
+        *name = NULL;
+        return 0;
+    }
+    for (cursor = path; *cursor != L'\0'; ++cursor) {
+        if (*cursor == L'/' || *cursor == L'\\') component = cursor + 1;
+    }
+    *name = component;
+    return wcslen(component);
+}
+
+static size_t pgf_encode_wide_name(const wchar_t *wide, uint8_t output[64]) {
+    size_t input_length = wcslen(wide);
+    size_t input_index = 0;
+    size_t output_length = 0;
+    while (input_index < input_length) {
+        uint32_t scalar = pgf_wide_scalar(wide, &input_index);
+        uint8_t encoded[4];
+        size_t encoded_length;
+        if (scalar <= 0x7fu) {
+            encoded[0] = (uint8_t)scalar;
+            encoded_length = 1u;
+        } else if (scalar <= 0x7ffu) {
+            encoded[0] = (uint8_t)(0xc0u | (scalar >> 6));
+            encoded[1] = (uint8_t)(0x80u | (scalar & 0x3fu));
+            encoded_length = 2u;
+        } else if (scalar <= 0xffffu) {
+            encoded[0] = (uint8_t)(0xe0u | (scalar >> 12));
+            encoded[1] = (uint8_t)(0x80u | ((scalar >> 6) & 0x3fu));
+            encoded[2] = (uint8_t)(0x80u | (scalar & 0x3fu));
+            encoded_length = 3u;
+        } else {
+            encoded[0] = (uint8_t)(0xf0u | (scalar >> 18));
+            encoded[1] = (uint8_t)(0x80u | ((scalar >> 12) & 0x3fu));
+            encoded[2] = (uint8_t)(0x80u | ((scalar >> 6) & 0x3fu));
+            encoded[3] = (uint8_t)(0x80u | (scalar & 0x3fu));
+            encoded_length = 4u;
+        }
+        if (output_length + encoded_length > 63u) break;
+        memcpy(output + output_length, encoded, encoded_length);
+        output_length += encoded_length;
+        ++input_index;
+    }
+    return output_length;
+}
+
+PGF *pgf_open_w(const wchar_t *path) {
+    const wchar_t *wide_name;
+    uint8_t encoded_name[64] = {0};
+    size_t encoded_length;
+    FILE *stream;
+    PGF *result;
+    if (!path) return NULL;
+    (void)pgf_wide_basename(path, &wide_name);
+    encoded_length = pgf_encode_wide_name(wide_name, encoded_name);
+    stream = _wfopen(path, L"rb");
+    if (!stream) return NULL;
+    result = pgf_read_stream(stream, encoded_name, encoded_length);
+    fclose(stream);
+    return result;
+}
+#endif
+
+PGF *pgf_open_memory(const void *data, size_t size) {
+    uint8_t *copy;
+    if (!data || size < PGF_BASE_HEADER_SIZE || size > PGF_MAX_IMAGE_SIZE) return NULL;
+    copy = (uint8_t *)malloc(size);
+    if (!copy) return NULL;
+    memcpy(copy, data, size);
+    return pgf_open_owned(copy, size, NULL, 0u);
+}
+
+void pgf_close(PGF *p) {
+    if (!p) return;
+    free(p->image);
+    free(p);
+}
+
+static int pgf_guest_span(uint32_t address, size_t size, int write_access) {
+    uint64_t end = (uint64_t)address + size;
+    if (size > UINT32_MAX || end > 0x100000000ULL || g_mem == NULL) return 0;
+    if (write_access) return sr_guest_span_writable(address, (uint32_t)size);
+#ifdef SR_SDL3VK
+    return sr_guest_span_readable_current(address, (uint32_t)size);
+#else
+    return sr_guest_span_readable(address, (uint32_t)size);
+#endif
+}
+
+static int pgf_guest_write(uint32_t address, const void *bytes, size_t size) {
+    if (!pgf_guest_span(address, size, 1)) return 0;
+#ifdef SR_SDL3VK
+    sr_guest_vram_write_prepare_bytes(address, (uint32_t)size);
+#endif
+    if (size != 0u) memcpy(SR_HOST(address), bytes, size);
+#ifdef SR_SDL3VK
+    sr_guest_vram_write_commit_bytes(address, (uint32_t)size);
+#endif
+    return 1;
+}
+
+static int pgf_guest_read(uint32_t address, void *bytes, size_t size) {
+    if (!pgf_guest_span(address, size, 0)) return 0;
+    if (size != 0u) memcpy(bytes, SR_HOST(address), size);
+    return 1;
+}
+
+static int pgf_lookup(const PGF *p, int char_code, int alt_char_code,
+                      int allow_alternate, PgfGlyph *glyph) {
+    uint32_t glyph_id;
+    if (p && char_code >= 0 &&
+        pgf_map_entry(p, (uint32_t)char_code, &glyph_id) &&
+        pgf_checked_glyph(p, glyph_id, glyph, 1)) {
+        return 1;
+    }
+    if (allow_alternate && p && char_code >= (int)p->first_glyph &&
+        alt_char_code >= 0 &&
+        pgf_map_entry(p, (uint32_t)alt_char_code, &glyph_id) &&
+        pgf_checked_glyph(p, glyph_id, glyph, 1)) {
+        return 1;
+    }
+    return 0;
+}
+
+int pgf_has_char(const PGF *p, int char_code) {
+    PgfGlyph glyph;
+    if (!pgf_lookup(p, char_code, 0, 0, &glyph)) return 0;
+    return glyph.width != 0u && glyph.height != 0u;
+}
+
+/* Coverage probes for the font-slot classification (see nk_font.c). Codes only. */
+static int pgf_probe_latin(const PGF *p) {
+    return pgf_has_char(p, 0x41) && pgf_has_char(p, 0x61);
+}
+
+static int pgf_probe_kana(const PGF *p) {
+    return pgf_has_char(p, 0x3042) || pgf_has_char(p, 0x30a2);
+}
+
+static int pgf_probe_hangul(const PGF *p) {
+    return pgf_has_char(p, 0xac00) || pgf_has_char(p, 0xd55c);
+}
+
+int pgf_validate_memory(const void *data, size_t size, PgfVerdict *verdict) {
+    PGF probe;
+    PgfRefusal refusal = PGF_REFUSE_NONE;
+    const uint8_t *bytes = (const uint8_t *)data;
+    if (!verdict) return 0;
+    memset(verdict, 0, sizeof(*verdict));
+    if (!bytes) {
+        verdict->refusal = PGF_REFUSE_TRUNCATED;
+        return 0;
+    }
+    /* The probe borrows the caller's bytes; the reader's parse functions only read them. */
+    memset(&probe, 0, sizeof(probe));
+    probe.image = (uint8_t *)bytes;
+    probe.size = size;
+    if (!pgf_check_image(&probe, &refusal)) {
+        verdict->refusal = refusal;
+        return 0;
+    }
+    verdict->refusal = PGF_REFUSE_NONE;
+    verdict->revision = probe.revision;
+    verdict->header_size = pgf_u16(bytes + 2u);
+    verdict->first_glyph = probe.first_glyph;
+    verdict->last_glyph = pgf_u16(bytes + 0xb8u);
+    verdict->glyph_count = probe.glyph_count;
+    verdict->char_map_count = probe.char_map_count;
+    verdict->nominal_h = pgf_i32(bytes + 0x24u);
+    verdict->nominal_v = pgf_i32(bytes + 0x28u);
+    verdict->has_latin = pgf_probe_latin(&probe) ? 1u : 0u;
+    verdict->has_kana = pgf_probe_kana(&probe) ? 1u : 0u;
+    verdict->has_hangul = pgf_probe_hangul(&probe) ? 1u : 0u;
+    return 1;
+}
+
+static uint32_t pgf_fixed_binary32(int32_t value) {
+    uint32_t sign = 0;
+    uint32_t exponent;
+    uint32_t significand;
+    uint64_t magnitude;
+    unsigned top_bit = 0;
+    int shift;
+
+    if (value == 0) return 0u;
+    if (value < 0) {
+        sign = 0x80000000u;
+        magnitude = (uint64_t)(-(int64_t)value);
+    } else {
+        magnitude = (uint64_t)value;
+    }
+    {
+        uint64_t scan = magnitude;
+        while (scan >>= 1) ++top_bit;
+    }
+    shift = (int)top_bit - 23;
+    if (shift > 0) {
+        uint64_t base = magnitude >> shift;
+        uint64_t remainder = magnitude - (base << shift);
+        uint64_t halfway = (uint64_t)1u << (shift - 1);
+        if (remainder > halfway || (remainder == halfway && (base & 1u))) ++base;
+        if (base == 0x1000000u) {
+            base >>= 1;
+            ++top_bit;
+        }
+        significand = (uint32_t)base;
+    } else {
+        significand = (uint32_t)(magnitude << (unsigned)(-shift));
+    }
+    exponent = (uint32_t)((int)top_bit - 6 + 127);
+    return sign | (exponent << 23) | (significand & 0x7fffffu);
+}
+
+static int pgf_resolves_code(const PGF *p, uint32_t code) {
+    uint32_t ignored;
+    return pgf_map_entry(p, code, &ignored);
+}
+
+void pgf_get_font_info(const PGF *p, uint32_t guest_info) {
+    uint8_t output[PGF_FONT_INFO_SIZE] = {0};
+    static const size_t raw_offsets[10] = {
+        0xf4u, 0xf8u, 0xd4u, 0xd8u, 0xdcu,
+        0xe0u, 0xe4u, 0xe8u, 0xecu, 0xf0u
+    };
+    size_t i;
+    uint16_t first;
+    if (!p) return;
+    for (i = 0; i < 10u; ++i) {
+        int32_t value = pgf_i32(p->image + raw_offsets[i]);
+        pgf_put_u32(output + i * 4u, (uint32_t)value);
+        pgf_put_u32(output + 0x28u + i * 4u, pgf_fixed_binary32(value));
+    }
+    pgf_put_u16(output + 0x50u, pgf_u16(p->image + 0xfcu));
+    pgf_put_u16(output + 0x52u, pgf_u16(p->image + 0xfeu));
+    pgf_put_u32(output + 0x54u, p->char_map_count);
+    pgf_put_u32(output + 0x58u, p->shadow_count);
+    for (i = 0; i < 4u; ++i) {
+        int32_t value = pgf_i32(p->image + 0x24u + i * 4u);
+        pgf_put_u32(output + 0x5cu + i * 4u, pgf_fixed_binary32(value));
+    }
+    pgf_put_u32(output + 0x6cu, 0u);
+    pgf_put_u16(output + 0x70u, 1u);
+    pgf_put_u16(output + 0x72u, 1u);
+    pgf_put_u16(output + 0x74u, 0u);
+    first = pgf_resolves_code(p, 0x3042u) ? 1u : 2u;
+    pgf_put_u16(output + 0x76u, first);
+    pgf_put_u16(output + 0x78u, 0u);
+    pgf_put_u16(output + 0x7au, 1u);
+    memcpy(output + 0x7cu, p->image + 0x35u, 64u);
+    memcpy(output + 0xbcu, p->file_name, 64u);
+    pgf_put_u32(output + 0xfcu, 0u);
+    pgf_put_u32(output + 0x100u, 0u);
+    output[0x104u] = p->image[0x22u];
+    (void)pgf_guest_write(guest_info, output, sizeof(output));
+}
+
+static void pgf_fill_char_info(const PgfGlyph *glyph, uint8_t output[PGF_CHAR_INFO_SIZE]) {
+    int64_t descender = (int64_t)glyph->y_base - (int64_t)glyph->dimension_height;
+    memset(output, 0, PGF_CHAR_INFO_SIZE);
+    pgf_put_u32(output + 0x00u, glyph->width);
+    pgf_put_u32(output + 0x04u, glyph->height);
+    pgf_put_u32(output + 0x08u, (uint32_t)glyph->bitmap_adjust_x);
+    pgf_put_u32(output + 0x0cu, (uint32_t)glyph->bitmap_adjust_y);
+    pgf_put_u32(output + 0x10u, (uint32_t)glyph->dimension_width);
+    pgf_put_u32(output + 0x14u, (uint32_t)glyph->dimension_height);
+    pgf_put_u32(output + 0x18u, (uint32_t)glyph->y_base);
+    pgf_put_u32(output + 0x1cu, (uint32_t)(int32_t)descender);
+    pgf_put_u32(output + 0x20u, (uint32_t)glyph->x_left);
+    pgf_put_u32(output + 0x24u, (uint32_t)glyph->y_base);
+    pgf_put_u32(output + 0x28u, (uint32_t)glyph->x_center);
+    pgf_put_u32(output + 0x2cu, (uint32_t)glyph->y_top);
+    pgf_put_u32(output + 0x30u, (uint32_t)glyph->advance_x);
+    pgf_put_u32(output + 0x34u, (uint32_t)glyph->advance_y);
+    pgf_put_u16(output + 0x38u, (uint16_t)glyph->shadow_row_order);
+    pgf_put_u16(output + 0x3au, (uint16_t)glyph->shadow_id);
+}
+
+int pgf_get_char_info(const PGF *p, int char_code, int alt_char_code,
+                      uint32_t guest_info) {
+    uint8_t output[PGF_CHAR_INFO_SIZE] = {0};
+    PgfGlyph glyph;
+    if (!pgf_guest_span(guest_info, sizeof(output), 1)) return 0;
+    (void)pgf_guest_write(guest_info, output, sizeof(output));
+    if (!pgf_lookup(p, char_code, alt_char_code, 1, &glyph)) return 0;
+    pgf_fill_char_info(&glyph, output);
+    (void)pgf_guest_write(guest_info, output, sizeof(output));
+    return 1;
+}
+
+static int pgf_get_glyph_by_id(const PGF *p, int glyph_id, PgfGlyph *glyph) {
+    if (!p || glyph_id < 0 || (uint32_t)glyph_id >= p->glyph_count) return 0;
+    return pgf_checked_glyph(p, (uint32_t)glyph_id, glyph, 1);
+}
+
+static int pgf_floor_64(int32_t value, int64_t *integer, uint32_t *fraction) {
+    int64_t quotient = (int64_t)value / 64;
+    int64_t remainder = (int64_t)value % 64;
+    if (remainder < 0) {
+        --quotient;
+        remainder += 64;
+    }
+    *integer = quotient;
+    *fraction = (uint32_t)remainder;
+    return 1;
+}
+
+static int pgf_nibble(const PGF *p, size_t bitmap_offset, uint64_t nibble_index,
+                      uint8_t *value) {
+    uint64_t byte_index = nibble_index / 2u;
+    size_t absolute;
+    if (byte_index > SIZE_MAX || bitmap_offset > p->size ||
+        (size_t)byte_index >= p->size - bitmap_offset) {
+        return 0;
+    }
+    absolute = bitmap_offset + (size_t)byte_index;
+    *value = (nibble_index & 1u) == 0u ?
+             (uint8_t)(p->image[absolute] & 0x0fu) :
+             (uint8_t)(p->image[absolute] >> 4);
+    return 1;
+}
+
+static void pgf_decode_bitmap(const PGF *p, const PgfGlyph *glyph,
+                              uint8_t samples[PGF_MAX_GLYPH_EDGE * PGF_MAX_GLYPH_EDGE]) {
+    uint32_t total = glyph->width * glyph->height;
+    uint32_t produced = 0;
+    uint64_t nibble_index = 0;
+    memset(samples, 0, PGF_MAX_GLYPH_EDGE * PGF_MAX_GLYPH_EDGE);
+    while (produced < total) {
+        uint8_t control;
+        uint8_t sample;
+        uint32_t run;
+        uint32_t count;
+        if (!pgf_nibble(p, glyph->bitmap_offset, nibble_index++, &control)) break;
+        if (control < 8u) {
+            if (!pgf_nibble(p, glyph->bitmap_offset, nibble_index++, &sample)) break;
+            run = (uint32_t)control + 1u;
+            count = run < total - produced ? run : total - produced;
+            memset(samples + produced, sample, count);
+            produced += count;
+        } else {
+            run = 16u - control;
+            count = run < total - produced ? run : total - produced;
+            while (count != 0u) {
+                if (!pgf_nibble(p, glyph->bitmap_offset, nibble_index++, &sample)) {
+                    return;
+                }
+                samples[produced++] = sample;
+                --count;
+            }
+        }
+    }
+}
+
+static uint8_t pgf_source_sample(const PgfGlyph *glyph,
+                                const uint8_t samples[PGF_MAX_GLYPH_EDGE * PGF_MAX_GLYPH_EDGE],
+                                int64_t x, int64_t y) {
+    uint64_t index;
+    if (x < 0 || y < 0 || (uint64_t)x >= glyph->width ||
+        (uint64_t)y >= glyph->height) {
+        return 0u;
+    }
+    if (glyph->row_order == 1u) {
+        index = (uint64_t)y * glyph->width + (uint64_t)x;
+    } else {
+        index = (uint64_t)x * glyph->height + (uint64_t)y;
+    }
+    return samples[(size_t)index];
+}
+
+static uint8_t pgf_interpolated_sample(const PgfGlyph *glyph,
+                                      const uint8_t samples[PGF_MAX_GLYPH_EDGE * PGF_MAX_GLYPH_EDGE],
+                                      uint32_t fx, uint32_t fy,
+                                      uint32_t ox, uint32_t oy) {
+    int upper = (int)fx * pgf_source_sample(glyph, samples,
+                                           (int64_t)ox - 1, (int64_t)oy - 1) +
+                (int)(64u - fx) * pgf_source_sample(glyph, samples, ox, (int64_t)oy - 1);
+    int lower = (int)fx * pgf_source_sample(glyph, samples,
+                                           (int64_t)ox - 1, oy) +
+                (int)(64u - fx) * pgf_source_sample(glyph, samples, ox, oy);
+    return (uint8_t)((upper * (int)fy + lower * (int)(64u - fy)) / 4096);
+}
+
+static int pgf_guest_row_span(uint32_t base, uint64_t row_offset,
+                              uint64_t byte_offset, uint64_t byte_count,
+                              uint32_t *address) {
+    uint64_t start = (uint64_t)base + row_offset + byte_offset;
+    uint64_t end = start + byte_count;
+    if (byte_count == 0u || start > UINT32_MAX || end > 0x100000000ULL ||
+        byte_count > UINT32_MAX || g_mem == NULL ||
+        !sr_guest_span_writable((uint32_t)start, (uint32_t)byte_count)) {
+        return 0;
+    }
+    *address = (uint32_t)start;
+    return 1;
+}
+
+static void pgf_store_pixel(uint32_t address, uint32_t x, uint32_t format,
+                            uint8_t sample, int combine) {
+    uint8_t *destination = SR_HOST(address);
+    uint8_t old;
+    if (format == 0u || format == 1u) {
+        uint8_t shift = (uint8_t)(((x & 1u) ^ (format == 1u ? 1u : 0u)) * 4u);
+        uint8_t mask = (uint8_t)(0x0fu << shift);
+#ifdef SR_SDL3VK
+        old = sr_r8(address);
+#else
+        old = *destination;
+#endif
+        if (combine && (uint8_t)((old >> shift) & 0x0fu) > (uint8_t)(sample & 0x0fu)) {
+            sample = (uint8_t)((old >> shift) & 0x0fu);
+        }
+        *destination = (uint8_t)((old & (uint8_t)~mask) |
+                                 ((uint8_t)(sample & 0x0fu) << shift));
+    } else if (format == 2u) {
+#ifdef SR_SDL3VK
+        old = sr_r8(address);
+#else
+        old = *destination;
+#endif
+        if (combine && old > sample) sample = old;
+        *destination = sample;
+    } else {
+#ifdef SR_SDL3VK
+        old = sr_r8(address);
+#else
+        old = destination[0];
+#endif
+        if (combine && old > sample) sample = old;
+        destination[0] = sample;
+        destination[1] = sample;
+        destination[2] = sample;
+        if (format == 4u) destination[3] = sample;
+    }
+}
+
+/* Everything one destination needs, derived once from the guest image record. */
+typedef struct PgfTarget {
+    uint32_t format;
+    int64_t base_x;
+    int64_t base_y;
+    uint32_t fraction_x;
+    uint32_t fraction_y;
+    uint32_t buffer_width;
+    uint32_t buffer_height;
+    uint32_t bytes_per_line;
+    uint32_t buffer_address;
+    uint64_t addressable_width;
+    uint64_t unit_bytes;
+} PgfTarget;
+
+/* The clipped, fully validated placement of one glyph or composite component. */
+typedef struct PgfPlan {
+    uint32_t first_x;
+    uint32_t last_x;
+    uint32_t first_row;
+    uint32_t row_count;
+    uint32_t dirty_count;
+    PgfDirtySpan dirty[PGF_MAX_GLYPH_EDGE + 1u];
+} PgfPlan;
+
+static PgfDrawStatus pgf_read_target(uint32_t guest_image, PgfTarget *target) {
+    uint8_t image[PGF_GLYPH_IMAGE_SIZE];
+    uint16_t buffer_width;
+    uint16_t buffer_height;
+    uint16_t bytes_per_line;
+
+    if (!pgf_guest_read(guest_image, image, sizeof(image))) return PGF_DRAW_BAD_IMAGE;
+    target->format = pgf_u32(image);
+    target->base_x = 0;
+    target->base_y = 0;
+    target->fraction_x = 0;
+    target->fraction_y = 0;
+    (void)pgf_floor_64(pgf_i32(image + 4u), &target->base_x, &target->fraction_x);
+    (void)pgf_floor_64(pgf_i32(image + 8u), &target->base_y, &target->fraction_y);
+    buffer_width = pgf_u16(image + 0x0cu);
+    buffer_height = pgf_u16(image + 0x0eu);
+    bytes_per_line = pgf_u16(image + 0x10u);
+    target->buffer_width = buffer_width;
+    target->buffer_height = buffer_height;
+    target->bytes_per_line = bytes_per_line;
+    target->buffer_address = pgf_u32(image + 0x14u);
+    if (target->format > 4u) return PGF_DRAW_BAD_IMAGE;
+    if (buffer_width == 0u || buffer_height == 0u || bytes_per_line == 0u) {
+        return PGF_DRAW_NOTHING;
+    }
+    if (target->buffer_address == 0u) return PGF_DRAW_BAD_IMAGE;
+    if (target->format <= 1u) {
+        target->addressable_width = (uint64_t)bytes_per_line * 2u;
+        target->unit_bytes = 1u;
+    } else if (target->format == 2u) {
+        target->addressable_width = bytes_per_line;
+        target->unit_bytes = 1u;
+    } else if (target->format == 3u) {
+        target->addressable_width = bytes_per_line / 3u;
+        target->unit_bytes = 3u;
+    } else {
+        target->addressable_width = bytes_per_line / 4u;
+        target->unit_bytes = 4u;
+    }
+    return target->addressable_width != 0u ? PGF_DRAW_DONE : PGF_DRAW_NOTHING;
+}
+
+/* Preflight one component: validate every byte it may touch, and record the
+   clipped pixel interval and the dirty spans, before any pixel is written. */
+static PgfDrawStatus pgf_plan_component(const PgfTarget *target, const PgfGlyph *glyph,
+                                        PgfPlan *plan) {
+    uint64_t writable_width;
+    uint64_t footprint_width;
+    uint64_t footprint_height;
+    uint64_t actual_x0;
+    uint64_t actual_x1;
+    uint64_t dirty_x0;
+    uint64_t dirty_x1;
+    int64_t pixel_x1;
+    int64_t first_y;
+    int64_t last_y;
+    int64_t y;
+
+    if (glyph->width == 0u || glyph->height == 0u ||
+        glyph->width > PGF_MAX_GLYPH_EDGE || glyph->height > PGF_MAX_GLYPH_EDGE ||
+        (uint64_t)glyph->width * glyph->height > PGF_MAX_SAMPLES ||
+        (glyph->row_order != 1u && glyph->row_order != 2u)) {
+        return PGF_DRAW_NOTHING;
+    }
+    writable_width = target->buffer_width < target->addressable_width ?
+                     target->buffer_width : target->addressable_width;
+    footprint_width = glyph->width + (target->fraction_x != 0u ? 1u : 0u);
+    footprint_height = glyph->height + (target->fraction_y != 0u ? 1u : 0u);
+    actual_x0 = target->base_x < 0 ? 0u : (uint64_t)target->base_x;
+    pixel_x1 = target->base_x + (int64_t)footprint_width;
+    actual_x1 = pixel_x1 < 0 ? 0u : (uint64_t)pixel_x1;
+    if (actual_x1 > writable_width) actual_x1 = writable_width;
+    if (actual_x0 >= actual_x1) return PGF_DRAW_NOTHING;
+
+    first_y = target->base_y < 0 ? 0 : target->base_y;
+    last_y = target->base_y + (int64_t)footprint_height;
+    if (last_y > (int64_t)target->buffer_height) last_y = target->buffer_height;
+    plan->first_x = (uint32_t)actual_x0;
+    plan->last_x = (uint32_t)actual_x1;
+    plan->first_row = (uint32_t)(first_y - target->base_y);
+    plan->row_count = last_y > first_y ? (uint32_t)(last_y - first_y) : 0u;
+    plan->dirty_count = 0u;
+
+    for (y = first_y; y < last_y; ++y) {
+        uint64_t row_offset = (uint64_t)y * target->bytes_per_line;
+        uint64_t byte_start = target->format <= 1u ?
+                              actual_x0 / 2u : actual_x0 * target->unit_bytes;
+        uint64_t byte_end = target->format <= 1u ?
+                            (actual_x1 + 1u) / 2u : actual_x1 * target->unit_bytes;
+        uint32_t ignored_address;
+        if (byte_end <= byte_start ||
+            !pgf_guest_row_span(target->buffer_address, row_offset, byte_start,
+                                byte_end - byte_start, &ignored_address)) {
+            return PGF_DRAW_BAD_BUFFER;
+        }
+    }
+
+    dirty_x0 = target->base_x < 0 ? 0u : (uint64_t)target->base_x;
+    dirty_x1 = pixel_x1 < 0 ? 0u : (uint64_t)pixel_x1;
+    if (dirty_x1 > target->addressable_width) dirty_x1 = target->addressable_width;
+    if (dirty_x0 < dirty_x1) {
+        for (y = first_y; y < last_y && plan->dirty_count < PGF_MAX_GLYPH_EDGE + 1u; ++y) {
+            uint64_t row_offset = (uint64_t)y * target->bytes_per_line;
+            uint64_t first_unit = dirty_x0 / (target->format <= 1u ? 2u : 1u);
+            uint64_t last_unit = (dirty_x1 + (target->format <= 1u ? 1u : 0u)) /
+                                 (target->format <= 1u ? 2u : 1u);
+            uint64_t byte_start = first_unit * target->unit_bytes;
+            uint64_t byte_count = (last_unit - first_unit) * target->unit_bytes;
+            uint32_t address;
+            if (byte_count == 0u || byte_count > UINT32_MAX ||
+                !pgf_guest_row_span(target->buffer_address, row_offset, byte_start,
+                                    byte_count, &address)) {
+                return PGF_DRAW_BAD_BUFFER;
+            }
+            plan->dirty[plan->dirty_count].address = address;
+            plan->dirty[plan->dirty_count].size = (uint32_t)byte_count;
+            ++plan->dirty_count;
+        }
+    }
+    return PGF_DRAW_DONE;
+}
+
+/* Write one planned component's pixels, then report its dirty spans. */
+static void pgf_blit_component(const PGF *p, const PgfTarget *target,
+                               const PgfGlyph *glyph, const PgfPlan *plan,
+                               int combine) {
+    uint8_t samples[PGF_MAX_GLYPH_EDGE * PGF_MAX_GLYPH_EDGE];
+    uint32_t row;
+
+    for (row = 0; row < plan->dirty_count; ++row) {
+#ifdef SR_SDL3VK
+        sr_guest_vram_write_prepare_bytes(plan->dirty[row].address,
+                                          plan->dirty[row].size);
+#endif
+    }
+    pgf_decode_bitmap(p, glyph, samples);
+    for (row = 0; row < plan->row_count; ++row) {
+        int64_t y = target->base_y + (int64_t)(plan->first_row + row);
+        uint32_t x;
+        for (x = plan->first_x; x < plan->last_x; ++x) {
+            uint32_t ox = (uint32_t)((int64_t)x - target->base_x);
+            uint8_t sample = pgf_interpolated_sample(glyph, samples,
+                                                     target->fraction_x,
+                                                     target->fraction_y,
+                                                     ox, plan->first_row + row);
+            uint64_t byte_offset = target->format <= 1u ?
+                                   x / 2u : (uint64_t)x * target->unit_bytes;
+            uint64_t address64 = (uint64_t)target->buffer_address +
+                                 (uint64_t)y * target->bytes_per_line + byte_offset;
+            pgf_store_pixel((uint32_t)address64, x, target->format, sample, combine);
+        }
+    }
+    for (row = 0; row < plan->dirty_count; ++row) {
+#ifdef SR_SDL3VK
+        sr_guest_vram_write_commit_bytes(plan->dirty[row].address,
+                                         plan->dirty[row].size);
+#else
+        sr_gpu_vram_dirty(plan->dirty[row].address, plan->dirty[row].size);
+#endif
+    }
+}
+
+static PgfDrawStatus pgf_draw(const PGF *p, const PgfGlyph *glyph, const PgfTarget *target) {
+    PgfPlan plans[PGF_COMPOSITE_PARTS];
+    PgfGlyph parts[PGF_COMPOSITE_PARTS];
+    PgfDrawStatus status;
+    unsigned part;
+    int drawn = 0;
+
+    if (!glyph->composite) {
+        status = pgf_plan_component(target, glyph, &plans[0]);
+        if (status != PGF_DRAW_DONE) return status;
+        pgf_blit_component(p, target, glyph, &plans[0], 0);
+        return PGF_DRAW_DONE;
+    }
+    /* Every component is preflighted before the first pixel is written, so a
+       component that cannot be placed leaves the whole draw untouched. */
+    for (part = 0; part < PGF_COMPOSITE_PARTS; ++part) {
+        if (glyph->component[part] == PGF_COMPONENT_NONE) continue;
+        if (!pgf_checked_glyph(p, glyph->component[part], &parts[part], 0)) {
+            return PGF_DRAW_NOTHING;
+        }
+        status = pgf_plan_component(target, &parts[part], &plans[part]);
+        if (status != PGF_DRAW_DONE) return status;
+    }
+    /* The first present component is written as it is; the later ones combine with it. */
+    for (part = 0; part < PGF_COMPOSITE_PARTS; ++part) {
+        if (glyph->component[part] == PGF_COMPONENT_NONE) continue;
+        pgf_blit_component(p, target, &parts[part], &plans[part], drawn);
+        drawn = 1;
+    }
+    return PGF_DRAW_DONE;
+}
+
+/* The glyph image is read before the glyph is looked up, so an image that is not guest memory is
+   reported even when the character has no glyph. */
+PgfDrawStatus pgf_draw_glyph_status(const PGF *p, int char_code, int alt_char_code,
+                                    uint32_t guest_image) {
+    PgfTarget target;
+    PgfGlyph glyph;
+    PgfDrawStatus status = pgf_read_target(guest_image, &target);
+    if (status != PGF_DRAW_DONE) return status;
+    if (!p || !pgf_lookup(p, char_code, alt_char_code, 1, &glyph)) return PGF_DRAW_NOTHING;
+    return pgf_draw(p, &glyph, &target);
+}
+
+PgfDrawStatus pgf_draw_glyph_by_id_status(const PGF *p, int glyph_id, uint32_t guest_image) {
+    PgfTarget target;
+    PgfGlyph glyph;
+    PgfDrawStatus status = pgf_read_target(guest_image, &target);
+    if (status != PGF_DRAW_DONE) return status;
+    if (!pgf_get_glyph_by_id(p, glyph_id, &glyph)) return PGF_DRAW_NOTHING;
+    return pgf_draw(p, &glyph, &target);
+}
+
+int pgf_draw_glyph(const PGF *p, int char_code, int alt_char_code,
+                   uint32_t guest_image) {
+    return pgf_draw_glyph_status(p, char_code, alt_char_code, guest_image) == PGF_DRAW_DONE;
+}
+
+int pgf_draw_glyph_by_id(const PGF *p, int glyph_id, uint32_t guest_image) {
+    return pgf_draw_glyph_by_id_status(p, glyph_id, guest_image) == PGF_DRAW_DONE;
+}

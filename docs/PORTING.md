@@ -1,0 +1,491 @@
+# Porting to Another PSP Game
+
+This guide walks through adapting the recompiler for a different PSP title.
+
+## Overview
+
+The code generator and much of the runtime are reusable, but this repository still contains
+HST-specific addresses, module bases, HLE coverage, and manager defaults. Porting another title
+is engineering work, not a supported one-command workflow. The main title-specific inputs are:
+
+1. **Input files** — the decrypted ELF/PRX and ISO
+2. **Build variables** — base address, entry point, extra PRXs
+3. **HLE coverage and runtime assumptions** — behavior exercised by that title
+
+Everything else (runtime, codegen, GPU backend) is shared.
+
+## Step 1: Choose a versioned public title manifest
+
+Start with a checked-in, versioned manifest under `assets/titles/`. It is the
+public source of title semantics: identity, disc/revision policy, executable
+base/entry, codegen profile, BSS metadata policy, required module names/load
+addresses, and public filesystem/profile requirements. Validate it before using
+it (this example is copy-pasteable from a public clone):
+
+```powershell
+python tools/title_manifest.py assets/titles/synthetic.json
+python tools/title_codegen_plan.py assets/titles/synthetic.json --print-protected-digest
+```
+
+The HST manifest (`assets/titles/hst-ucus98701.json`) is in the repository.
+With your own game inputs in `place_game_here/`, the same planner drives the HST
+lane:
+
+```powershell
+python tools/title_codegen_plan.py assets/titles/hst-ucus98701.json `
+  --game-name=hst `
+  --game-elf=place_game_here/EBOOT.elf `
+  --build-dir=build/hst `
+  --module-dir=place_game_here/EXTRACTED/decrypted `
+  --psp-header=place_game_here/EXTRACTED/PSP_GAME/SYSDIR/EBOOT.BIN `
+  --manager-plan
+```
+
+The manifest is not a storage location for absolute paths, usernames, hashes,
+keys, retail bytes, routes, saves, or oracle evidence. Those are private
+workspace bindings supplied locally and remain outside Git.
+
+For split loose-file layouts, declare the extra roots in
+`filesystem.loose_content_roots` rather than teaching generic runtime code
+directory names. Each entry has `root`, `mount`, and `precedence`, with optional
+`skip_primary_root` and `exclude` fields. `root` resolves relative to the
+parent of `filesystem.data_root`; `mount` is the guest-relative prefix (or
+`""` for the namespace root), and lower unique `precedence` values win
+duplicate file keys between loose roots. `root: "."` skips the primary data
+root by default; `exclude` lists up to two safe relative paths that the walk
+does not enter. Files under `filesystem.data_root` keep priority over matching
+files from loose roots. The schema rejects unsafe, duplicate, or overlapping
+roots. Existing manifests without this optional field still load with no extra
+roots; add the field when the title needs them.
+When staging an ISO, matching roots under PSP_GAME/USRDIR are copied to the
+same relative staging paths; the player does not infer a directory when the
+field is absent.
+
+To migrate the former inferred layout whose data root is
+`<something>/USRDIR/xbdata` or
+`<something>/USRDIR/xbdata_extracted`, and whose loose assets live beside that
+directory under `USRDIR`, add this declaration:
+
+```json
+"loose_content_roots": [
+  {"root": ".", "mount": "", "precedence": 0, "skip_primary_root": true}
+]
+```
+
+This reproduces the former parent walk: it indexed the primary extracted tree,
+then recursively indexed readable regular files below the parent while
+skipping the primary child. It otherwise visited sibling directories too;
+omitting `exclude` preserves that complete historical file set. A profile may
+list additional relative paths in `exclude` when those subtrees are outside its
+disc namespace or would make the walk needlessly broad. For the extracted-tree
+layout, primary files win matching loose-file keys, as before. The former
+inference only activated for the documented `USRDIR`/archive-root layout; the
+manifest now states the root relationship directly. The archived and extracted
+routes have distinct open order: a matching extracted-primary file wins a loose
+file, while a loose filesystem file is checked before an XB archive member.
+This migration, loose-content root binding, landed under [#289](https://github.com/Jstar269/nakagawa-recomp/issues/289).
+
+For the HST title, the manager path is (it needs your own game inputs in
+`place_game_here/`):
+
+```powershell
+.\nk_manager.ps1 -Action BuildFull -GameName hst `
+  -TitleManifest assets/titles/hst-ucus98701.json
+```
+
+The canonical manager accepts validated title manifests, including public synthetic fixtures. Every
+build-facing value comes from the validated plan — the manager keeps no second copy
+of the title contract — and it re-checks the manifest's protected digest immediately
+before running Make, so a manifest edited after planning fails closed rather than
+building half of each contract. `-VulkanSdk`, `-RuntimeOpt`, `-RecompOpt`, and
+`-FuncsPerChunk` remain operational overrides. An explicit override wins only where
+the contract permits it. The planner default is the single authority for the
+chunk-size default; the matching Make, manager, and codegen fallbacks must agree
+with it rather than define it. Without `-TitleManifest`, `nk_manager.ps1` selects
+`assets/titles/synthetic.json`.
+
+`assets/titles/pspdev-phase5.json` is one of four materially different
+source-owned fixtures (with `synthetic.json`, `synthetic-title2.json`, and `display-smoke.json`)
+(`fixtures/pspdev_phase5`, a standard PSPDEV/PSPSDK `BUILD_PRX=1` module).
+It proves the planner is genuinely multi-title: a different load base, no guest
+modules, and a different feature surface flow through the same manifest → plan →
+codegen path.
+
+The analyzer never applies a title-specific executable span of its own. If your
+title needs a code range that lives outside the section table, declare it in the
+manifest's `executable.extra_executable_spans` (the manager then supplies it) or
+pass `--extra-span=LO,HI` to `codegen.py` for a direct Make build.
+
+## Step 2: Supply a plain (unencrypted) ELF
+
+The direct recompiler/codegen input must be a **plain** PSP ELF: a file that begins with the ELF magic bytes `7F 45 4C 46`; a `~PSP` or `~SCE` container is rejected at that boundary. The player decrypts the user's own disc into plain files first ([#1494](https://github.com/Jstar269/nakagawa-recomp/pull/1494)). In player and CLI disc workflows an encrypted executable or module without a plain copy fails closed as `ENCRYPTED_EXECUTABLE` or `ENCRYPTED_MODULE`. When a disc carries an unencrypted `BOOT.BIN`, the player and CLI select it automatically. For a direct Make/codegen route, supply a plain ELF such as an executable that you decrypted yourself.
+
+Keep the result in a Git-ignored private-input location such as `place_game_here/EBOOT.elf`, or pass its actual path to Make. Do not commit the decrypted game executable.
+
+## Step 3: Determine game-specific variables
+
+You need four values:
+
+| Variable | How to find it |
+| ---------- | --------------- |
+| `GAME_NAME` | Short identifier (e.g. `hst` for Hot Shots Tennis). Used in build dir names. |
+| `GAME_ELF` | Path to the decrypted ELF (e.g. `place_game_here/EBOOT.elf`). |
+| `GAME_BASE` | Base address where the ELF loads. Check the ELF header or Ghidra. PSP default: `0x08804000`. Some games use `0`. |
+| `GAME_ENTRY` | Entry point address (first PC value). Found in ELF header or Ghidra. |
+
+### Finding the base address and entry point
+
+**From the ELF header** (using `readelf` or a hex editor):
+
+```bash
+readelf -h place_game_here/EBOOT.elf | grep "Entry point"
+```
+
+**From Ghidra:**
+
+1. Load the decrypted ELF
+2. Check the ImageBase and the entry function address
+
+**From PPSSPP source:**
+Some games have their base/entry in `Core/Load/PSPELF.cpp` or game-specific config files.
+
+## Step 4: Check for extra PRXs
+
+Some games load additional modules (libraries). HST loads 3 extra PRXs from `place_game_here/EXTRACTED/decrypted/`. Your game may need different ones.
+
+Check the game's `MODULE.SYS` and the disc's directory listing to identify the PRXs it loads.
+
+If your game has extra PRXs, declare them in the manifest. Keep the decrypted
+module directory as a local private binding. Do not edit HST Makefile constants
+to configure a new title. Each module entry names the decrypted file, the path
+the game loads it by (`guest_path`), and its placement:
+
+- `"placement": "runtime"` (no `load_address`): the module is translated once,
+  position-independently, and the runtime lays it out when the game calls
+  `sceKernelLoadModule`, wherever the user-partition allocator puts it (the
+  lowest free range that holds it, as the kernel's loader does). Unloading it
+  returns the memory, so overlays that never fit together run one after another.
+  This is what `nk_cli.py bringup` declares for every discovered module that
+  runs as translated guest code. A module whose every user-callable export the
+  runtime registers is served by the runtime and not translated at all, and a
+  kernel-mode module is left out (planning stops with
+  `GUEST_MODULE_FORMAT_UNSUPPORTED` only when the main executable needs one of its
+  functions that nothing else provides).
+- a fixed `load_address` (the default placement): the runtime reserves exactly
+  that range and fails closed if it is occupied.
+
+No memory is reserved for modules at build time and no two modules need to fit
+at once. A main image must lie inside user memory (below `0x0a000000`); whatever
+it and the game's own allocations leave is what the guest allocator has to give,
+and a module load that finds no room fails at run time with
+`SCE_KERNEL_ERROR_NO_MEMORY` and a `GUEST_MODULE_LOAD_NO_MEMORY` line. One known
+difference from the PSP remains: the runtime's thread stacks and nested-call
+frames sit in a fixed region near the top of user memory instead of being taken
+from the partition, so the allocator neither counts nor avoids them. A fixed-address
+module (ELF type 2) must lie inside user memory without overlapping the main image.
+
+What the runtime cannot yet reproduce faithfully fails closed with
+`SCE_KERNEL_ERROR_NOTIMP` and a `GUEST_MODULE_BOUNDARY: <name>` line: a module the
+build did not translate (`guest-module-untranslated`), a staged file that is not
+the one that was translated (`guest-module-identity-mismatch`), a module codegen
+could not translate, for example one with GPREL16 relocations
+(`guest-module-translation-unsupported`), a second live instance of one module
+(`guest-module-second-instance`), and a load option asking for another partition
+or for High placement. These are in the works (#704).
+
+## Step 5: Build
+
+```bash
+mingw32-make GAME_NAME=mygame GAME_ELF=place_game_here/EBOOT.elf GAME_BASE=0x08804000 GAME_ENTRY=0x08804000
+```
+
+Use `nk_manager.ps1 -TitleManifest` with the title's validated manifest and
+explicit private bindings. The canonical manager supports generic title planning;
+this does not prove runtime portability or correctness for another title. Direct
+Make without a manifest remains an explicit non-canonical escape hatch: it bypasses
+the planner and its protected digest, so it carries no title contract.
+
+The first build can be substantially slower than a runtime-only rebuild because codegen must translate the title's MIPS functions and compile the generated translation units.
+
+## Step 6: Run and observe
+
+Launch the resulting executable with the arguments and private inputs required by the port. If you
+have deliberately generalized the manager for the new title, its diagnostic profiles can then be
+used as the front end.
+
+For the existing HST configuration, `-Profile Performance` is a log-free visual/audio smoke test
+and `-Profile Benchmark` records one-second aggregates plus `logs/perf.csv`; those presets should
+not be treated as automatically valid for a new game until reviewed.
+
+Watch `stderr` output for:
+
+- **HLE calls** — `SR_HLELOG=1` traces syscall dispatch
+- **Unknown NIDs** — a scheduled runtime run fails fast for an unhandled syscall
+- **Stubs** — check `build/<game>/<game>_recomp_stubs.txt` for functions that could not be translated
+
+## Step 7: Fix game-specific issues
+
+### Unknown NIDs
+
+When the recompiler hits a syscall it doesn't know, it stops. You have two options:
+
+1. **Add an HLE handler** in its subsystem's file, `src/rt/hle_<subsystem>.c` (the subsystem comes from
+   the library prefix in `tools/hle_registry_meta.py`), and register it there — implement the syscall
+   on the host side
+2. Add or map the missing NID in the runtime/import tables; unknown calls must not be silently treated as successful.
+
+### Codegen stubs
+
+Check `build/<game>/<game>_recomp_stubs.txt` for functions that generated empty stubs. These are guest PCs that didn't match any known MIPS pattern. Each needs either:
+
+- A codegen fix in `tools/codegen.py`
+- A faithful HLE boundary where the original operation is genuinely a system/API call
+
+Do not substitute a fabricated successful return merely to cross the frontier.
+
+### VFPU issues
+
+If VFPU instructions produce wrong results:
+
+- Check `assets/vfpu/*.dat` tables against the pinned upstream provenance documented in the repository
+- Compare behavior against an independent PSP/PPSSPP/reference-interpreter oracle where available
+
+### Graphics issues
+
+- **Software renderer** (`SR_GPU_GE=0`): the primary in-repository comparison path, but still under
+  correctness validation. Use it for A/B localization, not as an external oracle.
+- **Vulkan renderer** (`SR_GPU_GE=1`): faster but may have rendering bugs.
+- Capture PPM snapshots with `SR_FBSNAP=<N>` from both and diff them with `tools/ppmdiff.py`.
+
+## Step 8: Extend translation only with evidence
+
+Prefer a general analyzer/codegen correction over an address-specific replacement. If a narrow
+translation is truly unavoidable, first disassemble the complete guest function, document its
+ABI and side effects, and add a focused generator test. Never use a loop cap, forced return, or
+fabricated success value to cross a frontier. Rebuild the full pipeline after any generator edit.
+
+## Checklist
+
+- [ ] Decrypted ELF obtained and kept outside Git history
+- [ ] `GAME_BASE` and `GAME_ENTRY` determined
+- [ ] Extra PRXs identified (if any)
+- [ ] Build succeeds without errors
+- [ ] `<game>_recomp_stubs.txt` reviewed — all stubs accounted for
+- [ ] Unknown NIDs handled with faithful HLE behavior
+- [ ] First HLE call reached (`codegen_gate.py` can verify this when its required inputs are available)
+- [ ] Graphics: first frame renders and is validated against an appropriate comparison/oracle path
+
+## Title coupling in the generic core
+
+Nakagawa is a generic PSP static recompiler whose first mature profile happens to be
+*Hot Shots Tennis: Get a Grip* (HST). This section records where that distinction does
+not currently hold: where generic core (runtime/tooling) carries knowledge that is true
+only of one title. It is the second-title readiness record; the machine-enforced
+inventory lives in `tools/compat_overrides.py` (`RETIRED_HLE_DIAGNOSTIC_GROUPS`,
+`RETIRED_DIAGNOSTIC_GROUPS`, and the title-configured compatibility lists). The
+source guard in `tools/test_compat_manifest.py` rejects their HST addresses in generic
+runtime and dispatch source.
+The inventory is *not* an executable proof of unsupported-interpreter fail-closed; that
+property is proven by the production interpreter floor (`src/rt/guest_interp.c`) through
+`fixtures/cosim/cosim_selftest.c` (fail-closed negative corpus, control sweep, jalr link
+shape, form census) and `tests/native/dispatch_isolation_selftest.c`. Retirement work was
+tracked by [issue #98](https://github.com/Jstar269/nakagawa-recomp/issues/98), now closed. (This
+previously cited #20, which is a merged pull request about `sceSasCore` routing and has
+no relation to this surface — so the surface had no tracker at all.)
+
+**Readiness criterion.** A newly supplied PSP executable from your own copy of a game should be
+able to receive a profile, run analysis, produce its target/import/capability census,
+attempt compilation, and expose its first unsupported semantic boundary **without
+title-specific edits to generic core**.
+
+### C-1 — Title guest addresses in generic runtime — RETIRED
+
+Before 2026-08-20 the semantic-debt inventory's checked sources were `tools/codegen.py`
+and `src/rt/recomp.c`, with manual groups covering `src/rt/sched.c`. `src/rt/hle.c` was
+in none of them. A census found 38 distinct guest addresses across 50 sites in it that
+mean something only in this title's memory map, and none were inventoried. They now
+are.
+
+That census was itself incomplete, and said so with confidence: it reported 38/38
+covered while eight further title addresses sat in
+the runtime-sync seeding (since retired) — a configuration block base, a semaphore name
+pointer, and six guest wrapper entry points, all reached from an unconditionally
+registered `sceDisplaySetMode`. Not one of them is written inside a `MEM_*` call: each
+is bound to a local or assigned into a `CpuState` register first, so the extractor's
+direct-literal regex matched none of them. The gate now also recognizes those indirect
+shapes (`bound_local`, `cpu_state_register`); its grammar and its explicit limits are
+documented in `tools/test_compat_manifest.py` (static inventory — see executable
+fail-closed coverage in `fixtures/cosim/` and `tests/native/dispatch_isolation_selftest.c`).
+Historical diagnostic census (now retired):
+
+| Group | Bucket | Addresses | Sites |
+| --- | --- | --- | --- |
+| `guest_bss_snapshots` | deleted; use SR_TRACE_PC / SR_WATCH | 27 | 30 |
+| `exit_path_context` | deleted; use SR_TRACE_PC / SR_WATCH | 2 | 3 |
+| `umd_ufl_head_dump` | deleted; use SR_TRACE_PC / SR_WATCH | 1 | 3 |
+
+The HST-specific reads, snapshots, UMD dump, scheduler boot/spin/audio probes, and
+recompiler address probes have been removed from generic `hle.c`, `sched.c`, and
+`recomp.c`. The historical inventory remains under `RETIRED_*` names as a guard;
+the live HST diagnostic count in those files is zero. Generic runtime diagnostics
+use `SR_TRACE_PC` and `SR_WATCH`.
+The four former `EXPLICIT_COMPATIBILITY_OVERRIDE` groups are all retired: libfont readiness
+injection, and the display bring-up replay, runtime-sync seeding and frame-latch assist
+(retired under [#363](https://github.com/Jstar269/nakagawa-recomp/issues/363)). Their
+historical addresses remain only in the inventory,
+`tools/compat_overrides.py:HLE_TITLE_CONFIGURED_COMPAT`, gated by
+`tools/test_hle_title_isolation.py`. A manifest that still names `display_bringup`,
+`runtime_sync` or `frame_ready_latch_addr` fails with `HLE_TITLE_ASSIST_RETIRED`.
+
+No Newlib master or guest thread-table address remains: the HST reent bindings were
+retired under [#363](https://github.com/Jstar269/nakagawa-recomp/issues/363), and the
+runtime writes nothing into a title's own per-thread reent table.
+
+By bucket (live `hle.c` only):
+
+- `GENERIC_PSP_SEMANTIC`: 0 (generic PSP constants are exempted only through
+  the narrow, explicit site rules in `HLE_GENERIC_SITE_RULES`: an exact
+  function, shape and literal triple, e.g. the EDRAM base returned by
+  `sceGeEdramGetAddr`).
+  There is no blanket numeric ceiling and no whole-region VRAM exemption: a
+  direct `MEM_R`/`MEM_W` at an arbitrary VRAM address (`0x04000000`..
+  `0x041fffff`) is inventoried like any other absolute guest address.
+- `PROFILE_OWNED_CONFIGURATION`: 0 inside the live `hle.c` gate (the retired title-configured
+  addresses stay only in `HLE_TITLE_CONFIGURED_COMPAT`); two documented build/profile
+  couplings below (C-2, C-3) are retired.
+- `EXPLICIT_COMPATIBILITY_OVERRIDE`: 0 in live `hle.c` (migrated).
+- `DIAGNOSTIC_ONLY`: 0 live; 30 addresses / 36 historical sites retired.
+- `PRIVATE_ACCEPTANCE_ONLY`: 0.
+- `FALSE_POSITIVE`: 0 (a deliberately injected generic constant never flags; the
+  explicit generic-site rules are regression-tested).
+- `UNRESOLVED_COUPLING`: 0 (all sites classified; the gate fails closed on any new one).
+
+Retired title-configured compat (formerly `PROFILE_OWNED_CONFIGURATION` via `runtime_bindings`):
+
+| Group | Addresses | Former title config | Status |
+| --- | --- | --- | --- |
+| `frame_ready_latch_assist` | 1 | `frame_ready_latch_addr` | retired; field fails with `HLE_TITLE_ASSIST_RETIRED` |
+| `runtime_sync_callback_config` | 8 | `runtime_sync` | retired; field fails with `HLE_TITLE_ASSIST_RETIRED` |
+| `display_setmode_guest_init` | 6 | `display_bringup` | retired; field fails with `HLE_TITLE_ASSIST_RETIRED` |
+
+**Why these no longer block title #2.** `sceDisplaySetMode`, `sceKernelLoadModule` and
+`sr_vblank_tick` perform no title guest calls, writes or callback installs for any profile:
+`h_DisplaySetMode` logs the requested mode and size and returns success, and only a title's
+own GE finish callback advances its counters. The `HLE_TITLE_CONFIGURED_COMPAT` inventory
+keeps the retired addresses auditable, and `test_hle_title_isolation.py` proves no generic
+source or header carries them.
+
+### Top remaining title-#2 blockers
+
+1. HST dispatch hooks and diagnostic probes (C-1, #361, #362) — **RETIRED**:
+   exact trace hooks, target-pattern swallowing, and HST-address diagnostics were
+   removed. A synthetic resource-shaped call now fails at the named
+   `not-executable` boundary; title-configured HST Newlib bindings remain available
+   to the flagship. The second-title bring-up landed under [#285](https://github.com/Jstar269/nakagawa-recomp/issues/285), and its
+   follow-on milestone, a second title that saves, closes and resumes, was met and closed as [#1126](https://github.com/Jstar269/nakagawa-recomp/issues/1126) (2026-10-28).
+
+The former blocker #1, one shared scratch stack for every nested guest call, is
+retired: see C-4.
+
+`SR_DATA_EXPECTED_COUNT` (former blocker #1) is now retired: see C-2.
+
+The `runtime_bindings` manifest section now carries the four retired groups by role —
+allocator, vblank-device creator, render-context initialiser, frame-ready counter,
+runtime sync config — so the handlers stay generic and consult the profile, or report
+an unsupported boundary when the profile is silent. This slice retires the 16
+addresses from generic core; the remaining blockers are tracked separately.
+
+### C-2 — `SR_DATA_EXPECTED_COUNT` in the build driver
+
+`Makefile` previously hard-coded `-DSR_DATA_EXPECTED_COUNT=56672`. As of 2026-08-28
+the count is owned by the validated title manifest (`runtime_bindings`
+`expected_data_file_count`) and flows through `tools/title_runtime_config.py`
+into `src/rt/title_config.c` (`SR_TITLE_CFG_EXPECTED_DATA_FILE_COUNT`,
+`SR_TITLE_CONFIG_EXPECTED_DATA_FILE_COUNT`). `src/rt/hle.c` now consults
+`sr_title_config_expected_data_file_count()` (0 = disabled). A generic build
+therefore has no census and enumerates no HST tree; a title-configured HST
+build asserts the expected 56,672-file census through the manifest.
+`PROFILE_OWNED_CONFIGURATION` — retired for this census (true typed
+title configuration; see `tools/test_hle_title_isolation.py` and
+`tools/test_title_runtime_config.py`).
+
+### C-3 — Disc ID duplicated outside the manifest — RETIRED
+
+The former HST doctor core previously defined `EXPECTED_DISC_ID = "UCUS98701"` independently
+of `manifest.disc.id`. The second source of truth has been retired: `tools/nk_doctor.py`
+and `tools/nk_doctor_checks.py` take disc identity from validated title configuration
+(`--title-manifest`, `TITLE_MANIFEST`, or `assets/titles/hst-ucus98701.json`).
+When no manifest is supplied, the doctor operates in generic mode, performing ISO9660
+format validation without title-specific disc ID confirmation.
+`PROFILE_OWNED_CONFIGURATION` — retired for this surface.
+
+### C-4 — One shared scratch stack for every nested guest call — RETIRED
+
+`SR_CALL_GUEST_STACK` (`src/rt/hle.c`) and the equivalent literal in `src/rt/mpeg.c`
+gave every nested guest call the same fixed guest stack address, `0x09df8000`. Three
+consequences were measured executably before the fix
+(`tests/native/hle_thread_selftest.c`): an inner call destroyed the outer body's guest
+locals; two *different* threads each only one level deep collided, because the
+marshalling is scheduler-preemptible at any `SR_YIELD`; and `0x09df8000` was inside
+the descending arena `sceKernelCreateThread` carves guest thread stacks from — the
+fifth default-sized create landed a thread stack on top of it.
+
+`src/rt/nested_frames.c` replaces the single address with per-owner, per-depth frames
+out of a statically reserved 1 MiB region, now `[0x08300000, 0x08400000)` at the top of
+kernel RAM, directly below the volatile partition. It first sat at `[0x09f00000, 0x0a000000)`,
+the top of the PSP user partition, which withheld that memory from the game: a title whose
+fixed-size block fits on a PSP was refused. Static assertions in `src/rt/sched.c` keep the
+region below the thread-stack arena (the user partition, `[0x08800000, 0x0a000000)`), and a
+partition based below kernel RAM ends at the runtime's stacks, so the exclusion is
+structural. Frames carry address-keyed guard bands, a deterministic
+maximum nesting depth, fail-closed refusal on exhaustion, and reclaim on both nonlocal
+exits (`sched_unwind_current` and the `g_hle_jmp` HLE boundary).
+
+What did **not** change: the register-seeding convention of a nested call (zeroed
+`CpuState`, `$gp` inherited from the caller, `$ra = 0`, `0xe4` VFPU prefix seeds,
+byte-exact caller restore), PSP callback dispatch on the interrupted thread's live
+stack (`sr_callback_dispatch_one`), and the VBLANK interrupt stack at `0x09df0000`.
+
+The PSP's real nested-call contract remains `NOT_ESTABLISHED` — what stack hardware
+hands a GE or MPEG callback still needs a probe. This change makes the runtime's own
+model coherent and non-destructive; it does not claim the model is the console's.
+`GENERIC_PSP_SEMANTIC` (open question on the hardware contract; the runtime-internal
+collision is fixed).
+
+### C-6 — The VBLANK interrupt stack is inside the thread-stack arena — RETIRED
+
+`src/rt/sched.c`'s `deliver_vblank()` previously seeded `$sp = 0x09df0000` for the interrupt
+frame, which fell inside the active thread-stack allocator range `[SR_STACK_ARENA_FLOOR, SR_STACK_ARENA_CEIL)`.
+This has been retired: a dedicated 64 KiB region `[0x082f0000, 0x08300000)` (`SR_VBLANK_STACK_BASE` to
+`SR_VBLANK_STACK_TOP`) in kernel RAM is now structurally reserved directly below the nested
+host->guest frame region (`SR_NESTED_FRAME_BASE`) and below the thread-stack arena, which is the PSP
+user partition `[0x08800000, 0x0a000000)`, so thread stacks allocated downwards cannot hand out,
+overlap, or collide with the VBLANK interrupt stack. (It first sat at `[0x09ef0000, 0x09f00000)`, inside
+the user partition, until that range was given back to the game.)
+`test_nested_frame_region_is_reserved_from_thread_stacks()` asserts the structural and empirical
+disjointness so it cannot drift silently. `GENERIC_PSP_SEMANTIC` — retired for this surface.
+
+### C-5 — `f_00046d14` game-loop entry stub — retired 2026-08-29
+
+Retired. `tools/codegen.py` previously replaced the translated body at
+`0x00046d14` with an immediate `s->pc = s->r[31]` return plus a
+scheduler-gated trace. Private executable analysis has proven `0x00046d14`
+is an interior basic-block loop header `L_00046d14` inside `f_000468c8_real`
+— not a callable entry, resume/continuation, `jal` or tail target, and not
+present in the current codegen entry catalog — and is reached via
+fall-through and loop back-edges. A clean A/B build removing only the
+codegen branch is byte-identical (`hst_recomp_1.c`
+`B82E0418C5005C34DBBD221F4EE391B3F7CAEF7136F62B3D549422F82D9BD58B`,
+`hst_recomp_funcs.h`
+`49B9153E8AF06D5F0B2B205AA88647434BD6552654C8DEC43B3D59F50AE1161E`,
+`hst.exe` `2AF5F4AB42D7668144B9EEE2C964663CB22836FFD35E967D2ACEC991BEE9F70B`).
+`0x00046d14` now takes the ordinary translated path under every profile; no
+title-address-specific override remains at this address.
+`tools/test_codegen_profile_isolation.py` guards against reintroduction by
+expecting no HST divergence at this address.
+
+## Reference
+
+- [`AGENTS.md`](../AGENTS.md) — project conventions and file reference
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — module-level breakdown of what lives where
+- [`tools/README.md`](../tools/README.md) — tool-specific documentation

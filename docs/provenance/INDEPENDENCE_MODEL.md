@@ -1,0 +1,209 @@
+# Independence model
+
+**Status: engineering provenance framework, not legal advice.** This defines how Nakagawa
+classifies the origin of its own implementation, how a classification may change, and what evidence
+each change requires. Inclusion in the active public repository or a derived
+candidate does not replace qualified human provenance and distribution review.
+
+Companions: [NOTICE.md](../../NOTICE.md) (what the project *tells the world*),
+[`PUBLIC_SOURCE_PROFILE.md`](../PUBLIC_SOURCE_PROFILE.md) (candidate scope),
+[`../../assets/public_provenance_ledger.json`](../../assets/public_provenance_ledger.json)
+(the per-path public provenance ledger), and
+[`PUBLICATION_READINESS.md`](../PUBLICATION_READINESS.md) (release gates).
+
+## Goal, stated precisely
+
+The objective is **not** to stop crediting PPSSPP, and it is **not** to make derived code look
+original. It is to reach a state where each of these sentences is either true and provable, or
+explicitly marked false:
+
+1. *Nakagawa does not require PPSSPP source or an installed PPSSPP binary to build or run.*
+2. *For subsystem X, the shipped implementation is authored from documented PSP behavior,
+   measured hardware, and source-owned tests.*
+3. *Where (2) is false, the file, the ledger, and NOTICE.md all say so, and the upstream notice is
+   preserved.*
+
+**Sentence 1 must be stated with its scope or it is an overclaim.** Measured at the audit commit:
+
+| activity | needs PPSSPP? | why |
+| --- | --- | --- |
+| build the runtime | no | nothing in the build reads `third_party/ppsspp*` |
+| run the game | no | `driver.c` accepts `none` for the reference-trace argument |
+| `make verify` | **yes** *(narrowed 2026-10-01)* | the codegen and microtest gates consume external golden traces and report NOT_RUN without them; the PSP-side v2 trace producer is not built (#312), so the only traces a user can supply today are PPSSPP-captured, which are corroborative only |
+| regenerate `src/rt/nid_names.h` | no *(was yes)* | IND-1 replaced the PPSSPP scrape with the tracked `tools/nid_corpus.json` |
+
+So the honest present-tense claim is "build and run", not "build, run and verify". One `yes` row
+remains. Retiring it is a longer-term question for the oracle gates -- the trace *format* is
+documented in `tools/TRACE_FORMAT.md` and consuming an oracle is not derivation, but a gate that
+cannot run without upstream output is still an upstream dependency. The row is a candidate for
+retirement once the PSP-side v2 producer lands and a `PSP_HARDWARE` capture can be supplied.
+
+Sentence 2 is true for a minority of the runtime today. Sentence 3 is the invariant this ledger
+exists to hold.
+
+**Never claim "clean room" or "zero PPSSPP influence".** Those are terms of art about a development
+process this project did not follow and cannot retroactively adopt. The defensible claim is
+narrower and still valuable: *this unit's behavior is independently established, and its expression
+is project-authored.*
+
+## Classification vocabulary
+
+Exactly one of these applies to each ledger record. They are not a severity scale and must not be
+collapsed.
+
+| Classification | Meaning |
+| --- | --- |
+| `project-authored-independent` | Written from public ABI/spec facts, hardware measurement, PSPAutotests, source-owned tests, or mathematical derivation. No upstream implementation was translated or adapted. |
+| `behavior-informed` | Project-authored expression, but another implementation (usually PPSSPP) was consulted, compared against, or used to *decide what the behavior is*. Not the same as derived code — and not automatically safe to relabel. |
+| `derived-translated` | Protectable implementation, structure, algorithmic expression, or substantial logic translated or adapted from an upstream implementation. |
+| `derived-data` | Tables, assets, or data whose bytes or whose selection originate in another project. |
+| `generated-project-owned` | Deterministically generated from project-owned mathematical or source definitions; regenerable from inputs this project controls. |
+| `upstream-third-party` | Ordinary external dependency or vendored component, license and provenance retained. |
+| `unresolved` | Evidence is insufficient to classify honestly. This is a real answer, not a placeholder to avoid. |
+
+### The distinction that does the work
+
+These are **not** equivalent, and conflating them is how a project talks itself into a false
+independence claim:
+
+- *"PPSSPP does X, so translate its implementation of X."* → `derived-translated`.
+- *"PPSSPP does X; hardware and PSPAutotests independently establish X; implement X from the
+  behavioral contract."* → `behavior-informed`, or `project-authored-independent` once the upstream
+  reference is no longer load-bearing.
+
+A citation like `/* matches PPSSPP Clipper::ProcessTriangle */` is evidence **against** independence
+until an equivalent hardware or specification citation replaces it. Do not delete such comments to
+improve a classification. Earn the replacement citation first, then change both together.
+
+### AI assistance is provenance-neutral
+
+Project policy discloses AI assistance ([docs/AI_USAGE.md](../AI_USAGE.md)). For this ledger, model
+output is treated exactly like human output:
+
+- *"Here is PPSSPP's function; rewrite it so it looks original."* is `derived-translated`, whoever
+  or whatever typed it.
+- *"Here is the hardware/ABI/test contract; implement it."* can be `project-authored-independent`,
+  subject to the same review as human work.
+
+If upstream source was in the authoring context, the record says so. That fact is recorded in
+`behavior_sources` and, where it matters, in `uncertainty`.
+
+## Evidence tiers for independence claims
+
+Reuses the repository's existing evidence discipline (see [AGENTS.md](../../AGENTS.md)); these are
+the *provenance* analogues.
+
+| Tier | Evidence | Sufficient to claim |
+| --- | --- | --- |
+| H | Measured on real Allegrex hardware via PSPLINK, with model/firmware/PRX digest recorded | `project-authored-independent` for the measured contract |
+| S | Public specification, PSP ABI fact, PSPSDK declaration, or mathematical identity that can be recomputed by a third party | `project-authored-independent` for the specified contract |
+| A | PSPAutotests-derived expected result, where license permits its use | `project-authored-independent` for the covered cases |
+| R | Renderer/interpreter agreement, differential fuzz, or PPSSPP comparison | `behavior-informed` only — **never** sufficient for an independence claim |
+| N | No independent evidence; behavior is believed because upstream does it | `derived-translated` or `unresolved` |
+
+Tier R localizes a divergence. It does not establish what the PSP does. Renderer agreement between
+`ge.c` and `ge_gpu.c` proves the two agree with each other, and both descend from the same upstream
+model.
+
+## Replacement process
+
+Wholesale rewrites are forbidden. Each candidate moves through five phases, and a phase may not be
+skipped because the unit "looks obvious".
+
+**Phase A — behavioral specification.** Write the guest-visible contract from independent evidence:
+inputs, outputs, error values and their precedence, state transitions, edge cases, and any
+guest-observable ordering or timing. If the contract cannot be written without consulting upstream
+implementation, the candidate is not ready; file a hardware question instead.
+
+**Phase B — source-owned regression corpus.** Tests must not simply assert agreement with PPSSPP.
+Acceptable: PSPLINK hardware oracle records, PSPAutotests-derived expectations where licensing
+permits, PSPSDK ABI declarations, mathematical identities, synthetic or homebrew fixtures built from
+source this project owns.
+
+**Phase C — implementation.** Implement from the Phase A contract. Do not place the upstream
+function beside the new one and paraphrase it. If upstream source is consulted during
+implementation, record that truthfully — the result is `behavior-informed`, not
+`project-authored-independent`.
+
+**Phase D — provenance review.** Check for accidental structural copying where practical (identical
+helper decomposition, identical constant ordering, identical control-flow shape with renamed
+identifiers). Record: authoring process, behavior sources, upstream source consulted or deliberately
+not consulted, tests, hardware fixtures, and the commit that replaced the old code.
+
+**Phase E — attribution retirement.** A classification may change **only** when protectable derived
+implementation is genuinely gone from the shipped file. Historic attribution is never deleted merely
+because current code is new: `NOTICE.md` and Git history must continue to explain the lineage
+accurately, and the ledger keeps the prior classification in `replacement_state`.
+
+## Prioritization
+
+Candidates are ranked by
+
+```text
+independence leverage x confidence x evidence availability / replacement risk
+```
+
+- **Independence leverage** — does this remove a real derived unit, or retire a required upstream
+  dependency? A PPSSPP name in a comment is not leverage by itself.
+- **Confidence** — can the contract be stated completely today?
+- **Evidence availability** — does hardware/spec/test evidence exist now, or must it be collected?
+- **Replacement risk** — blast radius, guest-visible surface, and how a regression would present.
+
+Deliberately *low* priority regardless of score: anything owned by another active agent lane,
+anything blocked on unresolved licensing (`pgf.c` while PGF provenance and
+distribution remain unresolved), and anything requiring
+speculative PSP semantics.
+
+## Rules that override the score
+
+1. Do not change `assets/vfpu/*.dat` to remove PPSSPP provenance. Bit-exactness is the requirement;
+   provenance cosmetics are not. If independent regeneration cannot be proven, the ledger says so.
+2. Do not generate replacement fonts and call their provenance/distribution review solved.
+3. Do not touch a subsystem another agent lane currently owns. Audit it, record it, defer.
+4. Do not rewrite or reconnect repository history. The active public history
+   deliberately begins with the sanitized restoration lineage; any topology
+   change requires a separately authorized review.
+5. Do not remove or weaken an upstream notice on the strength of this engineering audit alone.
+6. Never invent a `Signed-off-by:` identity.
+
+## Ledger maintenance
+
+`assets/public_provenance_ledger.json` is the machine-readable public record.
+The detailed development ledger is deliberately outside the active public source tree;
+`tools/provenance_ledger.py` builds the public record from it and
+`tools/test_provenance_ledger.py` enforces the public record instead:
+
+- every included implementation path is covered by exactly one **path-specific** record;
+  wildcard records such as `tools/*` are never expanded, so a newly added tool without its
+  own record resolves to `unresolved` and cannot be published;
+- every classification is in the closed vocabulary above;
+- every file whose header declares `Derived from <project>` has a record whose classification is
+  `derived-translated`, `derived-data`, `behavior-informed`, or `unresolved` — never
+  `project-authored-independent`;
+- every record naming an upstream project also carries a license field.
+
+Documentation, configuration, public factual metadata, and explicitly synthetic fixtures keep
+narrow deterministic classifications that need no ledger record. Any other unrecorded path — in
+particular implementation under `src/`, `tools/`, or a user interface — resolves to `unresolved`,
+and the generator refuses to write release evidence while any included path is unresolved.
+
+The gate catches drift; it cannot catch a dishonest record. Classification remains a human judgment
+that the ledger merely makes auditable.
+
+## Open question backlog
+
+This compact index records open provenance questions. It is an engineering tracking
+record, not a legal opinion, a title-run record, or a hardware-acceptance log. Detailed
+private measurements and source-comparison work products remain outside the public
+candidate.
+
+| ID | Scope | Public disposition |
+| --- | --- | --- |
+| `IND-1` | Canonical NID-name corpus | Tracked source-owned corpus and generator; recheck when the corpus changes. |
+| `IND-2` | VFPU behavioral evidence | Source-owned implementation and synthetic regressions retained; hardware evidence is not implied by a local test. |
+| `IND-4` | Retained upstream implementation lineage | Attribution and notices remain explicit in the implementation ledger and `NOTICE.md`. |
+| `IND-5` | VFPU table regeneration | Open question; retained data remains explicitly attributed and may be regenerated or re-reviewed later. |
+
+The publication decision is made by the machine-readable profile,
+`assets/public_provenance_ledger.json`, `assets/release_manifest.json`, and the
+exact candidate audit. This index cannot authorize an unresolved component.

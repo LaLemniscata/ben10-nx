@@ -1,0 +1,1724 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "name": "nakagawa-recomp",
+  "description": "Reproducible release and asset provenance manifest for Nakagawa Recomp public releases",
+  "version": "0.0.2-dev",
+  "license": "GPL-3.0-or-later",
+  "license_notice": "Nakagawa Recomp's project-level declared license is GPL-3.0-or-later. That declaration does not resolve component-specific provenance or redistribution questions. Two remain open and each closes on provenance evidence (project-authored replacement code or confirmed license terms), not on the administrative state of any tracker item: (1) PGF/JPCSP/intraFont implementation provenance; (2) replacement PGF font redistribution terms and notices. PGD/amctrl support is engineering work: it is published when it works. The project ships no keys bound to a console or a user and no firmware keys; its only key material is the public game-decryption tables PPSSPP also ships, in src/core/nk_psp_builtin_keys.c. See NOTICE.md.",
+  "reference_environment": {
+    "compiler": "GCC >= 13.0.0 (MSYS2 UCRT64)",
+    "make": "GNU Make >= 4.4",
+    "python": "Python 3.15.x",
+    "vulkan_sdk": "Vulkan SDK 1.4.363.0",
+    "glslc": "glslc from Vulkan SDK",
+    "sdl": "SDL3 3.4.18"
+  },
+  "lockfiles": {
+    "python": "tools/requirements-lock.txt"
+  },
+  "toolchain_policy": {
+    "compiler": ">=4.9.0 (rolling-msys2)",
+    "make": ">=4.0 (rolling-msys2)",
+    "python": ">=3.15,<3.16",
+    "sdl3": ">=3.0.0 (rolling-msys2)",
+    "vulkan_sdk": ">=1.1.0"
+  },
+  "release_locks": {
+    "status": "DEPENDENCY_LOCKS_AND_TOOLCHAIN_POLICY_VERIFIED",
+    "comment": "Release dependency lockfiles, authenticated artifact hashes, and toolchain policy shape verified via tools/verify_sbom.py."
+  },
+  "provenance_families": [
+    {
+      "id": "sal063",
+      "name": "sal063 PSP Recompilation Project",
+      "license": "GPL-2.0-or-later",
+      "origin": "https://github.com/sal063/PSP-recompilation-project",
+      "revision": "da17b0e1db209206a407d097d132201e516e3855",
+      "notice_path": "THIRD_PARTY_LICENSES/SAL063_CREDITS.txt",
+      "evidence_path": "assets/public_provenance_ledger.json",
+      "disposition": "included_with_attribution"
+    },
+    {
+      "id": "ppsspp",
+      "name": "PPSSPP PSP emulator lineage",
+      "license": "GPL-2.0-or-later and component notices",
+      "origin": "https://github.com/hrydgard/ppsspp",
+      "revision": "f0baf3ade7bcb6c86f0835962b36eb4e51559d8f",
+      "notice_path": "THIRD_PARTY_LICENSES/SAL063_CREDITS.txt",
+      "evidence_path": "assets/public_provenance_ledger.json",
+      "disposition": "included_data_and_attribution; PGF_surface_excluded"
+    },
+    {
+      "id": "pspsdk",
+      "name": "PSPSDK and PSPDEV public ABI",
+      "license": "BSD-3-Clause and per-component",
+      "origin": "https://github.com/pspdev/pspsdk",
+      "revision": "see assets/upstream/pspdev.lock.json",
+      "notice_path": "THIRD_PARTY_LICENSES/PSPSDK.txt",
+      "evidence_path": "assets/upstream/pspdev.evidence.json",
+      "disposition": "included_notice_and_synthetic_fixtures"
+    },
+    {
+      "id": "ffmpeg-atrac3p",
+      "name": "FFmpeg n4.4 ATRAC3+ subset",
+      "license": "LGPL-2.1-or-later",
+      "origin": "https://github.com/FFmpeg/FFmpeg",
+      "revision": "n4.4 / dc91b913b6260e85e1304c74ff7bb3c22a8c9fb1",
+      "notice_path": "src/rt/atrac3p/LICENSE.LGPLv2.1.txt",
+      "evidence_path": "src/rt/atrac3p/PROVENANCE.md",
+      "disposition": "included_vendored_subset"
+    },
+    {
+      "id": "ffmpeg-h264",
+      "name": "FFmpeg n4.4 H.264 decoder subset",
+      "license": "LGPL-2.1-or-later",
+      "origin": "https://github.com/FFmpeg/FFmpeg",
+      "revision": "n4.4 / dc91b913b6260e85e1304c74ff7bb3c22a8c9fb1",
+      "notice_path": "src/rt/h264_ffmpeg_sub/LICENSE.LGPLv2.1.txt",
+      "evidence_path": "src/rt/h264_ffmpeg_sub/PROVENANCE.md",
+      "disposition": "included_vendored_subset"
+    },
+    {
+      "id": "clay-layout",
+      "name": "Clay layout library",
+      "license": "Zlib",
+      "origin": "https://github.com/nicbarker/clay",
+      "revision": "main / e6cc36941ab2af5d81107617039d6f527a1c660b",
+      "notice_path": "third_party/clay/LICENSE.md",
+      "evidence_path": "third_party/clay/PROVENANCE.md",
+      "disposition": "vendored_header; linked into the player and the in-game overlay via src/ui/nk_ui_clay.c"
+    },
+    {
+      "id": "portable-snippets-safe-math",
+      "name": "Portable Snippets safe-math",
+      "license": "CC0-1.0",
+      "origin": "https://github.com/nemequ/portable-snippets",
+      "revision": "84abba93ff3d52c87e08ba81de1cc6615a42b72e",
+      "notice_path": "third_party/portable-snippets/COPYING.md",
+      "evidence_path": "third_party/portable-snippets/PROVENANCE.md",
+      "disposition": "vendored_header; compiled into the native player via src/core/nk_iso.c and src/core/nk_xb.c"
+    },
+    {
+      "id": "dr-libs-dr-wav",
+      "name": "dr_libs dr_wav",
+      "license": "Unlicense",
+      "origin": "https://github.com/mackron/dr_libs",
+      "revision": "d422edf14ec2b81ac40a7f22b5a7f64276b5fc34",
+      "notice_path": "third_party/dr_libs/LICENSE.txt",
+      "evidence_path": "third_party/dr_libs/PROVENANCE.md",
+      "disposition": "vendored_source_only; selftests only, not linked into the player or runtime"
+    },
+    {
+      "id": "monocypher-ed25519",
+      "name": "Monocypher 4.0.3 Ed25519 signature check",
+      "license": "CC0-1.0",
+      "origin": "https://github.com/LoupVaillant/Monocypher",
+      "revision": "4.0.3 / ab2b16dd619ad5f6979a4fbe69cfa324a6fcc35f",
+      "notice_path": "third_party/monocypher/LICENCE.md",
+      "evidence_path": "third_party/monocypher/PROVENANCE.md",
+      "disposition": "vendored_source_only; upstream dual BSD-2-Clause OR CC0-1.0, CC0-1.0 elected; not linked into player runtime yet"
+    },
+    {
+      "id": "sdl3",
+      "name": "SDL3",
+      "license": "Zlib",
+      "origin": "https://github.com/libsdl-org/SDL",
+      "revision": "reference_environment sdl3-3.4.18",
+      "notice_path": "NOTICE.md",
+      "evidence_path": "assets/release_manifest.json",
+      "disposition": "external_optional_dependency; audio_backend_excluded"
+    },
+    {
+      "id": "vulkan",
+      "name": "Vulkan loader and headers",
+      "license": "Apache-2.0",
+      "origin": "https://github.com/KhronosGroup/Vulkan-Loader",
+      "revision": "reference_environment vulkan-sdk-1.4.363.0",
+      "notice_path": "NOTICE.md",
+      "evidence_path": "assets/release_manifest.json",
+      "disposition": "external_system_dependency"
+    },
+    {
+      "id": "vfpu",
+      "name": "PPSSPP-origin VFPU lookup tables",
+      "license": "GPL-2.0-or-later and upstream data notices",
+      "origin": "https://github.com/hrydgard/ppsspp",
+      "revision": "f0baf3ade7bcb6c86f0835962b36eb4e51559d8f",
+      "notice_path": "assets/vfpu/PROVENANCE.json",
+      "evidence_path": "assets/vfpu/PROVENANCE.json",
+      "disposition": "included_byte_verified_data"
+    },
+    {
+      "id": "stb-image",
+      "name": "stb_image 2.30 PNG decoder",
+      "license": "Unlicense",
+      "origin": "https://github.com/nothings/stb",
+      "revision": "v2.30 / 003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5",
+      "notice_path": "third_party/stb/LICENSE",
+      "evidence_path": "third_party/stb/PROVENANCE.md",
+      "disposition": "vendored_source; MIT OR Unlicense upstream, used under Unlicense; linked into the player (PNG only)"
+    },
+    {
+      "id": "kenney-ui-assets",
+      "name": "Kenney Input Prompts 1.5 and Interface Sounds 1.0",
+      "license": "CC0-1.0",
+      "origin": "https://kenney.nl/assets/input-prompts",
+      "revision": "kenney_input-prompts_1.5.zip ac2fcf599080b0f3ba2d174c9474db6df1a0e96ff0662580e2da79a122ab78a1; kenney_interface-sounds.zip f2193d072726d6758a5f7871b2dcc54dcce0d5c35c6f0a62f92549b327c81232",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "evidence_path": "third_party/kenney/PROVENANCE.md",
+      "disposition": "vendored_assets; embedded in the player by tools/gen_ui_assets.py"
+    }
+  ],
+  "excluded_paths": [
+    {
+      "path": "docs/AUDIO_OUTPUT_ACCEPTANCE_20260807.md",
+      "comment": "Private title-run acceptance evidence excluded from public scope."
+    },
+    {
+      "path": "docs/COVERAGE_LEDGER.md",
+      "comment": "Internal coverage/audit snapshot excluded from public scope."
+    },
+    {
+      "path": "docs/DOCUMENTATION_AUDIT.md",
+      "comment": "Internal documentation/publication audit work product excluded from public scope."
+    },
+    {
+      "path": "docs/DUAL_REPO_SYNC.md",
+      "comment": "Private repository topology and synchronization procedure excluded from public scope."
+    },
+    {
+      "path": "docs/GHIDRA.md",
+      "comment": "Title-specific reverse-engineering workflow excluded pending a generic rewrite."
+    },
+    {
+      "path": "docs/HLE_CALL_CENSUS_2026-08-05.md",
+      "comment": "Private title-run census excluded from public scope."
+    },
+    {
+      "path": "docs/INVESTIGATION_CHECKPOINT_2026-07-18.md",
+      "comment": "Private retail investigation checkpoint excluded from public scope."
+    },
+    {
+      "path": "docs/KEY_HISTORY_SCRUB.md",
+      "comment": "Private archive sanitation runbook excluded from public scope."
+    },
+    {
+      "path": "docs/LEGAL_REWRITE_ASSESSMENT.md",
+      "comment": "Counsel-oriented legal-risk work product excluded from public scope."
+    },
+    {
+      "path": "docs/NID_INTEGRITY_AUDIT_2026-08-06.md",
+      "comment": "Dated HST/NID investigation record excluded from public scope."
+    },
+    {
+      "path": "docs/NEXT_SESSION.md",
+      "comment": "Private operational continuation notes excluded from public scope."
+    },
+    {
+      "path": "docs/PGD_AMCTRL_REVIEW_PACKET.md",
+      "comment": "Qualified-review packet for the excluded PGD/amctrl surface."
+    },
+    {
+      "path": "docs/PGD_KEYS.md",
+      "comment": "Local PSP constants/key operating instructions excluded from public scope."
+    },
+    {
+      "path": "docs/PGF_LICENSE_REVIEW_PACKET.md",
+      "comment": "Qualified-review packet for the excluded PGF/font surface."
+    },
+    {
+      "path": "docs/PERFORMANCE.md",
+      "comment": "Private title-run performance/capture evidence excluded from public scope."
+    },
+    {
+      "path": "docs/PHASE5_HARDWARE_EVIDENCE.md",
+      "comment": "Dated development-lane hardware acceptance record excluded from public scope."
+    },
+    {
+      "path": "docs/PSP_HARDWARE_FINDING_waitthreadend_20260805.md",
+      "comment": "Dated hardware-finding work product excluded from public scope."
+    },
+    {
+      "path": "docs/PSP_HARDWARE_ORACLE.md",
+      "comment": "Historical hardware-oracle operations record excluded from public scope."
+    },
+    {
+      "path": "docs/PSP_ISSUE_MATRIX.json",
+      "comment": "Volatile historical issue snapshot with private-route classifications excluded from public scope."
+    },
+    {
+      "path": "docs/PUBLISH_VS_EXCLUDE_MATRIX.md",
+      "comment": "Internal disposition matrix excluded; machine policy is authoritative."
+    },
+    {
+      "path": "docs/PUBLICATION_LANE_VERIFICATION_2026-08-06.md",
+      "comment": "Private publication-lane verification record excluded from public scope."
+    },
+    {
+      "path": "docs/RETAINED_BRANCH_AUDIT_2026-08-04.md",
+      "comment": "Internal branch/topology audit excluded from public scope."
+    },
+    {
+      "path": "docs/SAS_NID_SIGNATURES.md",
+      "comment": "HST route-census/audio disposition table excluded from public scope."
+    },
+    {
+      "path": "docs/STATUS_HISTORY.md",
+      "comment": "Private/game-derived engineering history excluded from public scope."
+    },
+    {
+      "path": "docs/TEST_DISCOVERY.md",
+      "comment": "Dated test-discovery report with private-input-dependent counts excluded from public scope."
+    },
+    {
+      "path": "docs/TEST_MATRIX.json",
+      "comment": "Generated test matrix with private asset/key skip conditions excluded from public scope."
+    },
+    {
+      "path": "docs/TEST_SHAPE_CLASSIFICATION.md",
+      "comment": "Internal source-shape triage report excluded from public scope."
+    },
+    {
+      "path": "docs/TEST_SKIPS.md",
+      "comment": "Private-input/key skip inventory excluded from public scope."
+    },
+    {
+      "path": "docs/ROADMAP.md",
+      "comment": "Historical HST-specific strategy/topology roadmap excluded from public scope."
+    },
+    {
+      "path": "docs/VFPU_ORACLE_BASELINE_2026-08-05.md",
+      "comment": "Dated VFPU oracle/hardware-result narrative excluded from public scope."
+    },
+    {
+      "path": "docs/issue-139-face-resource-semantics.md",
+      "comment": "Title-specific retail-image investigation excluded from public scope."
+    },
+    {
+      "path": "docs/issue-51-entry-semantics.md",
+      "comment": "Title-specific continuation investigation excluded from public scope."
+    },
+    {
+      "path": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+      "comment": "Detailed development provenance ledger contains private investigation context and links to excluded review work products; the public candidate carries the path-hashed public ledger instead."
+    },
+    {
+      "path": "docs/provenance/PGD_AMCTRL_SOURCE_ARCHAEOLOGY_2026-08-09.md",
+      "comment": "PGD/amctrl qualified-review source archaeology excluded from public scope."
+    },
+    {
+      "path": "docs/provenance/PGF_SOURCE_ARCHAEOLOGY_2026-08-08.md",
+      "comment": "PGF/font qualified-review source archaeology excluded from public scope."
+    },
+    {
+      "path": "docs/provenance/SAL063_RETENTION_2026-08-06.md",
+      "comment": "Internal sal063 retention worksheet excluded from public scope."
+    }
+  ],
+  "components": [
+    {
+      "id": "sdl3-runtime",
+      "name": "SDL3 Runtime",
+      "type": "library",
+      "relationship": "DEPENDS_ON",
+      "presence": "required",
+      "source_path": "SDL3.dll",
+      "upstream_origin": "https://github.com/libsdl-org/SDL",
+      "license": "Zlib",
+      "notice_path": "NOTICE.md",
+      "disposition": "included",
+      "public_scope_included": true,
+      "optional": false,
+      "comment": "External/optional local runtime library. Reference SDL >= 3.0.0. Staged dist package lock remains unasserted."
+    },
+    {
+      "id": "pgf-font-jpn0",
+      "name": "PSP PGF Font jpn0.pgf",
+      "type": "asset",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "tracked_file",
+      "source_path": "font/jpn0.pgf",
+      "upstream_origin": "https://github.com/hrydgard/ppsspp",
+      "byte_verified_upstream_commit": "f0baf3ade7bcb6c86f0835962b36eb4e51559d8f",
+      "historical_replacement_commit": "0c243ee13909a1256de4be2b9d374aa6f7b46d38",
+      "first_upstream_commit": "e4aa9e517",
+      "conversion_script": "ttf2pgfJ",
+      "source_font_candidate": "Source Han Sans (Adobe, SIL OFL 1.1; release and variant unknown; see docs/provenance/FONT_ORIGINS.md). Superseded predecessors were Ume Gothic S5 and Ume Hy Gothic conversions.",
+      "license": "Unresolved",
+      "notice_path": "NOTICE.md",
+      "disposition": "optional_excluded_if_unverified",
+      "public_scope_included": false,
+      "optional": true,
+      "git_blob": "17304b24f6175f7a221f167425b307e761ccb6bb",
+      "hashes": {
+        "sha256": "d363cec75fecfafd1511e370e48c748c30199c694b83a4026be34d799b192917"
+      }
+    },
+    {
+      "id": "pgf-font-kr0",
+      "name": "PSP PGF Font kr0.pgf",
+      "type": "asset",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "tracked_file",
+      "source_path": "font/kr0.pgf",
+      "upstream_origin": "https://github.com/hrydgard/ppsspp",
+      "byte_verified_upstream_commit": "f0baf3ade7bcb6c86f0835962b36eb4e51559d8f",
+      "historical_replacement_commit": "0c243ee13909a1256de4be2b9d374aa6f7b46d38",
+      "first_upstream_commit": "dc34bea8d",
+      "source_font_candidate": "Source Han Sans (Adobe, SIL OFL 1.1; release and variant unknown; see docs/provenance/FONT_ORIGINS.md)",
+      "license": "Unresolved",
+      "notice_path": "NOTICE.md",
+      "disposition": "optional_excluded_if_unverified",
+      "public_scope_included": false,
+      "optional": true,
+      "git_blob": "9f8cce0390c827fa2195a5dc3e9885a997db6488",
+      "hashes": {
+        "sha256": "6b0b3a8be9e709d6af02223d077675e1530f9879f42656377a9d8d42e2614333"
+      }
+    },
+    {
+      "id": "pgf-font-ltn0",
+      "name": "PSP PGF Font ltn0.pgf",
+      "type": "asset",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "tracked_file",
+      "source_path": "font/ltn0.pgf",
+      "upstream_origin": "https://github.com/hrydgard/ppsspp",
+      "byte_verified_upstream_commit": "f0baf3ade7bcb6c86f0835962b36eb4e51559d8f",
+      "historical_replacement_commit": "0c243ee13909a1256de4be2b9d374aa6f7b46d38",
+      "first_upstream_commit": "a384b6224",
+      "source_font_candidate": "Ume Hy Gothic (Ume-family licence; release unknown; see docs/provenance/FONT_ORIGINS.md)",
+      "license": "Unresolved",
+      "notice_path": "NOTICE.md",
+      "disposition": "optional_excluded_if_unverified",
+      "public_scope_included": false,
+      "optional": true,
+      "git_blob": "1f3d907ac717270a005c2e8a00e05c385d718d22",
+      "hashes": {
+        "sha256": "1184f16bc89bad1fea49093806784470281af54f279b57ef0378ce33e6603870"
+      }
+    },
+    {
+      "id": "pgf-font-ltn8",
+      "name": "PSP PGF Font ltn8.pgf",
+      "type": "asset",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "tracked_file",
+      "source_path": "font/ltn8.pgf",
+      "upstream_origin": "https://github.com/hrydgard/ppsspp",
+      "byte_verified_upstream_commit": "f0baf3ade7bcb6c86f0835962b36eb4e51559d8f",
+      "historical_replacement_commit": "0c243ee13909a1256de4be2b9d374aa6f7b46d38",
+      "first_upstream_commit": "da40ed6e8",
+      "source_font_candidate": "Ume Hy Gothic (Ume-family licence; release unknown; see docs/provenance/FONT_ORIGINS.md)",
+      "license": "Unresolved",
+      "notice_path": "NOTICE.md",
+      "disposition": "optional_excluded_if_unverified",
+      "public_scope_included": false,
+      "optional": true,
+      "git_blob": "a58450c7675c6f1b4e0840cef5f2dd9787eed68c",
+      "hashes": {
+        "sha256": "c8620bdd244585bbf993a82903168f6ec8464d4cbcad238d4e0ca5623c1ba3c1"
+      }
+    },
+    {
+      "id": "pgf-runtime-private-backend",
+      "name": "Lineage-sensitive PGF parser and rasterizer",
+      "type": "library",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "tracked_file",
+      "source_path": "src/rt/pgf.c",
+      "upstream_origin": "https://github.com/hrydgard/ppsspp",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_qualified_review",
+      "public_scope_included": false,
+      "optional": true,
+      "hashes": {
+        "sha256": "0049fefc0278ace82b43f803f45e50e14b69041d6ec123cce78e00d5030205b6"
+      },
+      "comment": "Private development backend. The public-safe profile uses pgf_unavailable.c and does not redistribute this file."
+    },
+    {
+      "id": "pgd-amctrl-private-backend",
+      "name": "PGD/amctrl interoperability implementation",
+      "type": "library",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "tracked_file",
+      "source_path": "src/rt/pgd.c",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_qualified_review",
+      "public_scope_included": false,
+      "optional": true,
+      "hashes": {
+        "sha256": "95d61eeaa69ffbf2690eafafc369a68036c01b58f4c072e42e94b855caa4270a"
+      },
+      "comment": "Private development backend. The public-safe profile uses pgd_unavailable.c and does not redistribute this file."
+    },
+    {
+      "id": "vfpu-lut-tables",
+      "name": "VFPU LUT Data Tables Collection",
+      "type": "data_collection",
+      "relationship": "DEPENDS_ON",
+      "presence": "tracked_collection",
+      "provenance_path": "assets/vfpu/PROVENANCE.json",
+      "provenance_directory": "assets/vfpu",
+      "upstream_origin": "https://github.com/hrydgard/ppsspp",
+      "byte_verified_upstream_commit": "f0baf3ade7bcb6c86f0835962b36eb4e51559d8f",
+      "license": "GPL-2.0-or-later",
+      "notice_path": "NOTICE.md",
+      "disposition": "included",
+      "public_scope_included": true,
+      "optional": false,
+      "comment": "Collection of 15 runtime VFPU lookup tables tracked under assets/vfpu/. Individual file blob IDs recorded in PROVENANCE.json."
+    },
+    {
+      "id": "pspsdk-headers",
+      "name": "PSPSDK Lineage",
+      "type": "source_lineage",
+      "relationship": "OTHER",
+      "presence": "notice_lineage",
+      "upstream_origin": "https://github.com/pspdev/pspsdk",
+      "license": "BSD-3-Clause",
+      "notice_path": "THIRD_PARTY_LICENSES/PSPSDK.txt",
+      "disposition": "SOURCE_LINEAGE",
+      "public_scope_included": true,
+      "optional": false,
+      "comment": "Incorporated definitions and structure lineage from PSPSDK headers. No binary runtime or build dependency."
+    },
+    {
+      "id": "pgd-amctrl-header",
+      "name": "PGD/amctrl interoperability declarations",
+      "type": "source",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "excluded_from_public_profile",
+      "source_path": "src/rt/pgd.h",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_qualified_review",
+      "public_scope_included": false,
+      "optional": true,
+      "hashes": {
+        "sha256": "d4c343248ca7e16a71d00410a882624b90b9339ac44bc93b6cca310613193355"
+      },
+      "comment": "Declarations for the excluded PGD/amctrl implementation. Excluded with src/rt/pgd.c; the public-safe profile builds pgd_unavailable.c."
+    },
+    {
+      "id": "pgf-runtime-header",
+      "name": "Lineage-sensitive PGF parser/rasterizer declarations",
+      "type": "source",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "excluded_from_public_profile",
+      "source_path": "src/rt/pgf.h",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_qualified_review",
+      "public_scope_included": false,
+      "optional": true,
+      "hashes": {
+        "sha256": "1402ba9bc7a038a6646d506fcaae8c87a921f059619049435e163373b013ac36"
+      },
+      "comment": "Declarations for the excluded PGF implementation. Excluded with src/rt/pgf.c; the public-safe profile builds pgf_unavailable.c."
+    },
+    {
+      "id": "pgd-python-reference",
+      "name": "PGD/amctrl Python reference decryptor",
+      "type": "source",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "excluded_from_public_profile",
+      "source_path": "tools/pgd_decrypt.py",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_qualified_review",
+      "public_scope_included": false,
+      "optional": true,
+      "hashes": {
+        "sha256": "026353d488f1e8a8ddef08ed8e920b3052306251c30d28af1f13750fe427299a"
+      },
+      "comment": "Python reference implementation from which src/rt/pgd.c was ported. Same unresolved distribution and anti-circumvention questions."
+    },
+    {
+      "id": "pgd-e2e-harness",
+      "name": "PGD end-to-end C harness",
+      "type": "source",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "excluded_from_public_profile",
+      "source_path": "tools/pgd_e2e_harness.c",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_qualified_review",
+      "public_scope_included": false,
+      "optional": true,
+      "hashes": {
+        "sha256": "1d4aeb54108f9ccd16bc88371ea4294ee5beb20194c5b1e3be0949e098f7a34d"
+      },
+      "comment": "Harness that exercises the excluded PGD implementation end to end."
+    },
+    {
+      "id": "pgd-synthetic-test-keys",
+      "name": "PGD synthetic test constants",
+      "type": "source",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "excluded_from_public_profile",
+      "source_path": "tools/pgd_test_keys.py",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_qualified_review",
+      "public_scope_included": false,
+      "optional": true,
+      "hashes": {
+        "sha256": "078f023c43b4f4fe8f5a9436208f9181e457bdb17f8b6148475a9cd984ba637e"
+      },
+      "comment": "Provably synthetic constants (computed affine byte patterns, not PSP key material). Excluded because it exists only to drive the excluded implementation, not because it carries key material."
+    },
+    {
+      "id": "pgd-test-c-port",
+      "name": "PGD C-port comparison tests",
+      "type": "source",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "excluded_from_public_profile",
+      "source_path": "tools/test_pgd_c.py",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_qualified_review",
+      "public_scope_included": false,
+      "optional": true,
+      "hashes": {
+        "sha256": "6c6ba54a84a8c12dd4c36574e6117c45c3d88fc66ab1772f88965a82f3f73f04"
+      },
+      "comment": "Tests for the excluded PGD C port."
+    },
+    {
+      "id": "pgd-test-python-reference",
+      "name": "PGD Python reference tests",
+      "type": "source",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "excluded_from_public_profile",
+      "source_path": "tools/test_pgd_decrypt.py",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_qualified_review",
+      "public_scope_included": false,
+      "optional": true,
+      "hashes": {
+        "sha256": "47f7551a0f8cc13b1db65f4ea45121becc8b6cdec3e10474941875437d80e3ba"
+      },
+      "comment": "Tests for the excluded PGD Python reference."
+    },
+    {
+      "id": "pgd-test-hardening",
+      "name": "PGD hardening tests",
+      "type": "source",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "excluded_from_public_profile",
+      "source_path": "tools/test_pgd_hardening.py",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_qualified_review",
+      "public_scope_included": false,
+      "optional": true,
+      "hashes": {
+        "sha256": "5369f600d03cf9427891376ec81a1f3fb15fab76d5c1439cf53c2809ed2f89b0"
+      },
+      "comment": "Tests for the excluded PGD implementation."
+    },
+    {
+      "id": "pgd-test-malformed",
+      "name": "PGD malformed-input tests",
+      "type": "source",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "excluded_from_public_profile",
+      "source_path": "tools/test_pgd_malformed.py",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_qualified_review",
+      "public_scope_included": false,
+      "optional": true,
+      "hashes": {
+        "sha256": "700b9bc9db8c16ef7125e175d6479b343a4296a5bb1162ce55b5e73c2c11f5e3"
+      },
+      "comment": "Tests for the excluded PGD implementation."
+    },
+    {
+      "id": "audio-backend",
+      "name": "Optional SDL audio backend",
+      "type": "source",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "excluded_from_public_profile",
+      "source_path": "src/rt/audio.c",
+      "license": "GPL-2.0-or-later",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_public_review",
+      "public_scope_included": false,
+      "optional": true,
+      "comment": "Materially modified sal063-derived backend. Excluded while the optional audio path is reviewed for the first public restoration."
+    },
+    {
+      "id": "iso-vfs",
+      "name": "ISO9660 virtual filesystem backend",
+      "type": "source",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "excluded_from_public_profile",
+      "source_path": "src/rt/iso.c",
+      "license": "GPL-2.0-or-later",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_public_review",
+      "public_scope_included": false,
+      "optional": true,
+      "comment": "Extended sal063-derived ISO/VFS implementation; excluded pending a separate generic public review."
+    },
+    {
+      "id": "ppsspp-font-evidence",
+      "name": "PPSSPP replacement-font evidence packet",
+      "type": "documentation",
+      "relationship": "OPTIONAL_DEPENDENCY_OF",
+      "presence": "excluded_from_public_profile",
+      "source_path": "THIRD_PARTY_LICENSES/PPSSPP_FONTS.txt",
+      "license": "Unresolved",
+      "notice_path": "NOTICE.md",
+      "disposition": "excluded_pending_qualified_review",
+      "public_scope_included": false,
+      "optional": true,
+      "comment": "Font provenance and redistribution terms remain unresolved; the evidence packet is kept private with the optional binaries."
+    },
+    {
+      "id": "readme-nakagawa-mark-light",
+      "name": "README brand mark: dark ink for light themes",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "docs/images/brand/nakagawa-mark-light.svg",
+      "license": "GPL-3.0-or-later",
+      "notice_path": "NOTICE.md",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "9520cd1f6a3208d8f7989b53556968bea9d9346580d39624d421236a67caef11"
+      },
+      "comment": "Project-authored N1 Block & Branch artwork for light page themes."
+    },
+    {
+      "id": "readme-nakagawa-mark-dark",
+      "name": "README brand mark: light ink for dark themes",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "docs/images/brand/nakagawa-mark-dark.svg",
+      "license": "GPL-3.0-or-later",
+      "notice_path": "NOTICE.md",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "b96d8659532051a4758b8c48b1ec7a32135eabf94303b8fbf395a719488aee51"
+      },
+      "comment": "Project-authored N1 Block & Branch artwork for dark page themes."
+    },
+    {
+      "id": "app-icon-nakagawa",
+      "name": "App icon: the N1 mark on its ink tile",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "assets/brand/nakagawa.ico",
+      "license": "GPL-3.0-or-later",
+      "notice_path": "NOTICE.md",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "12e54111d63342a0c6baa6a9ffeaece01a1dddd7c5e90698bec563193766f5fe"
+      },
+      "comment": "Project-authored app icon drawn from docs/images/brand/nakagawa-mark-dark.svg by tools/make_app_icon.py; linked into the Windows executables through assets/brand/nakagawa.rc."
+    },
+    {
+      "id": "site-og-card",
+      "name": "Website share card (Open Graph image)",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "docs/images/brand/og-card.png",
+      "license": "GPL-3.0-or-later",
+      "notice_path": "NOTICE.md",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "49df1cf342198bbee93b80258decd49719f5030be4bcd868aed4682521831529"
+      },
+      "comment": "Project-authored link preview: the N1 mark, the site's tennis court and text in Geist (OFL-1.1). No game imagery."
+    },
+    {
+      "id": "readme-showcase-ge-scene-animation",
+      "name": "README animation: 3D scene showcase",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "docs/images/showcase-ge-scene.gif",
+      "license": "GPL-3.0-or-later",
+      "notice_path": "NOTICE.md",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "61e2ccdc10b2f0578b858961446fb228ea301bf5ae1ad3433c3b6c181ec47657"
+      },
+      "comment": "41-frame present-truthful capture from the normal player route for the source-owned TEST00007 3D showcase; no retail bytes."
+    },
+    {
+      "id": "readme-showcase-breakout-animation",
+      "name": "README animation: Breakout showcase",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "optional_local_or_external",
+      "source_path": "docs/images/showcase-breakout.gif",
+      "license": "GPL-3.0-or-later",
+      "notice_path": "NOTICE.md",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": true,
+      "hashes": {
+        "sha256": "1d40d4cf155465577c4903adbd82c2ad944ccff197cf031b0c88331d14122e61"
+      },
+      "comment": "41-frame present-truthful capture from the normal player route for the source-owned TEST00008 Breakout showcase; no retail bytes."
+    },
+    {
+      "id": "site-hst-rally-clip",
+      "name": "Website presentation clip: a Hot Shots Tennis rally with sound",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "docs/media/hst-rally.mp4",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "a6ffaeb082a09078c7895e355bb38fb51690f0dfbf86600d33a8d6d7d5ff6dac"
+      },
+      "comment": "Presentation media of Hot Shots Tennis: Get a Grip running in Nakagawa Recomp, approved by the maintainer for v0.0.1. The game belongs to its publisher; not licensed under this repository. Published with its notice under the presentation-media rule (AGENTS.md section 5)."
+    },
+    {
+      "id": "site-hst-rally-poster",
+      "name": "Website presentation poster: a frame of the Hot Shots Tennis rally clip",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "docs/media/hst-rally-poster.png",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "55523ab5a86ea6dfdd2c128eb032b212c7744f4fe6b034d966bd86d55a62e31e"
+      },
+      "comment": "Presentation media of Hot Shots Tennis: Get a Grip running in Nakagawa Recomp, approved by the maintainer for v0.0.1. The game belongs to its publisher; not licensed under this repository. Published with its notice under the presentation-media rule (AGENTS.md section 5)."
+    },
+    {
+      "id": "site-launcher-library",
+      "name": "Website screenshot: the launcher's library",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "docs/media/launcher-library.png",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "0e40d1d521ca853bb711cf8fc369f6aba0f7666576d4665ef4f2a3b7898596ac"
+      },
+      "comment": "Presentation screenshot of the Nakagawa player from the v0.0.1 release build, approved by the maintainer on 2026-10-27. Game art and names shown belong to their publishers; not licensed under this repository. Published with its notice under the presentation-media rule (AGENTS.md section 5)."
+    },
+    {
+      "id": "site-launcher-building",
+      "name": "Website screenshot: the launcher building a game",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "docs/media/launcher-building.png",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "1f1706c9a8aa1c11e7a3b44f3c9eb9cc8edbad059233f51fc7e6e6eea91c40db"
+      },
+      "comment": "Presentation screenshot of the Nakagawa player from the v0.0.1 release build, approved by the maintainer on 2026-10-27. Game art and names shown belong to their publishers; not licensed under this repository. Published with its notice under the presentation-media rule (AGENTS.md section 5)."
+    },
+    {
+      "id": "fixture-fonts-gowundodum-regular",
+      "name": "Pinned permissively redistributable Korean font source: GowunDodum-Regular.ttf",
+      "source_path": "fixtures/fonts/gowundodum/GowunDodum-Regular.ttf",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "upstream_origin": "https://github.com/google/fonts",
+      "license": "OFL-1.1",
+      "notice_path": "fixtures/fonts/gowundodum/OFL.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "a6e457933227483a11758fd0947bc74422a106d46f0bf057fdaa5af94a30067d"
+      },
+      "comment": "Retrieved from google/fonts ofl/gowundodum/GowunDodum-Regular.ttf at c1eda9233c33ad7775b27efd794f931095cf6133; byte-identical pinned source for the build-time project Korean PGF. Shipped beside its OFL license text."
+    },
+    {
+      "id": "fixture-fonts-gudea-regular",
+      "name": "Pinned permissively redistributable Latin font fixture: Gudea-Regular.ttf",
+      "source_path": "fixtures/fonts/gudea/Gudea-Regular.ttf",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "upstream_origin": "https://github.com/google/fonts",
+      "license": "OFL-1.1",
+      "notice_path": "fixtures/fonts/gudea/OFL.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "a4b5410090a821ea17021627312babdf3d8db0271217fd8c4d9f629ef0a2d90b"
+      },
+      "comment": "Retrieved from google/fonts ofl/gudea/Gudea-Regular.ttf; byte-identical pinned fixture for the deterministic OpenType/TTF to PGF converter (#313). Shipped beside its OFL license text."
+    },
+    {
+      "id": "fixture-fonts-mplus1p-regular",
+      "name": "Pinned permissively redistributable Japanese font source: MPLUS1p-Regular.ttf",
+      "source_path": "fixtures/fonts/mplus1p/MPLUS1p-Regular.ttf",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "upstream_origin": "https://github.com/google/fonts",
+      "license": "OFL-1.1",
+      "notice_path": "fixtures/fonts/mplus1p/OFL.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "2f294ad496432b1608f070d310e3aa2adcf1de4af429f4901df97ec4bd361ed1"
+      },
+      "comment": "Retrieved from google/fonts ofl/mplus1p/MPLUS1p-Regular.ttf at d714b17ce2379f06daf6295617f961df605dccb5; byte-identical pinned source for the build-time project Japanese PGF at font index 0. Shipped beside its OFL license text."
+    },
+    {
+      "id": "readme-hst-title-screen",
+      "name": "README presentation screenshot: Hot Shots Tennis title screen",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "docs/media/hst-title-screen.png",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "18f1317bc35cb5403fdcff6efefe8e125dfa6ca1e4b316500140b9e353a8e58f"
+      },
+      "comment": "Presentation capture of Hot Shots Tennis: Get a Grip running in Nakagawa Recomp. The game belongs to its publisher; not licensed under this repository. Admitted under the maintainer authorization of 2026-10-21."
+    },
+    {
+      "id": "site-hst-title-screen-960",
+      "name": "Website presentation screenshot: Hot Shots Tennis title screen, 960 px",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "docs/media/hst-title-screen-960.png",
+      "license": "NOASSERTION",
+      "notice_path": "NOTICE.md",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "8abe8ddfc74d02d04cf74791b3924c8b2ae5daf4000403f3b6e01134a775b878"
+      },
+      "comment": "docs/media/hst-title-screen.png reduced to 960 x 540 and a 256-colour palette for the project website. The game belongs to its publisher; not licensed under this repository. Shown with its notice under the maintainer authorization of 2026-10-21 for presentation screenshots."
+    },
+    {
+      "id": "ui-font-chakrapetch-semibold",
+      "name": "UI font: Chakra Petch SemiBold (600)",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "assets/fonts/ui/chakra-petch/ChakraPetch-SemiBold.ttf",
+      "license": "OFL-1.1",
+      "notice_path": "assets/fonts/ui/chakra-petch/OFL.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "45264de3204ddbd5fb3e14a2402acd5c630d16650ae5fc221d2c52da46a6734b"
+      },
+      "comment": "Player UI font from google/fonts 45e3d5269e4a17d823f6d84470bc084dc5ae46f6 under the SIL Open Font License 1.1; origin and instancing recorded in docs/provenance/FONT_ORIGINS.md section 8."
+    },
+    {
+      "id": "ui-font-chakrapetch-bold",
+      "name": "UI font: Chakra Petch Bold (700)",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "assets/fonts/ui/chakra-petch/ChakraPetch-Bold.ttf",
+      "license": "OFL-1.1",
+      "notice_path": "assets/fonts/ui/chakra-petch/OFL.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "65fbf76d95651697275e19db4d717c0e95a789ddd3476478b05292104db278a0"
+      },
+      "comment": "Player UI font from google/fonts 45e3d5269e4a17d823f6d84470bc084dc5ae46f6 under the SIL Open Font License 1.1; origin and instancing recorded in docs/provenance/FONT_ORIGINS.md section 8."
+    },
+    {
+      "id": "ui-font-geist-regular",
+      "name": "UI font: Geist Regular (400)",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "assets/fonts/ui/geist/Geist-Regular.ttf",
+      "license": "OFL-1.1",
+      "notice_path": "assets/fonts/ui/geist/OFL.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "58a4bac9a7b901313822aada65bb1469b3c873874e11b3fc88ba75ed9576d98a"
+      },
+      "comment": "Player UI font from google/fonts 45e3d5269e4a17d823f6d84470bc084dc5ae46f6 under the SIL Open Font License 1.1; origin and instancing recorded in docs/provenance/FONT_ORIGINS.md section 8."
+    },
+    {
+      "id": "ui-font-geist-medium",
+      "name": "UI font: Geist Medium (500)",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "assets/fonts/ui/geist/Geist-Medium.ttf",
+      "license": "OFL-1.1",
+      "notice_path": "assets/fonts/ui/geist/OFL.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "35089cbe873bf2764d4ba9810b90f6b93eee45ea37efe4cd83997825b97ab0db"
+      },
+      "comment": "Player UI font from google/fonts 45e3d5269e4a17d823f6d84470bc084dc5ae46f6 under the SIL Open Font License 1.1; origin and instancing recorded in docs/provenance/FONT_ORIGINS.md section 8."
+    },
+    {
+      "id": "ui-font-geist-semibold",
+      "name": "UI font: Geist SemiBold (600)",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "assets/fonts/ui/geist/Geist-SemiBold.ttf",
+      "license": "OFL-1.1",
+      "notice_path": "assets/fonts/ui/geist/OFL.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "c157d36cc1778633d43f5a0ff92b078bb6de26f5011a6a092b7b6f49fe022fc5"
+      },
+      "comment": "Player UI font from google/fonts 45e3d5269e4a17d823f6d84470bc084dc5ae46f6 under the SIL Open Font License 1.1; origin and instancing recorded in docs/provenance/FONT_ORIGINS.md section 8."
+    },
+    {
+      "id": "ui-font-geistmono-regular",
+      "name": "UI font: Geist Mono Regular (400)",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "assets/fonts/ui/geist-mono/GeistMono-Regular.ttf",
+      "license": "OFL-1.1",
+      "notice_path": "assets/fonts/ui/geist-mono/OFL.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "341cdaf235d2cdcfa85ff4eed9628381a89422bd3439710c80e45b725db70b2c"
+      },
+      "comment": "Player UI font from google/fonts 45e3d5269e4a17d823f6d84470bc084dc5ae46f6 under the SIL Open Font License 1.1; origin and instancing recorded in docs/provenance/FONT_ORIGINS.md section 8."
+    },
+    {
+      "id": "ui-font-geistmono-medium",
+      "name": "UI font: Geist Mono Medium (500)",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "assets/fonts/ui/geist-mono/GeistMono-Medium.ttf",
+      "license": "OFL-1.1",
+      "notice_path": "assets/fonts/ui/geist-mono/OFL.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "3fc64e39b238a4d4370a35b5226103ab34d04fe741d93bbd59929cab8bbe3500"
+      },
+      "comment": "Player UI font from google/fonts 45e3d5269e4a17d823f6d84470bc084dc5ae46f6 under the SIL Open Font License 1.1; origin and instancing recorded in docs/provenance/FONT_ORIGINS.md section 8."
+    },
+    {
+      "id": "ui-font-notosansjp-regular",
+      "name": "UI font: Noto Sans JP Regular (400)",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "assets/fonts/ui/noto-sans-jp/NotoSansJP-Regular.ttf",
+      "license": "OFL-1.1",
+      "notice_path": "assets/fonts/ui/noto-sans-jp/OFL.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "a66655d7b24ac6f793f73914c60ad44522b9fbd9e5f9b3706220b66c44fdaad2"
+      },
+      "comment": "Player UI font from google/fonts 45e3d5269e4a17d823f6d84470bc084dc5ae46f6 under the SIL Open Font License 1.1; origin and instancing recorded in docs/provenance/FONT_ORIGINS.md section 8."
+    },
+    {
+      "id": "stb-license",
+      "name": "stb licence text (MIT or Unlicense)",
+      "type": "documentation",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/stb/LICENSE",
+      "upstream_origin": "https://github.com/nothings/stb",
+      "license": "MIT OR Unlicense",
+      "notice_path": "third_party/stb/LICENSE",
+      "disposition": "included",
+      "public_scope_included": true,
+      "optional": false,
+      "comment": "Upstream LICENSE from nothings/stb 003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5, byte-identical; the project uses stb_image under the Unlicense option (third_party/stb/PROVENANCE.md)."
+    },
+    {
+      "id": "kenney-prompt-kbd-arrows",
+      "name": "UI prompt glyph: kbd_arrows.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/kbd_arrows.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "ab5374333366fe237be253bd7f051984dd4524e3c44d6fb351fd81574f78515e"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-kbd-d",
+      "name": "UI prompt glyph: kbd_d.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/kbd_d.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "6ca4515b5f56dd2730cb9acec3b183c8b2800ae641d75b434edd753e12bc36ad"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-kbd-e",
+      "name": "UI prompt glyph: kbd_e.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/kbd_e.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "1008502780281c8c2e06bebbc477a60f485d2260072b04611fbd294340f266d7"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-kbd-enter",
+      "name": "UI prompt glyph: kbd_enter.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/kbd_enter.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "f849f917caa0a7eaa5c2322acc62c1de8e18322036961a2282cd85f1eca302c1"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-kbd-escape",
+      "name": "UI prompt glyph: kbd_escape.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/kbd_escape.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "8874e394d80161d6188ffce8b715357fea8059a9d6627a28769a91e3855bcbd7"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-kbd-f1",
+      "name": "UI prompt glyph: kbd_f1.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/kbd_f1.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "78277a3c50bada687a7d912220c1caa581d9d23948b9884631d405a4b441e31e"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-kbd-q",
+      "name": "UI prompt glyph: kbd_q.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/kbd_q.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "cee375cefc9e2f19089bbd669153af9099fe71e08b6c577d48eb2a32bc567c96"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-kbd-space",
+      "name": "UI prompt glyph: kbd_space.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/kbd_space.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "8ce6f043b05888bd1655f7660f8f7cc02acb6c763fecf358fef20405239524bf"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-playstation5-button-options",
+      "name": "UI prompt glyph: playstation5_button_options.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/playstation5_button_options.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "330360b4eb9f62799521a01a8c95c9ca0ef31bf9ab235fd551fe0c35a0e973f3"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-playstation-button-circle",
+      "name": "UI prompt glyph: playstation_button_circle.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/playstation_button_circle.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "74a47e04595c6db17a5c7d6f3e9c8830732d3e81f1e66ff4b19782213c9411d7"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-playstation-button-cross",
+      "name": "UI prompt glyph: playstation_button_cross.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/playstation_button_cross.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "afa03be5a125aea7e9746e030adc63d78689e8931c05905b7c079b755796fbcc"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-playstation-button-square",
+      "name": "UI prompt glyph: playstation_button_square.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/playstation_button_square.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "66e53b7714e0e16eafa04713718667fa5b78b7c739f315e380a88f533eafc6db"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-playstation-button-triangle",
+      "name": "UI prompt glyph: playstation_button_triangle.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/playstation_button_triangle.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "73f646a94056a71484f788375dd25efa1555489085e7f2f727175b1384b89e1c"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-playstation-dpad",
+      "name": "UI prompt glyph: playstation_dpad.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/playstation_dpad.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "785171ce3d605c75accb44b6da44d05c2581cff3c32d905ab44ef76961f4222e"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-playstation-trigger-l1",
+      "name": "UI prompt glyph: playstation_trigger_l1.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/playstation_trigger_l1.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "17a323e995f7706a8237ef1db173a70f62b40585f6cb8a4557da05c92a4b8a94"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-playstation-trigger-r1",
+      "name": "UI prompt glyph: playstation_trigger_r1.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/playstation_trigger_r1.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "4fcd174085f00fdf22b286966d47ff52b2eac065df57b16ac68306ebb5d519a0"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-switch-button-a",
+      "name": "UI prompt glyph: switch_button_a.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/switch_button_a.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "c24af67ce34d3116e4750f052221d6bfe8a87cb0de8364bb23a573a85391fb10"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-switch-button-b",
+      "name": "UI prompt glyph: switch_button_b.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/switch_button_b.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "5d95680fcfbf59ba94a3cc696fd8251e4fe292b421716b90b5272ca5b32d91bf"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-switch-button-l",
+      "name": "UI prompt glyph: switch_button_l.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/switch_button_l.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "944cbe119693f0bbae7bfceb9cb453c5ee4da898180441937190aeedb6bc0b83"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-switch-button-plus",
+      "name": "UI prompt glyph: switch_button_plus.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/switch_button_plus.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "0f8b7a6deb6665279a7763e5150bb74303a83dc45f442c978ed990bbd8e76d64"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-switch-button-r",
+      "name": "UI prompt glyph: switch_button_r.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/switch_button_r.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "9a1a982e2f6ed96863d796809007298cd4108ac3b04e425f279d486ddd6051b1"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-switch-button-x",
+      "name": "UI prompt glyph: switch_button_x.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/switch_button_x.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "90f1f195dd70724a605408bd60359c04b4013d8c5236442655256f43ea0cc043"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-switch-button-y",
+      "name": "UI prompt glyph: switch_button_y.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/switch_button_y.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "133e98bbd388d29d7325b20b729518c98bb96707d743f2e142882b528bcf6263"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-switch-dpad",
+      "name": "UI prompt glyph: switch_dpad.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/switch_dpad.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "cb6bbdc12a3b651f65ba511a163c73020936696bb1f0ba26483653848bfc3109"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-xbox-button-a",
+      "name": "UI prompt glyph: xbox_button_a.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/xbox_button_a.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "c24af67ce34d3116e4750f052221d6bfe8a87cb0de8364bb23a573a85391fb10"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-xbox-button-b",
+      "name": "UI prompt glyph: xbox_button_b.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/xbox_button_b.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "5d95680fcfbf59ba94a3cc696fd8251e4fe292b421716b90b5272ca5b32d91bf"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-xbox-button-menu",
+      "name": "UI prompt glyph: xbox_button_menu.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/xbox_button_menu.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "49e03870c73236cdc757e7df6a053e52569acbf0ace0f95d4f1881c53e090247"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-xbox-button-x",
+      "name": "UI prompt glyph: xbox_button_x.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/xbox_button_x.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "90f1f195dd70724a605408bd60359c04b4013d8c5236442655256f43ea0cc043"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-xbox-button-y",
+      "name": "UI prompt glyph: xbox_button_y.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/xbox_button_y.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "133e98bbd388d29d7325b20b729518c98bb96707d743f2e142882b528bcf6263"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-xbox-dpad",
+      "name": "UI prompt glyph: xbox_dpad.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/xbox_dpad.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "10e27b4bb02ba3f6c9994e85998fca7bc002c6dc8297f8b67e80207273b202c6"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-xbox-lb",
+      "name": "UI prompt glyph: xbox_lb.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/xbox_lb.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "587d43aac834743c64e6958f3fb13b0c5cc9075c9a84400e59c6fe1acbe3897f"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-prompt-xbox-rb",
+      "name": "UI prompt glyph: xbox_rb.png",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/input-prompts/xbox_rb.png",
+      "upstream_origin": "https://kenney.nl/assets/input-prompts",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/input-prompts/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "692acf85c1b9e5c9d2b6c9b0a44bba2f21bf0f417e6192a4eb674f0c3627005e"
+      },
+      "comment": "Kenney Input Prompts 1.5 glyph, byte-identical to the archive's Default (64 x 64) file; embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-sound-back-001",
+      "name": "UI sound: back_001.wav",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/interface-sounds/back_001.wav",
+      "upstream_origin": "https://kenney.nl/assets/interface-sounds",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/interface-sounds/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "ea6abe8e02c7c2dd4d537a498d2a20f09f97d1983f4227fc45e65bdb3a7557e4"
+      },
+      "comment": "Kenney Interface Sounds 1.0 clip, decoded once from the archive's Ogg Vorbis to 16-bit PCM WAV (LOCAL DELTA); embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-sound-confirmation-001",
+      "name": "UI sound: confirmation_001.wav",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/interface-sounds/confirmation_001.wav",
+      "upstream_origin": "https://kenney.nl/assets/interface-sounds",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/interface-sounds/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "68771678d3d344051a1e7747e5f3384d35728b5232a043d4dd2851921b5c9293"
+      },
+      "comment": "Kenney Interface Sounds 1.0 clip, decoded once from the archive's Ogg Vorbis to 16-bit PCM WAV (LOCAL DELTA); embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    },
+    {
+      "id": "kenney-sound-tick-001",
+      "name": "UI sound: tick_001.wav",
+      "type": "asset",
+      "relationship": "CONTAINS",
+      "presence": "required",
+      "source_path": "third_party/kenney/interface-sounds/tick_001.wav",
+      "upstream_origin": "https://kenney.nl/assets/interface-sounds",
+      "license": "CC0-1.0",
+      "notice_path": "third_party/kenney/interface-sounds/License.txt",
+      "disposition": "approved_binary",
+      "public_scope_included": true,
+      "optional": false,
+      "hashes": {
+        "sha256": "5bb62847f130ced4299d758cee7d21bef49bff53c906e44e1ebc19d3d8f3a91a"
+      },
+      "comment": "Kenney Interface Sounds 1.0 clip, decoded once from the archive's Ogg Vorbis to 16-bit PCM WAV (LOCAL DELTA); embedded in the player by tools/gen_ui_assets.py; manifest in third_party/kenney/PROVENANCE.md."
+    }
+  ]
+}

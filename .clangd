@@ -1,0 +1,13 @@
+# Generated translation units are large and title-specific: skip background
+# indexing for every build/<game>/ directory, not only one title's.
+If:
+  PathMatch: 'build[\\/][^\\/]+[\\/].*'
+CompileFlags:
+  Add: [-ferror-limit=0]
+Index:
+  Background: Skip
+---
+CompileFlags:
+  Add: [-ferror-limit=0]
+Diagnostics:
+  UnusedIncludes: None

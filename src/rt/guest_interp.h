@@ -1,0 +1,119 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 the Nakagawa Recomp authors
+
+#ifndef NAKAGAWA_GUEST_INTERP_H
+#define NAKAGAWA_GUEST_INTERP_H
+
+#include <stdint.h>
+
+#include "recomp.h"
+
+typedef enum SrGuestInterpResult {
+    SR_GUEST_INTERP_AOT_HANDOFF       = 1,
+    SR_GUEST_INTERP_CALL_RETURN       = 2,
+    SR_GUEST_INTERP_EXCEPTION         = 3,
+    SR_GUEST_INTERP_ERET              = 4,
+    SR_GUEST_INTERP_NOT_EXECUTABLE    = -1,
+    SR_GUEST_INTERP_MISALIGNED_PC     = -2,
+    SR_GUEST_INTERP_FETCH_BOUNDARY    = -3,
+    SR_GUEST_INTERP_UNSUPPORTED       = -4,
+    SR_GUEST_INTERP_MEMORY_FAULT      = -5,
+    SR_GUEST_INTERP_MISALIGNED_DATA   = -6,
+    SR_GUEST_INTERP_FLOW_FATAL        = -7,
+    SR_GUEST_INTERP_HOST_STACK_EXHAUSTED = -8,
+    SR_GUEST_INTERP_HOST_STACK_BOUNDS_UNAVAILABLE = -9,
+    /* jr/jalr read 0 from its target register (#1375): a null code pointer, even on
+     * an image whose offset-0 function has guest address 0. */
+    SR_GUEST_INTERP_NULL_CODE_POINTER = -10,
+} SrGuestInterpResult;
+
+typedef struct SrGuestInterpFault {
+    uint32_t pc;
+    uint32_t opcode;
+    uint32_t address;
+    int opcode_valid;
+} SrGuestInterpFault;
+
+/* A CALL into the interpreter carries the caller's already-decoded resume PC
+ * separately from CpuState::$ra.  The callee is allowed to change $ra, including
+ * in the return delay slot; the boundary remains the continuation selected by the
+ * call instruction.  A NULL boundary means a TAIL transfer with no native caller
+ * resume to protect. */
+typedef struct SrGuestInterpCallBoundary {
+    uint32_t resume_pc;
+    /* A linked call owes its caller the $sp it was called with, as a callable native body
+     * does (#1935); a live frame's continuation owes none. */
+    uint32_t entry_sp;
+    uint8_t owes_entry_sp;
+    /* The innermost AOT return boundary is this call's own, begun by a generated call site
+     * that honours its end check (dispatch_call_checked): native code run for the call
+     * returns into it, and a return elsewhere unwinds as a direct call's does. */
+    uint8_t site_boundary;
+    /* Native code an interpreted linked call handed its live frame to: the rest of that
+     * call, not a call of its own (dispatch_call_continue). */
+    uint8_t continuation;
+} SrGuestInterpCallBoundary;
+
+/* The interpreter hands the live frame of the linked call `call` to the native body at
+ * `target`, whose chain ends in that call's return (recomp.c). Returns 1 when that return
+ * went somewhere other than the call's resume PC, a longjmp: the guest's $sp stands. */
+int dispatch_call_continue(CpuState *s, uint32_t target, const SrGuestInterpCallBoundary *call);
+
+/* Execute from entry until an unlinked transfer reaches a registered AOT destination
+ * or a fail-closed boundary. A linked transfer into a registered body is a CALL: the
+ * body runs as a nested native frame and interpretation resumes at the link address. There is deliberately no instruction-count escape hatch:
+ * a guest loop is guest behavior, not permission to fabricate completion.
+ *
+ * IMPLEMENTED INSTRUCTION SET
+ * ---------------------------
+ * Every form below exists because a cell in fixtures/cosim executes it and its
+ * result is compared against real codegen output; nothing here was added to
+ * inflate coverage, and tools/test_cosim_fixture.py enforces that in both
+ * directions. Anything else -- including every control-transfer form not listed
+ * -- fails closed as SR_GUEST_INTERP_UNSUPPORTED rather than being decoded as
+ * some unrelated arithmetic form.
+ *
+ *   ALU        sll srl rotr sra addu subu and or xor slt sltu / addiu ori lui
+ *              (rotr is the Allegrex srl with rs=1; any other nonzero rs is reserved)
+ *   HI/LO      mult multu mfhi mflo
+ *   memory     lb lbu lh lhu lw / sb sh sw / lwl lwr swl swr / lwc1 swc1
+ *   atomic     ll sc (CpuState.llbit: ll sets it; sc stores and writes 1 only
+ *              while it is set, else writes 0; same width-4 alignment and span
+ *              checks as lw/sw, run before the link is consulted)
+ *   control    beq bne j jal jr jalr
+ *   scalar FPU mfc1 mtc1 add.s mul.s cvt.w.s   (via the src/rt/fp_convert.h
+ *              helpers the generated code also calls, so guest FCR31 selects
+ *              the result in both execution lanes)
+ *   LLE CPU    mfc0 mtc0 syscall break eret (src/rt/cpu_lle.h helpers, gated
+ *              on sr_cpu_lle_enabled(); with the gate off these keep the
+ *              historical fail-closed SR_GUEST_INTERP_UNSUPPORTED so the
+ *              default lane and the cosim form census are unchanged)
+ *   LLE VFPU   lv.s sv.s lv.q sv.q lvl.q lvr.q svl.q svr.q address checks
+ *              (widths 4/16, left/right width 0 bypass; gated on
+ *              sr_cpu_lle_enabled() with the same historical UNSUPPORTED
+ *              when off; the access itself runs via sr_vfpu_interp)
+ *
+ * The LLE gate is what keeps the cosim census honest: census probes run with
+ * the default (disabled) configuration, so the newly decoded COP0/syscall
+ * shapes still read as "not decoded" there, while LLE selftests enable the
+ * gate explicitly.
+ *
+ * While SR_INSTRUCTION_TRACE is compiled in, execution emits the canonical
+ * per-instruction trace (tools/TRACE_FORMAT.md) through the same sr_begin/sr_end
+ * hooks the generated code uses, in the same branch-before-delay-slot order. */
+SrGuestInterpResult sr_guest_interp_run(
+    CpuState *s,
+    uint32_t entry,
+    SrGuestInterpFault *fault);
+
+/* CALL form: execute the interpreted callee, including its return instruction and
+ * delay slot, then stop before executing boundary->resume_pc. */
+SrGuestInterpResult sr_guest_interp_run_with_boundary(
+    CpuState *s,
+    uint32_t entry,
+    const SrGuestInterpCallBoundary *boundary,
+    SrGuestInterpFault *fault);
+
+const char *sr_guest_interp_result_name(SrGuestInterpResult result);
+
+#endif

@@ -1,0 +1,1370 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 the Nakagawa Recomp authors */
+
+/* setenv/unsetenv are POSIX: without this, -std=c99 on glibc leaves them undeclared. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+#include "input_settings.h"
+#include "nk_input_profile.h"
+#include "nk_platform.h"
+#include "native_test_isolation.h"
+
+/* The per-run root setup and its recursive cleanup run inside assert(); keep
+ * them even in a build that defines NDEBUG (#735). */
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+#include <assert.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Scratch root for the files this test writes: the checkout's build/ by default, or
+ * the BUILD_ROOT the Makefile passes as -DSR_SELFTEST_BUILD_ROOT, so a scratch run never
+ * touches the checkout. */
+#ifndef SR_SELFTEST_BUILD_ROOT
+#define SR_SELFTEST_BUILD_ROOT "build"
+#endif
+
+#if defined(_WIN32) || defined(_WIN64)
+#include <direct.h>
+#include <windows.h>
+#include <wchar.h>
+#define test_rmdir _rmdir
+#else
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#define test_rmdir rmdir
+#endif
+
+static void test_setenv(const char *name, const char *val) {
+    native_test_set_env(name, val);
+}
+
+/* -----------------------------------------------------------------------------
+ * 1. Default Load
+ * -------------------------------------------------------------------------- */
+static void test_default_load(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 1: Default load when file is missing...\n");
+
+    InputSettingsState state;
+    input_settings_init(&state);
+
+    /* Resolved default profile path must live inside temporary test root */
+    assert(state.profile_path[0] != '\0');
+    assert(native_test_path_within(state.profile_path, native_test_get_root()));
+    if (native_test_get_real_config_probe()[0]) {
+        assert(!native_test_path_within(state.profile_path, native_test_get_real_config_probe()));
+    }
+
+    /* Point to non-existent file */
+    NkResult res = input_settings_load(&state, SR_SELFTEST_BUILD_ROOT "/nonexistent_profile_12345.json");
+    assert(res == NK_OK);
+    assert(!state.loaded_from_file);
+    assert(!state.has_load_diagnostic);
+    assert(state.load_diagnostic[0] == '\0');
+    assert(state.profile.schema_version == NK_INPUT_PROFILE_SCHEMA_VERSION);
+    assert(state.profile.trigger_threshold == NK_INPUT_DEFAULT_TRIGGER_THRESHOLD);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == NK_INPUT_DEFAULT_DEADZONE_INNER);
+    assert(!input_settings_has_conflicts(&state));
+
+    /* Every control has a name and, in the controller's words, a binding */
+    for (int i = 0; i < INPUT_CONTROL_TOTAL_COUNT; i++) {
+        const char *name = input_settings_control_name(i);
+        assert(name != NULL && strlen(name) > 0);
+        char binding_str[128] = {0};
+        input_settings_format_binding(&state, i, binding_str, sizeof(binding_str));
+        assert(strlen(binding_str) > 0);
+    }
+
+    printf("[INPUT_SETTINGS_TEST] Subtest 1 PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 1b. Binding words fit their button
+ * The walkthrough saw three Controls-page buttons end in "...": the default L and R
+ * read "Left Bumper (LB / L1) / Left Trigger (LT / L2)". Every default binding, in
+ * either device's words, and every single input stay within the characters the
+ * button shows whole.
+ * -------------------------------------------------------------------------- */
+static void check_binding_words(const char *what, const char *words) {
+    if (strlen(words) > INPUT_SETTINGS_BINDING_TEXT_MAX) {
+        printf("[INPUT_SETTINGS_TEST] %s: \"%s\" is %zu characters, more than %d\n", what, words,
+               strlen(words), INPUT_SETTINGS_BINDING_TEXT_MAX);
+    }
+    assert(strlen(words) <= INPUT_SETTINGS_BINDING_TEXT_MAX);
+}
+
+static void test_binding_words_fit(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 1b: Binding words fit their button...\n");
+    InputSettingsState state;
+    char words[128];
+    input_settings_init(&state);
+    for (int i = 0; i < INPUT_CONTROL_DIGITAL_COUNT; i++) {
+        input_settings_format_binding(&state, i, words, sizeof(words));
+        check_binding_words(input_settings_control_name(i), words);
+        input_settings_format_key_binding(&state, i, words, sizeof(words));
+        check_binding_words(input_settings_control_name(i), words);
+    }
+    NkDigitalBinding *select = &state.profile.psp_buttons[INPUT_CONTROL_BTN_SELECT];
+    memset(&select->secondary, 0, sizeof(select->secondary));
+    select->secondary.type = NK_BINDING_NONE;
+    for (int button = 0; button < NK_HOST_BUTTON_COUNT; button++) {
+        select->primary.type = NK_BINDING_HOST_BUTTON;
+        select->primary.index = button;
+        input_settings_format_binding(&state, INPUT_CONTROL_BTN_SELECT, words, sizeof(words));
+        check_binding_words("a host button", words);
+    }
+    for (int axis = 0; axis < NK_HOST_AXIS_COUNT; axis++) {
+        static const NkBindingSourceType kinds[] = {NK_BINDING_HOST_TRIGGER, NK_BINDING_HOST_AXIS_POS,
+                                                    NK_BINDING_HOST_AXIS_NEG};
+        for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+            select->primary.type = kinds[k];
+            select->primary.index = axis;
+            input_settings_format_binding(&state, INPUT_CONTROL_BTN_SELECT, words, sizeof(words));
+            check_binding_words("a host axis", words);
+        }
+    }
+    printf("[INPUT_SETTINGS_TEST] Subtest 1b PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 2. Corrupt File -> Defaults + Diagnostic
+ * -------------------------------------------------------------------------- */
+static void test_corrupt_file_load_diagnostic(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 2: Corrupt file gives defaults + diagnostic...\n");
+
+    const char *corrupt_path = SR_SELFTEST_BUILD_ROOT "/test_corrupt_profile.json";
+    FILE *f = fopen(corrupt_path, "wb");
+    assert(f != NULL);
+    fputs("{\n  \"schema_version\": 999,\n  \"invalid\": true\n}\n", f);
+    fclose(f);
+
+    InputSettingsState state;
+    NkResult res = input_settings_load(&state, corrupt_path);
+    assert(res != NK_OK);
+    assert(state.loaded_from_file);
+    assert(state.has_load_diagnostic);
+    assert(strlen(state.load_diagnostic) > 0);
+    /* Falls back to safe defaults */
+    assert(state.profile.schema_version == NK_INPUT_PROFILE_SCHEMA_VERSION);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == NK_INPUT_DEFAULT_DEADZONE_INNER);
+    assert(!input_settings_has_conflicts(&state));
+
+    remove(corrupt_path);
+    printf("[INPUT_SETTINGS_TEST] Subtest 2 PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 3. Bind / Rebind and Capture
+ * -------------------------------------------------------------------------- */
+static void test_bind_rebind_and_capture(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 3: Bind, rebind, and interactive capture...\n");
+
+    InputSettingsState state;
+    input_settings_init(&state);
+
+    /* Direct assign */
+    NkBindingSource src_north = { NK_BINDING_HOST_BUTTON, NK_HOST_BUTTON_NORTH, 0 };
+    bool ok = input_settings_assign_binding(&state, INPUT_CONTROL_BTN_CROSS, src_north);
+    assert(ok);
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_CROSS].primary.type == NK_BINDING_HOST_BUTTON);
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_CROSS].primary.index == NK_HOST_BUTTON_NORTH);
+
+    /* Test capture workflow */
+    assert(!input_settings_is_capturing(&state));
+    ok = input_settings_start_capture(&state, INPUT_CONTROL_BTN_TRIANGLE);
+    assert(ok);
+    assert(input_settings_is_capturing(&state));
+    assert(input_settings_get_capture_control(&state) == INPUT_CONTROL_BTN_TRIANGLE);
+    assert(input_settings_get_capture_remaining_ms(&state) == INPUT_SETTINGS_CAPTURE_TIMEOUT_MS);
+
+    /* Advance time */
+    bool still_capturing = input_settings_update_capture(&state, 1000);
+    assert(still_capturing);
+    assert(input_settings_get_capture_remaining_ms(&state) == INPUT_SETTINGS_CAPTURE_TIMEOUT_MS - 1000);
+
+    /* Feed capture input */
+    NkBindingSource src_west = { NK_BINDING_HOST_BUTTON, NK_HOST_BUTTON_WEST, 0 };
+    ok = input_settings_feed_capture_source(&state, src_west);
+    assert(ok);
+    assert(!input_settings_is_capturing(&state));
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_TRIANGLE].primary.index == NK_HOST_BUTTON_WEST);
+
+    /* Test capture cancel */
+    input_settings_start_capture(&state, INPUT_CONTROL_BTN_CIRCLE);
+    assert(input_settings_is_capturing(&state));
+    input_settings_cancel_capture(&state);
+    assert(!input_settings_is_capturing(&state));
+    assert(input_settings_get_capture_control(&state) == -1);
+
+    /* Test capture timeout */
+    input_settings_start_capture(&state, INPUT_CONTROL_BTN_CIRCLE);
+    still_capturing = input_settings_update_capture(&state, 6000);
+    assert(!still_capturing);
+    assert(!input_settings_is_capturing(&state));
+
+    printf("[INPUT_SETTINGS_TEST] Subtest 3 PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 4. A taken input swaps, and the note names the other control (#1299)
+ * -------------------------------------------------------------------------- */
+static void test_conflict_detection(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 4: a taken input swaps, never a conflict...\n");
+    char diag[NK_INPUT_DIAGNOSTIC_MAX_LEN];
+    InputSettingsState state;
+    input_settings_init(&state);
+
+    /* In the default mapping CROSS = SOUTH and CIRCLE = EAST. Giving CIRCLE the
+     * south button moves it there, and CROSS takes CIRCLE's east button: one input
+     * never drives two buttons, so the mapping can always be saved. */
+    NkBindingSource src_south = { NK_BINDING_HOST_BUTTON, NK_HOST_BUTTON_SOUTH, 0 };
+    assert(input_settings_assign_binding(&state, INPUT_CONTROL_BTN_CIRCLE, src_south));
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_CIRCLE].primary.index == NK_HOST_BUTTON_SOUTH);
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_CROSS].primary.index == NK_HOST_BUTTON_EAST);
+    assert(!input_settings_has_conflicts(&state));
+    assert(state.note_control == INPUT_CONTROL_BTN_CROSS && !state.note_error);
+    assert(strcmp(state.note, "A (Cross) was Cross's. Cross now uses B (Circle).") == 0);
+    assert(state.dirty);
+    assert(nk_input_profile_validate(&state.profile, diag, sizeof(diag)) == NK_OK);
+    const char *tmp_save = SR_SELFTEST_BUILD_ROOT "/test_conflict_save.json";
+    assert(input_settings_save(&state, tmp_save) == NK_OK);
+    assert(!state.dirty);
+    remove(tmp_save);
+
+    /* A button with nothing to give leaves the other with nothing: that is the one
+     * thing to fix, and the note says so as an error. */
+    assert(input_settings_assign_binding(&state, INPUT_CONTROL_BTN_HOME, src_south));
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_CIRCLE].primary.type == NK_BINDING_NONE);
+    assert(state.note_control == INPUT_CONTROL_BTN_CIRCLE && state.note_error);
+    assert(strcmp(state.note, "A (Cross) was Circle's. Circle has no button now: choose one.") == 0);
+    assert(nk_input_profile_validate(&state.profile, diag, sizeof(diag)) == NK_OK);
+
+    /* A button's own second input swaps with its first. */
+    NkBindingSource left_trigger = { NK_BINDING_HOST_TRIGGER, NK_HOST_AXIS_LEFT_TRIGGER, 0 };
+    assert(input_settings_assign_binding(&state, INPUT_CONTROL_BTN_LTRIGGER, left_trigger));
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_LTRIGGER].primary.type == NK_BINDING_HOST_TRIGGER);
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_LTRIGGER].secondary.index ==
+           NK_HOST_BUTTON_LEFT_SHOULDER);
+    assert(state.note[0] == '\0');
+
+    /* Conflicts written into the mapping some other way are still found and named. */
+    state.profile.psp_buttons[INPUT_CONTROL_BTN_SQUARE].primary = src_south;
+    input_settings_refresh_conflicts(&state);
+    assert(input_settings_has_conflicts(&state));
+    assert(input_settings_is_control_conflicted(&state, INPUT_CONTROL_BTN_SQUARE));
+    assert(input_settings_is_control_conflicted(&state, INPUT_CONTROL_BTN_HOME));
+    assert(!input_settings_is_control_conflicted(&state, INPUT_CONTROL_BTN_TRIANGLE));
+    const char *summary = input_settings_get_conflict_summary(&state);
+    assert(strstr(summary, "Square") != NULL && strstr(summary, "Home") != NULL);
+
+    printf("[INPUT_SETTINGS_TEST] Subtest 4 PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 5. Deadzone and Trigger Bounds
+ * -------------------------------------------------------------------------- */
+static void test_deadzone_and_trigger_bounds(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 5: Deadzone and trigger bounds validation...\n");
+
+    InputSettingsState state;
+    input_settings_init(&state);
+
+    /* Deadzone adjustment within bounds */
+    input_settings_set_deadzone(&state, NK_PSP_AXIS_ANALOG_X, 10000);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == 10000);
+
+    /* Deadzone clamp at lower bound (0) */
+    input_settings_adjust_deadzone(&state, NK_PSP_AXIS_ANALOG_X, -20000);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == 0);
+
+    /* Deadzone clamp at upper bound (32766) */
+    input_settings_set_deadzone(&state, NK_PSP_AXIS_ANALOG_X, 50000);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == 32766);
+
+    /* Trigger threshold clamp */
+    input_settings_set_trigger_threshold(&state, 12000);
+    assert(state.profile.trigger_threshold == 12000);
+
+    input_settings_adjust_trigger_threshold(&state, -20000);
+    assert(state.profile.trigger_threshold == 0);
+
+    input_settings_set_trigger_threshold(&state, 40000);
+    assert(state.profile.trigger_threshold == 32767);
+
+    /* Axis inversion toggle */
+    assert(!state.profile.axes[NK_PSP_AXIS_ANALOG_X].inverted);
+    input_settings_toggle_axis_inversion(&state, NK_PSP_AXIS_ANALOG_X);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].inverted);
+    input_settings_toggle_axis_inversion(&state, NK_PSP_AXIS_ANALOG_X);
+    assert(!state.profile.axes[NK_PSP_AXIS_ANALOG_X].inverted);
+
+    printf("[INPUT_SETTINGS_TEST] Subtest 5 PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 6. Reset to Defaults
+ * -------------------------------------------------------------------------- */
+static void test_reset_to_defaults(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 6: Reset to defaults...\n");
+
+    InputSettingsState state;
+    input_settings_init(&state);
+
+    /* Mutate everything */
+    NkBindingSource src_none = { NK_BINDING_NONE, 0, 0 };
+    input_settings_assign_binding(&state, INPUT_CONTROL_BTN_CROSS, src_none);
+    input_settings_set_deadzone(&state, NK_PSP_AXIS_ANALOG_X, 25000);
+    input_settings_set_trigger_threshold(&state, 20000);
+    input_settings_toggle_axis_inversion(&state, NK_PSP_AXIS_ANALOG_Y);
+
+    /* Reset */
+    input_settings_reset_to_defaults(&state);
+
+    assert(state.profile.schema_version == NK_INPUT_PROFILE_SCHEMA_VERSION);
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_CROSS].primary.type == NK_BINDING_HOST_BUTTON);
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_CROSS].primary.index == NK_HOST_BUTTON_SOUTH);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == NK_INPUT_DEFAULT_DEADZONE_INNER);
+    assert(state.profile.trigger_threshold == NK_INPUT_DEFAULT_TRIGGER_THRESHOLD);
+    assert(!state.profile.axes[NK_PSP_AXIS_ANALOG_Y].inverted);
+    assert(!input_settings_has_conflicts(&state));
+
+    printf("[INPUT_SETTINGS_TEST] Subtest 6 PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 7. Save / Load Round Trip with Atomic Replace
+ * -------------------------------------------------------------------------- */
+static void test_save_load_roundtrip(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 7: Save/load round trip...\n");
+
+    const char *tmp_file = SR_SELFTEST_BUILD_ROOT "/test_roundtrip_profile.json";
+    InputSettingsState state;
+    input_settings_init(&state);
+
+    /* Configure customized mapping */
+    NkBindingSource src_north = { NK_BINDING_HOST_BUTTON, NK_HOST_BUTTON_NORTH, 0 };
+    NkBindingSource src_south = { NK_BINDING_HOST_BUTTON, NK_HOST_BUTTON_SOUTH, 0 };
+    /* Swap CROSS and TRIANGLE */
+    input_settings_assign_binding(&state, INPUT_CONTROL_BTN_CROSS, src_north);
+    input_settings_assign_binding(&state, INPUT_CONTROL_BTN_TRIANGLE, src_south);
+    input_settings_set_deadzone(&state, -1, 14000);
+    input_settings_set_trigger_threshold(&state, 10000);
+
+    NkResult save_res = input_settings_save(&state, tmp_file);
+    assert(save_res == NK_OK);
+    assert(!state.has_save_diagnostic);
+    assert(nk_platform_file_exists(tmp_file));
+
+    /* Load into fresh state */
+    InputSettingsState loaded;
+    NkResult load_res = input_settings_load(&loaded, tmp_file);
+    assert(load_res == NK_OK);
+    assert(loaded.loaded_from_file);
+    assert(!loaded.has_load_diagnostic);
+    assert(!input_settings_has_conflicts(&loaded));
+
+    assert(loaded.profile.psp_buttons[INPUT_CONTROL_BTN_CROSS].primary.index == NK_HOST_BUTTON_NORTH);
+    assert(loaded.profile.psp_buttons[INPUT_CONTROL_BTN_TRIANGLE].primary.index == NK_HOST_BUTTON_SOUTH);
+    assert(loaded.profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == 14000);
+    assert(loaded.profile.axes[NK_PSP_AXIS_ANALOG_Y].deadzone_inner == 14000);
+    assert(loaded.profile.trigger_threshold == 10000);
+
+    /* A second save must replace the existing file, not fail on it. */
+    input_settings_set_trigger_threshold(&loaded, 12000);
+    assert(input_settings_save(&loaded, tmp_file) == NK_OK);
+    InputSettingsState reloaded;
+    assert(input_settings_load(&reloaded, tmp_file) == NK_OK);
+    assert(reloaded.profile.trigger_threshold == 12000);
+
+    remove(tmp_file);
+    printf("[INPUT_SETTINGS_TEST] Subtest 7 PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 8. SR_PADSCRIPT Semantics Untouched
+ * -------------------------------------------------------------------------- */
+static void test_sr_padscript_semantics_untouched(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 8: SR_PADSCRIPT semantics remain untouched...\n");
+
+    /* Verify nk_input_profile_padscript_active behavior */
+    test_setenv("SR_PADSCRIPT", NULL);
+    assert(!nk_input_profile_padscript_active());
+
+    test_setenv("SR_PADSCRIPT", "");
+    assert(!nk_input_profile_padscript_active());
+
+    test_setenv("SR_PADSCRIPT", "synthetic_script.txt");
+    assert(nk_input_profile_padscript_active());
+
+    /* Path resolution helper resolves correctly under environment overrides */
+    char path_buf[512] = {0};
+    test_setenv("NK_INPUT_PROFILE", SR_SELFTEST_BUILD_ROOT "/override_profile.json");
+    NkResult res = nk_input_profile_resolve_path(path_buf, sizeof(path_buf));
+    assert(res == NK_OK);
+    assert(strcmp(path_buf, SR_SELFTEST_BUILD_ROOT "/override_profile.json") == 0);
+
+    test_setenv("NK_INPUT_PROFILE", NULL);
+    test_setenv("SR_PADSCRIPT", NULL);
+
+    /* Path resolution without overrides resolves inside temporary test root */
+    res = nk_input_profile_resolve_path(path_buf, sizeof(path_buf));
+    assert(res == NK_OK);
+    assert(native_test_path_within(path_buf, native_test_get_root()));
+    if (native_test_get_real_config_probe()[0]) {
+        assert(!native_test_path_within(path_buf, native_test_get_real_config_probe()));
+    }
+
+    printf("[INPUT_SETTINGS_TEST] Subtest 8 PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 8b. Environment Variable Clearing Consistency
+ * -------------------------------------------------------------------------- */
+static void test_env_clearing_consistency(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 8b: Environment variable clearing consistency...\n");
+
+    const char *test_var = "NK_TEST_ISOLATION_CLEAR_VAR";
+#if defined(_WIN32) || defined(_WIN64)
+    WCHAR wvar[NATIVE_TEST_PATH_MAX];
+    assert(MultiByteToWideChar(CP_UTF8, 0, test_var, -1, wvar, NATIVE_TEST_PATH_MAX) > 0);
+    WCHAR wbuf[64];
+#endif
+
+    /* 1. Set variable to a non-empty value */
+    native_test_set_env(test_var, "val_active");
+    assert(getenv(test_var) != NULL && strcmp(getenv(test_var), "val_active") == 0);
+#if defined(_WIN32) || defined(_WIN64)
+    SetLastError(0);
+    DWORD len = GetEnvironmentVariableW(wvar, wbuf, (DWORD)(sizeof(wbuf) / sizeof(wbuf[0])));
+    assert(len > 0 && wcscmp(wbuf, L"val_active") == 0);
+#endif
+
+    /* 2. Clear variable with NULL: must be absent via both getenv and GetEnvironmentVariableW */
+    native_test_set_env(test_var, NULL);
+    assert(getenv(test_var) == NULL);
+#if defined(_WIN32) || defined(_WIN64)
+    SetLastError(0);
+    len = GetEnvironmentVariableW(wvar, wbuf, (DWORD)(sizeof(wbuf) / sizeof(wbuf[0])));
+    assert(len == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND);
+#endif
+
+    /* 3. Set variable again */
+    native_test_set_env(test_var, "val_active_again");
+    assert(getenv(test_var) != NULL && strcmp(getenv(test_var), "val_active_again") == 0);
+#if defined(_WIN32) || defined(_WIN64)
+    SetLastError(0);
+    len = GetEnvironmentVariableW(wvar, wbuf, (DWORD)(sizeof(wbuf) / sizeof(wbuf[0])));
+    assert(len > 0 && wcscmp(wbuf, L"val_active_again") == 0);
+#endif
+
+    /* 4. Clear variable with "": must be absent via both getenv and GetEnvironmentVariableW */
+    native_test_set_env(test_var, "");
+    assert(getenv(test_var) == NULL);
+#if defined(_WIN32) || defined(_WIN64)
+    SetLastError(0);
+    len = GetEnvironmentVariableW(wvar, wbuf, (DWORD)(sizeof(wbuf) / sizeof(wbuf[0])));
+    assert(len == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND);
+#endif
+
+    printf("[INPUT_SETTINGS_TEST] Subtest 8b PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 9. Guided Calibration and Resting/Extreme Transform Math
+ * -------------------------------------------------------------------------- */
+static void test_guided_calibration_and_resting_extremes(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 9: Guided calibration and resting/extreme transforms...\n");
+
+    /* 9a. Calibrated Axis Transform Math */
+    /* Neutral stick with resting offset 500: at raw 500, output must be exact center 128 */
+    uint8_t center_val = nk_input_profile_transform_axis_calibrated(500, 7849, 0, false, 500, -30000, 30000);
+    assert(center_val == 128);
+
+    /* Within deadzone around rest (e.g. 500 + 4000 = 4500): still 128 */
+    assert(nk_input_profile_transform_axis_calibrated(4500, 7849, 0, false, 500, -30000, 30000) == 128);
+    assert(nk_input_profile_transform_axis_calibrated(-3500, 7849, 0, false, 500, -30000, 30000) == 128);
+
+    /* At positive extreme 30000: output must be 255 */
+    assert(nk_input_profile_transform_axis_calibrated(30000, 7849, 0, false, 500, -30000, 30000) == 255);
+    /* At negative extreme -30000: output must be 0 */
+    assert(nk_input_profile_transform_axis_calibrated(-30000, 7849, 0, false, 500, -30000, 30000) == 0);
+
+    /* 9b. Calibrated Trigger Evaluation Math */
+    /* Trigger resting at 200, extreme at 30000, threshold at 8192 (~25%) */
+    /* At rest (raw 200): not pressed */
+    assert(!nk_input_profile_eval_trigger_calibrated(200, 8192, 200, 30000));
+    assert(!nk_input_profile_eval_trigger_calibrated(100, 8192, 200, 30000));
+    /* Pull 5000 (below threshold): not pressed */
+    assert(!nk_input_profile_eval_trigger_calibrated(5000, 8192, 200, 30000));
+    /* Pull 15000 (~50%): pressed */
+    assert(nk_input_profile_eval_trigger_calibrated(15000, 8192, 200, 30000));
+    /* Pull 30000 (100%): pressed */
+    assert(nk_input_profile_eval_trigger_calibrated(30000, 8192, 200, 30000));
+
+    /* 9c. Guided Calibration State Machine */
+    InputSettingsState state;
+    input_settings_init(&state);
+
+    assert(!input_settings_is_calibrating(&state));
+    assert(input_settings_get_calibration_stage(&state) == CALIBRATION_STAGE_INACTIVE);
+
+    bool started = input_settings_start_calibration(&state);
+    assert(started);
+    assert(input_settings_is_calibrating(&state));
+    assert(input_settings_get_calibration_stage(&state) == CALIBRATION_STAGE_REST);
+
+    /* Advance time during rest stage with host axes at resting drift */
+    int16_t rest_axes[NK_HOST_AXIS_COUNT] = {0};
+    rest_axes[NK_HOST_AXIS_LEFTX] = 450;
+    rest_axes[NK_HOST_AXIS_LEFTY] = -320;
+    rest_axes[NK_HOST_AXIS_LEFT_TRIGGER] = 80;
+    rest_axes[NK_HOST_AXIS_RIGHT_TRIGGER] = 90;
+
+    /* Tick 500ms -> still in rest */
+    input_settings_update_calibration(&state, 500, rest_axes);
+    assert(input_settings_get_calibration_stage(&state) == CALIBRATION_STAGE_REST);
+
+    /* Tick remaining 500ms -> should transition to EXTREMES stage */
+    input_settings_update_calibration(&state, 500, rest_axes);
+    assert(input_settings_get_calibration_stage(&state) == CALIBRATION_STAGE_EXTREMES);
+
+    /* Simulate user moving stick in circles and pulling triggers */
+    int16_t move_axes[NK_HOST_AXIS_COUNT] = {0};
+    move_axes[NK_HOST_AXIS_LEFTX] = -29500;
+    move_axes[NK_HOST_AXIS_LEFTY] = -31000;
+    move_axes[NK_HOST_AXIS_LEFT_TRIGGER] = 31200;
+    move_axes[NK_HOST_AXIS_RIGHT_TRIGGER] = 30800;
+    input_settings_update_calibration(&state, 100, move_axes);
+
+    move_axes[NK_HOST_AXIS_LEFTX] = 30500;
+    move_axes[NK_HOST_AXIS_LEFTY] = 29800;
+    input_settings_update_calibration(&state, 100, move_axes);
+
+    /* User clicks Finish Sampling */
+    bool finished = input_settings_finish_calibration_extremes(&state);
+    assert(finished);
+    assert(input_settings_get_calibration_stage(&state) == CALIBRATION_STAGE_RESULT);
+
+    /* User clicks Accept */
+    bool accepted = input_settings_accept_calibration(&state);
+    assert(accepted);
+    assert(!input_settings_is_calibrating(&state));
+    assert(input_settings_get_calibration_stage(&state) == CALIBRATION_STAGE_INACTIVE);
+
+    /* Verify profile has the calibrated values */
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].rest == 450);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].min_val == -29500);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].max_val == 30500);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_Y].rest == -320);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_Y].min_val == -31000);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_Y].max_val == 29800);
+    assert(state.profile.trigger_rest == 90);
+    assert(state.profile.trigger_extreme == 31200);
+
+    /* 9d. Save/load round-trip preserves calibrated fields */
+    const char *calib_file = SR_SELFTEST_BUILD_ROOT "/test_calib_profile.json";
+    assert(input_settings_save(&state, calib_file) == NK_OK);
+
+    InputSettingsState loaded;
+    assert(input_settings_load(&loaded, calib_file) == NK_OK);
+    assert(loaded.profile.axes[NK_PSP_AXIS_ANALOG_X].rest == 450);
+    assert(loaded.profile.axes[NK_PSP_AXIS_ANALOG_X].min_val == -29500);
+    assert(loaded.profile.axes[NK_PSP_AXIS_ANALOG_X].max_val == 30500);
+    assert(loaded.profile.trigger_rest == 90);
+    assert(loaded.profile.trigger_extreme == 31200);
+    remove(calib_file);
+
+    /* 9e. Backward compatibility: load profile without calibration fields */
+    const char *legacy_file = SR_SELFTEST_BUILD_ROOT "/test_legacy_profile.json";
+    FILE *lf = fopen(legacy_file, "w");
+    assert(lf != NULL);
+    fputs("{\n"
+          "  \"schema_version\": 1,\n"
+          "  \"device\": {\n"
+          "    \"guid\": \"legacy_test\",\n"
+          "    \"name_hint\": \"Legacy Controller\"\n"
+          "  },\n"
+          "  \"calibration\": {\n"
+          "    \"trigger_threshold\": 8192,\n"
+          "    \"analog_x\": {\n"
+          "      \"host_axis\": \"leftx\",\n"
+          "      \"deadzone_inner\": 7849,\n"
+          "      \"deadzone_outer\": 0,\n"
+          "      \"inverted\": false\n"
+          "    },\n"
+          "    \"analog_y\": {\n"
+          "      \"host_axis\": \"lefty\",\n"
+          "      \"deadzone_inner\": 7849,\n"
+          "      \"deadzone_outer\": 0,\n"
+          "      \"inverted\": false\n"
+          "    }\n"
+          "  },\n"
+          "  \"psp_bindings\": [],\n"
+          "  \"navigation_bindings\": []\n"
+          "}\n", lf);
+    fclose(lf);
+
+    InputSettingsState legacy_loaded;
+    assert(input_settings_load(&legacy_loaded, legacy_file) == NK_OK);
+    /* Should have defaulted cleanly */
+    assert(legacy_loaded.profile.axes[NK_PSP_AXIS_ANALOG_X].rest == 0);
+    assert(legacy_loaded.profile.axes[NK_PSP_AXIS_ANALOG_X].min_val == -32768);
+    assert(legacy_loaded.profile.axes[NK_PSP_AXIS_ANALOG_X].max_val == 32767);
+    assert(legacy_loaded.profile.trigger_rest == 0);
+    assert(legacy_loaded.profile.trigger_extreme == 32767);
+    remove(legacy_file);
+
+    printf("[INPUT_SETTINGS_TEST] Subtest 9 PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 10. Per-Title Mapping Scope, Global Isolation, and Atomic Persistence
+ * -------------------------------------------------------------------------- */
+static void test_per_title_scope_and_atomic_save(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 10: per-title scope, global isolation, atomic save...\n");
+
+    const char *file_path = SR_SELFTEST_BUILD_ROOT "/test_per_title_settings.json";
+    remove(file_path);
+
+    /* A fresh state edits the global mapping and owns no per-title entry. */
+    InputSettingsState state;
+    input_settings_init(&state);
+    assert(!input_settings_is_title_scope(&state));
+    assert(strcmp(input_settings_scope_label(&state), "Global mapping") == 0);
+    assert(state.file.title_count == 0);
+    assert(!input_settings_has_title_mapping(&state, "UCUS98701"));
+
+    /* A distinctive global binding to prove the per-title edit cannot touch it. */
+    NkBindingSource guide;
+    guide.type = NK_BINDING_HOST_BUTTON;
+    guide.index = NK_HOST_BUTTON_GUIDE;
+    assert(input_settings_assign_binding(&state, INPUT_CONTROL_BTN_CROSS, guide));
+    assert(input_settings_save(&state, file_path) == NK_OK);
+
+    /* Choosing a disc's own mapping seeds it from the global mapping, so the
+     * first edit in that scope starts from what the user already had. */
+    assert(input_settings_set_scope(&state, "UCUS98701"));
+    assert(input_settings_is_title_scope(&state));
+    assert(strcmp(input_settings_scope_label(&state), "UCUS98701") == 0);
+    assert(input_settings_has_title_mapping(&state, "UCUS98701"));
+    assert(state.file.title_count == 1);
+    assert(state.profile.psp_buttons[NK_PSP_BTN_CROSS].primary.index == NK_HOST_BUTTON_GUIDE);
+    assert(state.file.global.psp_buttons[NK_PSP_BTN_CROSS].primary.index == NK_HOST_BUTTON_GUIDE);
+
+    /* Editing in the per-title scope changes only that disc. */
+    NkBindingSource left_stick;
+    left_stick.type = NK_BINDING_HOST_BUTTON;
+    left_stick.index = NK_HOST_BUTTON_LEFT_STICK;
+    assert(input_settings_assign_binding(&state, INPUT_CONTROL_BTN_CROSS, left_stick));
+    input_settings_set_deadzone(&state, NK_PSP_AXIS_ANALOG_X, 5000);
+    assert(state.profile.psp_buttons[NK_PSP_BTN_CROSS].primary.index == NK_HOST_BUTTON_LEFT_STICK);
+    assert(state.file.global.psp_buttons[NK_PSP_BTN_CROSS].primary.index == NK_HOST_BUTTON_GUIDE);
+    assert(state.file.global.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == NK_INPUT_DEFAULT_DEADZONE_INNER);
+
+    /* The global scope still shows the global mapping, unchanged. */
+    assert(input_settings_set_scope(&state, NULL));
+    assert(!input_settings_is_title_scope(&state));
+    assert(state.profile.psp_buttons[NK_PSP_BTN_CROSS].primary.index == NK_HOST_BUTTON_GUIDE);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == NK_INPUT_DEFAULT_DEADZONE_INNER);
+
+    /* Toggling flips between the two, which is what the library card and
+     * Controller Settings do. Going back to the global mapping drops the disc's
+     * own entry, so that disc's next launch uses the global profile. */
+    assert(input_settings_toggle_scope(&state, "UCUS98701"));
+    assert(input_settings_is_title_scope(&state));
+    assert(state.profile.psp_buttons[NK_PSP_BTN_CROSS].primary.index == NK_HOST_BUTTON_LEFT_STICK);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == 5000);
+    assert(input_settings_toggle_scope(&state, "UCUS98701"));
+    assert(!input_settings_is_title_scope(&state));
+    assert(!input_settings_has_title_mapping(&state, "UCUS98701"));
+    assert(state.file.title_count == 0);
+
+    /* A disc ID that cannot name a file is refused and the scope is kept. */
+    assert(!input_settings_set_scope(&state, "../escape"));
+    assert(!input_settings_is_title_scope(&state));
+
+    /* Saving writes both mappings: the global one the user edited before, and
+     * the per-title one edited after. */
+    assert(input_settings_set_scope(&state, "UCUS98701"));
+    NkBindingSource rebind;
+    rebind.type = NK_BINDING_HOST_BUTTON;
+    rebind.index = NK_HOST_BUTTON_LEFT_STICK;
+    assert(input_settings_assign_binding(&state, INPUT_CONTROL_BTN_CROSS, rebind));
+    input_settings_set_deadzone(&state, NK_PSP_AXIS_ANALOG_X, 5000);
+    assert(input_settings_save(&state, file_path) == NK_OK);
+    assert(input_settings_save(&state, file_path) == NK_OK); /* atomic overwrite */
+
+    InputSettingsState reloaded;
+    assert(input_settings_load(&reloaded, file_path) == NK_OK);
+    assert(reloaded.file.title_count == 1);
+    assert(reloaded.file.global.psp_buttons[NK_PSP_BTN_CROSS].primary.index == NK_HOST_BUTTON_GUIDE);
+    assert(reloaded.file.global.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == NK_INPUT_DEFAULT_DEADZONE_INNER);
+    char diag[NK_INPUT_DIAGNOSTIC_MAX_LEN];
+    const NkInputProfile *resolved =
+        input_settings_resolve_for_disc(&reloaded, "UCUS98701", diag, sizeof(diag));
+    assert(resolved != NULL);
+    assert(resolved->psp_buttons[NK_PSP_BTN_CROSS].primary.index == NK_HOST_BUTTON_LEFT_STICK);
+    assert(resolved->axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == 5000);
+    resolved = input_settings_resolve_for_disc(&reloaded, "TEST80001", diag, sizeof(diag));
+    assert(resolved == &reloaded.file.global);
+
+    /* An interrupted write leaves the previous file intact: the temporary file
+     * cannot be opened, so the rename never happens and the saved document on
+     * disk is still the one that was there. */
+    /* Sized for an absolute BUILD_ROOT: a scratch path is much longer than the default. */
+    char blocker[NATIVE_TEST_PATH_MAX];
+    int blocker_len = snprintf(blocker, sizeof(blocker), "%s.tmp", file_path);
+    assert(blocker_len > 0 && (size_t)blocker_len < sizeof(blocker));
+#if defined(_WIN32) || defined(_WIN64)
+    assert(CreateDirectoryA(blocker, NULL) != 0);
+#else
+    assert(mkdir(blocker, 0777) == 0);
+#endif
+    assert(input_settings_set_scope(&state, "UCUS98701"));
+    state.profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner = 1234;
+    assert(input_settings_save(&state, file_path) != NK_OK);
+    assert(state.has_save_diagnostic);
+    assert(state.save_diagnostic[0] != '\0');
+    InputSettingsState after_failed;
+    assert(input_settings_load(&after_failed, file_path) == NK_OK);
+    assert(after_failed.file.title[0].axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == 5000);
+#if defined(_WIN32) || defined(_WIN64)
+    assert(RemoveDirectoryA(blocker) != 0);
+#else
+    assert(rmdir(blocker) == 0);
+#endif
+    assert(input_settings_save(&state, file_path) == NK_OK);
+    assert(input_settings_load(&after_failed, file_path) == NK_OK);
+    assert(after_failed.file.title[0].axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == 1234);
+
+    /* The file the launched runtime is handed carries the effective mapping for
+     * that disc and nothing else. */
+    char path[NK_MAX_PATH] = {0};
+    assert(input_settings_write_disc_profile(&after_failed, "UCUS98701", path, sizeof(path),
+                                             diag, sizeof(diag)) == NK_OK);
+    assert(strstr(path, "UCUS98701") != NULL);
+    assert(native_test_path_within(path, native_test_get_root()));
+    if (native_test_get_real_config_probe()[0]) {
+        assert(!native_test_path_within(path, native_test_get_real_config_probe()));
+    }
+    native_test_assert_real_config_untouched();
+    NkInputProfile handed;
+    assert(nk_input_profile_load(&handed, path, diag, sizeof(diag)) == NK_OK);
+    assert(handed.psp_buttons[NK_PSP_BTN_CROSS].primary.index == NK_HOST_BUTTON_LEFT_STICK);
+    assert(handed.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == 1234);
+
+    /* An unsafe disc ID never produces a path at all. */
+    char bad_path[NK_MAX_PATH];
+    bad_path[0] = 'x';
+    assert(input_settings_write_disc_profile(&after_failed, "../escape", bad_path, sizeof(bad_path),
+                                             diag, sizeof(diag)) != NK_OK);
+    assert(bad_path[0] == '\0');
+    assert(strstr(diag, "disc ID") != NULL);
+
+    /* A config directory that cannot hold the file is an error with a reason,
+     * not a silently global launch. Point the per-user config location at a
+     * regular file so creating the profile directory cannot succeed. */
+    {
+        const char *blocker_file = SR_SELFTEST_BUILD_ROOT "/test_config_blocker";
+        FILE *bf = fopen(blocker_file, "wb");
+        assert(bf != NULL);
+        fputs("not a directory\n", bf);
+        fclose(bf);
+#if defined(_WIN32) || defined(_WIN64)
+        const char *saved = getenv("LOCALAPPDATA");
+        char saved_copy[1024];
+        if (saved) snprintf(saved_copy, sizeof(saved_copy), "%s", saved);
+        test_setenv("LOCALAPPDATA", blocker_file);
+#else
+        const char *saved = getenv("XDG_CONFIG_HOME");
+        char saved_copy[1024];
+        if (saved) snprintf(saved_copy, sizeof(saved_copy), "%s", saved);
+        test_setenv("XDG_CONFIG_HOME", blocker_file);
+#endif
+        char blocked_path[NK_MAX_PATH];
+        blocked_path[0] = 'x';
+        assert(input_settings_write_disc_profile(&after_failed, "UCUS98701", blocked_path,
+                                                 sizeof(blocked_path), diag, sizeof(diag)) != NK_OK);
+        assert(blocked_path[0] == '\0');
+        assert(diag[0] != '\0');
+        if (saved) {
+#if defined(_WIN32) || defined(_WIN64)
+            test_setenv("LOCALAPPDATA", saved_copy);
+#else
+            test_setenv("XDG_CONFIG_HOME", saved_copy);
+#endif
+        } else {
+#if defined(_WIN32) || defined(_WIN64)
+            test_setenv("LOCALAPPDATA", NULL);
+#else
+            test_setenv("XDG_CONFIG_HOME", NULL);
+#endif
+        }
+        remove(blocker_file);
+        native_test_assert_config_root_isolated();
+        native_test_assert_real_config_untouched();
+    }
+
+    /* The document the player writes is bounded: a full table refuses another
+     * disc rather than dropping one. */
+    for (int i = 0; after_failed.file.title_count < NK_INPUT_MAX_PER_TITLE; i++) {
+        char disc_id[NK_MAX_DISC_ID_LEN];
+        snprintf(disc_id, sizeof(disc_id), "FILL%05d", i);
+        assert(input_settings_set_scope(&after_failed, disc_id));
+    }
+    assert(!input_settings_set_scope(&after_failed, "ONET00TOOMANY"));
+    assert(!input_settings_is_title_scope(&after_failed) ||
+           strcmp(after_failed.editing_disc_id, "ONET00TOOMANY") != 0);
+
+    remove(path);
+    remove(file_path);
+    native_test_assert_real_config_untouched();
+    printf("[INPUT_SETTINGS_TEST] Subtest 10 PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 11. Hostile Profile Files Through The Player Loader
+ * -------------------------------------------------------------------------- */
+static void test_hostile_profile_files(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 11: hostile files leave the player at defaults...\n");
+
+    /* A file the user can edit is a file the user can break. Every shape here
+     * has to leave the settings screen on the safe default mapping with the
+     * diagnostic on screen, never with half a mapping the pad cannot see. */
+    static const char *const kHostileFiles[] = {
+        "",                                                                     /* empty */
+        "   \n",                                                                /* blank */
+        "{",                                                                    /* cut short */
+        "{\"schema_version\": 2, \"device\": {\"guid\": \"g\"},",                  /* cut mid-object */
+        "{\"schema_version\":2,\"device\":{\"guid\":\"g\"},"
+        "\"calibration\":{\"trigger_threshold\":8192,"
+        "\"analog_x\":{\"host_axis\":\"leftx\",\"deadzone_inner\":1000},"
+        "\"analog_y\":{\"host_axis\":\"lefty\",\"deadzone_inner\":1000}},"
+        "\"psp_bindings\":[{\"control\":\"cross\"}],\"navigation_bindings\":[]}", /* unbound control */
+        "{\"schema_version\":2,\"device\":{\"guid\":\"g\"},"
+        "\"calibration\":{\"trigger_threshold\":99999,"
+        "\"analog_x\":{\"host_axis\":\"leftx\",\"deadzone_inner\":1000},"
+        "\"analog_y\":{\"host_axis\":\"lefty\",\"deadzone_inner\":1000}},"
+        "\"psp_bindings\":[],\"navigation_bindings\":[]}",                       /* out of range */
+        "{\"schema_version\":2,\"device\":{\"guid\":\"g\xFF\"},"
+        "\"calibration\":{\"trigger_threshold\":8192,"
+        "\"analog_x\":{\"host_axis\":\"leftx\",\"deadzone_inner\":1000},"
+        "\"analog_y\":{\"host_axis\":\"lefty\",\"deadzone_inner\":1000}},"
+        "\"psp_bindings\":[],\"navigation_bindings\":[]}",                       /* invalid UTF-8 */
+        "{\"schema_version\":2,\"device\":{\"guid\":\"g\"},"
+        "\"calibration\":{\"trigger_threshold\":8192,"
+        "\"analog_x\":{\"host_axis\":\"leftx\",\"deadzone_inner\":1000},"
+        "\"analog_y\":{\"host_axis\":\"lefty\",\"deadzone_inner\":1000}},"
+        "\"psp_bindings\":[],\"navigation_bindings\":[],"
+        "\"per_title\":[{\"disc_id\":\"NUL\",\"profile\":{}}]}",                  /* reserved name */
+        "{\"schema_version\":2,\"device\":{\"guid\":\"g\"},"
+        "\"calibration\":{\"trigger_threshold\":8192,"
+        "\"analog_x\":{\"host_axis\":\"leftx\",\"deadzone_inner\":1000},"
+        "\"analog_y\":{\"host_axis\":\"lefty\",\"deadzone_inner\":1000}},"
+        "\"psp_bindings\":[],\"navigation_bindings\":[],"
+        "\"per_title\":[{\"disc_id\":\"../../escape\",\"profile\":{}}]}",         /* traversal */
+        "{\"schema_version\":2,\"device\":{\"guid\":\"g\"},"
+        "\"calibration\":{\"trigger_threshold\":8192,"
+        "\"analog_x\":{\"host_axis\":\"leftx\",\"deadzone_inner\":1000},"
+        "\"analog_y\":{\"host_axis\":\"lefty\",\"deadzone_inner\":1000}},"
+        "\"psp_bindings\":[],\"navigation_bindings\":[]} TRAILING",               /* garbage */
+    };
+    static const char *const kRawNulFile =
+        "{\"schema_version\":2,\"device\":{\"guid\":\"g\0h\"}}";
+    size_t hostile_count = sizeof(kHostileFiles) / sizeof(kHostileFiles[0]);
+    const char *path = SR_SELFTEST_BUILD_ROOT "/test_hostile_settings.json";
+
+    assert(nk_platform_mkdir_p(SR_SELFTEST_BUILD_ROOT));
+
+    for (size_t i = 0; i < hostile_count; i++) {
+        InputSettingsState state;
+        FILE *f = fopen(path, "wb");
+        assert(f != NULL);
+        assert(fwrite(kHostileFiles[i], 1, strlen(kHostileFiles[i]), f) ==
+               strlen(kHostileFiles[i]));
+        assert(fclose(f) == 0);
+
+        NkResult res = input_settings_load(&state, path);
+        if (res == NK_OK || !state.has_load_diagnostic || state.load_diagnostic[0] == '\0') {
+            printf("  hostile file %zu: expected a refusal with a diagnostic, got res=%d\n",
+                   i, (int)res);
+            assert(0 && "hostile profile file was not refused with a diagnostic");
+        }
+        assert(state.loaded_from_file);
+        assert(state.profile.schema_version == NK_INPUT_PROFILE_SCHEMA_VERSION);
+        assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner ==
+               NK_INPUT_DEFAULT_DEADZONE_INNER);
+        assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_CROSS].primary.type !=
+               NK_BINDING_NONE);
+        assert(state.file.title_count == 0);
+        assert(state.editing_disc_id[0] == '\0');
+        assert(!input_settings_is_title_scope(&state));
+        assert(!input_settings_has_conflicts(&state));
+        /* A refused document leaves the player usable: a save from here writes
+         * the defaults, and that file loads back. */
+        if (i == 0 || i == 2) {
+            assert(input_settings_save(&state, path) == NK_OK);
+            assert(!state.has_save_diagnostic);
+            InputSettingsState reloaded;
+            assert(input_settings_load(&reloaded, path) == NK_OK);
+            assert(!reloaded.has_load_diagnostic);
+            assert(reloaded.file.title_count == 0);
+        }
+    }
+
+    /* A NUL byte inside the file is data, not an end of file. */
+    {
+        InputSettingsState state;
+        FILE *f = fopen(path, "wb");
+        assert(f != NULL);
+        assert(fwrite(kRawNulFile, 1, strlen(kRawNulFile) + 1, f) == strlen(kRawNulFile) + 1);
+        assert(fclose(f) == 0);
+        assert(input_settings_load(&state, path) != NK_OK);
+        assert(state.has_load_diagnostic);
+        assert(state.file.title_count == 0);
+    }
+
+    /* A disc ID the whitelist refuses never becomes a file name: the write is
+     * refused before the profile directory is touched. */
+    {
+        static const char *const kUnusableIds[] = {
+            "", "..", "../escape", "a/b", "NUL", "nul.json", "COM1", "LPT9", "AUX"
+        };
+        size_t n_ids = sizeof(kUnusableIds) / sizeof(kUnusableIds[0]);
+        for (size_t i = 0; i < n_ids; i++) {
+            InputSettingsState state;
+            char out_path[NK_MAX_PATH];
+            char diag[NK_INPUT_DIAGNOSTIC_MAX_LEN];
+            input_settings_init(&state);
+            out_path[0] = 'X';
+            diag[0] = '\0';
+            assert(input_settings_write_disc_profile(&state, kUnusableIds[i], out_path,
+                                                    sizeof(out_path), diag, sizeof(diag)) != NK_OK);
+            assert(out_path[0] == '\0');
+            assert(strstr(diag, "disc ID") != NULL);
+        }
+    }
+
+    remove(path);
+    printf("[INPUT_SETTINGS_TEST] Subtest 11 PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 12. Keyboard keys on the Controls page (#1299)
+ * -------------------------------------------------------------------------- */
+static void test_keyboard_keys(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 12: keyboard keys listed, rebound, refused, reset, saved...\n");
+
+    /* The profile's default keys (nk_input_profile_init_default) in the page's words. */
+    static const char *const expected[INPUT_CONTROL_DIGITAL_COUNT] = {
+        "Shift", "Enter", "Up Arrow", "Right Arrow", "Down Arrow",
+        "Left Arrow", "Q", "W", "S", "Z", "X", "A", "None", "None"
+    };
+    const char *file_path = SR_SELFTEST_BUILD_ROOT "/test_keyboard_keys_profile.json";
+    const int key_c = nk_host_key_from_name("c");
+    const int key_x = nk_host_key_from_name("x");
+    char buf[64];
+    char diag[NK_INPUT_DIAGNOSTIC_MAX_LEN];
+    InputSettingsState state;
+    remove(file_path);
+    input_settings_init(&state);
+    assert(state.device == INPUT_DEVICE_CONTROLLER);
+
+    /* Every PSP button is listed with the key the profile gives it. */
+    for (int i = 0; i < INPUT_CONTROL_DIGITAL_COUNT; i++) {
+        input_settings_format_key_binding(&state, i, buf, sizeof(buf));
+        if (strcmp(buf, expected[i]) != 0) {
+            printf("[INPUT_SETTINGS_TEST] %s shows '%s', expected '%s'\n",
+                   input_settings_control_name(i), buf, expected[i]);
+        }
+        assert(strcmp(buf, expected[i]) == 0);
+    }
+    state.profile.psp_keys[NK_PSP_BTN_HOME].primary = nk_host_key_from_name("kp_5");
+    input_settings_format_key_binding(&state, INPUT_CONTROL_BTN_HOME, buf, sizeof(buf));
+    assert(strcmp(buf, "Keypad 5") == 0);
+    state.profile.psp_keys[NK_PSP_BTN_HOME].primary = NK_HOST_KEY_NONE;
+
+    /* On the keyboard page a chosen button waits for a key, and the key pressed is
+     * its key; a controller input does not answer the wait. */
+    input_settings_set_device(&state, INPUT_DEVICE_KEYBOARD);
+    assert(input_settings_start_capture(&state, INPUT_CONTROL_BTN_START));
+    NkBindingSource south = { NK_BINDING_HOST_BUTTON, NK_HOST_BUTTON_SOUTH, 0 };
+    assert(!input_settings_feed_capture_source(&state, south));
+    assert(input_settings_is_capturing(&state));
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_START].primary.index == NK_HOST_BUTTON_START);
+    assert(input_settings_feed_capture_key(&state, key_c));
+    assert(!input_settings_is_capturing(&state));
+    assert(state.profile.psp_keys[NK_PSP_BTN_START].primary == key_c);
+    assert(state.note[0] == '\0');
+
+    /* A key another button uses moves here, and that button takes this one's key:
+     * nothing is lost, and the page names the button that changed. */
+    assert(input_settings_start_capture(&state, INPUT_CONTROL_BTN_START));
+    assert(input_settings_feed_capture_key(&state, key_x));
+    assert(!input_settings_is_capturing(&state));
+    assert(state.profile.psp_keys[NK_PSP_BTN_START].primary == key_x);
+    assert(state.profile.psp_keys[NK_PSP_BTN_CROSS].primary == key_c);
+    assert(strcmp(state.note, "X was Cross's. Cross now uses C.") == 0);
+    assert(state.note_control == INPUT_CONTROL_BTN_CROSS && !state.note_error);
+    assert(input_settings_assign_key(&state, INPUT_CONTROL_BTN_START, key_c));
+    assert(state.profile.psp_keys[NK_PSP_BTN_CROSS].primary == key_x);
+    /* A button's second key counts too: it takes the key's place there. */
+    assert(input_settings_assign_key(&state, INPUT_CONTROL_BTN_CIRCLE,
+                                     nk_host_key_from_name("rshift")));
+    assert(state.profile.psp_keys[NK_PSP_BTN_SELECT].secondary == nk_host_key_from_name("z"));
+    assert(strcmp(state.note, "Right Shift was Select's. Select now uses Z.") == 0);
+    assert(input_settings_assign_key(&state, INPUT_CONTROL_BTN_CIRCLE, nk_host_key_from_name("z")));
+    assert(state.profile.psp_keys[NK_PSP_BTN_SELECT].secondary == nk_host_key_from_name("rshift"));
+    /* Escape, F1 and codes past the key table cannot be bound at all. */
+    assert(!input_settings_assign_key(&state, INPUT_CONTROL_BTN_CIRCLE, 41));
+    assert(!input_settings_assign_key(&state, INPUT_CONTROL_BTN_CIRCLE, 58));
+    assert(!input_settings_assign_key(&state, INPUT_CONTROL_BTN_CIRCLE, NK_HOST_KEY_LIMIT));
+    assert(strstr(state.note, "can't be used") != NULL && state.note_error);
+    assert(state.profile.psp_keys[NK_PSP_BTN_CIRCLE].primary == nk_host_key_from_name("z"));
+    assert(nk_input_profile_validate(&state.profile, diag, sizeof(diag)) == NK_OK);
+
+    /* Reset to defaults resets only the device shown. */
+    NkBindingSource left_stick = { NK_BINDING_HOST_BUTTON, NK_HOST_BUTTON_LEFT_STICK, 0 };
+    assert(input_settings_assign_binding(&state, INPUT_CONTROL_BTN_START, left_stick));
+    input_settings_reset_device_to_defaults(&state);
+    assert(state.profile.psp_keys[NK_PSP_BTN_START].primary == nk_host_key_from_name("return"));
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_START].primary.index ==
+           NK_HOST_BUTTON_LEFT_STICK);
+    assert(state.note[0] == '\0');
+    assert(input_settings_assign_key(&state, INPUT_CONTROL_BTN_START, key_c));
+    input_settings_set_device(&state, INPUT_DEVICE_CONTROLLER);
+    input_settings_reset_device_to_defaults(&state);
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_START].primary.index == NK_HOST_BUTTON_START);
+    assert(state.profile.psp_keys[NK_PSP_BTN_START].primary == key_c);
+
+    /* The key is saved with the mapping and loaded back. */
+    assert(input_settings_save(&state, file_path) == NK_OK);
+    InputSettingsState loaded;
+    assert(input_settings_load(&loaded, file_path) == NK_OK);
+    assert(!loaded.has_load_diagnostic);
+    input_settings_format_key_binding(&loaded, INPUT_CONTROL_BTN_START, buf, sizeof(buf));
+    assert(strcmp(buf, "C") == 0);
+
+    /* A game's own keys reach the file the launched game is handed (NK_INPUT_PROFILE). */
+    assert(input_settings_set_scope(&loaded, "UCUS98701"));
+    input_settings_set_device(&loaded, INPUT_DEVICE_KEYBOARD);
+    assert(input_settings_assign_key(&loaded, INPUT_CONTROL_BTN_HOME, nk_host_key_from_name("h")));
+    assert(input_settings_save(&loaded, file_path) == NK_OK);
+    char path[NK_MAX_PATH] = {0};
+    assert(input_settings_write_disc_profile(&loaded, "UCUS98701", path, sizeof(path),
+                                             diag, sizeof(diag)) == NK_OK);
+    assert(native_test_path_within(path, native_test_get_root()));
+    NkInputProfile handed;
+    assert(nk_input_profile_load(&handed, path, diag, sizeof(diag)) == NK_OK);
+    assert(handed.psp_keys[NK_PSP_BTN_START].primary == key_c);
+    assert(handed.psp_keys[NK_PSP_BTN_HOME].primary == nk_host_key_from_name("h"));
+
+    remove(path);
+    remove(file_path);
+    printf("[INPUT_SETTINGS_TEST] Subtest 12 PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 12b. The stick's keys, the controller's stick, and saving as you go (#1299)
+ * -------------------------------------------------------------------------- */
+static void test_stick_keys_and_saving(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 12b: stick keys, stick choice, saved as made...\n");
+    static const char *const expected[4] = {"I", "K", "J", "L"};
+    const char *file_path = SR_SELFTEST_BUILD_ROOT "/test_stick_keys_profile.json";
+    char buf[64];
+    char diag[NK_INPUT_DIAGNOSTIC_MAX_LEN];
+    InputBindingGlyph glyph;
+    InputSettingsState state;
+    remove(file_path);
+    input_settings_init(&state);
+    strcpy(state.profile_path, file_path);
+
+    /* The stick's four keys are controls of their own, on the keyboard only. */
+    for (int d = 0; d < 4; d++) {
+        int control = INPUT_CONTROL_STICK_UP + d;
+        assert(input_settings_control_has_keys(control));
+        assert(!input_settings_control_bindable(&state, control));
+        input_settings_format_key_binding(&state, control, buf, sizeof(buf));
+        assert(strcmp(buf, expected[d]) == 0);
+        input_settings_key_glyph(&state, control, &glyph);
+        assert(glyph.kind == INPUT_GLYPH_KEY && strcmp(glyph.legend, expected[d]) == 0);
+    }
+    assert(!input_settings_control_has_keys(INPUT_CONTROL_ANALOG_STICK));
+    assert(!input_settings_start_capture(&state, INPUT_CONTROL_STICK_UP));
+    assert(strcmp(input_settings_control_name(INPUT_CONTROL_STICK_RIGHT), "Stick Right") == 0);
+
+    /* On the keyboard a stick key is captured like a button's, and a key a button uses
+     * swaps with it. Nothing is written while the wait runs; the change is written
+     * once it ends. */
+    input_settings_set_device(&state, INPUT_DEVICE_KEYBOARD);
+    assert(input_settings_start_capture(&state, INPUT_CONTROL_STICK_UP));
+    assert(input_settings_save_if_dirty(&state) == NK_OK && !nk_platform_file_exists(file_path));
+    assert(input_settings_feed_capture_key(&state, nk_host_key_from_name("w")));
+    assert(state.profile.stick_keys[NK_PSP_STICK_UP].primary == nk_host_key_from_name("w"));
+    assert(state.profile.psp_keys[NK_PSP_BTN_RTRIGGER].primary == nk_host_key_from_name("i"));
+    assert(strcmp(state.note, "W was R Trigger (R1)'s. R Trigger (R1) now uses I.") == 0);
+    assert(nk_input_profile_validate(&state.profile, diag, sizeof(diag)) == NK_OK);
+    assert(state.dirty);
+    assert(input_settings_save_if_dirty(&state) == NK_OK);
+    assert(!state.dirty && nk_platform_file_exists(file_path));
+    assert(input_settings_save_if_dirty(&state) == NK_OK);
+
+    InputSettingsState loaded;
+    assert(input_settings_load(&loaded, file_path) == NK_OK && !loaded.has_load_diagnostic);
+    assert(loaded.profile.stick_keys[NK_PSP_STICK_UP].primary == nk_host_key_from_name("w"));
+    assert(loaded.profile.psp_keys[NK_PSP_BTN_RTRIGGER].primary == nk_host_key_from_name("i"));
+
+    /* The keyboard's reset brings the stick keys back too, and is saved. */
+    input_settings_reset_device_to_defaults(&state);
+    assert(state.profile.stick_keys[NK_PSP_STICK_UP].primary == nk_host_key_from_name("i"));
+    assert(state.profile.psp_keys[NK_PSP_BTN_RTRIGGER].primary == nk_host_key_from_name("w"));
+    assert(state.dirty && input_settings_save_if_dirty(&state) == NK_OK);
+
+    /* The controller chooses the stick that drives the PSP stick; its calibration
+     * stays. The controller's reset puts the left stick back and keeps the keys. */
+    input_settings_set_device(&state, INPUT_DEVICE_CONTROLLER);
+    assert(!input_settings_stick_is_right(&state));
+    state.profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner = 9000;
+    input_settings_set_stick(&state, true);
+    assert(input_settings_stick_is_right(&state));
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].host_axis == NK_HOST_AXIS_RIGHTX);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_Y].host_axis == NK_HOST_AXIS_RIGHTY);
+    assert(state.profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner == 9000);
+    assert(state.dirty && input_settings_save_if_dirty(&state) == NK_OK);
+    assert(input_settings_load(&loaded, file_path) == NK_OK);
+    assert(input_settings_stick_is_right(&loaded));
+    state.profile.stick_keys[NK_PSP_STICK_LEFT].primary = nk_host_key_from_name("h");
+    input_settings_reset_device_to_defaults(&state);
+    assert(!input_settings_stick_is_right(&state));
+    assert(state.profile.stick_keys[NK_PSP_STICK_LEFT].primary == nk_host_key_from_name("h"));
+
+    /* A refused write (the folder it names is a file) is reported, and not retried
+     * until the next change. */
+    FILE *blocker = fopen(file_path, "wb");
+    assert(blocker != NULL);
+    fclose(blocker);
+    snprintf(state.profile_path, sizeof(state.profile_path), "%s/profile.json", file_path);
+    input_settings_set_stick(&state, true);
+    assert(input_settings_save_if_dirty(&state) != NK_OK);
+    assert(!state.dirty && state.has_save_diagnostic && state.save_diagnostic[0] != '\0');
+    assert(state.unsaved);
+    assert(input_settings_save_if_dirty(&state) == NK_OK);   /* not retried every frame */
+    /* A swap after a failed write still fails, and says so; the flush that leaving the
+     * page or closing does writes it once the folder can be written. */
+    input_settings_set_device(&state, INPUT_DEVICE_KEYBOARD);
+    assert(input_settings_assign_key(&state, INPUT_CONTROL_BTN_START, nk_host_key_from_name("x")));
+    assert(state.note[0] != '\0' && input_settings_save_if_dirty(&state) != NK_OK);
+    assert(state.has_save_diagnostic && state.unsaved);
+    remove(file_path);
+    snprintf(state.profile_path, sizeof(state.profile_path), "%s", file_path);
+    assert(input_settings_start_capture(&state, INPUT_CONTROL_STICK_UP));
+    assert(input_settings_flush(&state) == NK_OK);
+    assert(!state.unsaved && !state.has_save_diagnostic && !input_settings_is_capturing(&state));
+    assert(input_settings_load(&loaded, file_path) == NK_OK);
+    assert(loaded.profile.psp_keys[NK_PSP_BTN_START].primary == nk_host_key_from_name("x"));
+    assert(input_settings_stick_is_right(&loaded));
+    assert(input_settings_flush(&state) == NK_OK);           /* nothing left to write */
+
+    remove(file_path);
+    printf("[INPUT_SETTINGS_TEST] Subtest 12b PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 12c. A key listed in both of a control's slots moves whole, and a per-title
+ *      mapping the document refuses is reported, not saved as if it were (review)
+ * -------------------------------------------------------------------------- */
+static void test_per_title_rebind_persists(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 12c: per-title rebinds persist or say why not...\n");
+    const char *file_path = SR_SELFTEST_BUILD_ROOT "/test_per_title_rebind_profile.json";
+    const int key_x = nk_host_key_from_name("x");
+    const int key_c = nk_host_key_from_name("c");
+    char diag[NK_INPUT_DIAGNOSTIC_MAX_LEN];
+    InputSettingsState state;
+    InputSettingsState loaded;
+    remove(file_path);
+    input_settings_init(&state);
+    snprintf(state.profile_path, sizeof(state.profile_path), "%s", file_path);
+    assert(input_settings_set_scope(&state, "TEST00005"));
+    input_settings_set_device(&state, INPUT_DEVICE_KEYBOARD);
+    /* Cross lists X in both slots, which the profile allows. */
+    state.profile.psp_keys[NK_PSP_BTN_CROSS].secondary = key_x;
+    assert(nk_input_profile_validate(&state.profile, diag, sizeof(diag)) == NK_OK);
+    assert(input_settings_assign_key(&state, INPUT_CONTROL_BTN_START, key_x));
+    assert(state.profile.psp_keys[NK_PSP_BTN_CROSS].primary == nk_host_key_from_name("return"));
+    assert(state.profile.psp_keys[NK_PSP_BTN_CROSS].secondary == NK_HOST_KEY_NONE);
+    assert(nk_input_profile_validate(&state.profile, diag, sizeof(diag)) == NK_OK);
+    assert(input_settings_save_if_dirty(&state) == NK_OK && !state.has_save_diagnostic);
+    assert(input_settings_load(&loaded, file_path) == NK_OK);
+    assert(input_settings_set_scope(&loaded, "TEST00005"));
+    assert(loaded.profile.psp_keys[NK_PSP_BTN_START].primary == key_x);
+
+    /* The controller likewise: a button listed in both slots leaves both. */
+    input_settings_set_device(&state, INPUT_DEVICE_CONTROLLER);
+    NkBindingSource north = {NK_BINDING_HOST_BUTTON, NK_HOST_BUTTON_NORTH, 0};
+    state.profile.psp_buttons[INPUT_CONTROL_BTN_TRIANGLE].secondary = north;
+    assert(input_settings_assign_binding(&state, INPUT_CONTROL_BTN_SQUARE, north));
+    assert(state.profile.psp_buttons[INPUT_CONTROL_BTN_TRIANGLE].secondary.type == NK_BINDING_NONE);
+    assert(nk_input_profile_validate(&state.profile, diag, sizeof(diag)) == NK_OK);
+    assert(input_settings_save_if_dirty(&state) == NK_OK);
+
+    /* A per-title mapping the document refuses is not written over the old one as if
+     * saved: the save fails, says why, and the mapping stays unsaved. */
+    input_settings_set_device(&state, INPUT_DEVICE_KEYBOARD);
+    state.profile.psp_keys[NK_PSP_BTN_SQUARE].secondary = key_c;
+    state.profile.psp_keys[NK_PSP_BTN_CIRCLE].secondary = key_c;   /* one key, two controls */
+    assert(input_settings_assign_key(&state, INPUT_CONTROL_BTN_HOME, nk_host_key_from_name("h")));
+    assert(state.has_save_diagnostic && state.unsaved);
+    assert(input_settings_save_if_dirty(&state) != NK_OK);
+    assert(state.has_save_diagnostic && state.unsaved && state.save_diagnostic[0] != '\0');
+    assert(input_settings_load(&loaded, file_path) == NK_OK);
+    assert(input_settings_set_scope(&loaded, "TEST00005"));
+    assert(loaded.profile.psp_keys[NK_PSP_BTN_HOME].primary == NK_HOST_KEY_NONE);
+
+    remove(file_path);
+    printf("[INPUT_SETTINGS_TEST] Subtest 12c PASSED!\n");
+}
+
+/* -----------------------------------------------------------------------------
+ * 13. The prompt glyph beside each binding on the Controls page (#1299)
+ * -------------------------------------------------------------------------- */
+static void expect_glyph(const InputBindingGlyph *glyph, InputGlyphKind kind, const char *legend,
+                         const char *what) {
+    if (glyph->kind != kind || strcmp(glyph->legend, legend) != 0) {
+        printf("[INPUT_SETTINGS_TEST] %s: glyph %d '%s', expected %d '%s'\n", what,
+               (int)glyph->kind, glyph->legend, (int)kind, legend);
+    }
+    assert(glyph->kind == kind && strcmp(glyph->legend, legend) == 0);
+}
+
+static void test_binding_glyphs(void) {
+    printf("[INPUT_SETTINGS_TEST] Subtest 13: a glyph for every binding, keyboard and controller...\n");
+
+    /* The default keys: keycaps with the legend the key prints, the arrows as arrows. */
+    static const struct { InputGlyphKind kind; const char *legend; } keys[INPUT_CONTROL_DIGITAL_COUNT] = {
+        {INPUT_GLYPH_KEY, "SHIFT"}, {INPUT_GLYPH_KEY, "ENTER"}, {INPUT_GLYPH_ARROW_KEY, ""},
+        {INPUT_GLYPH_ARROW_KEY, ""}, {INPUT_GLYPH_ARROW_KEY, ""}, {INPUT_GLYPH_ARROW_KEY, ""},
+        {INPUT_GLYPH_KEY, "Q"}, {INPUT_GLYPH_KEY, "W"}, {INPUT_GLYPH_KEY, "S"},
+        {INPUT_GLYPH_KEY, "Z"}, {INPUT_GLYPH_KEY, "X"}, {INPUT_GLYPH_KEY, "A"},
+        {INPUT_GLYPH_NONE, ""}, {INPUT_GLYPH_NONE, ""}
+    };
+    /* The default controller mapping: face buttons by position, Back named the way an
+     * Xbox-style pad (A south) names it; Home is unbound (Guide pauses the game). */
+    static const struct { InputGlyphKind kind; const char *legend; } pad[INPUT_CONTROL_DIGITAL_COUNT] = {
+        {INPUT_GLYPH_PAD_LEGEND, "VIEW"}, {INPUT_GLYPH_PAD_START, ""}, {INPUT_GLYPH_DPAD, ""},
+        {INPUT_GLYPH_DPAD, ""}, {INPUT_GLYPH_DPAD, ""}, {INPUT_GLYPH_DPAD, ""},
+        {INPUT_GLYPH_SHOULDER_LEFT, ""}, {INPUT_GLYPH_SHOULDER_RIGHT, ""},
+        {INPUT_GLYPH_FACE_NORTH, ""}, {INPUT_GLYPH_FACE_EAST, ""}, {INPUT_GLYPH_FACE_SOUTH, ""},
+        {INPUT_GLYPH_FACE_WEST, ""}, {INPUT_GLYPH_NONE, ""}, {INPUT_GLYPH_NONE, ""}
+    };
+    InputSettingsState state;
+    InputBindingGlyph glyph;
+    input_settings_init(&state);
+    for (int i = 0; i < INPUT_CONTROL_DIGITAL_COUNT; i++) {
+        input_settings_key_glyph(&state, i, &glyph);
+        expect_glyph(&glyph, keys[i].kind, keys[i].legend, input_settings_control_name(i));
+        input_settings_pad_glyph(&state, i, INPUT_PAD_NAMES_A_SOUTH, &glyph);
+        expect_glyph(&glyph, pad[i].kind, pad[i].legend, input_settings_control_name(i));
+    }
+
+    /* A keycap prints what the key prints: one legend for a key's left and right and
+     * its keypad copy, short forms for the long names; a second key alone is shown. */
+    static const struct { const char *name; const char *legend; } legends[] = {
+        {"rshift", "SHIFT"}, {"lctrl", "CTRL"}, {"ralt", "ALT"}, {"backspace", "BKSP"},
+        {"pagedown", "PG DN"}, {"delete", "DEL"}, {"kp_enter", "ENTER"}, {"kp_5", "5"},
+        {"kp_divide", "/"}, {"space", "SPACE"}, {"semicolon", ";"}, {"7", "7"}
+    };
+    for (size_t i = 0; i < sizeof(legends) / sizeof(legends[0]); i++) {
+        state.profile.psp_keys[NK_PSP_BTN_HOME].primary = nk_host_key_from_name(legends[i].name);
+        assert(state.profile.psp_keys[NK_PSP_BTN_HOME].primary != NK_HOST_KEY_NONE);
+        input_settings_key_glyph(&state, INPUT_CONTROL_BTN_HOME, &glyph);
+        expect_glyph(&glyph, INPUT_GLYPH_KEY, legends[i].legend, legends[i].name);
+    }
+    state.profile.psp_keys[NK_PSP_BTN_SELECT].primary = NK_HOST_KEY_NONE;
+    input_settings_key_glyph(&state, INPUT_CONTROL_BTN_SELECT, &glyph);
+    expect_glyph(&glyph, INPUT_GLYPH_KEY, "SHIFT", "Select's second key alone");
+
+    /* A rebound key changes the glyph with the words. */
+    input_settings_set_device(&state, INPUT_DEVICE_KEYBOARD);
+    assert(input_settings_assign_key(&state, INPUT_CONTROL_BTN_START, nk_host_key_from_name("c")));
+    input_settings_key_glyph(&state, INPUT_CONTROL_BTN_START, &glyph);
+    expect_glyph(&glyph, INPUT_GLYPH_KEY, "C", "Start after rebinding to C");
+
+    /* A pad input with no glyph of its own is named the way the pad's family names it. */
+    static const struct { NkBindingSource source; const char *legends[INPUT_PAD_NAMES_COUNT]; } pills[] = {
+        {{NK_BINDING_HOST_BUTTON, NK_HOST_BUTTON_BACK, 0}, {"BACK", "VIEW", "-", "CREATE"}},
+        {{NK_BINDING_HOST_BUTTON, NK_HOST_BUTTON_GUIDE, 0}, {"HOME", "GUIDE", "HOME", "HOME"}},
+        {{NK_BINDING_HOST_BUTTON, NK_HOST_BUTTON_LEFT_STICK, 0}, {"LS", "LS", "LS", "L3"}},
+        {{NK_BINDING_HOST_TRIGGER, NK_HOST_AXIS_LEFT_TRIGGER, 0}, {"LT", "LT", "ZL", "L2"}},
+        {{NK_BINDING_HOST_AXIS_POS, NK_HOST_AXIS_RIGHT_TRIGGER, 0}, {"RT", "RT", "ZR", "R2"}},
+        {{NK_BINDING_HOST_AXIS_NEG, NK_HOST_AXIS_RIGHTY, 0}, {"RS", "RS", "RS", "RS"}},
+        {{NK_BINDING_HOST_BUTTON, NK_HOST_BUTTON_LEFT_PADDLE1, 0}, {"P3", "P3", "P3", "P3"}}
+    };
+    for (size_t i = 0; i < sizeof(pills) / sizeof(pills[0]); i++) {
+        state.profile.psp_buttons[INPUT_CONTROL_BTN_HOME].primary = pills[i].source;
+        for (int names = 0; names < INPUT_PAD_NAMES_COUNT; names++) {
+            input_settings_pad_glyph(&state, INPUT_CONTROL_BTN_HOME, (InputPadNames)names, &glyph);
+            expect_glyph(&glyph, INPUT_GLYPH_PAD_LEGEND, pills[i].legends[names], "a pad pill");
+        }
+    }
+    /* A control with only a second source shows it; one with none shows no glyph. */
+    state.profile.psp_buttons[INPUT_CONTROL_BTN_HOLD].secondary =
+        (NkBindingSource){NK_BINDING_HOST_BUTTON, NK_HOST_BUTTON_WEST, 0};
+    input_settings_pad_glyph(&state, INPUT_CONTROL_BTN_HOLD, INPUT_PAD_NAMES_NEUTRAL, &glyph);
+    expect_glyph(&glyph, INPUT_GLYPH_FACE_WEST, "", "Hold's second source alone");
+    input_settings_pad_glyph(&state, INPUT_CONTROL_ANALOG_STICK, INPUT_PAD_NAMES_NEUTRAL, &glyph);
+    expect_glyph(&glyph, INPUT_GLYPH_NONE, "", "the stick is not a digital control");
+    input_settings_key_glyph(NULL, 0, &glyph);
+    expect_glyph(&glyph, INPUT_GLYPH_NONE, "", "no state");
+    printf("[INPUT_SETTINGS_TEST] Subtest 13 PASSED!\n");
+}
+
+int main(void) {
+    /* Unbuffered: a failing case names itself on stdout, and the harness reads
+     * that line even when the run aborts on the assert that follows. */
+    setbuf(stdout, NULL);
+
+    native_test_capture_real_config_probe();
+    native_test_create_root("input-settings");
+    native_test_isolate_user_data_roots();
+    native_test_assert_config_root_isolated();
+    native_test_assert_real_config_untouched();
+
+    printf("=================================================================\n");
+    printf("Starting Nakagawa Native Player Input Settings Test Suite\n");
+    printf("=================================================================\n");
+
+    test_default_load();
+    test_binding_words_fit();
+    test_corrupt_file_load_diagnostic();
+    test_bind_rebind_and_capture();
+    test_conflict_detection();
+    test_deadzone_and_trigger_bounds();
+    test_reset_to_defaults();
+    test_save_load_roundtrip();
+    test_sr_padscript_semantics_untouched();
+    test_env_clearing_consistency();
+    test_guided_calibration_and_resting_extremes();
+    test_per_title_scope_and_atomic_save();
+    test_hostile_profile_files();
+    test_keyboard_keys();
+    test_stick_keys_and_saving();
+    test_per_title_rebind_persists();
+    test_binding_glyphs();
+
+    native_test_assert_real_config_untouched();
+
+    printf("=================================================================\n");
+    printf("ALL INPUT SETTINGS TESTS PASSED SUCCESSFULLY!\n");
+    printf("=================================================================\n");
+    return 0;
+}

@@ -1,0 +1,1388 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+"""Classify a change for the path-gated public CI workflow.
+
+The classifier deliberately errs toward running a gate.  It has no game-input
+dependencies and can be exercised with ``--files`` in unit tests.  In GitHub
+Actions it reads the event payload and the checked-out commit history, then
+writes boolean outputs to ``GITHUB_OUTPUT``.
+
+Its one repository dependency is the publication policy.  Whether a path is
+published is a fact the policy already owns, so ``_is_public_surface`` asks the
+policy rather than maintaining a second, drifting list; it fails closed to "in
+the surface" when the policy cannot be read.  It is intentionally not used to
+widen ``run_python`` here: every tracked file is published, so that would make
+the Python gate unconditional and buy nothing, because the publication audit
+already runs ungated in the hygiene jobs on every event.  The output is exported so a
+local readiness check can route the same decision, where no ungated equivalent
+runs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+from functools import lru_cache
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import subprocess
+import sys
+import time
+from typing import Iterable, Mapping, Sequence
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _normalise(path: str) -> str:
+    normalised = path.replace("\\", "/")
+    while normalised.startswith("./"):
+        normalised = normalised[2:]
+    return normalised
+
+
+def _is_markdown(path: str) -> bool:
+    return PurePosixPath(path).suffix.lower() in {".md", ".mdx", ".markdown"}
+
+
+def _is_docs(path: str) -> bool:
+    return (
+        path.startswith("docs/")
+        or path.startswith(".github/ISSUE_TEMPLATE/")
+        or path.startswith(".github/PULL_REQUEST_TEMPLATE")
+        or path in {"README.md", "AGENTS.md", ".github/copilot-instructions.md"}
+        or _is_markdown(path)
+    )
+
+
+def _is_workflow_ci(path: str) -> bool:
+    logical_path = _logical_tool_path(path) or path
+    return (
+        logical_path.startswith(".github/workflows/")
+        or logical_path.startswith(".github/actions/")
+        or logical_path
+        in {
+            "tools/ci_paths.py",
+            "tools/test_ci_paths.py",
+            "tools/ci_required.py",
+            "tools/test_ci_required.py",
+            "tools/ci_test_shards.py",
+            "tools/test_ci_test_shards.py",
+        }
+    )
+
+
+def _is_dependency_metadata(path: str) -> bool:
+    return path in {
+        ".github/dependabot.yml",
+        ".pre-commit-config.yaml",
+        "pyproject.toml",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "Pipfile",
+        "Pipfile.lock",
+        "poetry.lock",
+    } or path.startswith("requirements/")
+
+
+GENERATED_PUBLIC_METADATA = frozenset(
+    {
+        "PUBLIC_EXPORT.json",
+        "assets/public_provenance_ledger.json",
+        "assets/public_source_profile.json",
+    }
+)
+
+
+def _is_generated_public_metadata(path: str) -> bool:
+    """True for the derived public metadata the publication gate exists to protect.
+
+    These files are regenerated from the tracked tree by nearly every publish, so
+    treating them as unknown paths made ``force_full`` fire on 106 of 111 commits and
+    saturated the routing the classifier computes.  They are publication artifacts,
+    not an unrecognised file class: recognising them routes the publication gate while
+    leaving the fail-closed rule intact for genuinely unknown paths.
+    """
+    return path in GENERATED_PUBLIC_METADATA
+
+
+def _is_security_publication(path: str) -> bool:
+    logical_path = _logical_tool_path(path) or path
+    name = PurePosixPath(logical_path).name
+    return (
+        logical_path.startswith(".github/ISSUE_TEMPLATE/")
+        or name in {"SECURITY.md", "SECURITY.txt", "NOTICE", "NOTICE.md", "LICENSE", "LICENSE.md"}
+        or logical_path.startswith("docs/PUBLICATION")
+        or logical_path.startswith("docs/LEGAL")
+        or logical_path.startswith("docs/provenance/")
+        or logical_path == "docs/INDEPENDENCE_CAMPAIGN.md"
+        or _is_generated_public_metadata(logical_path)
+        or logical_path in {
+            "tools/publish_audit.py",
+            "tools/generate_sbom.py",
+            "tools/verify_key_scrub.py",
+            "tools/modified_file_notice_audit.py",
+            "tools/provenance_record_gap.py",
+        }
+    )
+
+
+@lru_cache(maxsize=1)
+def _public_policy() -> object | None:
+    """Load the publication policy once, or ``None`` when it is unreadable.
+
+    Imported lazily so that importing this module never depends on the policy
+    parsing cleanly; a broken policy must still let the classifier run and route
+    *everything*, which is what ``_is_public_surface`` does on ``None``.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import publication_policy
+
+        returned: object | None = publication_policy.load_policy(ROOT / "assets" / "public_source_profile.json")
+        return returned
+    except Exception:
+        return None
+
+
+def _is_public_surface(path: str) -> bool:
+    """True when the policy publishes this path.
+
+    Any change to a published path can invalidate the public provenance ledger
+    and ``PUBLIC_EXPORT.json``, so it must route the publication and provenance
+    integrity gates.  Asking the policy keeps this in step with the surface
+    automatically; an unreadable policy fails closed.
+    """
+    policy = _public_policy()
+    if policy is None:
+        return True
+    try:
+        returned: bool = policy.resolve(path).disposition == "included"
+        return returned
+    except Exception:
+        return True
+
+
+def _is_policy_included(path: str) -> bool:
+    """True when the publication policy explicitly includes this path.
+
+    Fails closed (returns False) when the policy is unreadable or raises an error,
+    so an unreadable policy forces full validation via unknown paths rather than
+    silently classifying everything as recognized.
+    """
+    policy = _public_policy()
+    if policy is None:
+        return False
+    try:
+        returned: bool = policy.resolve(path).disposition == "included"
+        return returned
+    except Exception:
+        return False
+
+
+def _is_manager(path: str) -> bool:
+    return PurePosixPath(path).suffix.lower() in {".ps1", ".psm1"}
+
+
+def _is_title_manifest(path: str) -> bool:
+    logical_path = _logical_tool_path(path) or path
+    return (
+        logical_path.startswith("assets/titles/")
+        or logical_path == "assets/title_manifest.schema.json"
+        or logical_path.startswith("tools/title_")
+    )
+
+
+def _is_build_system(path: str) -> bool:
+    logical_path = _logical_tool_path(path) or path
+    name = PurePosixPath(logical_path).name
+    return (
+        logical_path in {"Makefile", "GNUmakefile", "CMakeLists.txt"}
+        or logical_path.startswith("mk/")
+        or logical_path.startswith("cmake/")
+        or logical_path.startswith("tools/build")
+        or logical_path.startswith("tools/hst_")
+        or logical_path in {
+            "tools/nk_doctor.py",
+            "tools/nk_doctor_checks.py",
+            "tools/nk_doctor_core.py",
+            "tools/nk_safety.ps1",
+        }
+        or logical_path.startswith("tools/pspdev_")
+        or name.endswith(".mk")
+    )
+
+
+# ---- Makefile recipe-only routing (#702) ------------------------------------------
+#
+# A change to the top-level Makefile normally classifies as ``build_system``, which
+# routes every gate.  That is right for anything that can change how a shared object,
+# flag or rule is built, and wrong for the common edit that only rewrites the recipe
+# of one phony tool or test target (``player-ui-regressions``, ``contrib-check``):
+# such an edit changes what that target runs, not how any variable, flag, header or
+# shared rule is defined.  A file rule that depends on the phony target still runs
+# the new recipe, so the narrowed route keeps every native and Windows gate (they
+# execute recipes) and only trims Python modules that neither read the Makefile nor
+# run make.
+#
+# ``makefile_recipe_only_targets`` proves that narrower claim structurally or returns
+# None.  It parses both revisions into per-line kinds, diffs them line by line, and
+# accepts the change only when
+#
+# * every removed and added line is a comment, a blank line, or a recipe line of an
+#   explicit rule whose targets are all literal names declared ``.PHONY``;
+# * every unchanged line keeps exactly the same kind and owning targets, so an edit
+#   cannot reshape its neighbours (a dropped line continuation, a recipe that now
+#   belongs to a different header); and
+# * neither revision uses a construct the parser does not model
+#   (``.RECIPEPREFIX``, an unterminated ``define``, a recipe line outside a rule).
+#
+# Everything else -- a variable or flag assignment, a rule header or prerequisite, a
+# pattern or static-pattern rule, a file-producing rule's recipe, a conditional, an
+# include, a ``.PHONY`` list -- returns None, and the path keeps the full
+# ``build_system`` routing.  None is also the answer whenever either revision cannot
+# be read.
+
+_MAKE_CONDITIONALS = frozenset({"ifeq", "ifneq", "ifdef", "ifndef", "else", "endif"})
+_MAKE_DIRECTIVES = frozenset(
+    {"include", "-include", "sinclude", "export", "unexport", "override", "private", "vpath", "undefine"}
+)
+_MAKE_ASSIGNMENT = re.compile(
+    r"^(?P<prefix>(?:(?:override|export|private)\s+)*)(?P<name>[^\s:#=]+)\s*(?P<op>:{1,3}=|\?=|\+=|!=|=)"
+)
+_MAKE_RULE_HEADER = re.compile(r"^(?P<targets>[^:=#]+?)\s*(?P<colons>::?)(?![=:])(?P<rest>.*)$")
+_MAKE_VARIABLE_REF = re.compile(r"\$[({]([A-Za-z0-9_.-]+)[)}]")
+
+
+class _MakefileUnsupported(ValueError):
+    """The Makefile uses a construct this structural classifier does not model."""
+
+
+def _strip_make_comment(text: str) -> str:
+    """Drop an unescaped ``#`` comment from a non-recipe logical line."""
+
+    index = 0
+    while True:
+        index = text.find("#", index)
+        if index < 0:
+            return text
+        backslashes = len(text[:index]) - len(text[:index].rstrip("\\"))
+        if backslashes % 2 == 0:
+            return text[:index]
+        index += 1
+
+
+def _continues(line: str) -> bool:
+    """True when ``line`` continues onto the next one.
+
+    GNU make joins lines only on an odd number of trailing backslashes; an even
+    count is literal backslashes (``C:\\\\``) and ends the line.
+    """
+
+    return (len(line) - len(line.rstrip("\\"))) % 2 == 1
+
+
+_DEFINE_PREFIXES = frozenset({"override", "export", "private"})
+
+
+def _opens_define(words: Sequence[str]) -> bool:
+    """Return whether whitespace-split ``words`` open a ``define`` block.
+
+    The directive may follow any run of ``override``/``export``/``private``
+    prefixes; splitting on whitespace accepts tab separators as GNU make does.
+    """
+
+    index = 0
+    while index < len(words) and words[index] in _DEFINE_PREFIXES:
+        index += 1
+    return index < len(words) and words[index] == "define"
+
+
+def _makefile_line_kinds(text: str) -> tuple[list[tuple[object, ...]], frozenset[str]]:
+    """Return one kind tuple per physical line, and the literal ``.PHONY`` names.
+
+    Kinds are ``("blank",)``, ``("comment",)``, ``("recipe", targets, explicit)``
+    and ``("other", detail)``.  ``targets`` is the owning rule's target tuple and
+    ``explicit`` is False for pattern, static-pattern and computed-name rules.
+    """
+
+    lines = text.split("\n")
+    kinds: list[tuple[object, ...]] = []
+    context: tuple[tuple[str, ...], bool] | None = None
+    phony_words: list[str] = []
+    simple_values: dict[str, list[str]] = {}
+    assignment_counts: dict[str, int] = {}
+    in_define = False
+    depth = 0
+    index = 0
+    while index < len(lines):
+        start = index
+        logical = lines[index]
+        while _continues(logical) and index + 1 < len(lines):
+            index += 1
+            logical = logical[:-1] + " " + lines[index]
+        span = index - start + 1
+        index += 1
+        raw = lines[start]
+
+        if in_define:
+            kinds.extend([("other", "define")] * span)
+            words = logical.strip().split()
+            if words[:1] == ["endef"]:
+                in_define = False
+            elif _opens_define(words):
+                # GNU make nests define blocks; the first endef would close only
+                # the inner one. Not modelled, so refuse to narrow.
+                raise _MakefileUnsupported(f"line {start + 1}: nested define")
+            continue
+        if raw.startswith("\t"):
+            if context is None:
+                raise _MakefileUnsupported(f"line {start + 1}: recipe line outside a rule")
+            kinds.extend([("recipe", context[0], context[1])] * span)
+            continue
+        stripped = logical.strip()
+        if not stripped:
+            kinds.extend([("blank",)] * span)
+            continue
+        if stripped.startswith("#"):
+            kinds.extend([("comment",)] * span)
+            continue
+        if ".RECIPEPREFIX" in stripped:
+            raise _MakefileUnsupported(f"line {start + 1}: .RECIPEPREFIX is not modelled")
+        code = _strip_make_comment(stripped).strip()
+        first = code.split(None, 1)[0] if code else ""
+        if first in _MAKE_CONDITIONALS:
+            # A conditional may sit inside a recipe; it does not end the rule context.
+            if first in {"ifeq", "ifneq", "ifdef", "ifndef"}:
+                depth += 1
+            elif first == "endif":
+                depth -= 1
+            kinds.extend([("other", "conditional")] * span)
+            continue
+        if _opens_define(code.split()):
+            in_define = True
+            kinds.extend([("other", "define")] * span)
+            if code.split()[-1:] == ["endef"]:
+                in_define = False
+            continue
+        context = None
+        assignment = _MAKE_ASSIGNMENT.match(code)
+        header = _MAKE_RULE_HEADER.match(code)
+        if assignment:
+            name = assignment.group("name")
+            assignment_counts[name] = assignment_counts.get(name, 0) + 1
+            if depth == 0 and not assignment.group("prefix") and assignment.group("op") in {"=", ":=", "::="}:
+                simple_values[name] = code[assignment.end():].split()
+            kinds.extend([("other", "assignment")] * span)
+            continue
+        if first in _MAKE_DIRECTIVES:
+            kinds.extend([("other", "directive")] * span)
+            continue
+        if header is None:
+            kinds.extend([("other", "unparsed")] * span)
+            continue
+        targets = tuple(header.group("targets").split())
+        rest = header.group("rest")
+        recipe_part = ""
+        if ";" in rest:
+            rest, recipe_part = rest.split(";", 1)
+        if _MAKE_ASSIGNMENT.match(rest.strip()):
+            # ``target: VAR = value`` is a target-specific variable, not a rule; a
+            # tab line after it is not modelled as anyone's recipe.
+            kinds.extend([("other", "target-variable")] * span)
+            continue
+        explicit = (
+            bool(targets)
+            and ":" not in rest
+            and not any("%" in target or "$" in target for target in targets)
+        )
+        if targets == (".PHONY",) and depth == 0:
+            # A conditionally declared phony target is not phony in every
+            # configuration, so only unconditional declarations count.
+            phony_words.extend(rest.split())
+        context = (targets, explicit)
+        kinds.extend([("other", "rule-header", targets, recipe_part.strip())] * span)
+
+    if in_define:
+        raise _MakefileUnsupported("unterminated define")
+
+    phony: set[str] = set()
+    for word in phony_words:
+        reference = _MAKE_VARIABLE_REF.fullmatch(word)
+        if reference is None:
+            if "$" not in word:
+                phony.add(word)
+            continue
+        name = reference.group(1)
+        # Only a name assigned exactly once, recursively or simply, to literal words
+        # is expanded; anything appended, conditional or computed stays unresolved,
+        # which keeps its targets out of the phony set and therefore out of the
+        # narrow route.
+        values = simple_values.get(name)
+        if assignment_counts.get(name) == 1 and values is not None and not any("$" in v for v in values):
+            phony.update(values)
+    return kinds, frozenset(phony)
+
+
+def makefile_recipe_only_targets(old_text: str, new_text: str) -> tuple[str, ...] | None:
+    """Return the phony targets whose recipes alone changed, or None.
+
+    An empty tuple means only comments or blank lines changed.  None means the change
+    is not provably recipe-only and must keep the full ``build_system`` routing.
+    """
+
+    import difflib
+
+    try:
+        old_kinds, old_phony = _makefile_line_kinds(old_text)
+        new_kinds, new_phony = _makefile_line_kinds(new_text)
+    except (_MakefileUnsupported, RecursionError):
+        return None
+    if old_phony != new_phony:
+        return None
+
+    def narrow(kind: tuple[object, ...], phony: frozenset[str]) -> bool:
+        if kind[0] in {"blank", "comment"}:
+            return True
+        if kind[0] != "recipe" or not kind[2]:
+            return False
+        return all(target in phony for target in kind[1])  # type: ignore[union-attr]
+
+    old_lines = old_text.split("\n")
+    new_lines = new_text.split("\n")
+    targets: set[str] = set()
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if tag == "equal":
+            if old_kinds[old_start:old_end] != new_kinds[new_start:new_end]:
+                return None
+            continue
+        for kinds, phony, start, end in (
+            (old_kinds, old_phony, old_start, old_end),
+            (new_kinds, new_phony, new_start, new_end),
+        ):
+            for kind in kinds[start:end]:
+                if not narrow(kind, phony):
+                    return None
+                if kind[0] == "recipe":
+                    targets.update(kind[1])  # type: ignore[arg-type]
+    return tuple(sorted(targets))
+
+
+def _is_native_runtime(path: str) -> bool:
+    suffix = PurePosixPath(path).suffix.lower()
+    return (
+        path.startswith("src/")
+        or path.startswith("include/")
+        or path.startswith("assets/vfpu/")
+        or path.startswith("assets/shaders/")
+        or suffix in {".c", ".cc", ".cpp", ".h", ".hpp"}
+        or path in {"driver.c", "recomp.h"}
+    )
+
+
+def _is_native_tool(path: str) -> bool:
+    """Return true for Python tools whose output/semantics feed native gates."""
+
+    logical_path = _logical_tool_path(path)
+    if logical_path is None:
+        return False
+    name = PurePosixPath(logical_path).name
+    prefixes = (
+        "analyze",
+        "boot_gate",
+        "codegen",
+        "gen_microtest",
+        "hle_",
+        "host_stubs",
+        "import_audit",
+        "imports",
+        "microtest",
+        "native_",
+        "prxload",
+        "psp_import",
+        "pspdev",
+        "ref_",
+        "savedata_",
+        "sched_",
+        "shader_embed",
+        "title_",
+        "verify_gates",
+        "vfpu_",
+    )
+    return name.startswith(prefixes) or name.endswith("_c.py")
+
+
+def _logical_tool_path(path: str) -> str | None:
+    """Map one ``tools/test_<subject>.py`` path to its logical tool subject.
+
+    The mapping is intentionally one-way and non-recursive: subsystem
+    predicates inspect the subject as if it were the implementation file, so a
+    test cannot accidentally classify itself through a second test prefix.
+    """
+
+    normalised = _normalise(path)
+    pure_path = PurePosixPath(normalised)
+    if not normalised.startswith("tools/") or pure_path.suffix.lower() != ".py":
+        return None
+    if not pure_path.name.startswith("test_"):
+        return normalised
+    return str(pure_path.with_name(pure_path.name[5:]))
+
+
+def _is_python_tool(path: str) -> bool:
+    # Data artefacts under tools/ are inputs and outputs of the Python pipeline,
+    # not a separate surface: tools/import_audit_baseline.json is regenerated by
+    # hle_manifest.py --write-baseline, and tools/psp_oracle/manifest.json is
+    # consumed by the oracle tooling. Leaving them unclassified made every HLE
+    # registration change an `unknown_paths` hit, which sets force_full and drags
+    # in gates the change cannot affect. The Python gate is the one that actually
+    # validates these files -- test_hle_manifest asserts the baseline is current
+    # and reproducible -- so classifying them here neither skips nor weakens a
+    # check that was doing real work.
+    #
+    # `tools/README.md` is Markdown, not Python, but it is the *subject* of a
+    # Python regression: `tools/test_lint_docs.py` compares its module index
+    # against the tracked `tools/` module set and fails closed on drift. Routing
+    # the file whose content can break that test is what makes the check enforced
+    # rather than advisory -- otherwise the hosted `python_tests` job is skipped
+    # for exactly the edit that breaks it, and the check only runs in the change
+    # that introduces it. It is named individually instead of through the
+    # `markdown` flag so every other Markdown-only edit keeps skipping the Python
+    # matrix.
+    return (
+        path.startswith("tools/")
+        and (path.endswith(".py") or path.endswith(".json") or path.endswith(".toml"))
+        or path
+        in {
+            "pyproject.toml",
+            "requirements.txt",
+            "requirements-dev.txt",
+            "Pipfile",
+            "Pipfile.lock",
+            "poetry.lock",
+            "tools/README.md",
+        }
+    )
+
+
+#: Files whose text decides which Python test modules the native and Windows gates run.
+#: Those gates run make targets and fixed ``unittest`` module names, never a discovery
+#: sweep (that is the Python shards' job), so a test module none of these files names is
+#: executed by the Python shards alone.
+#: ``tests/`` and ``fixtures/`` are included because a native-side Python driver can import a
+#: tools test module (``tests/native/test_player_ui.py`` imports ``test_player_package_route``).
+_NATIVE_GATE_SOURCE_GLOBS = (
+    "Makefile",
+    "GNUmakefile",
+    "mk/*.mk",
+    "CMakeLists.txt",
+    ".github/workflows/*.yml",
+    ".github/actions/**/*.yml",
+    "tests/**/*.py",
+    "fixtures/**/*.py",
+    "tools/*.sh",
+    "tools/*.ps1",
+)
+_NATIVE_GATE_SCRIPT_GLOB = "tools/*.py"
+
+
+@lru_cache(maxsize=1)
+def _native_gate_sources() -> str | None:
+    """Text of the build and CI descriptors and tool scripts, or None when unreadable.
+
+    Test modules and this classifier are left out: a test that merely names another test
+    is not a gate that runs it. None makes ``_is_unexecuted_test`` answer False, so an
+    unreadable tree keeps every native route.
+    """
+
+    chunks: list[str] = []
+    try:
+        for pattern in _NATIVE_GATE_SOURCE_GLOBS:
+            for path in sorted(ROOT.glob(pattern)):
+                chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+        for path in sorted(ROOT.glob(_NATIVE_GATE_SCRIPT_GLOB)):
+            if path.name.startswith("test_") or path.name in {"ci_paths.py", "mypy_baseline.py"}:
+                continue
+            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return None
+    return "\n".join(chunks)
+
+
+def _is_unexecuted_test(path: str) -> bool:
+    """True for a ``tools/test_*.py`` module that no native or Windows gate runs.
+
+    Such a change is exercised by the Python shards only, so it needs neither the native
+    nor the Windows job even when the module's subject (``codegen``, ``hst_*``) is a
+    native one. A module any build or CI descriptor or tool script names stays routed, and
+    so does a CI classifier test (``_is_workflow_ci``), whose edit changes what CI runs.
+    """
+
+    normalised = _normalise(path)
+    pure = PurePosixPath(normalised)
+    if pure.parent != PurePosixPath("tools") or not pure.name.startswith("test_") or pure.suffix != ".py":
+        return False
+    if _is_workflow_ci(normalised):
+        return False
+    sources = _native_gate_sources()
+    if sources is None:
+        return False
+    # A module that no longer exists (a deleted test) is still run by a descriptor that
+    # names it, so the direct name check does not depend on the file being present.
+    return pure.stem not in _gate_executed_tests(sources) and not _names_module(sources, pure.stem)
+
+
+@lru_cache(maxsize=8)
+def _identifiers(text: str) -> frozenset[str]:
+    return frozenset(re.findall(r"[A-Za-z0-9_]+", text))
+
+
+def _names_module(text: str, module: str) -> bool:
+    """Whether ``text`` names ``module`` as a whole identifier (``test_a`` is not in ``test_a_b``)."""
+
+    return module in _identifiers(text)
+
+
+@lru_cache(maxsize=8)
+def _gate_executed_tests(sources: str) -> frozenset[str]:
+    """The ``tools/test_*.py`` modules a native or Windows gate runs, directly or by import.
+
+    A module is run when the gate descriptors and scripts in ``sources`` name it. A module
+    that one of those imports, or names as a string (``importlib.import_module``, a
+    ``unittest`` target), is run through it, and so on. A module that cannot be parsed
+    hides its imports, so every test module counts as run then.
+    """
+
+    tools = ROOT / "tools"
+    modules = {path.stem for path in tools.glob("test_*.py")}
+    executed = {module for module in modules if _names_module(sources, module)}
+    pending = sorted(executed)
+    while pending:
+        module = pending.pop()
+        try:
+            tree = ast.parse((tools / f"{module}.py").read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            return frozenset(modules)
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                names.add(node.module or "")
+                names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                names.add(node.value)
+        for name in names:
+            for part in name.split("."):
+                if part in modules and part not in executed:
+                    executed.add(part)
+                    pending.append(part)
+    return frozenset(executed)
+
+
+#: Languages Trusted CodeQL analyses (.github/workflows/codeql.yml). ``c-cpp`` and
+#: ``python`` build nothing (``build-mode: none``), so only their own source files and the
+#: workflow definitions the ``actions`` language reads can change a result.
+_CODEQL_SOURCE_SUFFIXES = frozenset(
+    {".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hpp", ".hxx", ".h++", ".inc", ".inl", ".tcc",
+     ".py", ".pyi", ".pyw"}
+)
+
+
+def _is_codeql_relevant(path: str) -> bool:
+    normalised = _normalise(path)
+    name = PurePosixPath(normalised).name
+    return (
+        PurePosixPath(normalised).suffix.lower() in _CODEQL_SOURCE_SUFFIXES
+        or normalised.startswith((".github/workflows/", ".github/actions/", ".github/codeql/"))
+        or name in {"action.yml", "action.yaml"}
+    )
+
+
+def codeql_scan_needed(paths: Iterable[str]) -> bool:
+    """Whether a pull request's changed paths can change a Trusted CodeQL result.
+
+    Fails closed: no paths, an unreadable history, any C/C++, Python or workflow path
+    (a deleted or renamed one included), or a path this function cannot classify with
+    confidence (a quoted, escaped or control-character name, or one with leading or
+    trailing whitespace) means a full analysis. Only a change made wholly of plainly named
+    other files, for example documentation, assets or Makefiles, skips it.
+    """
+
+    listed = list(paths)
+    if not listed or "<history-unavailable>" in listed:
+        return True
+    if not all(_is_plain_path(path) for path in listed):
+        return True
+    return any(_is_codeql_relevant(path) for path in listed)
+
+
+#: Characters ``git diff`` uses to quote a name it printed without ``-z``.
+QUOTING_CHARACTERS = '"'+chr(92)
+
+
+def _is_plain_path(path: str) -> bool:
+    """True when ``path`` is a name whose suffix can be trusted.
+
+    ``git diff`` without ``-z`` prints a name with non-ASCII bytes as a double-quoted,
+    octal-escaped string, so the suffix of ``src/<e-acute>.c`` becomes ``.c"``. Callers use
+    ``-z``, but a quote, a backslash, a control character or edge whitespace still means
+    the name was not read as written.
+    """
+
+    return (
+        bool(path)
+        and path == path.strip()
+        and not any(ord(char) < 0x20 or ord(char) == 0x7F or char in QUOTING_CHARACTERS for char in path)
+    )
+
+
+def codeql_scope_from_git(base: str, head: str, cwd: Path | None = None) -> list[str]:
+    """The paths that differ between a pull request's base and its merge commit."""
+
+    # ``-z`` prints each name verbatim, NUL-terminated, instead of quoting non-ASCII names.
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-status", "--find-renames", "-z", base, head],
+            cwd=cwd or ROOT,
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return ["<history-unavailable>"]
+    return _parse_changed_paths_z(result.stdout.decode("utf-8", errors="replace"))
+
+
+def _parse_changed_paths_z(output: str) -> list[str]:
+    """Parse ``git diff --name-status -z``, keeping both sides of a rename or copy.
+
+    Names are returned exactly as git printed them. Any record that does not parse makes
+    the whole answer ``<history-unavailable>``.
+    """
+
+    if output and not output.endswith("\0"):
+        return ["<history-unavailable>"]
+    tokens = output.split("\0")
+    if tokens and tokens[-1] == "":
+        tokens.pop()
+    paths: list[str] = []
+    index = 0
+    while index < len(tokens):
+        status = tokens[index]
+        width = 2 if re.fullmatch(r"[RC](?:100|0?[0-9]{1,2})", status) else 1 if re.fullmatch(r"[ACDMTUXB]", status) else 0
+        names = tokens[index + 1 : index + 1 + width]
+        if width == 0 or len(names) != width or not all(names):
+            return ["<history-unavailable>"]
+        paths.extend(names)
+        index += 1 + width
+    return paths
+
+
+def _is_recognised(path: str) -> bool:
+    return any(
+        predicate(path)
+        for predicate in (
+            _is_docs,
+            _is_workflow_ci,
+            _is_dependency_metadata,
+            _is_security_publication,
+            _is_manager,
+            _is_title_manifest,
+            _is_build_system,
+            _is_native_runtime,
+            _is_python_tool,
+        )
+    )
+
+
+def _parse_changed_paths(output: str) -> list[str]:
+    """Parse ``git diff --name-status`` while retaining rename old/new paths."""
+
+    paths: list[str] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        status = fields[0]
+        if re.fullmatch(r"[RC](?:100|0?[0-9]{1,2})", status):
+            if len(fields) != 3 or not fields[1] or not fields[2]:
+                return ["<history-unavailable>"]
+            paths.extend((_normalise(fields[1]), _normalise(fields[2])))
+        elif re.fullmatch(r"[ACDMTUXB]", status):
+            if len(fields) != 2 or not fields[1]:
+                return ["<history-unavailable>"]
+            paths.append(_normalise(fields[1]))
+        else:
+            # Never salvage a path from an unknown or structurally malformed
+            # record. One bad record makes the complete classification fail
+            # closed to the full matrix.
+            return ["<history-unavailable>"]
+    return paths
+
+
+#: Events that always run the complete matrix, whatever the changed paths. A manual
+#: dispatch and the nightly schedule ask for the complete contract. A merge-queue group
+#: is a candidate for ``main``, so every required check runs on the group commit.
+FULL_MATRIX_EVENTS = frozenset({"workflow_dispatch", "merge_group", "schedule"})
+# Events whose run on main may write the persisted Windows compiler cache (#735).
+COMPILER_CACHE_WRITE_EVENTS = frozenset({"push", "schedule", "workflow_dispatch"})
+
+#: Where the Linux jobs that read ``linux_runner`` run. The self-hosted pool (``nk-wsl``)
+#: is a set of ephemeral, one-job runner containers on the maintainer's PC (docs/CI.md,
+#: "Self-hosted Linux runners"). It takes only trusted runs: a push to ``main``, a merge
+#: group, and the integration desk's batch pull requests. Every other run, a fork's above
+#: all, stays on GitHub's hosted image, because a pull request's code would run on the
+#: maintainer's machine. The runner refuses any other job itself as well (its job-started
+#: hook), so this routing is not the only guard.
+HOSTED_LINUX_RUNNER = "ubuntu-24.04"
+HOSTED_LINUX_RUNNER_2604 = "ubuntu-26.04"
+SELF_HOSTED_LINUX_RUNNER = ("self-hosted", "linux", "x64", "nk-wsl")
+SELF_HOSTED_REPOSITORY = "Jstar269/nakagawa-recomp"
+
+
+def same_repository(name: object, expected: str) -> bool:
+    """Whether ``name`` is the repository ``expected``, ignoring letter case.
+
+    GitHub treats owner and repository names as case-insensitive and reports the
+    name in its current casing: after the repository was renamed to
+    ``Jstar269/Nakagawa-Recomp``, ``GITHUB_REPOSITORY`` and the payloads' ``full_name``
+    no longer matched the lower-case constant, so no run was trusted for the pool. Only
+    the repository name is folded; refs, branch prefixes, logins and the fork flag are
+    still compared exactly. Two different owners never compare equal. Both names must be
+    ASCII: Unicode case folding would let a crafted name match (the long s in "Jſtar269",
+    the Kelvin sign in "nakagawa"), and GitHub names are ASCII anyway.
+    """
+
+    return isinstance(name, str) and name.isascii() and expected.isascii() and name.lower() == expected.lower()
+
+
+#: Head branches of this repository that may carry an outside contributor's commits: the
+#: desk's ``carry/pr-<N>`` branches for locked fork pull requests, and ``desk/`` working
+#: branches. Their runs stay on hosted runners even though they live in this repository.
+SELF_HOSTED_UNTRUSTED_PREFIXES = ("carry/", "desk/")
+#: The pool's supervisor refreshes NK_SELF_HOSTED_HEARTBEAT every two minutes while the
+#: pool is healthy. An older heartbeat means the supervisor, the PC or the pool is gone,
+#: and trusted runs go back to hosted runners instead of waiting for a runner that will
+#: not come. A heartbeat from the future beyond clock skew is not trusted either.
+SELF_HOSTED_HEARTBEAT_MAX_AGE = 600
+SELF_HOSTED_HEARTBEAT_MAX_SKEW = 120
+
+
+def trusted_for_self_hosted(
+    event_name: str,
+    event: Mapping[str, object],
+    *,
+    repository: str,
+    ref: str,
+) -> bool:
+    """Whether this run may use the self-hosted pool: its code is already the maintainer's.
+
+    True only for this repository's push to ``main``, its merge groups (built from
+    pull requests a maintainer enqueued), and a pull request from a branch of this
+    repository itself that the repository owner opened and whose event the owner sent,
+    unless the branch is one that may carry an outside contributor's commits
+    (``SELF_HOSTED_UNTRUSTED_PREFIXES``). Those branches are pushed only with the
+    owner's credentials, and their code already runs on the owner's PC. A fork's pull
+    request is never trusted, whatever its branch is called; nor is any other event.
+    """
+
+    if not same_repository(repository, SELF_HOSTED_REPOSITORY):
+        return False
+    if event_name == "push":
+        return ref == "refs/heads/main"
+    if event_name == "merge_group":
+        return ref.startswith("refs/heads/gh-readonly-queue/main/")
+    if event_name != "pull_request":
+        return False
+    pull_request = event.get("pull_request")
+    if not isinstance(pull_request, dict):
+        return False
+    head = pull_request.get("head")
+    base = pull_request.get("base")
+    user = pull_request.get("user")
+    if not isinstance(head, dict) or not isinstance(base, dict) or not isinstance(user, dict):
+        return False
+    head_repo = head.get("repo")
+    base_repo = base.get("repo")
+    if not isinstance(head_repo, dict) or not isinstance(base_repo, dict):
+        return False
+    head_ref = head.get("ref")
+    sender = event.get("sender")
+    owner = SELF_HOSTED_REPOSITORY.split("/", 1)[0]
+    return (
+        same_repository(head_repo.get("full_name"), repository)
+        and same_repository(base_repo.get("full_name"), repository)
+        and head_repo.get("fork") is False
+        and isinstance(head_ref, str)
+        and bool(head_ref)
+        and not head_ref.startswith(SELF_HOSTED_UNTRUSTED_PREFIXES)
+        and user.get("login") == owner
+        and isinstance(sender, dict)
+        and sender.get("login") == owner
+    )
+
+
+def self_hosted_pool_available(switch: str, heartbeat: str, now: float) -> bool:
+    """Whether the pool's off switch is on and its supervisor reported in recently."""
+
+    if switch.strip().lower() != "on":
+        return False
+    try:
+        beat = int(heartbeat.strip())
+    except ValueError:
+        return False
+    age = now - beat
+    return -SELF_HOSTED_HEARTBEAT_MAX_SKEW <= age <= SELF_HOSTED_HEARTBEAT_MAX_AGE
+
+
+#: Trusted CodeQL's hosted image for the analyses (.github/workflows/codeql.yml).
+HOSTED_CODEQL_RUNNER = "ubuntu-26.04"
+
+
+def codeql_trusted_target(
+    event_name: str,
+    event: Mapping[str, object],
+    *,
+    repository: str,
+    ref: str,
+) -> bool:
+    """Whether a Trusted CodeQL run analyses a target that is already trusted.
+
+    Trusted CodeQL always runs the default branch's definition and reads the candidate tree
+    as data (``build-mode: none``), so no pull request's code or workflow runs in it. It
+    still takes the pool only for the targets CI would send there: a push to ``main``, and
+    a "CodeQL wake" run (``workflow_run``) of a merge group of ``main`` or of a pull request
+    from one of this repository's own branches pushed by the owner (not a branch in
+    ``SELF_HOSTED_UNTRUSTED_PREFIXES``). Every other pull request's analysis stays hosted.
+    """
+
+    if not same_repository(repository, SELF_HOSTED_REPOSITORY):
+        return False
+    if event_name == "push":
+        return ref == "refs/heads/main"
+    if event_name != "workflow_run":
+        return False
+    run = event.get("workflow_run")
+    if not isinstance(run, dict):
+        return False
+    head_repo = run.get("head_repository")
+    actor = run.get("actor")
+    head_branch = run.get("head_branch")
+    if not isinstance(head_repo, dict) or not isinstance(head_branch, str):
+        return False
+    if not same_repository(head_repo.get("full_name"), repository):
+        return False
+    kind = run.get("event")
+    if kind == "merge_group":
+        return head_branch.startswith("gh-readonly-queue/main/")
+    if kind == "pull_request":
+        owner = SELF_HOSTED_REPOSITORY.split("/", 1)[0]
+        return (
+            bool(head_branch)
+            and not head_branch.startswith(SELF_HOSTED_UNTRUSTED_PREFIXES)
+            and isinstance(actor, dict)
+            and actor.get("login") == owner
+        )
+    return False
+
+
+def codeql_runner(
+    event_name: str,
+    event: Mapping[str, object],
+    *,
+    repository: str,
+    ref: str,
+    switch: str,
+    heartbeat: str,
+    now: float,
+) -> str:
+    """The ``runs-on`` value, as JSON, for Trusted CodeQL's analyses."""
+
+    if codeql_trusted_target(event_name, event, repository=repository, ref=ref) and self_hosted_pool_available(
+        switch, heartbeat, now
+    ):
+        return json.dumps(list(SELF_HOSTED_LINUX_RUNNER), separators=(",", ":"))
+    return json.dumps(HOSTED_CODEQL_RUNNER)
+
+
+def linux_runner(
+    event_name: str,
+    event: Mapping[str, object],
+    *,
+    repository: str,
+    ref: str,
+    switch: str,
+    heartbeat: str,
+    now: float,
+    hosted: str = HOSTED_LINUX_RUNNER,
+) -> str:
+    """The ``runs-on`` value, as JSON, for the jobs that read a ``linux_runner*`` output.
+
+    ``hosted`` is the job's own hosted image: ``linux_runner`` falls back to
+    ``ubuntu-24.04``, ``linux_runner_2604`` to ``ubuntu-26.04``. The pool's image is
+    Ubuntu 24.04 for both.
+    """
+
+    if trusted_for_self_hosted(event_name, event, repository=repository, ref=ref) and self_hosted_pool_available(
+        switch, heartbeat, now
+    ):
+        return json.dumps(list(SELF_HOSTED_LINUX_RUNNER), separators=(",", ":"))
+    return json.dumps(hosted)
+
+
+def _diff_endpoints(event_name: str, event: Mapping[str, object]) -> tuple[str, str] | None:
+    """Return the ``(left, right)`` revisions this event's change spans, or None.
+
+    None means there is no left revision to diff against: a manual dispatch or
+    scheduled run, or a push whose ``before`` is absent or all zeros (a new ref).
+    A merge group names both ends of its range in the payload, so it never uses
+    the push fallback.
+    """
+
+    if event_name in {"workflow_dispatch", "schedule"}:
+        return None
+    sha = os.environ.get("GITHUB_SHA", "HEAD")
+    if event_name == "pull_request":
+        pull_request = event.get("pull_request")
+        base_sha = pull_request.get("base", {}).get("sha") if isinstance(pull_request, dict) else None
+        return str(base_sha or "HEAD^"), sha
+    if event_name == "merge_group":
+        group = event.get("merge_group")
+        if not isinstance(group, dict):
+            return None
+        base_sha = group.get("base_sha")
+        head_sha = group.get("head_sha")
+        if not isinstance(base_sha, str) or not isinstance(head_sha, str) or not base_sha or not head_sha:
+            return None
+        return base_sha, head_sha
+    left = os.environ.get("GITHUB_EVENT_BEFORE", "") or str(event.get("before") or "")
+    if not left or set(left) == {"0"}:
+        return None
+    return left, sha
+
+
+def _changed_files_from_git(event_name: str, event: Mapping[str, object]) -> list[str]:
+    if event_name in {"workflow_dispatch", "schedule"}:
+        return []
+
+    endpoints = _diff_endpoints(event_name, event)
+    if endpoints is None:
+        if event_name == "merge_group":
+            # A merge group always names its range. Without it the change set is
+            # unknowable, so fail closed rather than diff one commit as if it were it.
+            return ["<history-unavailable>"]
+        sha = os.environ.get("GITHUB_SHA", "HEAD")
+        result = subprocess.run(
+            ["git", "diff-tree", "--root", "--no-commit-id", "--name-status", "-r", sha],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return _parse_changed_paths(result.stdout)
+    left, sha = endpoints
+
+    try:
+        result = subprocess.run(
+            # Name-status keeps deletions and type changes, while retaining
+            # both sides of a rename lets a native source renamed into a
+            # documentation tree remain native-relevant.
+            ["git", "diff", "--name-status", "--find-renames", left, sha],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        # A shallow or unusual event checkout should fail closed.  The workflow
+        # uses fetch-depth: 0, but treating the current tree as fully relevant is
+        # safer than silently skipping a gate when history is unavailable.
+        return ["<history-unavailable>"]
+    return _parse_changed_paths(result.stdout)
+
+
+#: Python shards for a change whose only build-system edit is a recipe-only Makefile
+#: edit. The Makefile-coupled subset (tools/ci_test_shards.py --select makefile) is
+#: about nine tenths of the suite by measured weight, because most heavy modules run
+#: make, so it keeps four runners, two fewer than the full suite's six. Six full shards keep a
+#: shard well inside the 30-minute job limit on the busy self-hosted pool (2026-11-02).
+PYTHON_SHARDS_FULL = 6
+PYTHON_SHARDS_MAKEFILE = 4
+
+
+_MAKEFILE_INCLUDE_RE = re.compile(r"^[ \t]*include[ \t]+(mk/[A-Za-z0-9_./-]+\.mk)[ \t]*$")
+
+
+def _is_makefile_source(path: str) -> bool:
+    """The root Makefile or one of the ``mk/*.mk`` fragments it includes."""
+
+    return path == "Makefile" or (path.startswith("mk/") and path.endswith(".mk"))
+
+
+def _makefile_text_at(revision: str, path: str = "Makefile", seen: tuple[str, ...] = ()) -> str:
+    """The Makefile at ``revision`` with each literal ``include mk/<name>.mk`` inlined.
+
+    The root Makefile includes its fragments where their text used to be, so the
+    inlined text is the single text GNU Make evaluates.  A fragment that is missing
+    at the revision raises, and the caller keeps the full routing.
+    """
+
+    if path in seen:
+        raise ValueError(f"include cycle through {path}")
+    result = subprocess.run(
+        ["git", "show", f"{revision}:{path}"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    )
+    lines: list[str] = []
+    for line in result.stdout.decode("utf-8").split("\n"):
+        match = _MAKEFILE_INCLUDE_RE.match(line)
+        if match is not None:
+            lines.append(_makefile_text_at(revision, match.group(1), seen + (path,)).rstrip("\n"))
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _makefile_revisions(left: str, right: str) -> tuple[str, str] | None:
+    texts: list[str] = []
+    for revision in (left, right):
+        try:
+            texts.append(_makefile_text_at(revision))
+        except (OSError, ValueError, subprocess.CalledProcessError, UnicodeDecodeError):
+            return None
+    return texts[0], texts[1]
+
+
+def makefile_change_from_git(left: str, right: str) -> tuple[str, ...] | None:
+    """Return ``makefile_recipe_only_targets`` for the Makefile between two revisions.
+
+    None when either revision lacks a readable Makefile, so an added, deleted or
+    unreadable Makefile keeps the full build-system routing.
+    """
+
+    revisions = _makefile_revisions(left, right)
+    if revisions is None:
+        return None
+    return makefile_recipe_only_targets(*revisions)
+
+
+def classify(
+    paths: Iterable[str],
+    *,
+    event_name: str = "pull_request",
+    draft: bool = False,
+    makefile_change: tuple[str, ...] | None = None,
+) -> dict[str, str]:
+    """Classify ``paths`` into gate decisions.
+
+    ``makefile_change`` is the result of ``makefile_recipe_only_targets`` for this
+    change's Makefile edit, or None when there is none or it is not provably
+    recipe-only.  Only a non-None value narrows anything, so a caller that cannot
+    compute it keeps the full ``build_system`` routing.
+    """
+
+    files = sorted({_normalise(path) for path in paths if path.strip()})
+    unknown_paths = any(not _is_recognised(path) for path in files)
+    force_full = event_name in FULL_MATRIX_EVENTS or not files or "<history-unavailable>" in files or unknown_paths
+    # A full-matrix run is never documentation-only, whatever its paths say.
+    docs_only = not force_full and bool(files) and all(
+        _is_docs(path) or _is_generated_public_metadata(path) for path in files
+    )
+    workflow_ci = force_full or any(_is_workflow_ci(path) for path in files)
+    dependency_metadata = force_full or any(_is_dependency_metadata(path) for path in files)
+    security_publication = force_full or any(_is_security_publication(path) for path in files)
+    public_surface = force_full or any(_is_public_surface(path) for path in files)
+    manager_powershell = force_full or any(_is_manager(path) for path in files)
+    title_manifest = force_full or any(_is_title_manifest(path) for path in files)
+    makefile_recipe_only = (
+        not force_full and makefile_change is not None and any(_is_makefile_source(path) for path in files)
+    )
+    build_system = force_full or any(
+        _is_build_system(path) and not (makefile_recipe_only and _is_makefile_source(path)) for path in files
+    )
+    native_runtime = force_full or any(_is_native_runtime(path) for path in files)
+    python_tools = force_full or any(_is_python_tool(path) for path in files)
+    markdown = force_full or any(_is_markdown(path) for path in files)
+
+    # A tools/test_*.py module no native or Windows gate runs is checked by the Python
+    # shards alone, so it does not route the native and Windows jobs even when its subject
+    # is a native tool. The exported flags above keep describing the path's subject.
+    gated = [path for path in files if not _is_unexecuted_test(path)]
+    native_without_recipe = force_full or any(
+        _is_native_runtime(path)
+        or (_is_build_system(path) and not (makefile_recipe_only and _is_makefile_source(path)))
+        or _is_manager(path)
+        or _is_title_manifest(path)
+        or _is_native_tool(path)
+        or _is_workflow_ci(path)
+        for path in gated
+    )
+    # A recipe-only Makefile edit still runs every native and Windows gate: those are
+    # the jobs that execute recipes, and the edited target may be one of them.
+    run_native = native_without_recipe or makefile_recipe_only
+    # ``security_publication`` was computed and exported but fed no decision at
+    # all, so a change to the publication contract itself -- docs/PUBLICATION*,
+    # tools/publish_audit.py, the notice audit -- routed no Python gate.  It now
+    # routes one.
+    #
+    # ``public_surface`` deliberately does NOT widen this.  Every tracked file in
+    # this repository is published, so routing on it would make ``run_python``
+    # unconditional and buy nothing: the publication audit that protects the
+    # generated ledger and export runs in the ungated hygiene jobs on every
+    # event (see ``PublicationCoverageInvariantTests``).  The output is exported
+    # so a local readiness check can route the same decision, where no ungated
+    # equivalent runs.
+    python_full = python_tools or native_without_recipe or workflow_ci or security_publication
+    run_python = python_full or makefile_recipe_only
+    # #702: when the recipe-only Makefile edit is the only reason to run Python, run
+    # just the modules that can observe it, on fewer runners. Anything else that
+    # routes Python restores the complete suite.
+    python_scope = "all" if python_full or not makefile_recipe_only else "makefile"
+    python_num_shards = PYTHON_SHARDS_FULL if python_scope == "all" else PYTHON_SHARDS_MAKEFILE
+    run_windows = run_native
+    # A normal main push is already covered by its PR. Workflow changes are
+    # exceptional: validate the new workflow itself on the default branch too.
+    # Draft pull requests are not a separate validation mode: they get the
+    # same path-applicable gates as ready pull requests, so progress does not
+    # require a manual ready-for-review transition or workflow dispatch.
+    is_main_push = event_name == "push" and os.environ.get("GITHUB_REF") == "refs/heads/main"
+    allow_substantive = event_name in FULL_MATRIX_EVENTS or (not is_main_push or workflow_ci)
+    run_main_smoke = is_main_push or event_name in FULL_MATRIX_EVENTS
+    # #735: only a run of main's own code on main -- a push, the nightly schedule or
+    # a manual dispatch of main -- may save the persisted Windows compiler cache.
+    # Pull requests and merge groups only read it.
+    save_compiler_cache = (
+        event_name in COMPILER_CACHE_WRITE_EVENTS and os.environ.get("GITHUB_REF") == "refs/heads/main"
+    )
+
+    return {
+        "docs_only": str(docs_only).lower(),
+        "python_tools": str(python_tools).lower(),
+        "native_runtime": str(native_runtime).lower(),
+        "build_system": str(build_system).lower(),
+        "manager_powershell": str(manager_powershell).lower(),
+        "title_manifest": str(title_manifest).lower(),
+        "workflow_ci": str(workflow_ci).lower(),
+        "dependency_metadata": str(dependency_metadata).lower(),
+        "security_publication": str(security_publication).lower(),
+        "public_surface": str(public_surface).lower(),
+        "markdown": str(markdown).lower(),
+        "makefile_recipe_only": str(makefile_recipe_only).lower(),
+        "run_python": str(run_python).lower(),
+        "python_scope": python_scope,
+        "python_num_shards": str(python_num_shards),
+        "python_shards": json.dumps(list(range(python_num_shards)), separators=(",", ":")),
+        "run_native": str(run_native).lower(),
+        "run_windows": str(run_windows).lower(),
+        "run_markdown": str(markdown).lower(),
+        "run_main_smoke": str(run_main_smoke).lower(),
+        "save_compiler_cache": str(save_compiler_cache).lower(),
+        "allow_substantive": str(allow_substantive).lower(),
+        "draft": str(draft).lower(),
+    }
+
+
+def _read_event(path: str | None) -> dict[str, object]:
+    if not path:
+        return {}
+    try:
+        returned: dict[str, object] = json.loads(Path(path).read_text(encoding="utf-8"))
+        return returned
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _event_draft(event_name: str, event: Mapping[str, object]) -> bool:
+    if event_name != "pull_request":
+        return False
+    pull_request = event.get("pull_request")
+    return bool(pull_request.get("draft")) if isinstance(pull_request, dict) else False
+
+
+def _write_outputs(outputs: Mapping[str, str], output_path: str | None) -> None:
+    if not output_path:
+        return
+    with Path(output_path).open("a", encoding="utf-8", newline="\n") as handle:
+        for key, value in outputs.items():
+            handle.write(f"{key}={value}\n")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--files", nargs="*", help="changed paths (for local tests)")
+    parser.add_argument("--event-name", default=os.environ.get("GITHUB_EVENT_NAME", "pull_request"))
+    parser.add_argument("--event-path", default=os.environ.get("GITHUB_EVENT_PATH"))
+    parser.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
+    parser.add_argument(
+        "--codeql-runner",
+        action="store_true",
+        help="write only Trusted CodeQL's analysis runner (runner=...) and classify nothing",
+    )
+    parser.add_argument(
+        "--codeql-scope",
+        nargs=2,
+        metavar=("BASE", "HEAD"),
+        help="write only whether Trusted CodeQL must analyse a pull request (scan=...) and classify nothing",
+    )
+    args = parser.parse_args(argv)
+
+    if args.codeql_scope:
+        changed = codeql_scope_from_git(*args.codeql_scope)
+        scan = codeql_scan_needed(changed)
+        _write_outputs({"scan": str(scan).lower()}, args.github_output)
+        print(f"changed_files={len(changed)}")
+        print("changed_paths=" + ",".join(sorted(changed)))
+        print(f"scan={str(scan).lower()}")
+        return 0
+
+    event = _read_event(args.event_path)
+    pool = {
+        "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+        "ref": os.environ.get("GITHUB_REF", ""),
+        "switch": os.environ.get("NK_SELF_HOSTED_LINUX", ""),
+        "heartbeat": os.environ.get("NK_SELF_HOSTED_HEARTBEAT", ""),
+        "now": time.time(),
+    }
+    if args.codeql_runner:
+        runner = codeql_runner(args.event_name, event, **pool)
+        _write_outputs({"runner": runner}, args.github_output)
+        print(f"event={args.event_name}")
+        print(f"runner={runner}")
+        return 0
+    if args.files is not None:
+        paths = args.files
+    else:
+        paths = _changed_files_from_git(args.event_name, event)
+    makefile_change: tuple[str, ...] | None = None
+    if args.files is None and any(_is_makefile_source(_normalise(path)) for path in paths):
+        endpoints = _diff_endpoints(args.event_name, event)
+        if endpoints is not None:
+            makefile_change = makefile_change_from_git(*endpoints)
+    outputs = classify(
+        paths,
+        event_name=args.event_name,
+        draft=_event_draft(args.event_name, event),
+        makefile_change=makefile_change,
+    )
+    outputs["linux_runner"] = linux_runner(args.event_name, event, **pool)
+    outputs["linux_runner_2604"] = linux_runner(args.event_name, event, **pool, hosted=HOSTED_LINUX_RUNNER_2604)
+    _write_outputs(outputs, args.github_output)
+    print(f"event={args.event_name}")
+    print(f"changed_files={len(paths)}")
+    if paths:
+        print("changed_paths=" + ",".join(sorted(paths)))
+    if makefile_change is not None:
+        print("makefile_recipe_targets=" + ",".join(makefile_change))
+    for key, value in outputs.items():
+        print(f"{key}={value}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

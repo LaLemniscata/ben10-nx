@@ -1,0 +1,696 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+import copy
+import io
+import json
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+TOOLS = ROOT / "tools"
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+
+import vfpu_coverage_report as census
+from test_codegen_fp_convert import _synthetic_elf
+
+# A VFPU0 word the AOT translates directly and the interpreter accepts.
+ROUTE_CLEAN_WORD = 0x60000000
+# Reserved VFPU4 jump form: codegen raises Unsupported and sr_vfpu_interp
+# returns SR_VFPU_OTHER, so a route containing it must fail the route census.
+ROUTE_OTHER_WORD = 0xD3E08080
+# jr ra; nop -- ends the synthetic route body; neither word is VFPU.
+ROUTE_TAIL = (0x03E00008, 0x00000000)
+
+
+class VfpuCoverageCensusTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.census = census.build_census()
+        cls.rows = {row["form_id"]: row for row in cls.census["rows"]}
+
+    def test_schema_and_systematic_decoder_coverage(self):
+        self.assertEqual(self.census["schema"], census.CENSUS_SCHEMA)
+        self.assertGreater(self.census["systematic_space"]["words_visited"], 50000)
+        source = (ROOT / "src" / "rt" / "vfpu_interp.c").read_text(encoding="utf-8")
+        self.assertEqual(
+            self.census["systematic_space"]["production_decoder_return_sites"],
+            len(census.RETURN_PATTERN.findall(source)),
+        )
+        self.assertIn("0x18", self.census["systematic_space"]["opcode_families"])
+        self.assertIn("0x3c", self.census["systematic_space"]["opcode_families"])
+
+    def test_json_and_markdown_are_deterministic(self):
+        rebuilt = census.build_census()
+        self.assertEqual(
+            census._canonical_json(self.census),
+            census._canonical_json(rebuilt),
+        )
+        self.assertEqual(census.render_markdown(self.census), census.render_markdown(rebuilt))
+
+    def test_rows_have_explicit_dispositions_and_evidence(self):
+        required = {
+            "aot_disposition",
+            "compatibility_disposition",
+            "vector_size",
+            "differential_tests",
+            "hardware_measured",
+            "evidence_tier",
+            "sufficiently_verified_for_acceleration",
+        }
+        for row in self.census["rows"]:
+            self.assertTrue(required <= set(row), row["form_id"])
+            self.assertIn(row["evidence_tier"], {"U", "S", "D", "HP", "H"})
+            self.assertIn(row["compatibility_disposition"], {
+                "aot-direct",
+                "aot-routes-to-sr-vfpu-interp",
+                "interpreter-only",
+                "supported-opcode-form-unmodeled",
+                "unsupported-encoding",
+            })
+            if row["compatibility_disposition"] in {
+                "interpreter-only",
+                "supported-opcode-form-unmodeled",
+                "unsupported-encoding",
+            }:
+                self.assertEqual(row["boundary_issue"], 326)
+
+    def test_vector_widths_remain_distinct_forms(self):
+        vfpu0_rows = [
+            row for row in self.census["rows"]
+            if row["opcode"] == "0x18" and row["compatibility_disposition"] == "aot-direct"
+        ]
+        self.assertEqual({row["vector_size"] for row in vfpu0_rows}, {1, 2, 3, 4})
+        for row in vfpu0_rows:
+            self.assertEqual(len(row["size_classes"]), 1)
+
+    def test_agreement_gate_passes_and_vflush_is_explicit(self):
+        self.assertEqual(self.census["agreement_gate"]["status"], "pass")
+        controls = [
+            row for row in self.census["rows"]
+            if row["agreement"] == "explicit-aot-direct-control"
+        ]
+        self.assertTrue(controls)
+        self.assertEqual({row["opcode"] for row in controls}, {"0x3f"})
+
+    def test_vfpu3_compare_forms_are_supported_in_both_lanes(self):
+        # Major 0x1B sub-ops 5, 6 and 7 are vscmp, vsge and vslt (issue #69).
+        # Both lanes decode them now; neither lane may route them to vcmov.
+        words = (
+            (0x1B << 26) | (5 << 23) | (7 << 16),
+            (0x1B << 26) | (6 << 23) | (7 << 16),
+            (0x1B << 26) | (7 << 23) | (7 << 16),
+        )
+        records = census.classify_words(words)
+        self.assertEqual(len(records), 3)
+        for record in records:
+            self.assertTrue(record["interpreter_supported"])
+            self.assertEqual(record["interpreter_kind"], "compute")
+            self.assertEqual(record["aot_disposition"], "aot-direct")
+            self.assertEqual(census.compatibility_disposition(record), "aot-direct")
+            self.assertEqual(census.agreement_status(record), "agree-supported-direct")
+
+    def test_measured_vfpu7_forms_agree_as_interpreter_routes(self):
+        # PSP-VFPU-FORMS2-001 (2026-10-29, issue #326): vrnds.s seeds the random unit
+        # (a state op), the wide draws and the conversions compute; both lanes reject
+        # the widths the probe did not measure.
+        kinds = {0xD0200000: "state", 0xD0218080: "compute", 0xD0220080: "compute",
+                 0xD0238000: "compute", 0xD0320088: "compute", 0xD0328088: "compute",
+                 0xD0390008: "compute"}
+        rejected = (0xD0200080, 0xD0320008, 0xD0390088)
+        records = {r["word"]: r for r in census.classify_words(tuple(kinds) + rejected)}
+        for word, kind in kinds.items():
+            with self.subTest(word=f"0x{word:08x}"):
+                record = records[word]
+                self.assertTrue(record["interpreter_supported"])
+                self.assertEqual(record["interpreter_kind"], kind)
+                self.assertEqual(census.agreement_status(record), "agree-supported-routed")
+                self.assertEqual(
+                    census.compatibility_disposition(record), "aot-routes-to-sr-vfpu-interp"
+                )
+        for word in rejected:
+            with self.subTest(word=f"0x{word:08x}"):
+                record = records[word]
+                self.assertFalse(record["interpreter_supported"])
+                self.assertIn("issue=326", record["aot_emitted"])
+                self.assertEqual(census.agreement_status(record), "agree-unsupported")
+
+    def test_vrndi_single_is_direct_in_both_lanes(self):
+        # vrndi.s follows the issue #326 step rule in the generated code and the
+        # interpreter; its row names the selftest that runs both lanes against it.
+        records = census.classify_words((0xD0210000, 0xD021006E))
+        for record in records:
+            with self.subTest(word=f"0x{record['word']:08x}"):
+                self.assertTrue(record["interpreter_supported"])
+                self.assertEqual(census.agreement_status(record), "agree-supported-direct")
+        rows = census._make_rows(records)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["compatibility_disposition"], "aot-direct")
+        self.assertIsNone(rows[0]["boundary_issue"])
+        self.assertEqual(rows[0]["differential_tests"],
+                         ["vfpu-interp-selftest:check_alias_edge_sweep",
+                          "vfpu-interp-selftest:check_overlap_diff",
+                          "vfpu-interp-selftest:check_vrndi_rule_cells"])
+
+    def test_vfpu_forms_are_direct_in_both_lanes_at_measured_widths(self):
+        # PSP-VFPU-FORMS-001 (issue #326): the two retail stops (FF III vh2f.p, Super
+        # Stardust Portable vwbn.s) and the other measured forms agree as direct in both
+        # lanes and name the selftest that pins them; other widths agree as unsupported.
+        direct = (0xD0330080, 0xD0330008, 0xD0380100, 0xD0456041, 0xD0450088, 0xD37F0007,
+                  0xD0220000, 0xD0230000)
+        records = census.classify_words(direct)
+        for record in records:
+            with self.subTest(word=f"0x{record['word']:08x}"):
+                self.assertTrue(record["interpreter_supported"])
+                self.assertEqual(census.agreement_status(record), "agree-supported-direct")
+        for row in census._make_rows(records):
+            self.assertEqual(row["compatibility_disposition"], "aot-direct")
+            self.assertIn("vfpu-interp-selftest:check_vfpu_forms_measured", row["differential_tests"])
+        closed = census.classify_words((0xD0338088, 0xD0380088, 0xD0458008, 0xD37F0088))
+        self.assertEqual(census.validate_agreement(closed)["agree-unsupported"], len(closed))
+
+    def test_measured_vfpu9_forms_agree_as_interpreter_routes(self):
+        # PSP-3000 measured forms (2026-10-24, issue #326): both lanes support the
+        # measured widths through sr_vfpu_interp and both reject the other widths.
+        supported = (0xD04A0405, 0xD0420183, 0xD0428080, 0xD0438183, 0xD0599090)
+        rejected = (0xD0420000, 0xD0430080, 0xD0590080)
+        records = {r["word"]: r for r in census.classify_words(supported + rejected)}
+        for word in supported:
+            with self.subTest(word=f"0x{word:08x}"):
+                record = records[word]
+                self.assertTrue(record["interpreter_supported"])
+                self.assertEqual(record["interpreter_kind"], "compute")
+                self.assertEqual(census.agreement_status(record), "agree-supported-routed")
+                self.assertEqual(
+                    census.compatibility_disposition(record), "aot-routes-to-sr-vfpu-interp"
+                )
+        for word in rejected:
+            with self.subTest(word=f"0x{word:08x}"):
+                record = records[word]
+                self.assertFalse(record["interpreter_supported"])
+                self.assertEqual(census.agreement_status(record), "agree-unsupported")
+
+    def test_reserved_vcmov_form_is_unmodeled_and_fail_closed(self):
+        # vcmov lives in VFPU4 (jump 21); imm3 7 is the reserved selector.
+        words = ((0x34 << 26) | (21 << 21) | (7 << 16),)
+        records = census.classify_words(words)
+        self.assertEqual(len(records), 1)
+        for record in records:
+            self.assertFalse(record["interpreter_supported"])
+            self.assertEqual(record["aot_disposition"], "aot-unsupported")
+            self.assertEqual(
+                census.compatibility_disposition(record),
+                "supported-opcode-form-unmodeled",
+            )
+            self.assertEqual(census.agreement_status(record), "agree-unsupported")
+
+    def test_agreement_gate_catches_mutated_support_disagreement(self):
+        word = (0x34 << 26) | (21 << 21) | (7 << 16)
+        record = census.classify_words((word,))[0]
+        mutated = copy.deepcopy(record)
+        mutated["interpreter_supported"] = True
+        mutated["interpreter_kind"] = "compute"
+        with self.assertRaises(census.CensusAgreementError):
+            census.validate_agreement((mutated,))
+
+    def test_agreement_gate_catches_mutated_fail_open_fallback(self):
+        word = (0x35 << 26) | (4 << 21)
+        record = census.classify_words((word,))[0]
+        mutated = copy.deepcopy(record)
+        mutated["aot_emitted"] = mutated["aot_emitted"].replace("SR_VFPU_OTHER", "0")
+        with self.assertRaises(census.CensusAgreementError):
+            census.validate_agreement((mutated,))
+
+    def test_agreement_gate_catches_unsupported_form_with_no_fallback_call(self):
+        word = (0x34 << 26) | (31 << 21) | 0x8080  # vwbn.q: no measured rule
+        record = census.classify_words((word,))[0]
+        mutated = copy.deepcopy(record)
+        mutated["aot_emitted"] = ""
+        with self.assertRaises(census.CensusAgreementError):
+            census.validate_agreement((mutated,))
+
+    def test_acceleration_gate_is_empty_and_evidence_derived(self):
+        gate = self.census["acceleration_gate"]
+        self.assertEqual(gate["accelerated_forms"], [])
+        self.assertEqual(gate["violations"], [])
+        by_id = self.rows
+        for form_id in gate["accelerated_forms"]:
+            self.assertTrue(by_id[form_id]["sufficiently_verified_for_acceleration"])
+        row = copy.deepcopy(next(row for row in self.census["rows"] if row["differential_tests"]))
+        row["hardware_sensitive"] = True
+        row["evidence_tier"] = "D"
+        self.assertFalse(census.acceleration_verified(row))
+        row["evidence_tier"] = "H"
+        self.assertTrue(census.acceleration_verified(row))
+        row["compatibility_disposition"] = "unsupported-encoding"
+        self.assertFalse(census.acceleration_verified(row))
+
+    # Supported rows with no differential or semantic-hardware result check, as
+    # (opcode, canonical word). Pinned so a newly supported form with no verification
+    # fails this test until it gains evidence (add its word to the overlap-diff, fuzz
+    # or interpreter-selftest paths) or is added here deliberately (issue #326).
+    EXPECTED_UNVERIFIED = (
+        # lv.s/sv.s/lv.q/sv.q rows visited only with base register r0: the fuzz harness
+        # refuses r0 (it cannot relocate the address), so these decode paths have no
+        # cross-check of their own; their rs != 0 neighbours are verified.
+        ("0x32", "0xc8000000"), ("0x32", "0xc801810f"), ("0x32", "0xc805010f"),
+        ("0x32", "0xc8050101"), ("0x32", "0xc8058181"), ("0x32", "0xc80a8010"),
+        ("0x36", "0xd8000000"), ("0x36", "0xd801810f"), ("0x36", "0xd8050101"),
+        ("0x3a", "0xe8000000"), ("0x3a", "0xe801810f"), ("0x3a", "0xe805010f"),
+        ("0x3a", "0xe8050101"), ("0x3a", "0xe8058181"), ("0x3a", "0xe80a8010"),
+        ("0x3e", "0xf8000000"), ("0x3e", "0xf801810f"), ("0x3e", "0xf8050101"),
+        # VFPU4 forms the AOT routes to sr_vfpu_interp: both lanes are one implementation,
+        # so a cross-check would compare the interpreter with itself, and no PSP oracle row
+        # pins these widths (vsgn.p/.q, vt4444 other than .q).
+        ("0x34", "0xd04a0000"), ("0x34", "0xd04a80ff"), ("0x34", "0xd0598090"),
+        # vflush (AOT-owned control).
+        ("0x3f", "0xfc000000"),
+    )
+
+    def test_supported_forms_without_verification_are_listed_and_pinned(self):
+        summary = self.census["summary"]
+        listed = summary["supported_without_semantic_verification"]
+        derived = [
+            row for row in self.census["rows"]
+            if row["compatibility_disposition"] in {"aot-direct", "aot-routes-to-sr-vfpu-interp"}
+            and not row["differential_tests"]
+            and not any(item["kind"] == "semantic" for item in row["hardware_measured"])
+        ]
+        self.assertEqual({item["form_id"] for item in listed}, {row["form_id"] for row in derived})
+        self.assertEqual(
+            sorted((item["opcode"], item["canonical_word"]) for item in listed),
+            sorted(self.EXPECTED_UNVERIFIED),
+            "the unverified supported-form set changed: verify the new form or update the pin",
+        )
+        counts = summary["by_semantic_verification"]
+        self.assertEqual(sum(counts.values()), summary["rows"])
+        self.assertEqual(counts["none"], len(listed))
+
+    def test_semantic_verification_ignores_addressing_only_hardware(self):
+        addressing = [{"oracle_id": "hardware_vfpu_addr_001", "kind": "addressing", "coverage": "x"}]
+        semantic = [{"oracle_id": "issue-40-group-a", "kind": "semantic", "coverage": "x"}]
+        verify = census._semantic_verification
+        self.assertEqual(verify("aot-direct", [], addressing), "none")
+        self.assertEqual(verify("aot-direct", ["t"], addressing), "differential")
+        self.assertEqual(verify("aot-direct", [], semantic), "hardware")
+        self.assertEqual(verify("unsupported-encoding", ["t"], semantic), "not-applicable")
+
+    def test_differential_evidence_names_real_selftest_checks(self):
+        source = (ROOT / "tests" / "native" / "vfpu_interp_selftest.c").read_text(encoding="utf-8")
+        for row in self.census["rows"]:
+            for test in row["differential_tests"]:
+                if test.startswith("vfpu-interp-selftest:"):
+                    name = test.split(":", 1)[1]
+                    self.assertIn(f"static int {name}(", source, f"{row['form_id']}: {test}")
+
+    def test_census_gap_words_are_cross_checked_without_fallback(self):
+        import codegen
+        import vfpu_overlap_diff_gen as gen
+        import vfpu_synth_gen
+
+        for word in gen.CENSUS_GAP_WORDS:
+            body, _, _ = codegen.vfpu_effect(0x08900000, word)
+            self.assertNotIn("sr_vfpu_interp", body, f"0x{word:08x}")
+            self.assertIn(word, census.overlap_diff_words())
+            record = census.classify_words([word])[0]
+            self.assertTrue(record["interpreter_supported"], f"0x{word:08x}")
+        memory = set(vfpu_synth_gen.generate_memory_cop2_corpus())
+        for op, lows in ((0x32, vfpu_synth_gen._CENSUS_GAP_SCALAR_MEMORY),
+                         (0x3A, vfpu_synth_gen._CENSUS_GAP_SCALAR_MEMORY),
+                         (0x36, vfpu_synth_gen._CENSUS_GAP_QUAD_MEMORY),
+                         (0x3E, vfpu_synth_gen._CENSUS_GAP_QUAD_MEMORY)):
+            for low in lows:
+                self.assertIn((op << 26) | low, memory)
+
+    def test_acceleration_gate_rejects_unknown_form_ids(self):
+        original = census.ACCELERATED_FORMS
+        census.ACCELERATED_FORMS = ("vfpu-unknown",)
+        try:
+            with self.assertRaises(census.CensusAgreementError):
+                census.build_census()
+        finally:
+            census.ACCELERATED_FORMS = original
+
+    def test_vfpu_fuzz_uncovered_cases_are_fatal(self):
+        source = (ROOT / "src" / "rt" / "vfpu_fuzz.c").read_text(encoding="utf-8")
+        self.assertIn("if (trials <= 0)", source)
+        self.assertIn("if (FUZZ_NCASES <= 0)", source)
+        # A shard passes only when every case it admits is tested. For the default 0/1 shard
+        # "admitted" is FUZZ_NCASES, so the gate is unchanged; test_public_ci_wiring proves
+        # that the shards together admit every case exactly once.
+        self.assertIn(
+            "return (bad_cases || skipped || tested != admitted) ? 1 : 0;",
+            source,
+        )
+        self.assertIn('#define FUZZ_SHARD_ENV "FUZZ_CASE_SHARD"', source)
+        self.assertIn("if ((unsigned)c % shard_n != shard_k) continue;", source)
+        self.assertIn("admits no case", source)
+
+    def test_hardware_ids_are_row_level_not_inherited(self):
+        memory_rows = [
+            row for row in self.census["rows"]
+            if row["opcode"] in {"0x32", "0x35", "0x36", "0x3a", "0x3e"}
+        ]
+        self.assertTrue(memory_rows)
+        self.assertTrue(any(row["hardware_measured"] for row in memory_rows))
+        self.assertTrue(any(not row["hardware_measured"] for row in memory_rows))
+        ids = {
+            item["oracle_id"]
+            for row in memory_rows
+            for item in row["hardware_measured"]
+        }
+        self.assertIn("PSP-A3-08", ids)
+        self.assertIn("PSP-A3-09", ids)
+        self.assertIn("PSP-A3-15", ids)
+        self.assertNotIn("PSP-A3-14", ids)
+        self.assertIn("PSP-A3-14", self.census["hardware_oracle_boundary"]["context_only_not_inherited"])
+
+    def test_encounter_input_accepts_only_words_and_counts(self):
+        with tempfile.TemporaryDirectory(prefix="vfpu_encounter_") as tmp:
+            path = Path(tmp) / "words.json"
+            path.write_text(
+                json.dumps([
+                    {"word": "0x60000000", "count": 4},
+                    {"word": "0xd3e08080", "count": 2},
+                ]),
+                encoding="ascii",
+            )
+            report = census.build_encounter_report(path)
+            self.assertEqual(report["total_words"], 2)
+            self.assertEqual(report["total_count"], 6)
+            dispositions = {entry["word"]: entry["disposition"] for entry in report["entries"]}
+            self.assertEqual(dispositions["0x60000000"], "aot-direct")
+            self.assertEqual(dispositions["0xd3e08080"], "unsupported-encoding")
+            output = io.StringIO()
+            with redirect_stdout(output):
+                rc = census.main(["--encodings", str(path)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(output.getvalue())["total_count"], 6)
+
+    def test_encounter_input_rejects_context_fields(self):
+        invalid = (
+            [{"word": "0x60000000", "count": 1, "pc": "0x1000"}],
+            [{"word": "0x60000000", "count": 1, "address": 4096}],
+            [{"word": "0x60000000", "count": 1, "mnemonic": "vadd.s"}],
+            [{"word": "0x60000000", "count": 1, "title": "retail"}],
+            [{"word": "0x00000000", "count": 1}],
+            [{"word": "0x60000000", "count": 0}],
+        )
+        with tempfile.TemporaryDirectory(prefix="vfpu_encounter_reject_") as tmp:
+            path = Path(tmp) / "words.json"
+            for entries in invalid:
+                with self.subTest(entries=entries):
+                    path.write_text(json.dumps(entries), encoding="ascii")
+                    with self.assertRaises(census.CensusError):
+                        census.build_encounter_report(path)
+
+    def test_cli_writes_requested_json_and_markdown(self):
+        with tempfile.TemporaryDirectory(prefix="vfpu_census_cli_") as tmp:
+            json_path = Path(tmp) / "census.json"
+            markdown_path = Path(tmp) / "census.md"
+            rc = census.main(["--json", str(json_path), "--markdown", str(markdown_path)])
+            self.assertEqual(rc, 0)
+            loaded = json.loads(json_path.read_text(encoding="ascii"))
+            self.assertEqual(loaded, self.census)
+            markdown = markdown_path.read_text(encoding="utf-8")
+            self.assertIn("# VFPU Compatibility Census", markdown)
+            self.assertIn("issue #326", markdown)
+            self.assertIn("No SIMD path exists", markdown)
+
+
+    def test_alias_edge_sweep_covers_every_direct_form(self):
+        # Issue #326: every census form the AOT emits directly and the interpreter
+        # supports (memory forms and the 0x3F prefix reset aside) is run by
+        # check_alias_edge_sweep, and its row names that check.
+        import vfpu_overlap_diff_gen as gen
+
+        forms, cases = gen.build_sweep_cases()
+        swept = {forms[index] for _, index, _ in cases}
+        direct = [form_id for form_id, key, _ in census.supported_direct_forms()
+                  if key[0] not in gen.SWEEP_EXCLUDED_OPS]
+        self.assertGreater(len(direct), 300)
+        for form_id in direct:
+            with self.subTest(form=form_id):
+                self.assertIn(form_id, swept)
+                self.assertIn("vfpu-interp-selftest:check_alias_edge_sweep",
+                              self.rows[form_id]["differential_tests"])
+
+    def test_alias_edge_sweep_instances_stay_in_their_form(self):
+        import vfpu_overlap_diff_gen as gen
+
+        forms, cases = gen.build_sweep_cases()
+        keys = {form_id: key for form_id, key, _ in census.supported_direct_forms()}
+        records = {int(r["word"]): r for r in census.classify_words(w for w, _, _ in cases)}
+        for word, index, _ in cases:
+            self.assertEqual(census.row_key(records[word]), keys[forms[index]], f"0x{word:08x}")
+        signatures = {signature for _, _, signature in cases}
+        for relation in ("d=s", "d~s", "d|s", "d=t", "d~t", "s=t", "s~t"):
+            self.assertTrue(any(relation in signature for signature in signatures), relation)
+
+    def test_alias_signature_names_each_overlap(self):
+        import vfpu_overlap_diff_gen as gen
+
+        self.assertEqual(gen.alias_signature({"d": 0x00, "s": 0x00}, 4), "d=s")
+        self.assertEqual(gen.alias_signature({"d": 0x00, "s": 0x01}, 4), "d|s")  # C000 / C010
+        self.assertEqual(gen.alias_signature({"d": 0x00, "s": 0x20}, 4), "d~s")  # C000 / R000
+        self.assertEqual(gen.alias_signature({"d": 0x00, "s": 0x00, "t": 0x04}, 4), "d=s,d|t,s|t")
+        self.assertEqual(gen.alias_signature({}, 1), "as-encoded")
+
+    def test_measured_selftests_credit_only_the_measured_widths(self):
+        # Each PSP-pinned check is credited to the forms and widths it runs; the widths it
+        # refuses as unmeasured are not.
+        def tests(word):
+            record = census.classify_words([word])[0]
+            return census._differential_tests(record, set())
+
+        self.assertIn("vfpu-interp-selftest:check_vfpu_compare_measured_words", tests(0x6EA00040))
+        self.assertNotIn("vfpu-interp-selftest:check_vfpu_compare_measured_words", tests(0x6EA00080))
+        self.assertIn("vfpu-interp-selftest:check_psp_measured_sort", tests(0xD0408088))
+        self.assertNotIn("vfpu-interp-selftest:check_psp_measured_sort", tests(0xD0400088))
+        self.assertIn("vfpu-interp-selftest:check_psp_measured_funnel", tests(0xD0468008))
+        self.assertIn("vfpu-interp-selftest:check_psp_measured_forms2", tests(0xD0390008))
+        self.assertNotIn("vfpu-interp-selftest:check_psp_measured_forms2", tests(0xD0390088))
+        self.assertIn("vfpu-interp-selftest:check_vrexp2_measured_words", tests(0xD01C0040))
+
+
+class VfpuRouteCensusTests(unittest.TestCase):
+    """Join the census to the VFPU words a route's AOT actually emits."""
+
+    def _run_route(self, words):
+        with tempfile.TemporaryDirectory(prefix="vfpu_route_census_") as tmp:
+            elf = Path(tmp) / "route.elf"
+            elf.write_bytes(_synthetic_elf(list(words)))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                rc = census.main(["--route", str(elf)])
+            return rc, json.loads(output.getvalue())
+
+    def test_route_census_passes_clean_synthetic_route(self):
+        rc, report = self._run_route([ROUTE_CLEAN_WORD, *ROUTE_TAIL])
+        self.assertEqual(rc, 0)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["failures"], [])
+        self.assertEqual(report["route_emitted_words"], 3)
+        self.assertEqual(report["route_words"], 1)
+        entries = {entry["word"]: entry for entry in report["entries"]}
+        clean = entries[f"0x{ROUTE_CLEAN_WORD:08x}"]
+        self.assertEqual(clean["disposition"], "aot-direct")
+        self.assertEqual(clean["status"], "pass")
+        self.assertIsNone(clean["tracking_issue"])
+        self.assertNotIn(f"0x{ROUTE_TAIL[0]:08x}", entries)
+
+    def test_route_report_gives_one_disposition_per_form(self):
+        # Issue #326: a route report lists each census form it emits once, with how its
+        # result is checked and whether a PSP oracle row measured it.
+        vadd_other_registers = 0x60010203 & ~0x8080
+        vscmp_measured = 0x6EA00040  # vscmp.s S002, S000, S001 (PSP-VFPU-CMP-001)
+        rc, report = self._run_route([ROUTE_CLEAN_WORD, vadd_other_registers, vscmp_measured, *ROUTE_TAIL])
+        self.assertEqual(rc, 0)
+        forms = {form["form_id"]: form for form in report["forms"]}
+        self.assertEqual(len(forms), 2)
+        entries = {entry["word"]: entry for entry in report["entries"]}
+        vadd = forms[entries[f"0x{ROUTE_CLEAN_WORD:08x}"]["form_id"]]
+        self.assertEqual(vadd["words"], 2)
+        self.assertEqual(vadd["semantic_verification"], "differential")
+        self.assertEqual(vadd["psp"], "unmeasured")
+        vscmp = forms[entries[f"0x{vscmp_measured:08x}"]["form_id"]]
+        self.assertEqual(vscmp["psp"], "measured-cells")
+        self.assertEqual(vscmp["psp_evidence"], ["PSP-VFPU-CMP-001"])
+
+    def test_route_census_fails_closed_on_other_word(self):
+        rc, report = self._run_route(
+            [ROUTE_CLEAN_WORD, ROUTE_OTHER_WORD, *ROUTE_TAIL]
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["failures"], [f"0x{ROUTE_OTHER_WORD:08x}"])
+        entries = {entry["word"]: entry for entry in report["entries"]}
+        clean = entries[f"0x{ROUTE_CLEAN_WORD:08x}"]
+        self.assertEqual(clean["status"], "pass")
+        other = entries[f"0x{ROUTE_OTHER_WORD:08x}"]
+        self.assertEqual(other["disposition"], "unsupported-encoding")
+        self.assertEqual(other["aot"], "aot-unsupported")
+        self.assertEqual(other["interpreter"], "unsupported")
+        self.assertEqual(other["status"], "boundary")
+        self.assertEqual(other["tracking_issue"], 326)
+
+    def test_route_census_scans_generated_route_files(self):
+        with tempfile.TemporaryDirectory(prefix="vfpu_route_gen_") as tmp:
+            main_c = Path(tmp) / "route.c"
+            chunk_c = Path(tmp) / "route_0.c"
+            main_c.write_text(
+                f"    sr_begin(s, 0x00001000u, 0x{ROUTE_CLEAN_WORD:08x}u); sr_end(s, 0u, 0);\n",
+                encoding="ascii",
+            )
+            chunk_c.write_text(
+                f"    sr_begin(s, 0x00001004u, 0x{ROUTE_OTHER_WORD:08x}u); sr_end(s, 0u, 0);\n",
+                encoding="ascii",
+            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                rc = census.main(["--route", str(main_c)])
+            report = json.loads(output.getvalue())
+        self.assertEqual(rc, 1)
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["route_emitted_words"], 2)
+        self.assertEqual(report["failures"], [f"0x{ROUTE_OTHER_WORD:08x}"])
+        self.assertEqual(
+            {entry["word"] for entry in report["entries"]},
+            {f"0x{ROUTE_CLEAN_WORD:08x}", f"0x{ROUTE_OTHER_WORD:08x}"},
+        )
+
+    def test_route_arg_must_be_a_codegen_option(self):
+        with tempfile.TemporaryDirectory(prefix="vfpu_route_arg_") as tmp:
+            elf = Path(tmp) / "route.elf"
+            elf.write_bytes(_synthetic_elf([ROUTE_CLEAN_WORD, *ROUTE_TAIL]))
+            for bad in ("88000000", "-base=0x1000", "--", ""):
+                with self.subTest(bad=bad):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        rc = census.main(["--route", str(elf), f"--route-arg={bad}"])
+                    self.assertEqual(rc, 2)
+                    self.assertEqual(output.getvalue(), "")
+
+    def test_route_with_a_vfpu_stub_fails_closed_and_other_stubs_are_counted(self):
+        with tempfile.TemporaryDirectory(prefix="vfpu_route_stub_") as tmp:
+            main_c = Path(tmp) / "route.c"
+            main_c.write_text(
+                f"    sr_begin(s, 0x00001000u, 0x{ROUTE_CLEAN_WORD:08x}u); sr_end(s, 0u, 0);" + chr(10),
+                encoding="ascii",
+            )
+            stubs = Path(tmp) / "route_stubs.txt"
+
+            def run():
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    rc = census.main(["--route", str(main_c)])
+                return rc, output.getvalue()
+
+            # A function stubbed on a VFPU-routed opcode hides its VFPU words.
+            stubs.write_text("0x00001040 opcode 0x36 at 0x00001040" + chr(10), encoding="ascii")
+            rc, text = run()
+            self.assertEqual((rc, text), (2, ""))
+            # An unrelated stub is reported, not hidden: the pass covers translated functions only.
+            stubs.write_text("0x00001040 control in delay slot at 0x00001040" + chr(10), encoding="ascii")
+            rc, text = run()
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(text)["route_stubbed_functions"], 1)
+            stubs.write_text("", encoding="ascii")
+            rc, text = run()
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(text)["route_stubbed_functions"], 0)
+
+    def test_route_report_names_emitted_occurrences_and_classification_flags(self):
+        rc, report = self._run_route([ROUTE_CLEAN_WORD, *ROUTE_TAIL])
+        self.assertEqual(rc, 0)
+        self.assertIn("route_emitted_occurrences", report)
+        self.assertNotIn("route_occurrences", report)
+        self.assertFalse(report["classification_lle_cpu"])
+        for entry in report["entries"]:
+            self.assertIn("emitted_occurrences", entry)
+            self.assertNotIn("count", entry)
+
+    def test_lle_cpu_route_args_reach_the_classification(self):
+        """lv.q/sv.q route to the interpreter in the generated C under --lle-cpu."""
+        from unittest import mock
+
+        seen = []
+        original = census._classify_aot
+
+        def spy(word, *, lle_cpu=False):
+            seen.append(lle_cpu)
+            return original(word, lle_cpu=lle_cpu)
+
+        with tempfile.TemporaryDirectory(prefix="vfpu_route_lle_") as tmp:
+            main_c = Path(tmp) / "route.c"
+            main_c.write_text(
+                f"    sr_begin(s, 0x00001000u, 0x{ROUTE_CLEAN_WORD:08x}u); sr_end(s, 0u, 0);\n",
+                encoding="ascii",
+            )
+            with mock.patch.object(census, "_classify_aot", spy):
+                report = census.build_route_report(main_c)
+        self.assertEqual(seen, [False])
+        self.assertFalse(report["classification_lle_cpu"])
+        words = mock.MagicMock(return_value=(__import__("collections").Counter({ROUTE_CLEAN_WORD: 1}), 1, 0))
+        with mock.patch.object(census, "_route_words", words), \
+                mock.patch.object(census, "_classify_aot", spy):
+            report = census.build_route_report(Path("route.elf"), ["--lle-cpu"])
+        self.assertEqual(seen[-1], True)
+        self.assertTrue(report["classification_lle_cpu"])
+
+    def test_route_census_rejects_non_route_input(self):
+        with tempfile.TemporaryDirectory(prefix="vfpu_route_bad_") as tmp:
+            binary = Path(tmp) / "route.bin"
+            binary.write_bytes(b"\x00\x01\x02\x03")
+            output = io.StringIO()
+            with redirect_stdout(output):
+                rc = census.main(["--route", str(binary)])
+            self.assertEqual(rc, 2)
+            self.assertEqual(output.getvalue(), "")
+            # A parseable C file with no emitted guest words must not report a pass.
+            empty_c = Path(tmp) / "route.c"
+            empty_c.write_text("/* no emitted instructions */\n", encoding="ascii")
+            output = io.StringIO()
+            with redirect_stdout(output):
+                rc = census.main(["--route", str(empty_c)])
+            self.assertEqual(rc, 2)
+            self.assertEqual(output.getvalue(), "")
+
+    def test_profile_zero_route_has_no_boundary_vfpu_words(self):
+        """The committed public profile-zero route emits no Unsupported/OTHER word."""
+        elf = ROOT / "fixtures" / "profile_zero" / "prebuilt" / "profile_zero_guest.prx"
+        if not elf.is_file():
+            # Not committed (#1100): hosted CI stages it from the profile_zero_fixture job.
+            self.skipTest(f"NOT_RUN: profile-zero fixture bytes are absent: {elf}")
+        manifest = json.loads(
+            (ROOT / "assets" / "titles" / "synthetic.json").read_text(encoding="utf-8")
+        )
+        base = manifest["executable"]["base"]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            rc = census.main(["--route", str(elf), f"--route-arg=--base={base:x}"])
+        report = json.loads(output.getvalue())
+        self.assertEqual(rc, 0, report)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["failures"], [])
+        self.assertGreater(report["route_emitted_words"], 0)
+        # The route census sees exactly the VFPU words of the fixture's code sections.
+        # Words decoded from data (NID tables, .data) are not route code; a census that
+        # counted them once satisfied this test with no VFPU instruction in .text.
+        import analyze
+        image = analyze.Elf(str(elf), base=base)
+        code_words = {
+            int.from_bytes(image.read_at_vaddr(address, 4), "little")
+            for lo, hi in analyze.exec_ranges(image)
+            for address in range(lo, hi, 4)
+        }
+        expected = sum(1 for word in code_words if (word >> 26) in census.route_opcodes())
+        self.assertEqual(report["route_words"], expected)
+
+
+if __name__ == "__main__":
+    unittest.main()

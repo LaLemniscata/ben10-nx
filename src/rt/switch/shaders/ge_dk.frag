@@ -1,0 +1,366 @@
+#version 460
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025-2026 the psp-recomp authors
+// Copyright (C) 2026 the Nakagawa Recomp authors
+// Derived from sal063/PSP-recompilation-project (GPL-2.0-or-later)
+// Modified for deko3d by Nakagawa Recomp contributors, 2026-11-04.
+// Modified by Nakagawa Recomp contributors, 2026-08-10.
+// See NOTICE.md for upstream lineage and modification provenance.
+
+/* PSP GE fragment stage uber-shader, Phase 1. Mirrors ge.c shade() + zrange_ok():
+ * texfunc 0-7 (modulate/decal/blend/replace/add) with the RGBA and color-double bits,
+ * programmable alpha test, fog mix, and the minz/maxz depth-range DISCARD (transform
+ * mode only -- it is a kill test on the PSP, not a clamp). Clear-mode draws bypass
+ * texturing/alpha-test/fog like put_px_rgba does. Simple blends and write masks are VK
+ * fixed-function state chosen by ge_gpu.c; blend states fixed-function Vulkan cannot
+ * express (doubled DST-alpha factors, absdiff, two distinct FIX constants, post-blend
+ * 16-bit quantization/dither) run HERE against a destination snapshot (u_dst, taken at
+ * batch-build time -- overlapping primitives inside one batch read the pre-batch
+ * destination, the standard shader-blend hazard). Colors are computed in 0..255 space
+ * to track the integer formulas in shade()/blend_chan(). */
+layout(location = 0) noperspective in vec2  v_uv;
+layout(location = 1) noperspective in float v_rw;
+layout(location = 2) noperspective in float v_fog;
+layout(location = 3) noperspective in vec4  v_color;
+
+layout(location = 0) out vec4 o_color;
+
+layout(binding = 0) uniform sampler2D u_tex;
+layout(binding = 1) uniform sampler2D u_dst;   /* destination snapshot (shader blend) */
+
+/* flags bits (pc.cfg.x >> 8): 1 textured, 2 texfunc-RGBA, 4 color-double, 8 fog,
+ * 16 persp (apply minz/maxz), 32 clear mode, 64 nearest filter (both TEXFILTER fields),
+ * 128 premultiply rgb by 2*alpha (PSP src blend factor DOUBLE_SRC_ALPHA with VK factor
+ * ONE), 256 premultiply rgb by (1 - 2*alpha) (ONE_MINUS_DOUBLE_SRC_ALPHA),
+ * 512 ordered dithering enabled, bits 10-11 = framebuffer pixel format (psm 0..3):
+ * the output color is snapped to the native 5650/5551/4444 lattice so the RGBA8
+ * attachment only ever holds values that round-trip guest VRAM bit-exactly
+ * (truncate(bit_replicate(x)) == x -> zero drift across readback/upload cycles),
+ * 4096 shader blend (full PSP blend against u_dst; pipeline blending is OFF),
+ * 8192 stencil: the stencil test and ops of ge.c put_px_rgba_tested() against the
+ * destination alpha in u_dst (bl.z = GE_STENCILTEST, bl.w = GE_STENCILOP | PMSKA<<24).
+ * ge_gpu.c routes here only states whose depth-fail and depth-tested stencil-fail ops
+ * are KEEP, so a discard is exact wherever the depth test runs in the pipeline.
+ * 16384 per-fragment level of detail (#1373): TEXLEVEL automatic or slope mode, chosen
+ * per fragment as ge.c tex_detail16 and ge_tex_level_pick choose it; cfg.y bits 24-31 =
+ * slope mode | mipmap-linear << 1 | highest level << 2, texenv.a = TEXLODSLOPE,
+ * fogcol.a = the TEXLEVEL bias in 1/16 (the sampler spans every level).
+ * 32768 constant stencil (ge_gpu.c stencil_fixed_alpha): an 8888 stencil state that reads
+ * no destination stores bl.z (0-255) as its alpha; u_dst is not read. */
+layout(std140, binding = 0) uniform PC {
+    ivec4 cfg;      /* x = texfunc | flags<<8, y = alpha test (func|ref<<8|mask<<16),
+                       z = minz, w = maxz */
+    vec4  texenv;   /* rgb = GE_TEXENVCOLOR / 255 */
+    vec4  fogcol;   /* rgb = GE_FOGCOLOR / 255 */
+    vec4  texsize;  /* xy = tex dimensions, zw = texel offset (render-target sub-rect) */
+    ivec4 dith;     /* 4x4 GE dither matrix, one row per component, 4 x s8 packed per int */
+    ivec4 bl;       /* x = blend srcf | dstf<<8 | eq<<16, y = render scale (>= 1),
+                       z = stencil test (32768: the constant stencil), w = stencil ops |
+                       alpha write mask<<24 */
+    vec4  fixa;     /* rgb = GE_BLENDFIXEDA / 255 (src FIX constant) */
+    vec4  fixb;     /* rgb = GE_BLENDFIXEDB / 255 (dst FIX constant) */
+} pc;
+
+/* Keep the top `bits` of an 8-bit channel and expand by bit replication — exactly
+ * ge.c's pack565/pack5551/pack4444 followed by unpack_color. */
+float quant_chan(float c, int bits) {
+    int v = int(c) >> (8 - bits);
+    return float((v << (8 - bits)) | (v >> (2 * bits - 8)));
+}
+
+/* PSP blend factor, integer space — exactly ge.c factor_component(): 0..255 except the
+ * doubled alphas, 2a up to 510 and 255 - 2a down to -255. */
+ivec3 blend_factor(int f, bool srcSide, ivec3 s, int sa, ivec3 d, int da) {
+    switch (f & 15) {
+        case 0:  return srcSide ? d : s;
+        case 1:  return 255 - (srcSide ? d : s);
+        case 2:  return ivec3(sa);
+        case 3:  return ivec3(255 - sa);
+        case 4:  return ivec3(da);
+        case 5:  return ivec3(255 - da);
+        case 6:  return ivec3(sa * 2);
+        case 7:  return ivec3(255 - sa * 2);
+        case 8:  return ivec3(da * 2);
+        case 9:  return ivec3(255 - da * 2);
+        default: return ivec3((srcSide ? pc.fixa.rgb : pc.fixb.rgb) * 255.0 + 0.5);
+    }
+}
+
+/* Colour times factor as the PSP rounds it — exactly ge.c blend_mul():
+ * floor((2v + 1)(2|f| + 1) / 1024), with the factor's sign applied afterwards. */
+ivec3 blend_mul(ivec3 v, ivec3 f) {
+    ivec3 m = ((2 * v + 1) * (2 * abs(f) + 1)) >> 10;
+    return ivec3(f.x < 0 ? -m.x : m.x, f.y < 0 ? -m.y : m.y, f.z < 0 ? -m.z : m.z);
+}
+
+/* PSP stencil op on an 8-bit destination stencil -- exactly ge.c apply_stencil_op(). */
+int stencil_op(int op, int old, int ref, int fbfmt) {
+    switch (op & 7) {
+        case 0: return old;
+        case 1: return 0;
+        case 2: return ref;
+        case 3: return (~old) & 0xFF;
+        case 4:
+            if (fbfmt == 3) return old < 255 ? old + 1 : old;
+            if (fbfmt == 1) return 255;
+            if (fbfmt == 2) return old < 0xF0 ? old + 0x10 : old;
+            return old;
+        case 5:
+            if (fbfmt == 2) return old >= 0x10 ? old - 0x10 : old;
+            if (fbfmt == 1) return 0;
+            return old > 0 ? old - 1 : old;
+        default: return old;
+    }
+}
+
+/* An 8-bit alpha on the native lattice of framebuffer format `fbfmt`. */
+int quant_alpha(int a, int fbfmt) {
+    if (fbfmt == 1) return a >= 128 ? 255 : 0;
+    if (fbfmt == 2) return int(quant_chan(float(a), 4));
+    if (fbfmt == 0) return 255;
+    return a;
+}
+
+/* ge_shared.h ge_lod_log16: log2 in 1/16 levels from the float's exponent and top four
+ * mantissa bits (PSP-GE-MIP-001). */
+int lod_log16(float f) {
+    return int((floatBitsToUint(f) >> 19) & 0xFFFu) - 127 * 16;
+}
+
+/* In this copy every mode of TEXLEVEL takes the per-fragment path: bits 24-31 of cfg.y hold
+ * slope mode | mipmap-linear << 1 | highest level << 2 | constant mode << 5. */
+void main() {
+    int flags = pc.cfg.x >> 8;
+    int fbfmt = (flags >> 10) & 3;
+
+    /* Only the automatic mode needs these. The branch is on a uniform, so the derivatives are
+     * still taken in uniform control flow (before any discard). Per device pixel; times the
+     * render scale they are per PSP pixel. */
+    vec2 duv_dx = vec2(0.0), duv_dy = vec2(0.0);
+    float drw_dx = 0.0, drw_dy = 0.0;
+    if ((flags & 16384) != 0 && ((pc.cfg.y >> 24) & 33) == 0) {
+        float lod_scale = float(max(pc.bl.y, 1));
+        duv_dx = dFdxFine(v_uv) * lod_scale;
+        duv_dy = dFdyFine(v_uv) * lod_scale;
+        drw_dx = dFdxFine(v_rw) * lod_scale;
+        drw_dy = dFdyFine(v_rw) * lod_scale;
+    }
+
+    /* PSP depth-range test: discard transform-mode pixels outside [minz,maxz]. */
+    if ((flags & 16) != 0) {
+        int z16 = int(gl_FragCoord.z * 65535.0 + 0.5);
+        if (z16 < pc.cfg.z || z16 > pc.cfg.w) discard;
+    }
+
+    vec4 v = v_color * 255.0;
+    vec4 col = v;
+
+    if ((flags & 32) == 0) {
+        if ((flags & 1) != 0) {
+            /* Recover texel coords (u*rw interpolated affinely, divided per pixel; in
+             * through mode rw==1). The PSP samples the coordinate at the pixel centre with
+             * texel i centred at i + 0.5 (PSP-GE-SAMPLE-001), which is Vulkan's own
+             * convention: nearest returns floor(u), linear taps floor(u - 0.5) and the next
+             * texel. The PSP truncates the linear weight frac(u - 0.5) to 1/16; snapping
+             * u - 0.5 down to a 1/16 step reproduces that. Nearest samples the centre of
+             * texel floor(u) instead: a coordinate exactly on a texel edge (u = 2x + 1 at
+             * half scale) picks either neighbour depending on the implementation's
+             * sub-texel rounding, and floor(u) + 0.5 stays inside floor(u / 2^L) at every
+             * mip level L.
+             *
+             * Both rules floor, so the interpolated coordinate is first rounded to 1/4096
+             * of a texel: a host's fp32 attribute interpolation can land an exact edge like
+             * u = 1.0 a few ulps below it (lavapipe does at the half-scale case's first
+             * pixel), and floor then takes the texel before. The rounding moves only values
+             * within 1/8192 of that lattice, far below the 1/16 weight step. */
+            float rw = max(abs(v_rw), 1e-20);
+            vec2 uv = v_uv / rw;
+            uv = floor(uv * 4096.0 + vec2(0.5)) / 4096.0;
+            if ((flags & 64) != 0) uv = floor(uv) + vec2(0.5);
+            else uv = floor((uv - vec2(0.5)) * 16.0) / 16.0 + vec2(0.5);
+            uv += pc.texsize.zw;
+            vec4 t;
+            if ((flags & 16384) != 0) {
+                /* ge.c tex_detail16: automatic mode is log16 of the footprint (the larger
+                 * squared length of the level-0 texel coordinate's screen derivatives, each
+                 * the quotient rule's (d(u rw) - u d(rw)) / rw, as raster_tri takes them);
+                 * slope mode is 16 + log16(TEXLODSLOPE) - log16(q), q = 1/w; constant mode is
+                 * the bias alone. Then ge_tex_level_pick: nearest level (one half up) or level
+                 * + blend in 1/16, clamped to the highest level. A level of detail above 0
+                 * filters by the minification field (ge.c shade), and an explicit LOD of 0.25
+                 * keeps the sampler on it while nearest mipmap mode stays on level 0. */
+                int lcfg = (pc.cfg.y >> 24) & 0xFF, lmax = (lcfg >> 2) & 7;
+                int detail16 = int(pc.fogcol.a);
+                if ((lcfg & 32) != 0) {
+                    /* the bias alone */
+                } else if ((lcfg & 1) != 0) {
+                    detail16 += 16 + lod_log16(pc.texenv.a) - lod_log16(v_rw);
+                } else {
+                    vec2 u0 = v_uv / rw;
+                    vec2 dx = (duv_dx - u0 * drw_dx) / rw, dy = (duv_dy - u0 * drw_dy) / rw;
+                    detail16 += lod_log16(sqrt(max(dot(dx, dx), dot(dy, dy))));
+                }
+                float lod = 0.0;
+                if (detail16 > 0) {
+                    int level, frac = 0;
+                    if ((lcfg & 2) != 0) { level = detail16 >> 4; frac = detail16 & 15; }
+                    else                 level = (detail16 + 8) >> 4;
+                    if (level >= lmax) { level = lmax; frac = 0; }
+                    lod = float(level) + float(frac) / 16.0;
+                    if (lod == 0.0) lod = 0.25;
+                }
+                t = textureLod(u_tex, uv / pc.texsize.xy, lod) * 255.0;
+            } else {
+                t = texture(u_tex, uv / pc.texsize.xy) * 255.0;
+            }
+            int  tf    = pc.cfg.x & 7;
+            bool rgba  = (flags & 2) != 0;
+            float dscl = ((flags & 4) != 0) ? 2.0 : 1.0;
+            vec3 rgb; float al;
+            if (tf == 1) {                       /* decal */
+                if (rgba) rgb = mix(v.rgb, t.rgb, t.a * (1.0 / 255.0)) * dscl;
+                else      rgb = t.rgb * dscl;
+                al = v.a;
+            } else if (tf == 2) {                /* blend against TEXENVCOLOR */
+                rgb = mix(v.rgb, pc.texenv.rgb * 255.0, t.rgb * (1.0 / 255.0)) * dscl;
+                al  = rgba ? v.a * t.a * (1.0 / 255.0) : v.a;
+            } else if (tf == 3) {                /* replace */
+                rgb = t.rgb * dscl;
+                al  = rgba ? t.a : v.a;
+            } else if (tf >= 4) {                /* add */
+                rgb = (v.rgb + t.rgb) * dscl;
+                al  = rgba ? v.a * t.a * (1.0 / 255.0) : v.a;
+            } else {                             /* modulate */
+                rgb = v.rgb * t.rgb * (1.0 / 255.0) * dscl;
+                al  = rgba ? v.a * t.a * (1.0 / 255.0) : v.a;
+            }
+            col = vec4(min(rgb, vec3(255.0)), min(al, 255.0));
+        }
+
+        /* Alpha test (func order matches ge.c alpha_test). */
+        int at = pc.cfg.y, afunc = at & 7;
+        if (afunc != 1) {
+            int amask = (at >> 16) & 0xFF;
+            int aref  = ((at >> 8) & 0xFF) & amask;
+            int av    = int(col.a + 0.5) & amask;
+            bool pass;
+            if      (afunc == 0) pass = false;
+            else if (afunc == 2) pass = (av == aref);
+            else if (afunc == 3) pass = (av != aref);
+            else if (afunc == 4) pass = (av <  aref);
+            else if (afunc == 5) pass = (av <= aref);
+            else if (afunc == 6) pass = (av >  aref);
+            else                 pass = (av >= aref);
+            if (!pass) discard;
+        }
+
+        if ((flags & 8) != 0) {
+            /* ge.c shade(): F = fog * 256 truncated (1 = no fog), at most 255, and
+             * ((c + 1) F + (fog colour + 1)(255 - F)) / 256 truncated. */
+            int f = int(clamp(v_fog, 0.0, 1.0) * 256.0);
+            if (f < 256) {
+                ivec3 c = ivec3(col.rgb), fc = ivec3(pc.fogcol.rgb * 255.0 + 0.5);
+                col.rgb = vec3(((c + 1) * f + (fc + 1) * (255 - f)) >> 8);
+            }
+        }
+
+        /* doubled-src-alpha blend factors folded into the source color */
+        if ((flags & 128) != 0) col.rgb *= clamp(col.a * 2.0, 0.0, 255.0) * (1.0 / 255.0);
+        if ((flags & 256) != 0) col.rgb *= clamp(255.0 - col.a * 2.0, 0.0, 255.0) * (1.0 / 255.0);
+    }
+
+    /* Stencil test against the destination stencil (its alpha), reference OP destination
+     * as in ge.c stencil_test_pass(). A failing pixel keeps its colour and takes the
+     * stencil-fail op; a passing one carries the depth-pass op's value to the store.
+     * The depth-fail op is KEEP (ge_gpu.c), so the pipeline depth test discards. */
+    bool stencil_fail = false;
+    int stencil = 0;
+    ivec4 spx = ivec4(0);
+    if ((flags & 8192) != 0) {
+        spx = ivec4(texelFetch(u_dst, ivec2(gl_FragCoord.xy), 0) * 255.0 + 0.5);
+        if (fbfmt == 0) spx.a = 0;   /* a 565 pixel's stencil reads 0 (ge.c, PSP-GE-RASTER-001) */
+        int smask = (pc.bl.z >> 16) & 0xFF, sref = (pc.bl.z >> 8) & 0xFF;
+        int ref = sref & smask, val = spx.a & smask, sfunc = pc.bl.z & 7;
+        bool pass;
+        if      (sfunc == 0) pass = false;
+        else if (sfunc == 1) pass = true;
+        else if (sfunc == 2) pass = ref == val;
+        else if (sfunc == 3) pass = ref != val;
+        else if (sfunc == 4) pass = ref <  val;
+        else if (sfunc == 5) pass = ref <= val;
+        else if (sfunc == 6) pass = ref >  val;
+        else                 pass = ref >= val;
+        if (!pass) {
+            if ((pc.bl.w & 7) == 0) discard;
+            stencil_fail = true;
+            col = vec4(spx);
+            stencil = stencil_op(pc.bl.w & 7, spx.a, sref, fbfmt);
+        } else {
+            stencil = stencil_op((pc.bl.w >> 16) & 7, spx.a, sref, fbfmt);
+        }
+    }
+
+    /* Shader blend: full PSP factor/equation set against the destination snapshot,
+     * integer math identical to ge.c blend_chan(). Runs BEFORE dither/quantization so
+     * the 16-bit lattice snap applies to the blend RESULT, like the hardware store. */
+    if ((flags & 4096) != 0 && !stencil_fail) {
+        ivec4 dpx = ivec4(texelFetch(u_dst, ivec2(gl_FragCoord.xy), 0) * 255.0 + 0.5);
+        if (fbfmt == 0) dpx.a = 0;   /* blending reads a 565 pixel's alpha as 0 (ge.c read_fb_px) */
+        ivec3 s   = ivec3(col.rgb + 0.5);
+        int   sa  = int(col.a + 0.5);
+        int   sf  = pc.bl.x & 0xFF, df = (pc.bl.x >> 8) & 0xFF, eq = (pc.bl.x >> 16) & 7;
+        ivec3 fs  = blend_factor(sf, true,  s, sa, dpx.rgb, dpx.a);
+        ivec3 fd  = blend_factor(df, false, s, sa, dpx.rgb, dpx.a);
+        ivec3 sv  = blend_mul(s, fs), dv = blend_mul(dpx.rgb, fd);
+        ivec3 res;
+        if      (eq == 1) res = clamp(sv - dv, 0, 255);
+        else if (eq == 2) res = clamp(dv - sv, 0, 255);
+        else if (eq == 3) res = min(s, dpx.rgb);        /* min/max/absdiff: factors ignored */
+        else if (eq == 4) res = max(s, dpx.rgb);
+        else if (eq == 5) res = abs(s - dpx.rgb);
+        else if (eq >= 6) res = s;                      /* 6 and 7 pass the source through */
+        else              res = clamp(sv + dv, 0, 255);
+        col.rgb = vec3(res);
+    }
+
+    /* PSP 4x4 ordered dither: same signed offset added to r/g/b, keyed by GUEST
+     * framebuffer pixel position (ge.c compose_px_rgba) — divide the device coordinate
+     * by the render scale so upscaled rendering keeps the native pattern. Applies in
+     * clear mode too, and post-blend when shader blending is active (hardware order).
+     * A pixel centre never divides to a whole number, so a float division is exact enough. */
+    if ((flags & 512) != 0 && !stencil_fail) {
+        ivec2 fc = ivec2(gl_FragCoord.xy / float(max(pc.bl.y, 1)));
+        int row = pc.dith[fc.y & 3];
+        int dv = (row >> ((fc.x & 3) * 8)) & 0xFF;
+        if (dv >= 128) dv -= 256;           /* sign-extend packed s8 */
+        col.rgb = clamp(col.rgb + float(dv), 0.0, 255.0);
+    }
+
+    /* Native 16-bit store quantization (framebuffer psm 0/1/2). Emulates the precision
+     * limit of the real 5650/5551/4444 framebuffer: pack by truncation, expand by bit
+     * replication — identical to ge.c pack_fb + unpack_color, so the RGBA8 image and
+     * guest VRAM stay bit-identical across arbitrarily many frames. */
+    if (fbfmt == 0) {
+        col = vec4(quant_chan(col.r, 5), quant_chan(col.g, 6), quant_chan(col.b, 5), 255.0);
+    } else if (fbfmt == 1) {
+        col = vec4(quant_chan(col.r, 5), quant_chan(col.g, 5), quant_chan(col.b, 5),
+                   col.a >= 128.0 ? 255.0 : 0.0);
+    } else if (fbfmt == 2) {
+        col = vec4(quant_chan(col.r, 4), quant_chan(col.g, 4), quant_chan(col.b, 4),
+                   quant_chan(col.a, 4));
+    }
+
+    /* The stored stencil is the op's value on the native lattice, under the alpha write
+     * mask (ge.c pack_fb + fb_write_mask_native: a set mask bit keeps the old bit). On the
+     * native lattice a bitwise merge of expanded values equals the merge of native bits. */
+    if ((flags & 8192) != 0) {
+        int amask = quant_alpha((pc.bl.w >> 24) & 0xFF, fbfmt);
+        int a = quant_alpha(stencil, fbfmt);
+        col.a = float((a & ~amask) | (spx.a & amask));
+    }
+    /* A stencil state that stores a constant without reading the destination (ge_gpu.c
+     * stencil_fixed_alpha, 8888 targets only): ZERO or REPLACE under a full write mask. */
+    if ((flags & 32768) != 0) col.a = float(pc.bl.z & 0xFF);
+
+    o_color = col * (1.0 / 255.0);
+}

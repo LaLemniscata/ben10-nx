@@ -1,0 +1,1379 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+"""Validate and deterministically normalize public title manifests.
+
+These manifests contain source-owned configuration only. Private workspace
+bindings, keys, hashes, decompiler output, and game-derived evidence are outside
+this format and must remain in ignored local state.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+from typing import Any, NoReturn
+
+UINT32_MAX = 0xFFFFFFFF
+UINT32_END_MAX = 0x100000000
+PUBLIC_MANIFEST_MAX_BYTES = 256 * 1024
+MAX_JSON_DEPTH = 16
+
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+C_SYMBOL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+BUILD_TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+DISC_ID_RE = re.compile(r"^[A-Z]{4}[0-9]{5}$")
+FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# A disc image is only handed to the runtime (PSP_ISO), never to Make, so its file name may
+# carry the spaces, brackets and non-ASCII characters of ordinary dump names. Characters
+# Windows forbids in file names, and control characters, stay rejected.
+DISC_PATH_COMPONENT_RE = re.compile(r'^[^<>:"/\\|?*\x00-\x1f\x7f]+$')
+DEVICE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,15}:$")
+WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+ROOT_KEYS = {
+    "schema_version", "id", "display_name", "kind", "disc", "executable",
+    "modules", "filesystem", "hle_profile", "feature_requirements",
+    "compatibility_manifest", "verification_profile", "codegen_profile", "notes",
+    "runtime_contract", "profile_zero", "runtime_bindings", "game_name",
+    "required_runtime_bindings",
+}
+
+#: Optional title bindings the compiled runtime may consume. Every field is
+#: individually optional so a generic build has none of them; the paired VBLANK
+#: counters are the one exception because a half-configured pair has no meaning.
+RUNTIME_BINDING_FIELDS = (
+    "fallback_entry",
+    "worker_thread_entry",
+    "launcher_thread_entry",
+)
+
+RETIRED_RUNTIME_BINDING_FIELDS = (
+    "libfont_ready_flag_addr",
+    "vblank_frame_counter_addr",
+    "vblank_vsync_counter_addr",
+    "frame_ready_latch_addr",
+    "display_bringup",
+    "runtime_sync",
+    "callback_terminators",
+)
+
+#: The host assists retired under #363. A manifest that still names one fails with this
+#: named migration error instead of an unknown-field error.
+RETIRED_HLE_ASSIST_BINDINGS = ("frame_ready_latch_addr", "display_bringup", "runtime_sync")
+HLE_ASSIST_RETIRED_MESSAGE = (
+    "HLE_TITLE_ASSIST_RETIRED: the runtime no longer replays title display bring-up, seeds "
+    "runtime sync state or advances a frame latch; remove this field and let the title's "
+    "own code initialize that state"
+)
+CALLBACK_TERMINATOR_RETIRED_MESSAGE = (
+    "CALLBACK_TERMINATOR_RETIRED: the runtime no longer reports a dispatch target as a "
+    "completed walk; remove this field"
+)
+
+
+def retired_binding_message(name: str) -> str:
+    """The migration error for a retired runtime binding field."""
+    if name == "libfont_ready_flag_addr":
+        return ("LIBFONT_READY_FLAG_RETIRED: host readiness injection is not supported yet; "
+                "remove this field and provide translated guest libfont startup")
+    if name in RETIRED_HLE_ASSIST_BINDINGS:
+        return HLE_ASSIST_RETIRED_MESSAGE
+    if name == "callback_terminators":
+        return CALLBACK_TERMINATOR_RETIRED_MESSAGE
+    return f"{name} is retired; runtime does not write guest VBLANK counters"
+
+# Expected extracted-data file count for the title's xbdata tree.
+# Generic builds have no expectation (0 = disabled). A configured value
+# must be a positive, plausible census: too small or absurdly large would
+# be a typo or a stale contract.
+RUNTIME_BINDING_COUNTS = ("expected_data_file_count",)
+MAX_EXPECTED_DATA_FILE_COUNT = 1000000
+RUNTIME_BINDING_PAIRS: tuple[tuple[str, str], ...] = ()
+
+#: Optional *typed collections* of title bindings. Unlike the scalar fields above, each
+#: names a set of semantic sites rather than one address, so the runtime carries a table
+#: instead of a single value. It is optional and empty in a generic build.
+RUNTIME_BINDING_COLLECTIONS = ("dispatch_aliases",)
+
+#: Optional *typed objects* of title bindings. None remains: the display bring-up and
+#: runtime-sync objects were retired under #363.
+RUNTIME_BINDING_OBJECTS: tuple[str, ...] = ()
+
+#: Every binding family a title may DECLARE that it requires.
+#:
+#: Individual optionality is what keeps this schema generic -- a title that
+#: needs none of these is a legal title, and no family is globally mandatory.
+#: But optionality alone cannot distinguish "this title does not use display
+#: bring-up" from "this title's display bring-up was lost", and the runtime
+#: reads both as the same disabled binding. ``required_runtime_bindings`` is
+#: how a title says which of these it cannot function without, so the loss is
+#: a validation failure instead of a silent behavior change at run time.
+DECLARABLE_BINDING_FAMILIES = (
+    *RUNTIME_BINDING_FIELDS,
+    *RUNTIME_BINDING_COUNTS,
+    *RUNTIME_BINDING_COLLECTIONS,
+    *RUNTIME_BINDING_OBJECTS,
+)
+
+#: Per-collection ceilings. These are semantic-debt inventories, not general relocation
+#: tables: a manifest needing dozens of entries is describing a codegen or analysis gap
+#: that should be fixed upstream, and the bound keeps a malformed manifest from turning
+#: into an unbounded runtime table.
+MAX_DISPATCH_ALIASES = 32
+MAX_LOOSE_CONTENT_ROOTS = 16
+MAX_LOOSE_CONTENT_PRECEDENCE = 65535
+MAX_LOOSE_CONTENT_EXCLUDES = 2
+NK_LAUNCH_MAX_PATH_BYTES = 512
+
+#: Dispatch-target values the CORE runtime has already claimed, mirroring
+#: ``SR_DISPATCH_VFPU_TAG``/``SR_DISPATCH_VFPU_MASK`` in ``src/rt/recomp.h``. A target
+#: satisfying ``target & MASK == TAG`` encodes a per-instruction VFPU fallback, which
+#: ``dispatch()`` consumes before any title binding is consulted -- deliberately, because
+#: the VFPU encoding is core dispatch vocabulary a title must not be able to shadow.
+#:
+#: The converse needs enforcing too: a title binding whose *own* match value falls in
+#: that window can never be honoured, because dispatch() will have interpreted the value
+#: as a VFPU instruction address first. Accepting one would produce a build whose
+#: configuration silently does nothing (and, when the value is also a plausible guest
+#: address, dispatches into the VFPU interpreter instead). Rejecting it at manifest
+#: validation turns that into a precise build-time error.
+#:
+#: ``tools/test_title_runtime_config.py`` reads the two constants back out of
+#: ``src/rt/recomp.h`` so this mirror cannot drift from the runtime it describes.
+SR_DISPATCH_VFPU_TAG = 0x40000000
+SR_DISPATCH_VFPU_MASK = 0xFC000000
+
+
+def is_core_reserved_target(value: int) -> bool:
+    """True when ``dispatch()`` claims this target value before any title binding."""
+    return value & SR_DISPATCH_VFPU_MASK == SR_DISPATCH_VFPU_TAG
+
+
+def reject_core_reserved_target(value: int, path: str, role: str) -> None:
+    """Fail closed on a match value the core dispatch vocabulary has already claimed."""
+    if is_core_reserved_target(value):
+        fail(
+            path,
+            f"0x{value:08x} is inside the core VFPU dispatch-target range "
+            f"[0x{SR_DISPATCH_VFPU_TAG:08x}, "
+            f"0x{SR_DISPATCH_VFPU_TAG | ~SR_DISPATCH_VFPU_MASK & 0xFFFFFFFF:08x}]; "
+            f"dispatch() consumes such a target as a VFPU instruction address before any "
+            f"title binding is consulted, so this {role} could never match",
+        )
+
+CORE_CONTRACT_CAPABILITIES = frozenset({
+    "allegrex", "vfpu", "guest-memory", "scheduler", "interrupts", "callbacks",
+    "generic-hle", "ge-display", "audio", "io", "backend-contracts", "evidence",
+})
+EVIDENCE_CLASSES = frozenset({
+    "PSP_HARDWARE", "PRODUCTION_DISPATCH", "PRODUCTION_HELPER", "MODEL_REFERENCE",
+    "HOST_DIFFERENTIAL", "SOURCE_SHAPE", "PRIVATE_TITLE_ACCEPTANCE",
+})
+# Profile zero is the public synthetic surface: it may never cite evidence that
+# only a private title run can produce. These two names are the authoritative
+# vocabulary; assets/title_manifest.schema.json must publish exactly the same
+# set, and tools/test_title_manifest.py asserts that mechanically.
+PROFILE_ZERO_FORBIDDEN_EVIDENCE_CLASSES = frozenset({"PRIVATE_TITLE_ACCEPTANCE"})
+PROFILE_ZERO_EVIDENCE_CLASSES = EVIDENCE_CLASSES - PROFILE_ZERO_FORBIDDEN_EVIDENCE_CLASSES
+
+
+class TitleManifestError(ValueError):
+    """Deterministic user-facing validation failure."""
+
+
+def fail(path: str, message: str) -> NoReturn:
+    raise TitleManifestError(f"{path}: {message}")
+
+
+def obj(value: Any, path: str, allowed: set[str]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail(path, "must be an object")
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        fail(path, f"unknown field(s): {', '.join(unknown)}")
+    return value
+
+
+def array(value: Any, path: str, maximum: int) -> list[Any]:
+    if not isinstance(value, list):
+        fail(path, "must be an array")
+    if len(value) > maximum:
+        fail(path, f"contains {len(value)} items; maximum is {maximum}")
+    return value
+
+
+def text(value: Any, path: str, maximum: int, minimum: int = 1) -> str:
+    if not isinstance(value, str):
+        fail(path, "must be a string")
+    if value != value.strip():
+        fail(path, "must not have leading or trailing whitespace")
+    if not minimum <= len(value) <= maximum:
+        fail(path, f"length must be in range {minimum}..{maximum}")
+    if any(ord(char) < 0x20 for char in value):
+        fail(path, "must not contain control characters")
+    return value
+
+
+def uint(value: Any, path: str, maximum: int = UINT32_MAX) -> int:
+    if type(value) is not int:
+        fail(path, "must be an integer")
+    if value < 0 or value > maximum:
+        fail(path, f"must be in range 0..{maximum}")
+    return value
+
+
+def boolean(value: Any, path: str) -> bool:
+    if type(value) is not bool:
+        fail(path, "must be a boolean")
+    return value
+
+
+def identifier(value: Any, path: str) -> str:
+    value = text(value, path, 64)
+    if not ID_RE.fullmatch(value):
+        fail(path, "must match ^[a-z0-9][a-z0-9._-]{0,63}$")
+    returned: str = value
+    return returned
+
+
+def portable_path(value: Any, path: str) -> str:
+    value = text(value, path, 240)
+    if len(value.encode("utf-8")) > 240:
+        fail(path, "UTF-8 representation exceeds 240 bytes")
+    if value.startswith(("/", "\\")) or "\\" in value or ":" in value:
+        fail(path, "must be a portable relative POSIX-style path")
+    parts = value.split("/")
+    for part in parts:
+        if part in ("", ".", ".."):
+            fail(path, "must not contain empty, '.' or '..' components")
+        if not PATH_COMPONENT_RE.fullmatch(part) or part.endswith((".", " ")):
+            fail(path, f"invalid or non-portable path component: {part!r}")
+        if part.split(".", 1)[0].upper() in WINDOWS_RESERVED:
+            fail(path, f"reserved Windows path component: {part!r}")
+    return "/".join(parts)
+
+
+def disc_image_path(value: Any, path: str) -> str:
+    """Validate a relative disc-image path whose file names may contain spaces and Unicode."""
+    value = text(value, path, 240)
+    if len(value.encode("utf-8")) > 240:
+        fail(path, "UTF-8 representation exceeds 240 bytes")
+    if value.startswith(("/", "\\")) or "\\" in value or ":" in value:
+        fail(path, "must be a portable relative POSIX-style path")
+    parts = value.split("/")
+    for part in parts:
+        if part in ("", ".", ".."):
+            fail(path, "must not contain empty, '.' or '..' components")
+        if (not DISC_PATH_COMPONENT_RE.fullmatch(part) or part.endswith((".", " "))
+                or part.startswith(" ")):
+            fail(path, f"invalid or non-portable path component: {part!r}")
+        if part.split(".", 1)[0].strip().upper() in WINDOWS_RESERVED:
+            fail(path, f"reserved Windows path component: {part!r}")
+    return "/".join(parts)
+
+
+def require(mapping: dict[str, Any], path: str, *names: str) -> None:
+    missing = [name for name in names if name not in mapping]
+    if missing:
+        fail(path, f"missing required field(s): {', '.join(missing)}")
+
+
+def depth(value: Any, path: str = "$", level: int = 0) -> None:
+    if level > MAX_JSON_DEPTH:
+        fail(path, f"JSON nesting exceeds {MAX_JSON_DEPTH}")
+    if isinstance(value, dict):
+        for key, child in value.items():
+            depth(child, f"{path}.{key}", level + 1)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            depth(child, f"{path}[{index}]", level + 1)
+
+
+def no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise TitleManifestError(f"$: duplicate JSON object key: {key!r}")
+        result[key] = value
+    return result
+
+
+def loads_manifest(raw: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw, object_pairs_hook=no_duplicate_keys)
+    except TitleManifestError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise TitleManifestError(f"$: invalid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        fail("$", "must be an object")
+    depth(value)
+    return value
+
+
+def load_manifest(path: Path, *, max_bytes: int = PUBLIC_MANIFEST_MAX_BYTES) -> dict[str, Any]:
+    if not isinstance(path, Path):
+        raise TitleManifestError(f"{path!r}: manifest path must be a pathlib.Path")
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+    if path.is_symlink():
+        raise TitleManifestError(f"{path}: symbolic links are not accepted")
+    if not path.is_file():
+        raise TitleManifestError(f"{path}: manifest is not a regular file")
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raise TitleManifestError(f"{path}: input exceeds the {max_bytes}-byte limit")
+        return loads_manifest(raw.decode("utf-8"))
+    except TitleManifestError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise TitleManifestError(f"{path}: unable to read UTF-8 manifest: {exc}") from exc
+
+
+def validate_disc(value: Any, path: str) -> dict[str, Any]:
+    value = obj(value, path, {
+        "id", "region", "revision_policy", "compatible_revisions",
+        "require_local_compatibility_record",
+    })
+    require(value, path, "id", "region", "revision_policy")
+    disc_id = text(value["id"], f"{path}.id", 9)
+    if not DISC_ID_RE.fullmatch(disc_id):
+        fail(f"{path}.id", "must match a nine-character PSP disc ID such as TEST00001")
+    region = text(value["region"], f"{path}.region", 5)
+    if region not in {"JP", "NA", "EU", "KR", "ASIA", "OTHER"}:
+        fail(f"{path}.region", "unsupported region")
+    policy = text(value["revision_policy"], f"{path}.revision_policy", 32)
+    if policy not in {"exact-disc-id", "explicit-compatible-revisions"}:
+        fail(f"{path}.revision_policy", "unsupported revision policy")
+    result: dict[str, Any] = {"id": disc_id, "region": region, "revision_policy": policy}
+    local_record = value.get("require_local_compatibility_record", False)
+    if boolean(local_record, f"{path}.require_local_compatibility_record"):
+        result["require_local_compatibility_record"] = True
+    revisions = value.get("compatible_revisions")
+    if policy == "exact-disc-id":
+        if revisions is not None:
+            fail(f"{path}.compatible_revisions", "is forbidden for exact-disc-id policy")
+        return result
+    if revisions is None:
+        fail(path, "compatible_revisions is required for explicit-compatible-revisions")
+    revisions = array(revisions, f"{path}.compatible_revisions", 16)
+    if not revisions:
+        fail(f"{path}.compatible_revisions", "must not be empty")
+    normalized: set[str] = set()
+    for index, revision in enumerate(revisions):
+        revision = text(revision, f"{path}.compatible_revisions[{index}]", 9)
+        if not DISC_ID_RE.fullmatch(revision) or revision == disc_id:
+            fail(f"{path}.compatible_revisions[{index}]", "must be a distinct PSP disc ID")
+        if revision in normalized:
+            fail(f"{path}.compatible_revisions[{index}]", "duplicate disc ID")
+        normalized.add(revision)
+    result["compatible_revisions"] = sorted(normalized)
+    return result
+
+
+def validate_executable(value: Any, path: str) -> dict[str, Any]:
+    allowed = {
+        "base", "entry", "bss_metadata_source", "extra_executable_spans",
+        "load_address", "load_address_evidence",
+    }
+    value = obj(value, path, allowed)
+    require(value, path, "base", "entry", "bss_metadata_source", "extra_executable_spans")
+    source = text(value["bss_metadata_source"], f"{path}.bss_metadata_source", 32)
+    if source not in {"elf", "psp-header", "none"}:
+        fail(f"{path}.bss_metadata_source", "unsupported metadata source")
+    spans: list[dict[str, int]] = []
+    for index, item in enumerate(array(value["extra_executable_spans"], f"{path}.extra_executable_spans", 64)):
+        item_path = f"{path}.extra_executable_spans[{index}]"
+        item = obj(item, item_path, {"start", "end"})
+        require(item, item_path, "start", "end")
+        start = uint(item["start"], f"{item_path}.start")
+        end = uint(item["end"], f"{item_path}.end", UINT32_END_MAX)
+        if end <= start:
+            fail(item_path, "end must be greater than start")
+        spans.append({"start": start, "end": end})
+    spans.sort(key=lambda span: (span["start"], span["end"]))
+    for left, right in zip(spans, spans[1:], strict=False):
+        if right["start"] < left["end"]:
+            fail(f"{path}.extra_executable_spans", "spans must not overlap")
+    base = uint(value["base"], f"{path}.base")
+    result = {
+        "base": base,
+        "entry": uint(value["entry"], f"{path}.entry"),
+        "bss_metadata_source": source,
+        "extra_executable_spans": spans,
+    }
+    if "load_address" in value:
+        load_address = uint(value["load_address"], f"{path}.load_address")
+        if base != load_address:
+            fail(f"{path}.base", "must match load_address when a main executable load binding is declared")
+        if "load_address_evidence" not in value:
+            fail(f"{path}.load_address_evidence", "is required when load_address is declared")
+        evidence = text(value["load_address_evidence"], f"{path}.load_address_evidence", 32)
+        if evidence not in {
+            "measured-hw", "measured-ppsspp", "provisional", "documented-psp-default",
+        }:
+            fail(f"{path}.load_address_evidence", "unsupported evidence class")
+        result["load_address"] = load_address
+        result["load_address_evidence"] = evidence
+    elif "load_address_evidence" in value:
+        fail(f"{path}.load_address_evidence", "requires load_address")
+    return result
+
+
+def validate_runtime_contract(value: Any, path: str) -> dict[str, Any]:
+    """Validate the versioned core/profile boundary.
+
+    The core capability vocabulary is intentionally closed. A profile may select
+    capabilities and explicitly document HLE overrides, but it cannot introduce
+    an unknown capability or an implicit PSP-semantic replacement. Runtime code
+    should apply the same fail-closed rule when loading a contract.
+    """
+    value = obj(value, path, {
+        "schema_version", "core_contract", "profile_id", "capability_requirements",
+        "unknown_capability_policy", "boot", "resources", "hle_overrides",
+        "input_mapping", "enhancements", "evidence_profile",
+    })
+    require(value, path, "schema_version", "core_contract", "profile_id", "capability_requirements",
+            "unknown_capability_policy", "boot", "resources", "hle_overrides",
+            "input_mapping", "enhancements", "evidence_profile")
+    if uint(value["schema_version"], f"{path}.schema_version") != 1:
+        fail(f"{path}.schema_version", "only contract version 1 is supported")
+    core = identifier(value["core_contract"], f"{path}.core_contract")
+    if core != "psp-core-v1":
+        fail(f"{path}.core_contract", "unsupported PSP core contract")
+    profile_id = identifier(value["profile_id"], f"{path}.profile_id")
+    policy = text(value["unknown_capability_policy"], f"{path}.unknown_capability_policy", 32)
+    if policy != "fail-closed":
+        fail(f"{path}.unknown_capability_policy", "must be fail-closed")
+
+    capabilities: set[str] = set()
+    for index, capability in enumerate(array(value["capability_requirements"], f"{path}.capability_requirements", 32)):
+        capability = identifier(capability, f"{path}.capability_requirements[{index}]")
+        if capability not in CORE_CONTRACT_CAPABILITIES:
+            fail(f"{path}.capability_requirements[{index}]", "unknown core capability; contracts fail closed")
+        if capability in capabilities:
+            fail(f"{path}.capability_requirements[{index}]", "duplicate capability")
+        capabilities.add(capability)
+
+    boot = obj(value["boot"], f"{path}.boot", {"entry_policy", "thread_policy", "arguments"})
+    require(boot, f"{path}.boot", "entry_policy", "thread_policy", "arguments")
+    entry_policy = text(boot["entry_policy"], f"{path}.boot.entry_policy", 32)
+    if entry_policy not in {"image-entry", "manifest-entry"}:
+        fail(f"{path}.boot.entry_policy", "unsupported entry policy")
+    thread_policy = text(boot["thread_policy"], f"{path}.boot.thread_policy", 32)
+    if thread_policy not in {"profile-default", "no-main-thread"}:
+        fail(f"{path}.boot.thread_policy", "unsupported thread policy")
+    arguments = [
+        text(argument, f"{path}.boot.arguments[{index}]", 128, 0)
+        for index, argument in enumerate(array(boot["arguments"], f"{path}.boot.arguments", 16))
+    ]
+
+    resources = obj(value["resources"], f"{path}.resources", {"mode", "locators"})
+    require(resources, f"{path}.resources", "mode", "locators")
+    resource_mode = text(resources["mode"], f"{path}.resources.mode", 32)
+    if resource_mode not in {"none", "manifest-filesystem"}:
+        fail(f"{path}.resources.mode", "unsupported resource mode")
+    locators = [
+        portable_path(locator, f"{path}.resources.locators[{index}]")
+        for index, locator in enumerate(array(resources["locators"], f"{path}.resources.locators", 32))
+    ]
+    if resource_mode == "none" and locators:
+        fail(f"{path}.resources.locators", "must be empty when resource mode is none")
+
+    overrides = []
+    override_names: set[str] = set()
+    for index, item in enumerate(array(value["hle_overrides"], f"{path}.hle_overrides", 32)):
+        item_path = f"{path}.hle_overrides[{index}]"
+        item = obj(item, item_path, {"capability", "disposition", "reason", "evidence_class"})
+        require(item, item_path, "capability", "disposition", "reason", "evidence_class")
+        capability = identifier(item["capability"], f"{item_path}.capability")
+        if capability not in CORE_CONTRACT_CAPABILITIES:
+            fail(f"{item_path}.capability", "unknown capability; HLE overrides fail closed")
+        if capability in override_names:
+            fail(f"{item_path}.capability", "duplicate HLE override")
+        override_names.add(capability)
+        disposition = text(item["disposition"], f"{item_path}.disposition", 32)
+        if disposition not in {"core", "explicit-override", "unavailable"}:
+            fail(f"{item_path}.disposition", "unsupported HLE disposition")
+        evidence_class = text(item["evidence_class"], f"{item_path}.evidence_class", 32)
+        if evidence_class not in EVIDENCE_CLASSES:
+            fail(f"{item_path}.evidence_class", "unknown evidence class")
+        overrides.append({
+            "capability": capability,
+            "disposition": disposition,
+            "reason": text(item["reason"], f"{item_path}.reason", 512),
+            "evidence_class": evidence_class,
+        })
+    overrides.sort(key=lambda item: item["capability"])
+
+    mapping = obj(value["input_mapping"], f"{path}.input_mapping", {"labels", "replay"})
+    require(mapping, f"{path}.input_mapping", "labels", "replay")
+    labels = []
+    for index, label in enumerate(array(mapping["labels"], f"{path}.input_mapping.labels", 32)):
+        label = identifier(label, f"{path}.input_mapping.labels[{index}]")
+        if label in labels:
+            fail(f"{path}.input_mapping.labels[{index}]", "duplicate input label")
+        labels.append(label)
+    replay = text(mapping["replay"], f"{path}.input_mapping.replay", 32)
+    if replay not in {"none", "deterministic"}:
+        fail(f"{path}.input_mapping.replay", "unsupported input replay policy")
+
+    enhancements = obj(value["enhancements"], f"{path}.enhancements", {"enabled_by_default", "capabilities"})
+    require(enhancements, f"{path}.enhancements", "enabled_by_default", "capabilities")
+    enhancement_capabilities = []
+    for index, capability in enumerate(array(enhancements["capabilities"], f"{path}.enhancements.capabilities", 16)):
+        capability = identifier(capability, f"{path}.enhancements.capabilities[{index}]")
+        if capability in enhancement_capabilities:
+            fail(f"{path}.enhancements.capabilities[{index}]", "duplicate enhancement capability")
+        enhancement_capabilities.append(capability)
+    return {
+        "schema_version": 1,
+        "core_contract": core,
+        "profile_id": profile_id,
+        "capability_requirements": sorted(capabilities),
+        "unknown_capability_policy": policy,
+        "boot": {"entry_policy": entry_policy, "thread_policy": thread_policy, "arguments": arguments},
+        "resources": {"mode": resource_mode, "locators": sorted(locators)},
+        "hle_overrides": overrides,
+        "input_mapping": {"labels": sorted(labels), "replay": replay},
+        "enhancements": {
+            "enabled_by_default": boolean(enhancements["enabled_by_default"], f"{path}.enhancements.enabled_by_default"),
+            "capabilities": sorted(enhancement_capabilities),
+        },
+        "evidence_profile": identifier(value["evidence_profile"], f"{path}.evidence_profile"),
+    }
+
+
+def validate_profile_zero(value: Any, path: str) -> dict[str, Any]:
+    """Validate source-owned profile-zero cases and their proving-gate claims."""
+    value = obj(value, path, {"schema_version", "runnable", "source_program", "build", "acceptance"})
+    require(value, path, "schema_version", "runnable", "source_program", "build", "acceptance")
+    if uint(value["schema_version"], f"{path}.schema_version") != 1:
+        fail(f"{path}.schema_version", "only profile-zero schema version 1 is supported")
+    source = obj(value["source_program"], f"{path}.source_program", {"source_files", "entry_symbol", "ownership"})
+    require(source, f"{path}.source_program", "source_files", "entry_symbol", "ownership")
+    source_files = [
+        portable_path(item, f"{path}.source_program.source_files[{index}]")
+        for index, item in enumerate(array(source["source_files"], f"{path}.source_program.source_files", 16))
+    ]
+    if not source_files:
+        fail(f"{path}.source_program.source_files", "must not be empty")
+    source_file_keys = [item.casefold() for item in source_files]
+    if len(source_file_keys) != len(set(source_file_keys)):
+        fail(f"{path}.source_program.source_files", "duplicate source file")
+    ownership = text(source["ownership"], f"{path}.source_program.ownership", 64)
+    entry_symbol = text(source["entry_symbol"], f"{path}.source_program.entry_symbol", 128)
+    if not C_SYMBOL_RE.fullmatch(entry_symbol):
+        fail(f"{path}.source_program.entry_symbol", "must be a portable C symbol")
+    if ownership != "project-authored-public":
+        fail(f"{path}.source_program.ownership", "profile zero requires project-authored source")
+    build = obj(value["build"], f"{path}.build", {"makefile", "working_directory", "target", "toolchain"})
+    require(build, f"{path}.build", "makefile", "working_directory", "target", "toolchain")
+    toolchain = text(build["toolchain"], f"{path}.build.toolchain", 128)
+    if toolchain.startswith(("/", "\\")) or "\\" in toolchain or ":" in toolchain:
+        fail(f"{path}.build.toolchain", "must be a portable toolchain label, not a host path")
+    build_target = text(build["target"], f"{path}.build.target", 64)
+    if not BUILD_TARGET_RE.fullmatch(build_target):
+        fail(f"{path}.build.target", "must be a portable build target name")
+    build_normalized = {
+        "makefile": portable_path(build["makefile"], f"{path}.build.makefile"),
+        "working_directory": portable_path(build["working_directory"], f"{path}.build.working_directory"),
+        "target": build_target,
+        "toolchain": toolchain,
+    }
+    acceptance = obj(value["acceptance"], f"{path}.acceptance", {"schema_version", "status", "private_inputs_allowed", "cases"})
+    require(acceptance, f"{path}.acceptance", "schema_version", "status", "private_inputs_allowed", "cases")
+    if uint(acceptance["schema_version"], f"{path}.acceptance.schema_version") != 1:
+        fail(f"{path}.acceptance.schema_version", "only acceptance schema version 1 is supported")
+    status = text(acceptance["status"], f"{path}.acceptance.status", 32)
+    if status not in {"scaffold", "ready", "blocked"}:
+        fail(f"{path}.acceptance.status", "unsupported profile-zero acceptance status")
+    cases = []
+    case_ids: set[str] = set()
+    for index, item in enumerate(array(acceptance["cases"], f"{path}.acceptance.cases", 32)):
+        item_path = f"{path}.acceptance.cases[{index}]"
+        item = obj(item, item_path, {"id", "status", "evidence_class", "assertion", "gate"})
+        require(item, item_path, "id", "status", "evidence_class", "assertion")
+        case_id = identifier(item["id"], f"{item_path}.id")
+        if case_id in case_ids:
+            fail(f"{item_path}.id", "duplicate acceptance case")
+        case_ids.add(case_id)
+        case_status = text(item["status"], f"{item_path}.status", 32)
+        if case_status not in {"planned", "implemented", "blocked"}:
+            fail(f"{item_path}.status", "unsupported acceptance case status")
+        evidence_class = text(item["evidence_class"], f"{item_path}.evidence_class", 32)
+        if evidence_class not in EVIDENCE_CLASSES:
+            fail(f"{item_path}.evidence_class", "unknown evidence class")
+        if evidence_class in PROFILE_ZERO_FORBIDDEN_EVIDENCE_CLASSES:
+            fail(f"{item_path}.evidence_class", "profile zero cannot contain private-title evidence")
+        case = {
+            "id": case_id,
+            "status": case_status,
+            "evidence_class": evidence_class,
+            "assertion": text(item["assertion"], f"{item_path}.assertion", 512),
+        }
+        if "gate" in item:
+            case["gate"] = identifier(item["gate"], f"{item_path}.gate")
+        elif case_status == "implemented":
+            fail(f"{item_path}.gate", "implemented acceptance cases must name their proving gate")
+        cases.append(case)
+    if not cases:
+        fail(f"{path}.acceptance.cases", "must contain at least one case")
+    cases.sort(key=lambda item: item["id"])
+    runnable = boolean(value["runnable"], f"{path}.runnable")
+    if runnable != (status == "ready"):
+        fail(f"{path}.runnable", "must be true exactly when acceptance status is ready")
+    if status == "ready" and any(item["status"] != "implemented" for item in cases):
+        fail(f"{path}.acceptance.cases", "ready profile zero requires every case to be implemented")
+    if boolean(acceptance["private_inputs_allowed"], f"{path}.acceptance.private_inputs_allowed"):
+        fail(f"{path}.acceptance.private_inputs_allowed", "profile zero cannot require private inputs")
+    return {
+        "schema_version": 1,
+        "runnable": runnable,
+        "source_program": {
+            "source_files": sorted(source_files),
+            "entry_symbol": entry_symbol,
+            "ownership": ownership,
+        },
+        "build": build_normalized,
+        "acceptance": {
+            "schema_version": 1,
+            "status": status,
+            "private_inputs_allowed": False,
+            "cases": cases,
+        },
+    }
+
+
+def guest_address(value: Any, path: str) -> int:
+    """Validate one guest address used as a runtime binding.
+
+    Zero is the runtime's "not configured" sentinel, so an explicitly configured
+    zero is rejected rather than silently disabling a binding. Every binding is
+    either a MIPS entry point or a 32-bit guest counter, so a misaligned address
+    is a malformed binding, not a supported one.
+    """
+    value = uint(value, path)
+    if value == 0:
+        fail(path, "must not be zero; omit the field to leave the binding unconfigured")
+    if value % 4 != 0:
+        fail(path, "must be 4-byte aligned")
+    returned: int = value
+    return returned
+
+
+def validate_dispatch_aliases(value: Any, path: str) -> list[dict[str, int]]:
+    """Validate the dispatch-alias collection.
+
+    An alias says "a computed call to `from` must enter the body registered at `to`".
+    It exists for a *registration* gap -- a tail-call landing past a callee's prologue,
+    for instance -- and never invents behavior: the runtime still executes the ordinary
+    registered function, and an unaliased target is still an ordinary dispatch miss.
+
+    The runtime resolves exactly one step, so the rules below make one step sufficient:
+    no self-alias, no duplicate source, and no alias whose target is itself aliased.
+    A source inside the core VFPU dispatch-target range is rejected outright: dispatch()
+    claims that encoding first, so such an alias could never fire.
+    """
+    items = array(value, path, MAX_DISPATCH_ALIASES)
+    if not items:
+        fail(path, "must not be empty; omit the field instead")
+    result: list[dict[str, int]] = []
+    sources: dict[int, int] = {}
+    for index, item in enumerate(items):
+        item_path = f"{path}[{index}]"
+        item = obj(item, item_path, {"from", "to"})
+        require(item, item_path, "from", "to")
+        source = guest_address(item["from"], f"{item_path}.from")
+        # `from` is compared against a dispatch TARGET, so it is subject to the core
+        # reservation. `to` is not: it is only ever handed to sr_lookup().
+        reject_core_reserved_target(source, f"{item_path}.from", "alias source")
+        destination = guest_address(item["to"], f"{item_path}.to")
+        if source == destination:
+            fail(item_path, "from and to must differ; an alias to itself redirects nothing")
+        if source in sources:
+            fail(
+                f"{item_path}.from",
+                f"duplicates the alias source already declared at {path}[{sources[source]}]; "
+                "one source cannot redirect to two bodies",
+            )
+        sources[source] = index
+        result.append({"from": source, "to": destination})
+    for index, entry in enumerate(result):
+        if entry["to"] in sources:
+            fail(
+                f"{path}[{index}].to",
+                f"is itself an alias source (declared at {path}[{sources[entry['to']]}]); "
+                "the runtime resolves one step, so a chained alias would silently stop short",
+            )
+    result.sort(key=lambda entry: entry["from"])
+    return result
+
+
+def validate_expected_data_file_count(value: Any, path: str) -> int:
+    """Validate the expected extracted-data file-count census.
+
+    Generic builds have no expectation (field absent -> 0 = disabled).
+    A configured count must be a positive, plausible census: 0 would be
+    \"no expectation\", too large is a typo, and non-integers are rejected.
+    """
+    count = uint(value, path, MAX_EXPECTED_DATA_FILE_COUNT)
+    if count == 0:
+        fail(path, "must be > 0; omit the field to leave the census disabled")
+    return count
+
+
+def validate_runtime_bindings(value: Any, path: str) -> dict[str, Any]:
+    """Validate the optional, strictly-checked title bindings the runtime consumes.
+
+    This block carries title-specific *addresses and roles* only. It cannot redefine
+    generic PSP scheduler/kernel/GE semantics: the runtime decides what a worker
+    entry or a VBLANK counter means, and this block decides only whether -- and at
+    which address -- that meaning applies. A manifest without the block, or without
+    a given field, leaves the corresponding runtime behavior disabled.
+    """
+    if isinstance(value, dict):
+        for retired in RETIRED_RUNTIME_BINDING_FIELDS:
+            if retired in value:
+                fail(f"{path}.{retired}", retired_binding_message(retired))
+    value = obj(value, path,
+                {"schema_version", *RUNTIME_BINDING_FIELDS, *RUNTIME_BINDING_COLLECTIONS,
+                 *RUNTIME_BINDING_OBJECTS, *RUNTIME_BINDING_COUNTS})
+    require(value, path, "schema_version")
+    if uint(value["schema_version"], f"{path}.schema_version") != 1:
+        fail(f"{path}.schema_version", "only runtime-binding schema version 1 is supported")
+    result: dict[str, Any] = {"schema_version": 1}
+    for name in RUNTIME_BINDING_FIELDS:
+        if name in value:
+            result[name] = guest_address(value[name], f"{path}.{name}")
+    for name in RUNTIME_BINDING_COUNTS:
+        if name in value:
+            result[name] = validate_expected_data_file_count(value[name], f"{path}.{name}")
+    if "dispatch_aliases" in value:
+        result["dispatch_aliases"] = validate_dispatch_aliases(
+            value["dispatch_aliases"], f"{path}.dispatch_aliases")
+    if len(result) == 1:
+        fail(path, "must configure at least one binding; omit the block instead")
+    for left, right in RUNTIME_BINDING_PAIRS:
+        present = [name for name in (left, right) if name in result]
+        if len(present) == 1:
+            fail(
+                f"{path}.{present[0]}",
+                f"is paired with {left if present[0] == right else right}; configure both or neither",
+            )
+        if len(present) == 2 and result[left] == result[right]:
+            fail(path, f"{left} and {right} must be distinct addresses")
+    worker = result.get("worker_thread_entry")
+    launcher = result.get("launcher_thread_entry")
+    if worker is not None and worker == launcher:
+        fail(path, "worker_thread_entry and launcher_thread_entry must be distinct roles")
+    return result
+
+
+GUEST_MODULE_RAM_LO = 0x08800000
+GUEST_MODULE_RAM_HI = 0x0C000000  # 64 MB models extend user RAM; the runtime arena ends here
+# One title manifest names at most as many modules as disc discovery admits
+# (MAX_MODULE_CANDIDATES in tools/nk_core/iso_inspect.py, PLAYER_MAX_GUEST_MODULES
+# in src/player).
+MAX_TITLE_MODULES = 256
+# "fixed": the module is translated and loaded at its manifest load_address.
+# "runtime": the module carries no address; it is translated position-
+# independently and laid out wherever the guest allocator places it when the
+# game loads it (src/rt/hle.c sceKernelLoadModule). Absent means "fixed".
+MODULE_PLACEMENTS = ("fixed", "runtime")
+
+
+def validate_modules(value: Any, path: str) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    names: set[str] = set()
+    addresses: set[int] = set()
+    for index, item in enumerate(array(value, path, MAX_TITLE_MODULES)):
+        item_path = f"{path}[{index}]"
+        item = obj(item, item_path, {"name", "load_address", "required", "role",
+                                     "guest_path", "load_address_evidence", "placement"})
+        require(item, item_path, "name", "required", "role")
+        name = text(item["name"], f"{item_path}.name", 128)
+        if not FILENAME_RE.fullmatch(name) or name.endswith("."):
+            fail(f"{item_path}.name", "must be a portable module filename without path separators")
+        if name.split(".", 1)[0].upper() in WINDOWS_RESERVED:
+            fail(f"{item_path}.name", "must not use a reserved Windows filename")
+        if name.casefold() in names:
+            fail(f"{item_path}.name", "duplicate module name under case-insensitive comparison")
+        names.add(name.casefold())
+        required = boolean(item["required"], f"{item_path}.required")
+        role = text(item["role"], f"{item_path}.role", 32)
+        if role not in {"guest-prx", "hle-capability", "optional-guest-prx"}:
+            fail(f"{item_path}.role", "unsupported module role")
+        if role == "optional-guest-prx" and required:
+            fail(item_path, "optional-guest-prx cannot be marked required")
+        if role == "hle-capability" and not required:
+            fail(item_path, "hle-capability must be marked required")
+        placement = "fixed"
+        if "placement" in item:
+            placement = text(item["placement"], f"{item_path}.placement", 16)
+            if placement not in MODULE_PLACEMENTS:
+                fail(f"{item_path}.placement", "unsupported module placement")
+        if placement == "runtime":
+            if role not in {"guest-prx", "optional-guest-prx"}:
+                fail(f"{item_path}.placement", "only a guest module is placed by the runtime")
+            for field in ("load_address", "load_address_evidence"):
+                if field in item:
+                    fail(f"{item_path}.{field}", "a runtime-placed module has no manifest load address")
+            entry = {"name": name, "required": required, "role": role, "placement": "runtime"}
+        else:
+            require(item, item_path, "load_address")
+            address = uint(item["load_address"], f"{item_path}.load_address")
+            if address in addresses:
+                fail(f"{item_path}.load_address", "duplicate module load address")
+            addresses.add(address)
+            entry = {"name": name, "load_address": address, "required": required, "role": role}
+        if role in {"guest-prx", "optional-guest-prx"} and placement == "fixed":
+            # A guest module's code AND data live at load_address, so it must be real
+            # user RAM: a base outside it lets translated code run while every data
+            # write is dropped (the late-PRX bases once sat at 0x322xxxxx).
+            if not GUEST_MODULE_RAM_LO <= address < GUEST_MODULE_RAM_HI:
+                fail(f"{item_path}.load_address",
+                     f"guest module base must lie in user RAM [0x{GUEST_MODULE_RAM_LO:08x}, "
+                     f"0x{GUEST_MODULE_RAM_HI:08x})")
+        if "guest_path" in item:
+            guest_path = text(item["guest_path"], f"{item_path}.guest_path", 256)
+            if not guest_path.split(":", 1)[0] in {"disc0", "umd0", "ms0", "flash0", "host0"}                     or ":/" not in guest_path:
+                fail(f"{item_path}.guest_path", "must be an absolute PSP device path (e.g. disc0:/...)")
+            entry["guest_path"] = guest_path
+        if "load_address_evidence" in item:
+            evidence = text(item["load_address_evidence"], f"{item_path}.load_address_evidence", 32)
+            if evidence not in {"measured-hw", "measured-ppsspp", "provisional"}:
+                fail(f"{item_path}.load_address_evidence", "unsupported evidence class")
+            entry["load_address_evidence"] = evidence
+        result.append(entry)
+    return result
+
+
+def validate_filesystem(value: Any, path: str) -> dict[str, Any]:
+    # executable/module_dir/psp_header/disc_image are optional input-location declarations
+    # (issue #196 Phase 4): a manifest DECLARES where its private inputs live so
+    # generic manager paths never assume a layout. data_root/memory_stick_root/
+    # device_prefixes remain the required runtime-filesystem contract.
+    value = obj(value, path, {
+        "data_root", "memory_stick_root", "device_prefixes",
+        "executable", "module_dir", "psp_header", "disc_image",
+        "loose_content_roots",
+    })
+    require(value, path, "data_root", "memory_stick_root", "device_prefixes")
+    prefixes: set[str] = set()
+    for index, prefix in enumerate(array(value["device_prefixes"], f"{path}.device_prefixes", 16)):
+        prefix = text(prefix, f"{path}.device_prefixes[{index}]", 17)
+        if not DEVICE_RE.fullmatch(prefix):
+            fail(f"{path}.device_prefixes[{index}]", "must look like host0: or ms0:")
+        prefix = prefix.lower()
+        if prefix in prefixes:
+            fail(f"{path}.device_prefixes[{index}]", "duplicate device prefix")
+        prefixes.add(prefix)
+    raw_data_root = text(value["data_root"], f"{path}.data_root", 240, 0)
+    result = {
+        "data_root": portable_path(raw_data_root, f"{path}.data_root")
+        if raw_data_root else "",
+        "memory_stick_root": portable_path(value["memory_stick_root"], f"{path}.memory_stick_root"),
+        "device_prefixes": sorted(prefixes),
+        "loose_content_roots": validate_loose_content_roots(
+            value.get("loose_content_roots", []), f"{path}.loose_content_roots"),
+    }
+    # Paths the manager hands to Make keep the strict Make-safe component rule.
+    for optional_key in ("executable", "module_dir", "psp_header"):
+        if optional_key in value:
+            result[optional_key] = portable_path(value[optional_key], f"{path}.{optional_key}")
+    if "disc_image" in value:
+        result["disc_image"] = disc_image_path(value["disc_image"], f"{path}.disc_image")
+    return result
+
+
+def validate_loose_content_roots(value: Any, path: str) -> list[dict[str, Any]]:
+    """Validate optional loose roots; lower precedence numbers win guest-key collisions.
+
+    Roots are relative to the resolved data root's parent. The single root ``."`
+    means that parent itself and lets a manifest describe a split disc layout
+    without teaching generic runtime code any directory names.
+    """
+    roots = array(value, path, MAX_LOOSE_CONTENT_ROOTS)
+    result: list[dict[str, Any]] = []
+    seen_roots: list[tuple[str, ...]] = []
+    seen_precedence: set[int] = set()
+    for index, raw in enumerate(roots):
+        item_path = f"{path}[{index}]"
+        item = obj(raw, item_path, {
+            "root", "mount", "precedence", "skip_primary_root", "exclude",
+        })
+        require(item, item_path, "root", "mount", "precedence")
+        raw_root = text(item["root"], f"{item_path}.root", 240)
+        root = "." if raw_root == "." else portable_path(raw_root, f"{item_path}.root")
+        raw_mount = text(item["mount"], f"{item_path}.mount", 240, 0)
+        mount = "" if raw_mount == "" else portable_path(raw_mount, f"{item_path}.mount")
+        precedence = uint(item["precedence"], f"{item_path}.precedence",
+                          MAX_LOOSE_CONTENT_PRECEDENCE)
+        skip_primary_root = item.get("skip_primary_root", root == ".")
+        if not isinstance(skip_primary_root, bool):
+            fail(f"{item_path}.skip_primary_root", "must be a boolean")
+        if skip_primary_root != (root == "."):
+            fail(f"{item_path}.skip_primary_root",
+                 "must be true exactly when root is '.'")
+        excludes: list[str] = []
+        seen_excludes: set[str] = set()
+        exclude_values = array(
+            item.get("exclude", []), f"{item_path}.exclude", MAX_LOOSE_CONTENT_EXCLUDES
+        )
+        for exclude_index, raw_exclude in enumerate(exclude_values):
+            exclude_path = portable_path(
+                raw_exclude, f"{item_path}.exclude[{exclude_index}]"
+            )
+            folded_exclude = exclude_path.casefold()
+            if folded_exclude in seen_excludes:
+                fail(f"{item_path}.exclude[{exclude_index}]", "duplicate excluded path")
+            seen_excludes.add(folded_exclude)
+            excludes.append(exclude_path)
+        if precedence in seen_precedence:
+            fail(f"{item_path}.precedence", "duplicate loose-content precedence")
+        seen_precedence.add(precedence)
+        parts = () if root == "." else tuple(part.casefold() for part in root.split("/"))
+        for previous in seen_roots:
+            if not parts or not previous or parts[:len(previous)] == previous or previous[:len(parts)] == parts:
+                if parts == previous:
+                    fail(f"{item_path}.root", "duplicate loose-content root")
+                fail(f"{item_path}.root", "overlapping loose-content roots")
+        seen_roots.append(parts)
+        result.append({
+            "root": root,
+            "mount": mount,
+            "precedence": precedence,
+            "skip_primary_root": skip_primary_root,
+            "exclude": excludes,
+        })
+    return sorted(result, key=lambda entry: entry["precedence"])
+
+
+def encode_loose_content_roots(
+    validated_manifest: Any,
+    resolved_data_root: Path | str | None,
+) -> str:
+    """Encode the validated manifest roots using nk_launch.c's env transport.
+
+    Roots are resolved from the parent of the already-resolved absolute
+    SR_DATAROOT. Each UTF-8 tab-delimited row contains the host path, mount,
+    precedence, primary-root skip flag, exclusion count, and exclusion paths.
+    Rows end in LF. An empty declaration produces an empty
+    value, matching the native launcher's explicit inherited-value mask.
+    """
+    boundary = "Loose-content root binding"
+    if not isinstance(validated_manifest, dict):
+        raise TitleManifestError(f"{boundary}: validated manifest must be an object")
+    filesystem = validated_manifest.get("filesystem")
+    if not isinstance(filesystem, dict):
+        raise TitleManifestError(f"{boundary}: manifest filesystem block is missing")
+    try:
+        roots = validate_loose_content_roots(
+            filesystem.get("loose_content_roots", []),
+            "$.filesystem.loose_content_roots",
+        )
+    except TitleManifestError as exc:
+        raise TitleManifestError(f"{boundary}: {exc}") from exc
+    if not roots:
+        return ""
+
+    def fail(detail: str) -> NoReturn:
+        raise TitleManifestError(f"{boundary}: {detail}")
+
+    if resolved_data_root is None:
+        fail("the manifest declares roots but no resolved absolute SR_DATAROOT was supplied")
+    try:
+        data_root = Path(resolved_data_root)
+        if not data_root.is_absolute() or not data_root.is_dir():
+            fail("SR_DATAROOT must be an existing absolute directory when roots are declared")
+        # Match nk_platform_absolute_path: GetFullPathNameA on Windows and
+        # realpath on POSIX. The caller supplies a resolved path; Windows
+        # canonicalizes lexically while POSIX canonicalizes existing paths.
+        if os.name == "nt":
+            data_root = Path(os.path.abspath(os.fspath(data_root)))
+        else:
+            data_root = data_root.resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        fail(f"SR_DATAROOT could not be resolved: {exc}")
+    data_root_text = os.fspath(data_root)
+    if len(data_root_text.encode("utf-8")) >= NK_LAUNCH_MAX_PATH_BYTES:
+        fail("SR_DATAROOT exceeds the native launch path limit")
+    anchor = data_root.parent
+
+    # nk_launch.h sizes this as MAX_ROOTS * (2*NK_MAX_PATH + 512 + 2*241) + 1.
+    # Keep the byte count because the C buffers are bytes.
+    transport_capacity = MAX_LOOSE_CONTENT_ROOTS * (
+        2 * NK_LAUNCH_MAX_PATH_BYTES + 512 + MAX_LOOSE_CONTENT_EXCLUDES * 241
+    ) + 1
+    used = 0
+    encoded: list[str] = []
+    for binding in roots:
+        relative_root = binding["root"]
+        candidate = anchor if relative_root == "." else anchor.joinpath(*relative_root.split("/"))
+        candidate_text = os.fspath(candidate)
+        if len(candidate_text.encode("utf-8")) >= NK_LAUNCH_MAX_PATH_BYTES * 2:
+            fail("a configured loose-content root exceeds the native launch path limit")
+        try:
+            if not candidate.is_dir():
+                fail(f"configured loose-content root is not an existing directory: {relative_root}")
+            if os.name == "nt":
+                host_root = Path(os.path.abspath(candidate_text))
+            else:
+                host_root = candidate.resolve(strict=True)
+        except TitleManifestError:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            fail(f"configured loose-content root could not be resolved: {exc}")
+        host_text = os.fspath(host_root)
+        if os.name == "nt":
+            # Match GetFullPathNameA, which emits backslashes even when
+            # pathlib retained forward slashes from an absolute input.
+            host_text = host_text.replace("/", "\\")
+        host_bytes = host_text.encode("utf-8")
+        if len(host_bytes) >= NK_LAUNCH_MAX_PATH_BYTES * 2:
+            fail("a resolved loose-content root exceeds the native launch path limit")
+        mount = binding["mount"]
+        if any(character in host_text or character in mount for character in ("\t", "\n")):
+            fail("resolved paths and mounts cannot contain tabs or newlines")
+        fields = [
+            host_text,
+            mount,
+            str(binding["precedence"]),
+            "1" if binding["skip_primary_root"] else "0",
+            str(len(binding["exclude"])),
+            *binding["exclude"],
+        ]
+        row = "\t".join(fields) + "\n"
+        row_bytes = row.encode("utf-8")
+        if len(row_bytes) >= transport_capacity - used:
+            fail("serialized roots exceed the native launch environment limit")
+        encoded.append(row)
+        used += len(row_bytes)
+    return "".join(encoded)
+
+
+def validate_required_runtime_bindings(value: Any, path: str) -> list[str]:
+    """Validate the families a title declares it cannot run without.
+
+    Names are checked against the schema's own family list rather than accepted
+    freely: a typo that silently declared nothing would reinstate exactly the
+    failure this block exists to prevent.
+    """
+    declared: set[str] = set()
+    for index, name in enumerate(array(value, path, len(DECLARABLE_BINDING_FAMILIES))):
+        name = identifier(name, f"{path}[{index}]")
+        if name in RETIRED_RUNTIME_BINDING_FIELDS:
+            fail(f"{path}[{index}]", retired_binding_message(name))
+        if name not in DECLARABLE_BINDING_FAMILIES:
+            fail(f"{path}[{index}]",
+                 f"is not a runtime binding family (known: {', '.join(sorted(DECLARABLE_BINDING_FAMILIES))})")
+        if name in declared:
+            fail(f"{path}[{index}]", "duplicate required binding family")
+        declared.add(name)
+    return sorted(declared)
+
+
+def enforce_required_runtime_bindings(required: list[str], bindings: dict[str, Any] | None) -> None:
+    """Refuse a configuration that drops a family the title says it requires.
+
+    The per-family validators already reject a half-configured family and an
+    explicitly zero address. This closes the remaining hole: an entire family
+    -- or the whole ``runtime_bindings`` block -- simply not being there. That
+    shape validates cleanly, generates a header full of disabled bindings, and
+    changes runtime behavior with nothing to show for it.
+    """
+    if not required:
+        return
+    present = set(bindings or {})
+    missing = [name for name in required if name not in present]
+    if not missing:
+        return
+    fail("$.required_runtime_bindings",
+         "declares binding families the manifest does not configure: "
+         + ", ".join(missing)
+         + " (configure them under $.runtime_bindings, or drop the requirement)")
+
+
+def validate_manifest(value: Any) -> dict[str, Any]:
+    value = obj(value, "$", ROOT_KEYS)
+    required = {
+        "schema_version", "id", "display_name", "kind", "executable", "modules",
+        "filesystem", "hle_profile", "feature_requirements", "verification_profile",
+    }
+    require(value, "$", *sorted(required))
+    version = uint(value["schema_version"], "$.schema_version")
+    if version != 1:
+        fail("$.schema_version", "only schema version 1 is supported")
+    kind = text(value["kind"], "$.kind", 16)
+    if kind not in {"retail", "homebrew", "synthetic"}:
+        fail("$.kind", "unsupported title kind")
+    result: dict[str, Any] = {
+        "schema_version": version,
+        "id": identifier(value["id"], "$.id"),
+        "display_name": text(value["display_name"], "$.display_name", 128),
+        "kind": kind,
+    }
+    if "game_name" in value:
+        # Optional explicit build-name declaration (issue #196 Phase 4). The
+        # manager accepts -GameName, this field, or a portable id derivation —
+        # never an id-prefix mint. Same portable-identifier contract the
+        # codegen planner enforces for --game-name.
+        result["game_name"] = identifier(value["game_name"], "$.game_name")
+    if kind == "retail":
+        if "disc" not in value:
+            fail("$", "retail manifests require disc")
+        result["disc"] = validate_disc(value["disc"], "$.disc")
+    elif "disc" in value:
+        fail("$.disc", "is permitted only for retail manifests")
+    result["executable"] = validate_executable(value["executable"], "$.executable")
+    result["modules"] = validate_modules(value["modules"], "$.modules")
+    result["filesystem"] = validate_filesystem(value["filesystem"], "$.filesystem")
+    result["hle_profile"] = identifier(value["hle_profile"], "$.hle_profile")
+    if "codegen_profile" in value:
+        profile = text(value["codegen_profile"], "$.codegen_profile", 16)
+        if profile not in {"none", "hst"}:
+            fail("$.codegen_profile", "unsupported codegen profile")
+        result["codegen_profile"] = profile
+    features: set[str] = set()
+    for index, feature in enumerate(array(value["feature_requirements"], "$.feature_requirements", 64)):
+        feature = identifier(feature, f"$.feature_requirements[{index}]")
+        if feature in features:
+            fail(f"$.feature_requirements[{index}]", "duplicate feature requirement")
+        features.add(feature)
+    result["feature_requirements"] = sorted(features)
+    if "compatibility_manifest" in value:
+        result["compatibility_manifest"] = portable_path(value["compatibility_manifest"], "$.compatibility_manifest")
+    result["verification_profile"] = identifier(value["verification_profile"], "$.verification_profile")
+    if "runtime_contract" in value:
+        result["runtime_contract"] = validate_runtime_contract(value["runtime_contract"], "$.runtime_contract")
+    if "runtime_bindings" in value:
+        result["runtime_bindings"] = validate_runtime_bindings(value["runtime_bindings"], "$.runtime_bindings")
+    if "required_runtime_bindings" in value:
+        result["required_runtime_bindings"] = validate_required_runtime_bindings(
+            value["required_runtime_bindings"], "$.required_runtime_bindings")
+        enforce_required_runtime_bindings(result["required_runtime_bindings"],
+                                          result.get("runtime_bindings"))
+    if "profile_zero" in value:
+        if kind != "synthetic":
+            fail("$.profile_zero", "is permitted only for synthetic manifests")
+        if "runtime_contract" not in result or result["runtime_contract"]["profile_id"] != "profile-zero-v1":
+            fail("$.profile_zero", "requires runtime_contract.profile_id=profile-zero-v1")
+        result["profile_zero"] = validate_profile_zero(value["profile_zero"], "$.profile_zero")
+    if "notes" in value:
+        result["notes"] = text(value["notes"], "$.notes", 2048, 0)
+    return result
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(validate_manifest(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def render_native_title_catalog(values: list[dict[str, Any]]) -> str:
+    """Emit immutable C99 recognition data, never runtime/support authority.
+
+    The full canonical manifest digest identifies the source contract, but only
+    identity fields are projected. Synthetic/homebrew titles have no disc IDs.
+    Callers generating public output must use public_native_title_catalog().
+    """
+    titles = sorted((validate_manifest(value) for value in values), key=lambda value: value["id"])
+    identities: set[str] = set()
+    discs: set[str] = set()
+    for title in titles:
+        if title["id"] in identities:
+            fail("catalog", "duplicate title identity")
+        identities.add(title["id"])
+        disc = title.get("disc", {})
+        for disc_id in ([disc["id"]] + disc.get("compatible_revisions", []) if disc else []):
+            if disc_id in discs:
+                fail("catalog", "duplicate disc identity")
+            discs.add(disc_id)
+
+    def literal(value: str) -> str:
+        # Fixed-width octal encodes UTF-8 bytes without C escape/trigraph,
+        # source-charset or adjacent-hex-digit ambiguity.
+        return '"' + "".join(f"\\{byte:03o}" for byte in value.encode("utf-8")) + '"'
+
+    canonical = [canonical_json(title).encode("utf-8") for title in titles]
+    digest = hashlib.sha256(b"".join(canonical)).hexdigest()
+    lines = [
+        "/* SPDX-License-Identifier: GPL-3.0-or-later */",
+        "/* Copyright (C) 2026 the Nakagawa Recomp authors */",
+        "/* Generated by tools/title_manifest.py; do not edit. */",
+        "/* Recognition only: no compatibility or runtime execution authority. */",
+        "#ifndef NK_TITLE_IDENTITY_CATALOG_H",
+        "#define NK_TITLE_IDENTITY_CATALOG_H",
+        "#include <stddef.h>",
+        "#include <string.h>",
+        "#define NK_TITLE_IDENTITY_SCHEMA_VERSION 1",
+        f'#define NK_TITLE_IDENTITY_SHA256 "{digest}"',
+        "typedef struct {",
+        "    const char *id;",
+        "    const char *display_name;",
+        "    const char *kind;",
+        "    const char *manifest_sha256;",
+        "    const char *const *disc_ids;",
+        "    size_t disc_id_count;",
+        "} NkTitleIdentity;",
+    ]
+    for index, title in enumerate(titles):
+        disc = title.get("disc", {})
+        if disc:
+            ids = [disc["id"]] + disc.get("compatible_revisions", [])
+            lines.append(f"static const char *const nk_title_discs_{index}[] = {{")
+            lines.extend(f"    {literal(disc_id)}," for disc_id in ids)
+            lines.append("};")
+    lines.append(f"#define NK_TITLE_IDENTITY_COUNT {len(titles)}")
+    lines.append("static const NkTitleIdentity nk_title_identities[] = {")
+    for index, title in enumerate(titles):
+        disc = title.get("disc", {})
+        count = 1 + len(disc.get("compatible_revisions", [])) if disc else 0
+        fields = [literal(title[key]) for key in ("id", "display_name", "kind")]
+        fields += [literal(hashlib.sha256(canonical[index]).hexdigest()),
+                   f"nk_title_discs_{index}" if disc else "NULL", str(count)]
+        lines.append("    {" + ", ".join(fields) + "},")
+    if not titles:
+        # ISO C forbids zero-element arrays; the sentinel is never searched.
+        lines.append("    {NULL, NULL, NULL, NULL, NULL, 0},")
+    lines += [
+        "};",
+        "static inline const NkTitleIdentity *nk_title_identity_by_id(const char *id) {",
+        "    if (!id) return NULL;",
+        "    const size_t count = NK_TITLE_IDENTITY_COUNT;",
+        "    for (size_t i = 0; i < count; ++i)",
+        "        if (strcmp(id, nk_title_identities[i].id) == 0) return &nk_title_identities[i];",
+        "    return NULL;",
+        "}",
+        "static inline const NkTitleIdentity *nk_title_identity_by_disc(const char *id) {",
+        "    if (!id) return NULL;",
+        "    const size_t count = NK_TITLE_IDENTITY_COUNT;",
+        "    for (size_t i = 0; i < count; ++i)",
+        "        for (size_t j = 0; j < nk_title_identities[i].disc_id_count; ++j)",
+        "            if (strcmp(id, nk_title_identities[i].disc_ids[j]) == 0)",
+        "                return &nk_title_identities[i];",
+        "    return NULL;",
+        "}",
+        "#endif",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def public_native_title_catalog(root: Path) -> str:
+    """Project only explicitly included canonical title paths.
+
+    Private/unclassified files are not opened. This is public-input selection,
+    not provenance attestation; the repository publication gates still apply.
+    A quiescent checkout is required, as for the other offline generators.
+    """
+    import publication_policy
+
+    def reject_alias(path: Path) -> None:
+        for component in (path, *path.parents):
+            if component.is_symlink() or component.is_junction():
+                fail("catalog", "symbolic links and junctions are not accepted")
+
+    root = root.absolute()
+    policy_path = root / "assets" / "public_source_profile.json"
+    reject_alias(policy_path)
+    policy = publication_policy.load_policy(policy_path)
+    paths = sorted(
+        path for path in policy.include_paths
+        if Path(path).parent.as_posix() == "assets/titles"
+        and path.endswith(".json")
+        and policy.resolve(path).disposition == publication_policy.INCLUDED
+    )
+    values = []
+    for relative in paths:
+        path = root / relative
+        reject_alias(path)
+        values.append(load_manifest(path))
+    return render_native_title_catalog(values)
+
+
+def write_normalized(path: Path, value: Any) -> None:
+    rendered = canonical_json(value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise TitleManifestError(f"{path}: refusing to replace a symbolic link")
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(rendered)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("manifest", type=Path, nargs="?")
+    parser.add_argument("--print-public-catalog", action="store_true",
+                        help="emit a C99 identity catalog from included public manifests")
+    parser.add_argument("--normalize-out", type=Path)
+    parser.add_argument("--print-normalized", action="store_true")
+    parser.add_argument("--encode-loose-content-roots", action="store_true",
+                        help="emit the resolved loose-root environment value as a JSON string")
+    parser.add_argument("--resolved-data-root", type=Path,
+                        help="absolute SR_DATAROOT for --encode-loose-content-roots")
+    parser.add_argument("--max-bytes", type=int, default=PUBLIC_MANIFEST_MAX_BYTES)
+    args = parser.parse_args(argv)
+    if args.print_public_catalog:
+        import publication_policy
+
+        if (args.manifest or args.normalize_out or args.print_normalized or
+                args.encode_loose_content_roots or args.resolved_data_root):
+            parser.error("--print-public-catalog cannot be combined with manifest options")
+        try:
+            rendered = public_native_title_catalog(Path(__file__).resolve().parent.parent)
+            sys.stdout.buffer.write(rendered.encode("ascii"))
+            return 0
+        except (TitleManifestError, OSError, ValueError, publication_policy.PolicyError) as exc:
+            # No generated output is emitted until all inputs pass validation.
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+    if args.manifest is None:
+        parser.error("a manifest is required unless --print-public-catalog is selected")
+    if args.resolved_data_root and not args.encode_loose_content_roots:
+        parser.error("--resolved-data-root requires --encode-loose-content-roots")
+    try:
+        normalized = validate_manifest(load_manifest(args.manifest, max_bytes=args.max_bytes))
+        if args.encode_loose_content_roots:
+            if args.normalize_out or args.print_normalized:
+                parser.error("--encode-loose-content-roots cannot be combined with normalization options")
+            encoded = encode_loose_content_roots(normalized, args.resolved_data_root)
+            sys.stdout.write(json.dumps(encoded, ensure_ascii=True) + "\n")
+            return 0
+        if args.normalize_out:
+            write_normalized(args.normalize_out, normalized)
+        if args.print_normalized:
+            print(canonical_json(normalized), end="")
+        else:
+            print(f"OK: {normalized['id']} (schema v{normalized['schema_version']})")
+        return 0
+    except (TitleManifestError, OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,232 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+"""Source-shape gates for the finite #15 native bulk/parser slice.
+
+The production HLE/fast-path implementations are exercised by the native
+selftests and exact-main runtime routes; these assertions keep the reviewed
+whole-span preflight from regressing when generated code is regenerated.
+"""
+
+from pathlib import Path
+import re
+import unittest
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import hle_sources  # noqa: E402
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _body(text: str, name: str) -> str:
+    match = re.search(rf"\b{re.escape(name)}\s*\([^)]*\)\s*\{{", text)
+    if not match:
+        raise AssertionError(f"function {name} not found")
+    start = match.end() - 1
+    depth = 0
+    for pos in range(start, len(text)):
+        if text[pos] == "{":
+            depth += 1
+        elif text[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:pos + 1]
+    raise AssertionError(f"function {name} has no closing brace")
+
+
+def _range(text: str, name: str) -> tuple[int, int]:
+    body = _body(text, name)
+    start = text.find(body)
+    return start, start + len(body)
+
+
+class TestGuestSpanRouting(unittest.TestCase):
+    def test_generated_bulk_stubs_use_complete_span_helpers(self) -> None:
+        # The native memcpy/memset stub bodies are data in codegen_hst_stubs.py ("@ADDR@" is the
+        # stub's own address); the span helpers in codegen.py's own emitters stay in its source.
+        stubs = (ROOT / "tools" / "codegen_hst_stubs.py").read_text(encoding="utf-8")
+        self.assertIn("sr_native_memmove(dest, s->r[5], s->r[6], 0x@ADDR@u);", stubs)
+        self.assertIn("sr_native_memset(dest, (uint8_t)(s->r[5] & 0xFF), s->r[6], 0x@ADDR@u);", stubs)
+        text = (ROOT / "tools" / "codegen.py").read_text(encoding="utf-8")
+        self.assertIn("sr_guest_span_writable(_mf_base, _mf_cnt)", text)
+        self.assertNotIn("memmove(SR_HOST(dest), SR_HOST(src), size)", text)
+        self.assertNotIn("memset(SR_HOST(dest), val, size)", text)
+        # The stubs' bodies live in recomp.h (#1170): whole-span checks, the
+        # VRAM read-back before the source pointer, and the write notification.
+        header = (ROOT / "src" / "rt" / "recomp.h").read_text(encoding="utf-8")
+        # #1049: the bodies copy through sr_guest_memmove/sr_guest_fill, which
+        # split swizzled VRAM mirror spans into measured-contiguous pieces.
+        memmove = _body(header, "sr_native_memmove")
+        self.assertIn("sr_inrange_n(dest, size) && sr_inrange_n(src, size)", memmove)
+        self.assertIn("sr_oor(dest, 0u, 1); sr_oor(src, 0u, 0);", memmove)
+        self.assertLess(memmove.find("sr_heap_note_bulk_write(dest, size, pc)"),
+                        memmove.find("sr_guest_memmove(dest, src, size)"))
+        memset = _body(header, "sr_native_memset")
+        self.assertIn("sr_inrange_n(dest, size)", memset)
+        self.assertLess(memset.find("sr_heap_note_bulk_write(dest, size, pc)"),
+                        memset.find("sr_guest_fill(dest, val, size)"))
+        guest_memmove = _body(header, "sr_guest_memmove")
+        self.assertIn("sr_ge_vram_read_prepare(sr_vram_cpu_address(src), size)", guest_memmove)
+        self.assertLess(guest_memmove.find("sr_guest_vram_write_prepare_bytes(dst, size)"),
+                        guest_memmove.find("memmove(SR_HOST(dst), SR_HOST(src), size)"))
+        self.assertGreater(guest_memmove.find("sr_guest_vram_write_commit_bytes(dst, size)"),
+                           guest_memmove.find("memmove(SR_HOST(dst), SR_HOST(src), size)"))
+        for name, store in (("sr_guest_copy_out", "memcpy(SR_HOST(dst), in, run)"),
+                            ("sr_guest_fill", "memset(SR_HOST(dst), value, run)")):
+            body = _body(header, name)
+            self.assertLess(body.find("sr_guest_vram_write_prepare_bytes(dst, run)"), body.find(store))
+            self.assertGreater(body.find("sr_guest_vram_write_commit_bytes(dst, run)"), body.find(store))
+        copy_in = _body(header, "sr_guest_copy_in")
+        self.assertLess(copy_in.find("sr_guest_vram_read_prepare_bytes(src, run)"),
+                        copy_in.find("memcpy(out, SR_HOST(src), run)"))
+
+    def test_generic_memcpy_memset_preflight_before_sr_host(self) -> None:
+        text = hle_sources.text()
+        # The handlers through dmac_transfer, inside the one file that defines them (#307).
+        dmac_file = dict(hle_sources.sources())[hle_sources.defining_file("dmac_transfer")]
+        transfer = hle_sources.function_text("uint32_t dmac_transfer(CpuState *s, int try_only) {")
+        dmac_start = dmac_file.index("static uint32_t h_DmacMemcpy")
+        dmac = dmac_file[dmac_start:dmac_file.index(transfer, dmac_start) + len(transfer)]
+        self.assertIn("sr_guest_span_prefix(src, n)", dmac)
+        self.assertIn("sr_guest_span_prefix(dst, n)", dmac)
+        self.assertIn("uint32_t effective = src_prefix < dst_prefix ? src_prefix : dst_prefix;", dmac)
+        self.assertNotIn("SCE_DMAC_EFFECTIVE_MAX", dmac)
+        # Every copy goes through dmac_copy, after the span preflight above.
+        self.assertIn("memmove(SR_HOST(dst), SR_HOST(src), n)", dmac)
+        self.assertIn("dmac_copy(dst, src, effective)", dmac)
+        self.assertLess(dmac.find("sr_guest_span_writable(dst, effective)"),
+                        dmac.find("dmac_copy(dst, src, effective)"))
+        memcpy_start = text.find("static uint32_t h_Memcpy")
+        memcpy_end = text.find("static uint32_t", memcpy_start + 1)
+        memcpy = text[memcpy_start:memcpy_end]
+        self.assertIn("sr_guest_memmove(dst, src, n)", memcpy)
+        self.assertNotIn("SR_HOST", memcpy)
+        memset = text[text.find("static uint32_t h_Memset"):text.find("static uint32_t h_Memcpy")]
+        self.assertIn("sr_guest_fill(dst, (uint8_t)val, n)", memset)
+        self.assertNotIn("SR_HOST", memset)
+        # The shared bulk helper calls the kernel-utility subsystem's registration run (#307).
+        helper = hle_sources.function_text("static void hle_register_bulk_memory_handlers(void) {")
+        self.assertIn("hle_register_bulk_memory_kernel_utils();", helper)
+        registration = hle_sources.function_text("void hle_register_bulk_memory_kernel_utils(void) {")
+        self.assertIn("sceKernelMemcpy", registration)
+        self.assertIn("sceKernelMemset", registration)
+
+    def test_funcdiff_register_parser_has_per_file_register_limits(self) -> None:
+        text = (ROOT / "src" / "rt" / "funcdiff.c").read_text(encoding="utf-8")
+        self.assertIn("parse_indexed_register(name, 'r', 31", text)
+        self.assertIn("parse_indexed_register(name, 'f', 31", text)
+        self.assertIn("parse_indexed_register(name, 'v', 127", text)
+        self.assertNotIn("s->r[atoi(name + 1)]", text)
+        self.assertNotIn("s->fi[atoi(name + 1)]", text)
+        self.assertNotIn("s->vi[atoi(name + 1)]", text)
+
+    def test_loader_uses_shared_span_for_the_full_segment(self) -> None:
+        text = (ROOT / "src" / "rt" / "recomp.c").read_text(encoding="utf-8")
+        load = text[text.find("void sr_load_segment"):text.find("/* Newlib malloc", text.find("void sr_load_segment"))]
+        self.assertIn("sr_guest_span_writable(vaddr, len)", load)
+        self.assertNotIn("SR_PHYS(end_vaddr) >", load)
+
+    def test_ge_block_transfer_preflights_both_rectangles_before_side_effects(self) -> None:
+        text = (ROOT / "src" / "rt" / "ge.c").read_text(encoding="utf-8")
+        body = _body(text, "ge_block_transfer")
+        readable = body.find("sr_guest_rect_readable")
+        writable = body.find("sr_guest_rect_writable")
+        gpu_hook = body.find("s_gpu->xfer")
+        flush = body.find("s_gpu->flush")
+        copy = body.find("memmove")
+        dirty = body.find("sr_guest_vram_write_commit_bytes")
+        self.assertTrue(0 <= readable < gpu_hook < copy)
+        self.assertTrue(0 <= writable < flush < copy < dirty)
+        self.assertNotIn("if (!sr_inrange(so0)", body)
+
+    def test_vram_dump_preflights_the_span_before_its_host_pointer(self) -> None:
+        body = _body((ROOT / "src" / "rt" / "ge.c").read_text(encoding="utf-8"), "ge_vramdump_write")
+        readable = body.find("sr_guest_span_readable_current(GE_CAPTURE_VRAM_BASE, GE_CAPTURE_VRAM_SIZE)")
+        opened = body.find("fopen(")
+        host = body.find("SR_HOST(GE_CAPTURE_VRAM_BASE)")
+        self.assertTrue(0 <= readable < opened < host)
+
+    def test_ge_direct_guest_host_pointers_have_named_complete_span_owners(self) -> None:
+        cases = {
+            ROOT / "src" / "rt" / "ge.c": {
+                "ge_decode_tex_rgba": ("sr_guest_rect_readable",),
+                "ge_block_transfer": ("sr_guest_rect_readable", "sr_guest_rect_writable"),
+                "ge_vramdump_write": ("sr_guest_span_readable",),
+                "ge_tr_hash_span": ("sr_guest_span_readable",),
+            },
+            ROOT / "src" / "rt" / "ge_capture.c": {
+                "ge_capture_begin": ("sr_guest_span_readable",),
+                "append_page": ("sr_guest_span_readable",),
+                "ge_capture_apply": ("sr_guest_span_writable",),
+            },
+            ROOT / "src" / "rt" / "gpu_sdl3vk" / "ge_gpu.c": {
+                "write_guest_fb": ("gegpu_validate_guest_fb_descriptor",),
+                "target_upload": ("gegpu_validate_guest_fb_descriptor",),
+                "target_patch_vram_dirty": ("gegpu_validate_guest_fb_descriptor",),
+                "tex_source_ptr": ("sr_guest_span_readable",),
+            },
+        }
+        for path, owners in cases.items():
+            text = path.read_text(encoding="utf-8")
+            if path.name == "ge.c":
+                # The standalone VRAM decoder CLI build reads a private captured 2 MiB
+                # image through ge_vram_cli_read8, which bounds-checks every byte; it
+                # never touches guest memory. Blank those blocks, but require the check.
+                self.assertIn("ge_vram_cli_bad_read = 1;", text)
+                lines = text.split(chr(10))
+                depth = 0
+                for index, line in enumerate(lines):
+                    stripped = line.strip()
+                    if depth == 0 and stripped == "#ifdef SR_GE_VRAM_DECODER_CLI":
+                        depth = 1
+                        lines[index] = ""
+                    elif depth:
+                        if stripped.startswith(("#if", "#ifdef", "#ifndef")):
+                            depth += 1
+                        elif stripped.startswith("#endif"):
+                            depth -= 1
+                        lines[index] = ""
+                text = chr(10).join(lines)
+            if path.name == "ge_gpu.c":
+                # Ignore the explicitly synthetic Vulkan selftest block. Production
+                # code before and after it remains in the census.
+                start = text.find("#ifdef SR_GPU_COHERENCE_SELFTEST")
+                end = text.find("#endif", start)
+                self.assertGreaterEqual(start, 0)
+                self.assertGreater(end, start)
+                text = text[:start] + (" " * (end + len("#endif") - start)) + text[end + len("#endif"):]
+
+            ranges = {}
+            for owner, required in owners.items():
+                ranges[owner] = _range(text, owner)
+                body = _body(text, owner)
+                for token in required:
+                    self.assertIn(token, body, f"{path.name}:{owner} lost {token}")
+
+            for match in re.finditer(r"\bSR_HOST\s*\(", text):
+                containing = [name for name, (lo, hi) in ranges.items() if lo <= match.start() < hi]
+                self.assertEqual(
+                    len(containing), 1,
+                    f"{path.name}:{text.count(chr(10), 0, match.start()) + 1} has an unowned direct guest host pointer",
+                )
+
+    def test_texture_hash_uses_the_checked_source_capability(self) -> None:
+        text = (ROOT / "src" / "rt" / "gpu_sdl3vk" / "ge_gpu.c").read_text(encoding="utf-8")
+        body = _body(text, "tex_hash")
+        self.assertIn("tex_source_ptr", body)
+        self.assertNotIn("SR_HOST", body)
+
+    def test_framebuffer_target_is_validated_before_slot_or_image_allocation(self) -> None:
+        text = (ROOT / "src" / "rt" / "gpu_sdl3vk" / "ge_gpu.c").read_text(encoding="utf-8")
+        body = _body(text, "target_color_acquire")
+        check = body.find("gegpu_validate_guest_fb_descriptor")
+        slot = body.find("target_slot_acquire")
+        image = body.find("make_image")
+        self.assertTrue(0 <= check < slot < image)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,4207 @@
+{
+  "0x00061e74": {
+    "classification": "dedicated",
+    "handler": "h_ModuleStreamWrite",
+    "name": "newlibModuleStreamWrite",
+    "status": "unreviewed"
+  },
+  "0x011f03c1": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceRtcGetAccumulativeTime",
+    "refusal_error": "0x80020002",
+    "status": "controlled_unsupported"
+  },
+  "0x01562ba3": {
+    "classification": "dedicated",
+    "handler": "h_AudioOutput2Reserve",
+    "name": "sceAudioOutput2Reserve",
+    "status": "partial"
+  },
+  "0x01977054": {
+    "classification": "controlled_unsupported",
+    "handler": "h_MpegGetUserdataAu",
+    "name": "sceMpegGetUserdataAu",
+    "status": "controlled_unsupported"
+  },
+  "0x019b25eb": {
+    "classification": "dedicated",
+    "handler": "h_SasSetADSR",
+    "name": "__sceSasSetADSR",
+    "status": "unreviewed"
+  },
+  "0x0282a3bd": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceHttpGetContentLength",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x02baad91": {
+    "classification": "dedicated",
+    "handler": "h_CtrlGetSamplingCycle",
+    "name": "sceCtrlGetSamplingCycle",
+    "status": "partial"
+  },
+  "0x03444eb4": {
+    "classification": "dedicated",
+    "handler": "h_GeListSync",
+    "name": "sceGeListSync",
+    "status": "partial"
+  },
+  "0x034a921f": {
+    "classification": "dedicated",
+    "handler": "h_GetVTimerTime",
+    "name": "sceKernelGetVTimerTime",
+    "status": "partial"
+  },
+  "0x03b6807d": {
+    "classification": "dedicated",
+    "handler": "h_VaudioChReserve",
+    "name": "sceVaudioChReserve",
+    "status": "partial"
+  },
+  "0x03d9526f": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceHttpSetResolveRetry",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x04b7766e": {
+    "classification": "dedicated",
+    "handler": "h_PowerRegisterCallback",
+    "name": "scePowerRegisterCallback",
+    "status": "unreviewed"
+  },
+  "0x05572a5f": {
+    "classification": "dedicated",
+    "handler": "h_ExitGame",
+    "name": "sceKernelExitGame",
+    "status": "partial"
+  },
+  "0x0558b075": {
+    "classification": "dedicated",
+    "handler": "h_MpegAvcCopyYCbCr",
+    "name": "sceMpegAvcCopyYCbCr",
+    "status": "partial"
+  },
+  "0x05db22ce": {
+    "classification": "dedicated",
+    "handler": "h_GeUnsetCallback",
+    "name": "sceGeUnsetCallback",
+    "status": "partial"
+  },
+  "0x06a70004": {
+    "classification": "dedicated",
+    "handler": "h_IoMkdir",
+    "name": "sceIoMkdir",
+    "status": "complete"
+  },
+  "0x07ec321a": {
+    "classification": "dedicated",
+    "handler": "h_Mp3ReserveMp3Handle",
+    "name": "sceMp3ReserveMp3Handle",
+    "status": "unreviewed"
+  },
+  "0x07f58c24": {
+    "classification": "dedicated",
+    "handler": "h_SasGetAllEnvelopeHeights",
+    "name": "__sceSasGetAllEnvelopeHeights",
+    "status": "unreviewed"
+  },
+  "0x0840e808": {
+    "classification": "dedicated",
+    "handler": "h_Mp3ResetPlayPositionByFrame",
+    "name": "sceMp3ResetPlayPositionByFrame",
+    "status": "unreviewed"
+  },
+  "0x08d98894": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNpDrmEdataSetupKey",
+    "refusal_error": "0x80020002",
+    "status": "controlled_unsupported"
+  },
+  "0x08fff7a0": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlScan",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x090ccb3f": {
+    "classification": "dedicated",
+    "handler": "h_PowerTick",
+    "name": "sceKernelPowerTick",
+    "status": "unreviewed"
+  },
+  "0x092968f4": {
+    "classification": "dedicated",
+    "handler": "h_CpuSuspendIntr",
+    "name": "sceKernelCpuSuspendIntr",
+    "status": "partial"
+  },
+  "0x099ef33c": {
+    "classification": "dedicated",
+    "handler": "h_FontFindOptimumFont",
+    "name": "sceFontFindOptimumFont",
+    "status": "unreviewed"
+  },
+  "0x0ad043ed": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlConnect",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x0afd0d8b": {
+    "classification": "dedicated",
+    "handler": "h_PowerIsBatteryExist",
+    "name": "scePowerIsBatteryExist",
+    "status": "unreviewed"
+  },
+  "0x0b2228e9": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocGameModeDeleteReplica",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x0b588501": {
+    "classification": "dedicated",
+    "handler": "h_CtrlReadLatch",
+    "name": "sceCtrlReadLatch",
+    "status": "partial"
+  },
+  "0x0bf0a3ae": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetGetLocalEtherAddr",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x0bf608fb": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceGeRestoreContext",
+    "refusal_error": "0x80020002",
+    "status": "controlled_unsupported"
+  },
+  "0x0c116e1b": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceAtracLowLevelDecode",
+    "refusal_error": "0x80630004",
+    "status": "controlled_unsupported"
+  },
+  "0x0c622081": {
+    "classification": "dedicated",
+    "handler": "h_WlanGetEtherAddr",
+    "name": "sceWlanGetEtherAddr",
+    "status": "unreviewed"
+  },
+  "0x0cae832b": {
+    "classification": "dedicated",
+    "handler": "h_RegCloseCategory",
+    "name": "sceRegCloseCategory",
+    "status": "partial"
+  },
+  "0x0d5bc6d2": {
+    "classification": "dedicated",
+    "handler": "h_UtilityLoadUsbModule",
+    "name": "sceUtilityLoadUsbModule",
+    "status": "unreviewed"
+  },
+  "0x0d69bf40": {
+    "classification": "dedicated",
+    "handler": "h_RegFlushCategory",
+    "name": "sceRegFlushCategory",
+    "status": "partial"
+  },
+  "0x0d81716a": {
+    "classification": "dedicated",
+    "handler": "h_PollMbx",
+    "name": "sceKernelPollMbx",
+    "status": "partial"
+  },
+  "0x0da7535e": {
+    "classification": "dedicated",
+    "handler": "h_FontGetFontInfo",
+    "name": "sceFontGetFontInfo",
+    "status": "unreviewed"
+  },
+  "0x0db149f4": {
+    "classification": "dedicated",
+    "handler": "h_Mp3NotifyAddStreamData",
+    "name": "sceMp3NotifyAddStreamData",
+    "status": "unreviewed"
+  },
+  "0x0ddcd2c9": {
+    "classification": "dedicated",
+    "handler": "h_TryLockMutex",
+    "name": "sceKernelTryLockMutex",
+    "status": "partial"
+  },
+  "0x0e20f177": {
+    "classification": "dedicated",
+    "handler": "h_DisplaySetMode",
+    "name": "sceDisplaySetMode",
+    "status": "partial"
+  },
+  "0x0e2a73ab": {
+    "classification": "dedicated",
+    "handler": "h_AtracSetData",
+    "name": "sceAtracSetData",
+    "status": "unreviewed"
+  },
+  "0x0e3c2e9d": {
+    "classification": "dedicated",
+    "handler": "h_MpegAvcDecode",
+    "name": "sceMpegAvcDecode",
+    "status": "unreviewed"
+  },
+  "0x0ed48fe2": {
+    "classification": "dedicated",
+    "handler": "h_DeleteNotifyCallback",
+    "name": "sceKernelDeleteNotifyCallback",
+    "status": "unreviewed"
+  },
+  "0x0f6c18d7": {
+    "classification": "dedicated",
+    "handler": "h_MpegAvcDecodeDetail",
+    "name": "sceMpegAvcDecodeDetail",
+    "status": "partial"
+  },
+  "0x0facab19": {
+    "classification": "dedicated",
+    "handler": "h_IoWriteAsync",
+    "name": "sceIoWriteAsync",
+    "status": "partial"
+  },
+  "0x0fae370e": {
+    "classification": "dedicated",
+    "handler": "h_AtracSetHalfwayBufferAndGetID",
+    "name": "sceAtracSetHalfwayBufferAndGetID",
+    "status": "unreviewed"
+  },
+  "0x1078c008": {
+    "classification": "dedicated",
+    "handler": "h_PsmfStop",
+    "name": "scePsmfPlayerStop",
+    "status": "unreviewed"
+  },
+  "0x109f50bc": {
+    "classification": "dedicated",
+    "handler": "h_IoOpen",
+    "name": "sceIoOpen",
+    "status": "partial"
+  },
+  "0x10f3bb61": {
+    "classification": "dedicated",
+    "handler": "h_Memset",
+    "name": "memset",
+    "status": "complete"
+  },
+  "0x110dec9a": {
+    "classification": "dedicated",
+    "handler": "h_USec2SysClock",
+    "name": "sceKernelUSec2SysClock",
+    "status": "partial"
+  },
+  "0x1117c65f": {
+    "classification": "dedicated",
+    "handler": "h_IoRmdir",
+    "name": "sceIoRmdir",
+    "status": "partial"
+  },
+  "0x1181e963": {
+    "classification": "dedicated",
+    "handler": "h_DelaySysClockThreadCB",
+    "name": "sceKernelDelaySysClockThreadCB",
+    "status": "unreviewed"
+  },
+  "0x132f1eca": {
+    "classification": "dedicated",
+    "handler": "h_AtracReinit",
+    "name": "sceAtracReinit",
+    "status": "unreviewed"
+  },
+  "0x13407f13": {
+    "classification": "dedicated",
+    "handler": "h_MpegRingbufferDestruct",
+    "name": "sceMpegRingbufferDestruct",
+    "status": "unreviewed"
+  },
+  "0x136caf51": {
+    "classification": "dedicated",
+    "handler": "h_AudioOutputBlocking",
+    "name": "sceAudioOutputBlocking",
+    "status": "partial"
+  },
+  "0x13a5abef": {
+    "classification": "dedicated",
+    "handler": "h_KernelPrintf",
+    "name": "sceKernelPrintf",
+    "status": "unreviewed"
+  },
+  "0x13f592bc": {
+    "classification": "dedicated",
+    "handler": "h_AudioOutputPannedBlocking",
+    "name": "sceAudioOutputPannedBlocking",
+    "status": "unreviewed"
+  },
+  "0x1575d64b": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceAtracLowLevelInitDecoder",
+    "refusal_error": "0x80630004",
+    "status": "controlled_unsupported"
+  },
+  "0x1579a159": {
+    "classification": "dedicated",
+    "handler": "h_UtilityLoadNetModule",
+    "name": "sceUtilityLoadNetModule",
+    "status": "partial"
+  },
+  "0x157e6225": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocPtpClose",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x15b6446b": {
+    "classification": "dedicated",
+    "handler": "h_UnlockLwMutex",
+    "name": "sceKernelUnlockLwMutex",
+    "status": "partial"
+  },
+  "0x167afd9e": {
+    "classification": "dedicated",
+    "handler": "h_MpegInitAu",
+    "name": "sceMpegInitAu",
+    "status": "unreviewed"
+  },
+  "0x172d316e": {
+    "classification": "dedicated",
+    "handler": "h_StdFd",
+    "name": "sceKernelStdin",
+    "status": "unreviewed"
+  },
+  "0x17768e14": {
+    "classification": "dedicated",
+    "handler": "h_RegSetKeyValue",
+    "name": "sceRegSetKeyValue",
+    "status": "partial"
+  },
+  "0x17c1684e": {
+    "classification": "dedicated",
+    "handler": "h_ReferThreadStatus",
+    "name": "sceKernelReferThreadStatus",
+    "status": "partial"
+  },
+  "0x18260574": {
+    "classification": "dedicated",
+    "handler": "h_ReceiveMbx",
+    "name": "sceKernelReceiveMbx",
+    "status": "partial"
+  },
+  "0x1839852a": {
+    "classification": "dedicated",
+    "handler": "h_Memcpy",
+    "name": "sceKernelMemcpy",
+    "status": "partial"
+  },
+  "0x191cdeff": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceSslEnd",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x19cff145": {
+    "classification": "dedicated",
+    "handler": "h_CreateLwMutex",
+    "name": "sceKernelCreateLwMutex",
+    "status": "partial"
+  },
+  "0x1b385d8f": {
+    "classification": "dedicated",
+    "handler": "h_IoLseek32Async",
+    "name": "sceIoLseek32Async",
+    "status": "partial"
+  },
+  "0x1b4217bc": {
+    "classification": "dedicated",
+    "handler": "h_SetCompiledSdkVersion",
+    "name": "sceKernelSetCompiledSdkVersion603_605",
+    "status": "complete"
+  },
+  "0x1b839b83": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceMp3LowLevelInit",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x1c0d95a6": {
+    "classification": "dedicated",
+    "handler": "h_GeListEnQueueHead",
+    "name": "sceGeListEnQueueHead",
+    "status": "partial"
+  },
+  "0x1d8a762e": {
+    "classification": "dedicated",
+    "handler": "h_RegOpenCategory",
+    "name": "sceRegOpenCategory",
+    "status": "partial"
+  },
+  "0x1e490401": {
+    "classification": "dedicated",
+    "handler": "h_PowerIsBatteryCharging",
+    "name": "scePowerIsBatteryCharging",
+    "status": "unreviewed"
+  },
+  "0x1e57a8e7": {
+    "classification": "dedicated",
+    "handler": "h_PsmfConfig",
+    "name": "scePsmfPlayerConfigPlayer",
+    "status": "unreviewed"
+  },
+  "0x1f0fc3e3": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceHttpSetRecvTimeOut",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x1f4011e6": {
+    "classification": "dedicated",
+    "handler": "h_CtrlSetSamplingMode",
+    "name": "sceCtrlSetSamplingMode",
+    "status": "partial"
+  },
+  "0x1f6752ad": {
+    "classification": "dedicated",
+    "handler": "h_GeEdramGetSize",
+    "name": "sceGeEdramGetSize",
+    "status": "complete"
+  },
+  "0x1f803938": {
+    "classification": "dedicated",
+    "handler": "h_CtrlReadBuffer",
+    "name": "sceCtrlReadBufferPositive",
+    "status": "partial"
+  },
+  "0x1fb15a32": {
+    "classification": "dedicated",
+    "handler": "h_SetEventFlag",
+    "name": "sceKernelSetEventFlag",
+    "status": "partial"
+  },
+  "0x1fc64e09": {
+    "classification": "dedicated",
+    "handler": "h_LockLwMutexCB",
+    "name": "sceKernelLockLwMutexCB",
+    "status": "unreviewed"
+  },
+  "0x1ff89745": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlJoinEnterGameMode",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x20628e6f": {
+    "classification": "dedicated",
+    "handler": "h_UmdGetErrorStat",
+    "name": "sceUmdGetErrorStat",
+    "status": "compatibility"
+  },
+  "0x2085d15d": {
+    "classification": "dedicated",
+    "handler": "h_PowerGetBatteryLifePercent",
+    "name": "scePowerGetBatteryLifePercent",
+    "status": "unreviewed"
+  },
+  "0x208db1bd": {
+    "classification": "dedicated",
+    "handler": "h_HprmIsRemoteExist",
+    "name": "sceHprmIsRemoteExist",
+    "status": "partial"
+  },
+  "0x20b317a0": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlAddHandler",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x20fff560": {
+    "classification": "dedicated",
+    "handler": "h_CreateVTimer",
+    "name": "sceKernelCreateVTimer",
+    "status": "partial"
+  },
+  "0x210eab3a": {
+    "classification": "dedicated",
+    "handler": "h_DisplayGetAccumulatedHcount",
+    "name": "sceDisplayGetAccumulatedHcount",
+    "status": "partial"
+  },
+  "0x211a057c": {
+    "classification": "dedicated",
+    "handler": "h_MpegAvcQueryYCbCrSize",
+    "name": "sceMpegAvcQueryYCbCrSize",
+    "status": "partial"
+  },
+  "0x219c58f1": {
+    "classification": "dedicated",
+    "handler": "h_HprmIsMicrophoneExist",
+    "name": "sceHprmIsMicrophoneExist",
+    "status": "partial"
+  },
+  "0x21ff80e4": {
+    "classification": "dedicated",
+    "handler": "h_MpegQueryStreamOffset",
+    "name": "sceMpegQueryStreamOffset",
+    "status": "unreviewed"
+  },
+  "0x2255551e": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceHttpGetNetworkPspError",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x231fc6b7": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "_sceAtracGetContextAddress",
+    "refusal_error": "0x80630003",
+    "status": "controlled_unsupported"
+  },
+  "0x235d8787": {
+    "classification": "dedicated",
+    "handler": "h_PsmfCreate",
+    "name": "scePsmfPlayerCreate",
+    "status": "unreviewed"
+  },
+  "0x237dbd4f": {
+    "classification": "dedicated",
+    "handler": "h_AllocPartitionMemory",
+    "name": "sceKernelAllocPartitionMemory",
+    "status": "partial"
+  },
+  "0x24ac31eb": {
+    "classification": "dedicated",
+    "handler": "h_GamedataDialogInit",
+    "name": "sceUtilityGamedataInstallInitStart",
+    "status": "unreviewed"
+  },
+  "0x24fd7bcf": {
+    "classification": "dedicated",
+    "handler": "h_ImposeGetLanguageMode",
+    "name": "sceImposeGetLanguageMode",
+    "status": "unreviewed"
+  },
+  "0x267a6dd2": {
+    "classification": "dedicated",
+    "handler": "h_SasRevParam",
+    "name": "__sceSasRevParam",
+    "status": "unreviewed"
+  },
+  "0x26d25a5d": {
+    "classification": "dedicated",
+    "handler": "h_RtcTickAddMicroseconds",
+    "name": "sceRtcTickAddMicroseconds",
+    "status": "partial"
+  },
+  "0x278c0df5": {
+    "classification": "dedicated",
+    "handler": "h_WaitThreadEnd",
+    "name": "sceKernelWaitThreadEnd",
+    "status": "partial"
+  },
+  "0x27c4594c": {
+    "classification": "dedicated",
+    "handler": "h_RtcGetTime_t",
+    "name": "sceRtcGetTime_t",
+    "status": "partial"
+  },
+  "0x27cc57f0": {
+    "classification": "dedicated",
+    "handler": "h_LibcTime",
+    "name": "sceKernelLibcTime",
+    "status": "unreviewed"
+  },
+  "0x27e22ec2": {
+    "classification": "dedicated",
+    "handler": "h_ResumeDispatchThread",
+    "name": "sceKernelResumeDispatchThread",
+    "status": "unreviewed"
+  },
+  "0x27eb27b8": {
+    "classification": "dedicated",
+    "handler": "h_IoLseek",
+    "name": "sceIoLseek",
+    "status": "partial"
+  },
+  "0x27f6e642": {
+    "classification": "dedicated",
+    "handler": "h_FontGetNumFontList",
+    "name": "sceFontGetNumFontList",
+    "status": "partial"
+  },
+  "0x281928a9": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetTerm",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x289d82fe": {
+    "classification": "dedicated",
+    "handler": "h_DisplaySetFrameBuf",
+    "name": "sceDisplaySetFrameBuf",
+    "status": "partial"
+  },
+  "0x28a8e98a": {
+    "classification": "dedicated",
+    "handler": "h_RegGetKeyValue",
+    "name": "sceRegGetKeyValue",
+    "status": "partial"
+  },
+  "0x28b6489c": {
+    "classification": "dedicated",
+    "handler": "h_DeleteSema",
+    "name": "sceKernelDeleteSema",
+    "status": "partial"
+  },
+  "0x293b45b8": {
+    "classification": "dedicated",
+    "handler": "h_GetThreadIdSched",
+    "name": "sceKernelGetThreadId",
+    "status": "partial"
+  },
+  "0x29681260": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceAudiocodecReleaseEDRAM",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x2a2a1e07": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingInit",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x2a2b3de0": {
+    "classification": "dedicated",
+    "handler": "h_UtilityLoadModule",
+    "name": "sceUtilityLoadModule",
+    "status": "partial"
+  },
+  "0x2a368661": {
+    "classification": "dedicated",
+    "handler": "h_Mp3ResetPlayPosition",
+    "name": "sceMp3ResetPlayPosition",
+    "status": "unreviewed"
+  },
+  "0x2a3d44ff": {
+    "classification": "dedicated",
+    "handler": "h_GetCallbackCount",
+    "name": "sceKernelGetCallbackCount",
+    "status": "unreviewed"
+  },
+  "0x2ad8e239": {
+    "classification": "dedicated",
+    "handler": "h_MsgDialogInit",
+    "name": "sceUtilityMsgDialogInitStart",
+    "status": "unreviewed"
+  },
+  "0x2beb1569": {
+    "classification": "dedicated",
+    "handler": "h_PsmfBreak",
+    "name": "scePsmfPlayerBreak",
+    "status": "unreviewed"
+  },
+  "0x2c0db9dd": {
+    "classification": "dedicated",
+    "handler": "h_RegGetKeysNum",
+    "name": "sceRegGetKeysNum",
+    "status": "partial"
+  },
+  "0x2c34e053": {
+    "classification": "dedicated",
+    "handler": "h_ReleaseWaitThread",
+    "name": "sceKernelReleaseWaitThread",
+    "status": "partial"
+  },
+  "0x2c8e6ab3": {
+    "classification": "dedicated",
+    "handler": "h_SasGetPauseFlag",
+    "name": "__sceSasGetPauseFlag",
+    "status": "unreviewed"
+  },
+  "0x2d0e4e0a": {
+    "classification": "dedicated",
+    "handler": "h_PsmfSetTempBuf",
+    "name": "scePsmfPlayerSetTempBuf",
+    "status": "unreviewed"
+  },
+  "0x2d211135": {
+    "classification": "dedicated",
+    "handler": "h_RegGetKeys",
+    "name": "sceRegGetKeys",
+    "status": "partial"
+  },
+  "0x2d53f36e": {
+    "classification": "dedicated",
+    "handler": "h_AudioOutput2Blocking",
+    "name": "sceAudioOutput2OutputBlocking",
+    "status": "partial"
+  },
+  "0x2dd3e298": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetBufferInfoForResetting",
+    "name": "sceAtracGetBufferInfoForResetting",
+    "status": "unreviewed"
+  },
+  "0x2e0911aa": {
+    "classification": "dedicated",
+    "handler": "h_UnloadModule_Trace",
+    "name": "sceKernelUnloadModule",
+    "status": "unreviewed"
+  },
+  "0x30be0259": {
+    "classification": "dedicated",
+    "handler": "h_RegGetKeyValueByName",
+    "name": "sceRegGetKeyValueByName",
+    "status": "partial"
+  },
+  "0x30fd48f0": {
+    "classification": "dedicated",
+    "handler": "h_PollEventFlag",
+    "name": "sceKernelPollEventFlag",
+    "status": "partial"
+  },
+  "0x31327f19": {
+    "classification": "dedicated",
+    "handler": "h_LockLwMutexCB",
+    "name": "_sceKernelLockLwMutexCB",
+    "status": "unreviewed"
+  },
+  "0x315ad3a0": {
+    "classification": "dedicated",
+    "handler": "h_SetCompiledSdkVersion",
+    "name": "sceKernelSetCompiledSdkVersion380_390",
+    "status": "complete"
+  },
+  "0x31668baa": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetChannel",
+    "name": "sceAtracGetChannel",
+    "status": "unreviewed"
+  },
+  "0x31bd0272": {
+    "classification": "dedicated",
+    "handler": "h_MpegAvcCsc",
+    "name": "sceMpegAvcCsc",
+    "status": "partial"
+  },
+  "0x3251ea56": {
+    "classification": "dedicated",
+    "handler": "h_IoPollAsync",
+    "name": "sceIoPollAsync",
+    "status": "partial"
+  },
+  "0x3278ab0c": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocGameModeCreateReplica",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x328c546a": {
+    "classification": "dedicated",
+    "handler": "h_WaitEventFlagCB",
+    "name": "sceKernelWaitEventFlagCB",
+    "status": "unreviewed"
+  },
+  "0x328f9e52": {
+    "classification": "dedicated",
+    "handler": "h_DeleteVTimer",
+    "name": "sceKernelDeleteVTimer",
+    "status": "partial"
+  },
+  "0x32b156b3": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingStop",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x32bf938e": {
+    "classification": "dedicated",
+    "handler": "h_DeleteTlspl",
+    "name": "sceKernelDeleteTlspl",
+    "status": "unreviewed"
+  },
+  "0x32e32dcb": {
+    "classification": "dedicated",
+    "handler": "h_GamedataDialogShutdown",
+    "name": "sceUtilityGamedataInstallShutdownStart",
+    "status": "unreviewed"
+  },
+  "0x33be4024": {
+    "classification": "dedicated",
+    "handler": "h_ReferMsgPipeStatus",
+    "name": "sceKernelReferMsgPipeStatus",
+    "status": "partial"
+  },
+  "0x33d4ab37": {
+    "classification": "dedicated",
+    "handler": "h_SasRevType",
+    "name": "__sceSasRevType",
+    "status": "unreviewed"
+  },
+  "0x340b7686": {
+    "classification": "dedicated",
+    "handler": "h_UmdGetDiscInfo",
+    "name": "sceUmdGetDiscInfo",
+    "status": "unreviewed"
+  },
+  "0x342061e5": {
+    "classification": "dedicated",
+    "handler": "h_SetCompiledSdkVersion",
+    "name": "sceKernelSetCompiledSdkVersion370",
+    "status": "complete"
+  },
+  "0x34401d65": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlDisconnect",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x34885e0d": {
+    "classification": "dedicated",
+    "handler": "h_RtcConvertUtcToLocal",
+    "name": "sceRtcConvertUtcToLocalTime",
+    "status": "partial"
+  },
+  "0x349b864d": {
+    "classification": "dedicated",
+    "handler": "h_CancelMsgPipe",
+    "name": "sceKernelCancelMsgPipe",
+    "status": "partial"
+  },
+  "0x349d6d6c": {
+    "classification": "dedicated",
+    "handler": "h_CheckCallback",
+    "name": "sceKernelCheckCallback",
+    "status": "unreviewed"
+  },
+  "0x34b78343": {
+    "classification": "dedicated",
+    "handler": "h_GetSystemParamString",
+    "name": "sceUtilityGetSystemParamString",
+    "status": "partial"
+  },
+  "0x34b9fa9e": {
+    "classification": "dedicated",
+    "handler": "h_DcacheWritebackInvalidateRange",
+    "name": "sceKernelDcacheWritebackInvalidateRange",
+    "status": "unreviewed"
+  },
+  "0x34f9c463": {
+    "classification": "dedicated",
+    "handler": "h_PowerGetPllClockFrequencyInt",
+    "name": "scePowerGetPllClockFrequencyInt",
+    "status": "partial"
+  },
+  "0x3548aec8": {
+    "classification": "dedicated",
+    "handler": "h_Mp3GetFrameNum",
+    "name": "sceMp3GetFrameNum",
+    "status": "unreviewed"
+  },
+  "0x354d27ea": {
+    "classification": "dedicated",
+    "handler": "h_Mp3GetSumDecodedSample",
+    "name": "sceMp3GetSumDecodedSample",
+    "status": "unreviewed"
+  },
+  "0x35669d4c": {
+    "classification": "dedicated",
+    "handler": "h_SetCompiledSdkVersion",
+    "name": "sceKernelSetCompiledSdkVersion600_602",
+    "status": "complete"
+  },
+  "0x35750070": {
+    "classification": "dedicated",
+    "handler": "h_Mp3InitResource",
+    "name": "sceMp3InitResource",
+    "status": "unreviewed"
+  },
+  "0x358ca1bb": {
+    "classification": "dedicated",
+    "handler": "h_SetCompiledSdkVersion",
+    "name": "sceKernelSetCompiledSdkVersion606",
+    "status": "complete"
+  },
+  "0x35dbd746": {
+    "classification": "dedicated",
+    "handler": "h_IoWaitAsyncCB",
+    "name": "sceIoWaitAsyncCB",
+    "status": "partial"
+  },
+  "0x362a956b": {
+    "classification": "dedicated",
+    "handler": "h_LoadExecForUser_362A956B",
+    "name": "LoadExecForUser_362A956B",
+    "status": "partial"
+  },
+  "0x362cbe8f": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlGetAdhocId",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x369ed59d": {
+    "classification": "dedicated",
+    "handler": "h_GetSystemTimeLow",
+    "name": "sceKernelGetSystemTimeLow",
+    "status": "partial"
+  },
+  "0x36aa6e91": {
+    "classification": "dedicated",
+    "handler": "h_ImposeSetLanguageMode",
+    "name": "sceImposeSetLanguageMode",
+    "status": "unreviewed"
+  },
+  "0x36cdfade": {
+    "classification": "dedicated",
+    "handler": "h_DisplayWaitVblank",
+    "name": "sceDisplayWaitVblank",
+    "status": "unreviewed"
+  },
+  "0x36faabfb": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetNextSample",
+    "name": "sceAtracGetNextSample",
+    "status": "unreviewed"
+  },
+  "0x37295ed8": {
+    "classification": "dedicated",
+    "handler": "h_MpegRingbufferConstruct",
+    "name": "sceMpegRingbufferConstruct",
+    "status": "unreviewed"
+  },
+  "0x37431849": {
+    "classification": "dedicated",
+    "handler": "h_TryLockLwMutex600",
+    "name": "sceKernelTryLockLwMutex_600",
+    "status": "unreviewed"
+  },
+  "0x37fb5c42": {
+    "classification": "dedicated",
+    "handler": "h_GetGPI",
+    "name": "sceKernelGetGPI",
+    "status": "unreviewed"
+  },
+  "0x383f7bcc": {
+    "classification": "dedicated",
+    "handler": "h_TerminateDeleteThread",
+    "name": "sceKernelTerminateDeleteThread",
+    "status": "unreviewed"
+  },
+  "0x38553111": {
+    "classification": "dedicated",
+    "handler": "h_AudioSRCChReserve",
+    "name": "sceAudioSRCChReserve",
+    "status": "partial"
+  },
+  "0x39461b4d": {
+    "classification": "dedicated",
+    "handler": "h_RegFlushRegistry",
+    "name": "sceRegFlushRegistry",
+    "status": "partial"
+  },
+  "0x39810265": {
+    "classification": "dedicated",
+    "handler": "h_ReferVplStatus",
+    "name": "sceKernelReferVplStatus",
+    "status": "unreviewed"
+  },
+  "0x39af39a6": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetInit",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x3a20a200": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceAudiocodecGetEDRAM",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x3a622550": {
+    "classification": "dedicated",
+    "handler": "h_CtrlPeekBufferPositive",
+    "name": "sceCtrlPeekBufferPositive",
+    "status": "partial"
+  },
+  "0x3ad58b8c": {
+    "classification": "dedicated",
+    "handler": "h_SuspendDispatchThread",
+    "name": "sceKernelSuspendDispatchThread",
+    "status": "unreviewed"
+  },
+  "0x3aea8cb6": {
+    "classification": "dedicated",
+    "handler": "h_FontClose",
+    "name": "sceFontClose",
+    "status": "unreviewed"
+  },
+  "0x3aee7261": {
+    "classification": "dedicated",
+    "handler": "h_PowerUnlock",
+    "name": "sceKernelPowerUnlock",
+    "status": "unreviewed"
+  },
+  "0x3b183e26": {
+    "classification": "dedicated",
+    "handler": "h_GetThreadExitStatus",
+    "name": "sceKernelGetThreadExitStatus",
+    "status": "unreviewed"
+  },
+  "0x3b84732d": {
+    "classification": "dedicated",
+    "handler": "h_CpuResumeIntrWithSync",
+    "name": "sceKernelCpuResumeIntrWithSync",
+    "status": "partial"
+  },
+  "0x3c2fa058": {
+    "classification": "dedicated",
+    "handler": "h_Mp3TermResource",
+    "name": "sceMp3TermResource",
+    "status": "unreviewed"
+  },
+  "0x3c4b7e82": {
+    "classification": "dedicated",
+    "handler": "h_FontPointToPixelV",
+    "name": "sceFontPointToPixelV",
+    "status": "partial"
+  },
+  "0x3cef484f": {
+    "classification": "dedicated",
+    "handler": "h_Mp3SetLoopNum",
+    "name": "sceMp3SetLoopNum",
+    "status": "unreviewed"
+  },
+  "0x3d6d25a9": {
+    "classification": "dedicated",
+    "handler": "h_PsmfSetPsmf",
+    "name": "scePsmfPlayerSetPsmf",
+    "status": "unreviewed"
+  },
+  "0x3dfaeba9": {
+    "classification": "dedicated",
+    "handler": "h_OskShutdown",
+    "name": "sceUtilityOskShutdownStart",
+    "status": "unreviewed"
+  },
+  "0x3e0271d3": {
+    "classification": "dedicated",
+    "handler": "h_VolatileMemLock",
+    "name": "sceKernelVolatileMemLock",
+    "status": "unreviewed"
+  },
+  "0x3ea82a4b": {
+    "classification": "dedicated",
+    "handler": "h_PsmfAudioOutSize",
+    "name": "scePsmfPlayerGetAudioOutSize",
+    "status": "unreviewed"
+  },
+  "0x3eaba285": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceHttpAddExtraHeader",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x3ed62233": {
+    "classification": "dedicated",
+    "handler": "h_PsmfGetCurrentPts",
+    "name": "scePsmfPlayerGetCurrentPts",
+    "status": "partial"
+  },
+  "0x3ee30821": {
+    "classification": "dedicated",
+    "handler": "h_DcacheRangeMaintenance",
+    "name": "sceKernelDcacheWritebackRange",
+    "status": "partial"
+  },
+  "0x3f53e640": {
+    "classification": "dedicated",
+    "handler": "h_SignalSema",
+    "name": "sceKernelSignalSema",
+    "status": "partial"
+  },
+  "0x3f6e26b5": {
+    "classification": "dedicated",
+    "handler": "h_AtracSetHalfwayBuffer",
+    "name": "sceAtracSetHalfwayBuffer",
+    "status": "unreviewed"
+  },
+  "0x3f7ad767": {
+    "classification": "dedicated",
+    "handler": "h_RtcGetCurrentTick",
+    "name": "sceRtcGetCurrentTick",
+    "status": "complete"
+  },
+  "0x3fc9ae6a": {
+    "classification": "dedicated",
+    "handler": "h_KernelDevkitVersion",
+    "name": "sceKernelDevkitVersion",
+    "status": "partial"
+  },
+  "0x402fcf22": {
+    "classification": "dedicated",
+    "handler": "h_WaitEventFlag",
+    "name": "sceKernelWaitEventFlag",
+    "status": "partial"
+  },
+  "0x40f1469c": {
+    "classification": "dedicated",
+    "handler": "h_DisplayWaitVblankStartMulti",
+    "name": "sceDisplayWaitVblankStartMulti",
+    "status": "partial"
+  },
+  "0x40f8f435": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingGetPoolMaxAlloc",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x42560f23": {
+    "classification": "dedicated",
+    "handler": "h_MpegRegistStream",
+    "name": "sceMpegRegistStream",
+    "status": "unreviewed"
+  },
+  "0x42778a9f": {
+    "classification": "dedicated",
+    "handler": "h_SasInit",
+    "name": "__sceSasInit",
+    "status": "unreviewed"
+  },
+  "0x42842c77": {
+    "classification": "dedicated",
+    "handler": "h_RtcTickAddYears",
+    "name": "sceRtcTickAddYears",
+    "status": "partial"
+  },
+  "0x42ec03ac": {
+    "classification": "dedicated",
+    "handler": "h_IoWrite",
+    "name": "sceIoWrite",
+    "status": "partial"
+  },
+  "0x43196845": {
+    "classification": "dedicated",
+    "handler": "h_AudioOutput2Release",
+    "name": "sceAudioOutput2Release",
+    "status": "partial"
+  },
+  "0x438a385a": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceGeSaveContext",
+    "refusal_error": "0x80020002",
+    "status": "controlled_unsupported"
+  },
+  "0x440ca7d8": {
+    "classification": "dedicated",
+    "handler": "h_SasSetVolume",
+    "name": "__sceSasSetVolume",
+    "status": "unreviewed"
+  },
+  "0x446d8de6": {
+    "classification": "dedicated",
+    "handler": "h_CreateThread",
+    "name": "sceKernelCreateThread",
+    "status": "partial"
+  },
+  "0x44e07129": {
+    "classification": "dedicated",
+    "handler": "h_Mp3Init",
+    "name": "sceMp3Init",
+    "status": "unreviewed"
+  },
+  "0x4571cc64": {
+    "classification": "dedicated",
+    "handler": "h_MpegAvcDecodeFlush",
+    "name": "sceMpegAvcDecodeFlush",
+    "status": "unreviewed"
+  },
+  "0x469989ad": {
+    "classification": "dedicated",
+    "handler": "h_PowerSetClockFrequency",
+    "name": "scePowerSetClockFrequency630",
+    "status": "partial"
+  },
+  "0x46ebb729": {
+    "classification": "dedicated",
+    "handler": "h_UmdCheckMedium",
+    "name": "sceUmdCheckMedium",
+    "status": "partial"
+  },
+  "0x46f186c3": {
+    "classification": "dedicated",
+    "handler": "h_DisplayWaitVblankStartCB",
+    "name": "sceDisplayWaitVblankStartCB",
+    "status": "unreviewed"
+  },
+  "0x46f61f8b": {
+    "classification": "dedicated",
+    "handler": "h_PsmfGetVideo",
+    "name": "scePsmfPlayerGetVideoData",
+    "status": "partial"
+  },
+  "0x472694cd": {
+    "classification": "dedicated",
+    "handler": "h_FontPointToPixelH",
+    "name": "sceFontPointToPixelH",
+    "status": "partial"
+  },
+  "0x472e3825": {
+    "classification": "dedicated",
+    "handler": "h_AtracSetMOutDataAndGetID",
+    "name": "sceAtracSetMOutDataAndGetID",
+    "status": "unreviewed"
+  },
+  "0x478fe6f5": {
+    "classification": "dedicated",
+    "handler": "h_PowerGetBusClockFrequencyInt",
+    "name": "scePowerGetBusClockFrequency",
+    "status": "partial"
+  },
+  "0x47a0b729": {
+    "classification": "dedicated",
+    "handler": "h_CpuIsIntrSuspended",
+    "name": "sceKernelIsCpuIntrSuspended",
+    "status": "partial"
+  },
+  "0x48293280": {
+    "classification": "dedicated",
+    "handler": "h_FontSetResolution",
+    "name": "sceFontSetResolution",
+    "status": "unreviewed"
+  },
+  "0x4928bd96": {
+    "classification": "dedicated",
+    "handler": "h_MsgDialogAbort",
+    "name": "sceUtilityMsgDialogAbort",
+    "status": "partial"
+  },
+  "0x4a719fb2": {
+    "classification": "dedicated",
+    "handler": "h_FreeTlspl",
+    "name": "sceKernelFreeTlspl",
+    "status": "unreviewed"
+  },
+  "0x4a9e5e29": {
+    "classification": "dedicated",
+    "handler": "h_UmdWaitDriveStatCB",
+    "name": "sceUmdWaitDriveStatCB",
+    "status": "unreviewed"
+  },
+  "0x4aa9ead6": {
+    "classification": "controlled_unsupported",
+    "handler": "h_SasUnsupportedVoice",
+    "name": "__sceSasSetVoiceATRAC3",
+    "status": "controlled_unsupported"
+  },
+  "0x4ac57943": {
+    "classification": "dedicated",
+    "handler": "h_RegisterExitCallback",
+    "name": "sceKernelRegisterExitCallback",
+    "status": "unreviewed"
+  },
+  "0x4aecd179": {
+    "classification": "dedicated",
+    "handler": "h_GamedataDialogUpdate",
+    "name": "sceUtilityGamedataInstallUpdate",
+    "status": "unreviewed"
+  },
+  "0x4b1b5e82": {
+    "classification": "dedicated",
+    "handler": "h_RtcCheckValid",
+    "name": "sceRtcCheckValid",
+    "status": "partial"
+  },
+  "0x4b85c861": {
+    "classification": "dedicated",
+    "handler": "h_OskUpdate",
+    "name": "sceUtilityOskUpdate",
+    "status": "partial"
+  },
+  "0x4c06e472": {
+    "classification": "dedicated",
+    "handler": "h_GeContinue",
+    "name": "sceGeContinue",
+    "status": "partial"
+  },
+  "0x4c145944": {
+    "classification": "dedicated",
+    "handler": "h_ReferLwMutexStatusByID",
+    "name": "sceKernelReferLwMutexStatusByID",
+    "status": "unreviewed"
+  },
+  "0x4ca16893": {
+    "classification": "dedicated",
+    "handler": "h_RegRemoveCategory",
+    "name": "sceRegRemoveCategory",
+    "status": "partial"
+  },
+  "0x4cfa57b0": {
+    "classification": "dedicated",
+    "handler": "h_RtcGetCurrentClock",
+    "name": "sceRtcGetCurrentClock",
+    "status": "complete"
+  },
+  "0x4d4e10ec": {
+    "classification": "dedicated",
+    "handler": "h_DisplayIsVblank",
+    "name": "sceDisplayIsVblank",
+    "status": "unreviewed"
+  },
+  "0x4da4c788": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocPtpSend",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x4db1e739": {
+    "classification": "dedicated",
+    "handler": "h_NetDialogInit",
+    "name": "sceUtilityNetconfInitStart",
+    "status": "unreviewed"
+  },
+  "0x4e3a1105": {
+    "classification": "dedicated",
+    "handler": "h_WaitSema",
+    "name": "sceKernelWaitSema",
+    "status": "partial"
+  },
+  "0x500f0429": {
+    "classification": "dedicated",
+    "handler": "h_MpegFlushStream",
+    "name": "sceMpegFlushStream",
+    "status": "unreviewed"
+  },
+  "0x50647530": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetFreeThreadinfo",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x50a14dfc": {
+    "classification": "dedicated",
+    "handler": "h_SasCoreWithMix",
+    "name": "__sceSasCoreWithMix",
+    "status": "unreviewed"
+  },
+  "0x50c4cd57": {
+    "classification": "dedicated",
+    "handler": "h_SavedataInitStart",
+    "name": "sceUtilitySavedataInitStart",
+    "status": "unreviewed"
+  },
+  "0x50f0c1ec": {
+    "classification": "dedicated",
+    "handler": "h_StartModule",
+    "name": "sceKernelStartModule",
+    "status": "unreviewed"
+  },
+  "0x50f61d8a": {
+    "classification": "dedicated",
+    "handler": "h_FreeMemoryBlock",
+    "name": "sceKernelFreeMemoryBlock",
+    "status": "partial"
+  },
+  "0x52089ca1": {
+    "classification": "dedicated",
+    "handler": "h_GetThreadStackFreeSize",
+    "name": "sceKernelGetThreadStackFreeSize",
+    "status": "unreviewed"
+  },
+  "0x52df196c": {
+    "classification": "dedicated",
+    "handler": "h_Strlen",
+    "name": "strlen",
+    "status": "complete"
+  },
+  "0x53b00e9a": {
+    "classification": "dedicated",
+    "handler": "h_SetVTimerHandlerWide",
+    "name": "sceKernelSetVTimerHandlerWide",
+    "status": "partial"
+  },
+  "0x542ad630": {
+    "classification": "dedicated",
+    "handler": "h_SetVTimerTime",
+    "name": "sceKernelSetVTimerTime",
+    "status": "partial"
+  },
+  "0x54f5fb11": {
+    "classification": "dedicated",
+    "handler": "h_IoDevctl",
+    "name": "sceIoDevctl",
+    "status": "partial"
+  },
+  "0x55c20a00": {
+    "classification": "dedicated",
+    "handler": "h_CreateEventFlag",
+    "name": "sceKernelCreateEventFlag",
+    "status": "partial"
+  },
+  "0x55f4717d": {
+    "classification": "dedicated",
+    "handler": "h_IoChdir",
+    "name": "sceIoChdir",
+    "status": "partial"
+  },
+  "0x56202973": {
+    "classification": "dedicated",
+    "handler": "h_UmdWaitDriveStatWithTimer",
+    "name": "sceUmdWaitDriveStatWithTimer",
+    "status": "unreviewed"
+  },
+  "0x5622b7c1": {
+    "classification": "dedicated",
+    "handler": "h_AtracSetAA3DataAndGetID",
+    "name": "sceAtracSetAA3DataAndGetID",
+    "status": "unreviewed"
+  },
+  "0x56c039b5": {
+    "classification": "dedicated",
+    "handler": "h_CreateVpl",
+    "name": "sceKernelCreateVpl",
+    "status": "partial"
+  },
+  "0x574b6fbc": {
+    "classification": "dedicated",
+    "handler": "h_FontDoneLib",
+    "name": "sceFontDoneLib",
+    "status": "unreviewed"
+  },
+  "0x57641a81": {
+    "classification": "dedicated",
+    "handler": "h_RegCreateKey",
+    "name": "sceRegCreateKey",
+    "status": "partial"
+  },
+  "0x57726bc1": {
+    "classification": "dedicated",
+    "handler": "h_RtcGetDayOfWeek",
+    "name": "sceRtcGetDayOfWeek",
+    "status": "partial"
+  },
+  "0x57fcb733": {
+    "classification": "dedicated",
+    "handler": "h_FontOpenUserFile",
+    "name": "sceFontOpenUserFile",
+    "status": "unreviewed"
+  },
+  "0x58b1f937": {
+    "classification": "dedicated",
+    "handler": "h_PollSema",
+    "name": "sceKernelPollSema",
+    "status": "unreviewed"
+  },
+  "0x58b83577": {
+    "classification": "dedicated",
+    "handler": "h_PsmfSetPsmfCB",
+    "name": "scePsmfPlayerSetPsmfCB",
+    "status": "unreviewed"
+  },
+  "0x591a4aa2": {
+    "classification": "dedicated",
+    "handler": "h_MpegUnRegistStream",
+    "name": "sceMpegUnRegistStream",
+    "status": "unreviewed"
+  },
+  "0x5963991b": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetApctlDelHandler",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x5a014ce0": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlGetGameModeInfo",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x5b37eb1d": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceAudiocodecInit",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x5bf4dd27": {
+    "classification": "dedicated",
+    "handler": "h_LockMutexCB",
+    "name": "sceKernelLockMutexCB",
+    "status": "unreviewed"
+  },
+  "0x5c37c0ae": {
+    "classification": "dedicated",
+    "handler": "h_AudioSRCChRelease",
+    "name": "sceAudioSRCChRelease",
+    "status": "partial"
+  },
+  "0x5cf9d852": {
+    "classification": "dedicated",
+    "handler": "h_AtracSetMOutHalfwayBuffer",
+    "name": "sceAtracSetMOutHalfwayBuffer",
+    "status": "unreviewed"
+  },
+  "0x5d268707": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetStreamDataInfo",
+    "name": "sceAtracGetStreamDataInfo",
+    "status": "unreviewed"
+  },
+  "0x5dd66588": {
+    "classification": "dedicated",
+    "handler": "h_AtracSetAA3HalfwayBufferAndGetID",
+    "name": "sceAtracSetAA3HalfwayBufferAndGetID",
+    "status": "unreviewed"
+  },
+  "0x5e3d4b79": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingSelectTarget",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x5e7f79c9": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlJoin",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x5ec81c55": {
+    "classification": "dedicated",
+    "handler": "h_AudioChReserve",
+    "name": "sceAudioChReserve",
+    "status": "partial"
+  },
+  "0x5f10d406": {
+    "classification": "dedicated",
+    "handler": "h_CpuResumeIntr",
+    "name": "sceKernelCpuResumeIntr",
+    "status": "partial"
+  },
+  "0x5f32beaa": {
+    "classification": "dedicated",
+    "handler": "h_ReferVTimerStatus",
+    "name": "sceKernelReferVTimerStatus",
+    "status": "partial"
+  },
+  "0x5f9529f6": {
+    "classification": "dedicated",
+    "handler": "h_SasSetSL",
+    "name": "__sceSasSetSL",
+    "status": "unreviewed"
+  },
+  "0x5fb86ab0": {
+    "classification": "dedicated",
+    "handler": "h_GeListDeQueue",
+    "name": "sceGeListDeQueue",
+    "status": "partial"
+  },
+  "0x60107536": {
+    "classification": "dedicated",
+    "handler": "h_DeleteLwMutex",
+    "name": "sceKernelDeleteLwMutex",
+    "status": "partial"
+  },
+  "0x606a4649": {
+    "classification": "dedicated",
+    "handler": "h_MpegDelete",
+    "name": "sceMpegDelete",
+    "status": "unreviewed"
+  },
+  "0x60b81f86": {
+    "classification": "dedicated",
+    "handler": "h_CtrlReadBufferNegative",
+    "name": "sceCtrlReadBufferNegative",
+    "status": "partial"
+  },
+  "0x611e9e11": {
+    "classification": "dedicated",
+    "handler": "h_MpegQueryStreamSize",
+    "name": "sceMpegQueryStreamSize",
+    "status": "unreviewed"
+  },
+  "0x616403ba": {
+    "classification": "dedicated",
+    "handler": "h_TerminateThread",
+    "name": "sceKernelTerminateThread",
+    "status": "unreviewed"
+  },
+  "0x617f3fe6": {
+    "classification": "dedicated",
+    "handler": "h_DmacMemcpy",
+    "name": "sceDmacMemcpy",
+    "status": "partial"
+  },
+  "0x61eb33f5": {
+    "classification": "dedicated",
+    "handler": "h_AtracReleaseAtracID",
+    "name": "sceAtracReleaseAtracID",
+    "status": "unreviewed"
+  },
+  "0x623ae665": {
+    "classification": "dedicated",
+    "handler": "h_TryAllocateFpl",
+    "name": "sceKernelTryAllocateFpl",
+    "status": "partial"
+  },
+  "0x627e6f3a": {
+    "classification": "dedicated",
+    "handler": "h_ReferSystemStatus",
+    "name": "sceKernelReferSystemStatus",
+    "status": "partial"
+  },
+  "0x6332aa39": {
+    "classification": "dedicated",
+    "handler": "h_NetDialogStatus",
+    "name": "sceUtilityNetconfGetStatus",
+    "status": "unreviewed"
+  },
+  "0x63632449": {
+    "classification": "dedicated",
+    "handler": "h_IoIoctl",
+    "name": "sceIoIoctl",
+    "status": "unreviewed"
+  },
+  "0x63f2889c": {
+    "classification": "dedicated",
+    "handler": "h_AudioOutput2ChangeLength",
+    "name": "sceAudioOutput2ChangeLength",
+    "status": "unreviewed"
+  },
+  "0x6402490b": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlDelHandler",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x644395e2": {
+    "classification": "dedicated",
+    "handler": "h_GetModuleIdList",
+    "name": "sceKernelGetModuleIdList",
+    "status": "partial"
+  },
+  "0x644e5607": {
+    "classification": "dedicated",
+    "handler": "h_AtracResetPlayPosition",
+    "name": "sceAtracResetPlayPosition",
+    "status": "unreviewed"
+  },
+  "0x647cef33": {
+    "classification": "dedicated",
+    "handler": "h_AudioOutput2Rest",
+    "name": "sceAudioOutput2GetRestSample",
+    "status": "partial"
+  },
+  "0x64d4540e": {
+    "classification": "fake_success",
+    "handler": "h_ReferProfilerNull",
+    "name": "sceKernelReferThreadProfiler",
+    "status": "stub"
+  },
+  "0x64d50c56": {
+    "classification": "dedicated",
+    "handler": "h_UtilityUnloadNetModule",
+    "name": "sceUtilityUnloadNetModule",
+    "status": "partial"
+  },
+  "0x6652b8ca": {
+    "classification": "dedicated",
+    "handler": "h_SetAlarm",
+    "name": "sceKernelSetAlarm",
+    "status": "partial"
+  },
+  "0x67179b1b": {
+    "classification": "dedicated",
+    "handler": "h_MpegAvcInitYCbCr",
+    "name": "sceMpegAvcInitYCbCr",
+    "status": "partial"
+  },
+  "0x67585dfd": {
+    "classification": "dedicated",
+    "handler": "h_VaudioChRelease",
+    "name": "sceVaudioChRelease",
+    "status": "partial"
+  },
+  "0x67af3428": {
+    "classification": "dedicated",
+    "handler": "h_MsgDialogShutdown",
+    "name": "sceUtilityMsgDialogShutdownStart",
+    "status": "unreviewed"
+  },
+  "0x67f17ed7": {
+    "classification": "dedicated",
+    "handler": "h_FontNewLib",
+    "name": "sceFontNewLib",
+    "status": "unreviewed"
+  },
+  "0x682a619b": {
+    "classification": "dedicated",
+    "handler": "h_MpegInit",
+    "name": "sceMpegInit",
+    "status": "unreviewed"
+  },
+  "0x687660fa": {
+    "classification": "dedicated",
+    "handler": "h_CtrlGetIdleCancelThreshold",
+    "name": "sceCtrlGetIdleCancelThreshold",
+    "status": "unreviewed"
+  },
+  "0x68963324": {
+    "classification": "dedicated",
+    "handler": "h_IoLseek32",
+    "name": "sceIoLseek32",
+    "status": "unreviewed"
+  },
+  "0x68a46b95": {
+    "classification": "dedicated",
+    "handler": "h_SasGetEndFlag",
+    "name": "__sceSasGetEndFlag",
+    "status": "unreviewed"
+  },
+  "0x68da9e36": {
+    "classification": "dedicated",
+    "handler": "h_DelayThreadCB",
+    "name": "sceKernelDelayThreadCB",
+    "status": "partial"
+  },
+  "0x6a2774f3": {
+    "classification": "dedicated",
+    "handler": "h_CtrlSetSamplingCycle",
+    "name": "sceCtrlSetSamplingCycle",
+    "status": "partial"
+  },
+  "0x6a638d83": {
+    "classification": "dedicated",
+    "handler": "h_IoRead",
+    "name": "sceIoRead",
+    "status": "partial"
+  },
+  "0x6a8c3cd5": {
+    "classification": "dedicated",
+    "handler": "h_AtracDecodeData",
+    "name": "sceAtracDecodeData",
+    "status": "unreviewed"
+  },
+  "0x6ad345d7": {
+    "classification": "dedicated",
+    "handler": "h_SetGPO",
+    "name": "sceKernelSetGPO",
+    "status": "unreviewed"
+  },
+  "0x6af9b50a": {
+    "classification": "dedicated",
+    "handler": "h_UmdCancelWaitDriveStat",
+    "name": "sceUmdCancelWaitDriveStat",
+    "status": "partial"
+  },
+  "0x6b30100f": {
+    "classification": "dedicated",
+    "handler": "h_UnlockMutex",
+    "name": "sceKernelUnlockMutex",
+    "status": "partial"
+  },
+  "0x6b4a146c": {
+    "classification": "dedicated",
+    "handler": "h_UmdDriveStat",
+    "name": "sceUmdGetDriveStat",
+    "status": "partial"
+  },
+  "0x6d212bac": {
+    "classification": "dedicated",
+    "handler": "h_WaitSemaCB",
+    "name": "sceKernelWaitSemaCB",
+    "status": "unreviewed"
+  },
+  "0x6f92741b": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocPdpCreate",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x6fc46853": {
+    "classification": "dedicated",
+    "handler": "h_AudioChRelease",
+    "name": "sceAudioChRelease",
+    "status": "partial"
+  },
+  "0x6ff40acc": {
+    "classification": "dedicated",
+    "handler": "h_RtcGetTick",
+    "name": "sceRtcGetTick",
+    "status": "complete"
+  },
+  "0x707b7629": {
+    "classification": "dedicated",
+    "handler": "h_MpegFlushAllStream",
+    "name": "sceMpegFlushAllStream",
+    "status": "unreviewed"
+  },
+  "0x70a703f8": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceAudiocodecDecode",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x71040d5c": {
+    "classification": "dedicated",
+    "handler": "h_TryLockLwMutex",
+    "name": "_sceKernelTryLockLwMutex",
+    "status": "partial"
+  },
+  "0x71b19e77": {
+    "classification": "dedicated",
+    "handler": "h_IoLseekAsync",
+    "name": "sceIoLseekAsync",
+    "status": "partial"
+  },
+  "0x71bc9871": {
+    "classification": "dedicated",
+    "handler": "h_ChangeThreadPriority",
+    "name": "sceKernelChangeThreadPriority",
+    "status": "unreviewed"
+  },
+  "0x71ec4271": {
+    "classification": "dedicated",
+    "handler": "h_LibcGettimeofday",
+    "name": "sceKernelLibcGettimeofday",
+    "status": "unreviewed"
+  },
+  "0x721067f3": {
+    "classification": "dedicated",
+    "handler": "h_ReferTlsplStatus",
+    "name": "sceKernelReferTlsplStatus",
+    "status": "unreviewed"
+  },
+  "0x72189c48": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceImposeSetUMDPopup",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x730ed8bc": {
+    "classification": "dedicated",
+    "handler": "h_ReferCallbackStatus",
+    "name": "sceKernelReferCallbackStatus",
+    "status": "unreviewed"
+  },
+  "0x732b042a": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceMp3EndEntry",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x737486f2": {
+    "classification": "dedicated",
+    "handler": "h_PowerSetClockFrequency",
+    "name": "scePowerSetClockFrequency",
+    "status": "partial"
+  },
+  "0x740fccd1": {
+    "classification": "dedicated",
+    "handler": "h_MpegAvcDecodeStop",
+    "name": "sceMpegAvcDecodeStop",
+    "status": "unreviewed"
+  },
+  "0x74829b76": {
+    "classification": "dedicated",
+    "handler": "h_ReceiveMsgPipe",
+    "name": "sceKernelReceiveMsgPipe",
+    "status": "partial"
+  },
+  "0x748cbed9": {
+    "classification": "dedicated",
+    "handler": "h_QueryModuleInfo",
+    "name": "sceKernelQueryModuleInfo",
+    "status": "unreviewed"
+  },
+  "0x7497ea85": {
+    "classification": "controlled_unsupported",
+    "handler": "h_SasUnsupportedVoice",
+    "name": "__sceSasConcatenateATRAC3",
+    "status": "controlled_unsupported"
+  },
+  "0x74ae582a": {
+    "classification": "dedicated",
+    "handler": "h_SasGetEnvelopeHeight",
+    "name": "__sceSasGetEnvelopeHeight",
+    "status": "unreviewed"
+  },
+  "0x74b21701": {
+    "classification": "dedicated",
+    "handler": "h_FontPixelToPointH",
+    "name": "sceFontPixelToPointH",
+    "status": "partial"
+  },
+  "0x75156e8f": {
+    "classification": "dedicated",
+    "handler": "h_ResumeThread",
+    "name": "sceKernelResumeThread",
+    "status": "partial"
+  },
+  "0x7591c7db": {
+    "classification": "dedicated",
+    "handler": "h_SetCompiledSdkVersion",
+    "name": "sceKernelSetCompiledSdkVersion",
+    "status": "complete"
+  },
+  "0x75ecd386": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlGetState",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x769bebb6": {
+    "classification": "dedicated",
+    "handler": "h_MpegRingbufferQueryPackNum",
+    "name": "sceMpegRingbufferQueryPackNum",
+    "status": "unreviewed"
+  },
+  "0x76f01aca": {
+    "classification": "dedicated",
+    "handler": "h_SasSetKeyOn",
+    "name": "__sceSasSetKeyOn",
+    "status": "unreviewed"
+  },
+  "0x773dd3a3": {
+    "classification": "dedicated",
+    "handler": "h_DisplayGetCurrentHcount",
+    "name": "sceDisplayGetCurrentHcount",
+    "status": "unreviewed"
+  },
+  "0x779103a0": {
+    "classification": "dedicated",
+    "handler": "h_IoRename",
+    "name": "sceIoRename",
+    "status": "unreviewed"
+  },
+  "0x779242a2": {
+    "classification": "dedicated",
+    "handler": "h_RtcConvertLocalToUtc",
+    "name": "sceRtcConvertLocalTimeToUTC",
+    "status": "partial"
+  },
+  "0x77ed8b3a": {
+    "classification": "dedicated",
+    "handler": "h_DisplayWaitVblankStartMultiCB",
+    "name": "sceDisplayWaitVblankStartMultiCB",
+    "status": "partial"
+  },
+  "0x780f88d1": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetAtracID",
+    "name": "sceAtracGetAtracID",
+    "status": "unreviewed"
+  },
+  "0x7853182d": {
+    "classification": "dedicated",
+    "handler": "h_SharingDialogUpdate",
+    "name": "sceUtilityGameSharingUpdate",
+    "status": "unreviewed"
+  },
+  "0x787d04d5": {
+    "classification": "dedicated",
+    "handler": "h_SasSetPause",
+    "name": "__sceSasSetPause",
+    "status": "unreviewed"
+  },
+  "0x7945ecda": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingTerm",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x79d1c3fa": {
+    "classification": "dedicated",
+    "handler": "h_DcacheWritebackAll",
+    "name": "sceKernelDcacheWritebackAll",
+    "status": "unreviewed"
+  },
+  "0x7a20e7af": {
+    "classification": "dedicated",
+    "handler": "h_AtracSetDataAndGetID",
+    "name": "sceAtracSetDataAndGetID",
+    "status": "unreviewed"
+  },
+  "0x7c0dc2a0": {
+    "classification": "dedicated",
+    "handler": "h_CreateMsgPipe",
+    "name": "sceKernelCreateMsgPipe",
+    "status": "unreviewed"
+  },
+  "0x7c41f2c2": {
+    "classification": "dedicated",
+    "handler": "h_SendMsgPipeCB",
+    "name": "sceKernelSendMsgPipeCB",
+    "status": "unreviewed"
+  },
+  "0x7cff8cf3": {
+    "classification": "dedicated",
+    "handler": "h_LockLwMutex",
+    "name": "_sceKernelLockLwMutex",
+    "status": "partial"
+  },
+  "0x7db31251": {
+    "classification": "dedicated",
+    "handler": "h_AtracAddStreamData",
+    "name": "sceAtracAddStreamData",
+    "status": "unreviewed"
+  },
+  "0x7de6711b": {
+    "classification": "dedicated",
+    "handler": "h_RtcFormatRFC2822Local",
+    "name": "sceRtcFormatRFC2822LocalTime",
+    "status": "unreviewed"
+  },
+  "0x7e65b999": {
+    "classification": "dedicated",
+    "handler": "h_CancelAlarm",
+    "name": "sceKernelCancelAlarm",
+    "status": "partial"
+  },
+  "0x7e69eda4": {
+    "classification": "dedicated",
+    "handler": "h_HprmIsHeadphoneExist",
+    "name": "sceHprmIsHeadphoneExist",
+    "status": "partial"
+  },
+  "0x7ed29e40": {
+    "classification": "dedicated",
+    "handler": "h_RtcSetTick",
+    "name": "sceRtcSetTick",
+    "status": "complete"
+  },
+  "0x7ed59bc4": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceDisplaySetHoldMode",
+    "refusal_error": "0x80020002",
+    "status": "controlled_unsupported"
+  },
+  "0x7f27bb5e": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocPdpDelete",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x7f696782": {
+    "classification": "dedicated",
+    "handler": "h_Mp3GetMp3ChannelNum",
+    "name": "sceMp3GetMp3ChannelNum",
+    "status": "unreviewed"
+  },
+  "0x7f75c338": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocGameModeCreateMaster",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x800c44df": {
+    "classification": "dedicated",
+    "handler": "h_MpegAtracDecode",
+    "name": "sceMpegAtracDecode",
+    "status": "partial"
+  },
+  "0x809ce29b": {
+    "classification": "dedicated",
+    "handler": "h_ExitDeleteThread",
+    "name": "sceKernelExitDeleteThread",
+    "status": "partial"
+  },
+  "0x810c4bc3": {
+    "classification": "dedicated",
+    "handler": "h_IoClose",
+    "name": "sceIoClose",
+    "status": "partial"
+  },
+  "0x812346e4": {
+    "classification": "dedicated",
+    "handler": "h_ClearEventFlag",
+    "name": "sceKernelClearEventFlag",
+    "status": "partial"
+  },
+  "0x8125221d": {
+    "classification": "dedicated",
+    "handler": "h_CreateMbx",
+    "name": "sceKernelCreateMbx",
+    "status": "partial"
+  },
+  "0x81aee1be": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlGetScanInfo",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x8218b4dd": {
+    "classification": "fake_success",
+    "handler": "h_ReferProfilerNull",
+    "name": "sceKernelReferGlobalProfiler",
+    "status": "stub"
+  },
+  "0x82826f70": {
+    "classification": "dedicated",
+    "handler": "h_SleepThreadCB",
+    "name": "sceKernelSleepThreadCB",
+    "status": "unreviewed"
+  },
+  "0x82bc5777": {
+    "classification": "dedicated",
+    "handler": "h_GetSystemTimeWide",
+    "name": "sceKernelGetSystemTimeWide",
+    "status": "partial"
+  },
+  "0x83bf7afd": {
+    "classification": "dedicated",
+    "handler": "h_AtracSetSecondBuffer",
+    "name": "sceAtracSetSecondBuffer",
+    "status": "unreviewed"
+  },
+  "0x83e85ea0": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetSecondBufferInfo",
+    "name": "sceAtracGetSecondBufferInfo",
+    "status": "unreviewed"
+  },
+  "0x840e8133": {
+    "classification": "dedicated",
+    "handler": "h_WaitThreadEndCB",
+    "name": "sceKernelWaitThreadEndCB",
+    "status": "unreviewed"
+  },
+  "0x843fbf43": {
+    "classification": "dedicated",
+    "handler": "h_PowerSetCpuClockFrequency",
+    "name": "scePowerSetCpuClockFrequency",
+    "status": "partial"
+  },
+  "0x86255ada": {
+    "classification": "dedicated",
+    "handler": "h_DeleteMbx",
+    "name": "sceKernelDeleteMbx",
+    "status": "partial"
+  },
+  "0x868120b5": {
+    "classification": "dedicated",
+    "handler": "h_AtracSetLoopNum",
+    "name": "sceAtracSetLoopNum",
+    "status": "unreviewed"
+  },
+  "0x87440f5e": {
+    "classification": "dedicated",
+    "handler": "h_PowerIsPowerOnline",
+    "name": "scePowerIsPowerOnline",
+    "status": "unreviewed"
+  },
+  "0x874624d6": {
+    "classification": "dedicated",
+    "handler": "h_MpegFinish",
+    "name": "sceMpegFinish",
+    "status": "unreviewed"
+  },
+  "0x87533940": {
+    "classification": "dedicated",
+    "handler": "h_UmdReplaceProhibit",
+    "name": "sceUmdReplaceProhibit",
+    "status": "unreviewed"
+  },
+  "0x87677e40": {
+    "classification": "dedicated",
+    "handler": "h_Mp3GetBitRate",
+    "name": "sceMp3GetBitRate",
+    "status": "unreviewed"
+  },
+  "0x876dbfad": {
+    "classification": "dedicated",
+    "handler": "h_SendMsgPipe",
+    "name": "sceKernelSendMsgPipe",
+    "status": "partial"
+  },
+  "0x877f6d66": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocPtpOpen",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x87c263d1": {
+    "classification": "dedicated",
+    "handler": "h_Mp3GetMaxOutputSample",
+    "name": "sceMp3GetMaxOutputSample",
+    "status": "unreviewed"
+  },
+  "0x87d4dd36": {
+    "classification": "dedicated",
+    "handler": "h_CancelReceiveMbx",
+    "name": "sceKernelCancelReceiveMbx",
+    "status": "partial"
+  },
+  "0x87d9223c": {
+    "classification": "dedicated",
+    "handler": "h_CancelMutex",
+    "name": "sceKernelCancelMutex",
+    "status": "unreviewed"
+  },
+  "0x884c9f90": {
+    "classification": "dedicated",
+    "handler": "h_TrySendMsgPipe",
+    "name": "sceKernelTrySendMsgPipe",
+    "status": "partial"
+  },
+  "0x8874dbe0": {
+    "classification": "dedicated",
+    "handler": "h_DlgGetStatus",
+    "name": "sceUtilitySavedataGetStatus",
+    "status": "unreviewed"
+  },
+  "0x8916c003": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlGetNameByAddr",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x89360950": {
+    "classification": "dedicated",
+    "handler": "h_NetEtherNtostr",
+    "name": "sceNetEtherNtostr",
+    "status": "partial"
+  },
+  "0x8986295e": {
+    "classification": "dedicated",
+    "handler": "h_VaudioOutputBlocking",
+    "name": "sceVaudioOutputBlocking",
+    "status": "partial"
+  },
+  "0x89aa9906": {
+    "classification": "dedicated",
+    "handler": "h_IoOpenAsync",
+    "name": "sceIoOpenAsync",
+    "status": "partial"
+  },
+  "0x89b3d48c": {
+    "classification": "dedicated",
+    "handler": "h_DeleteVpl",
+    "name": "sceKernelDeleteVpl",
+    "status": "partial"
+  },
+  "0x8a389411": {
+    "classification": "dedicated",
+    "handler": "h_DisableSubIntr",
+    "name": "sceKernelDisableSubIntr",
+    "status": "unreviewed"
+  },
+  "0x8ab81558": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceMp3StartEntry",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x8bea2b3e": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocPtpRecv",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x8c1e027d": {
+    "classification": "controlled_unsupported",
+    "handler": "h_MpegGetPcmAu",
+    "name": "sceMpegGetPcmAu",
+    "status": "controlled_unsupported"
+  },
+  "0x8c943191": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceImposeGetBatteryIconStatus",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x8daff657": {
+    "classification": "dedicated",
+    "handler": "h_CreateTlspl",
+    "name": "sceKernelCreateTlspl",
+    "status": "unreviewed"
+  },
+  "0x8db83fdc": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlGetPeerInfo",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x8eb9ec49": {
+    "classification": "dedicated",
+    "handler": "h_DisplayWaitVblankCB",
+    "name": "sceDisplayWaitVblankCB",
+    "status": "unreviewed"
+  },
+  "0x8ef08fce": {
+    "classification": "dedicated",
+    "handler": "h_UmdWaitDriveStat",
+    "name": "sceUmdWaitDriveStat",
+    "status": "unreviewed"
+  },
+  "0x8efb3fa2": {
+    "classification": "dedicated",
+    "handler": "h_PowerGetBatteryLifeTime",
+    "name": "scePowerGetBatteryLifeTime",
+    "status": "partial"
+  },
+  "0x8f2df740": {
+    "classification": "dedicated",
+    "handler": "h_StopUnloadSelfModuleWithStatus",
+    "name": "sceKernelStopUnloadSelfModuleWithStatus",
+    "status": "unreviewed"
+  },
+  "0x8f450998": {
+    "classification": "dedicated",
+    "handler": "h_Mp3GetSamplingRate",
+    "name": "sceMp3GetSamplingRate",
+    "status": "unreviewed"
+  },
+  "0x8f58bedf": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingCancelTargetWithOpt",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x8ffdf9a2": {
+    "classification": "dedicated",
+    "handler": "h_CancelSema",
+    "name": "sceKernelCancelSema",
+    "status": "partial"
+  },
+  "0x912354a7": {
+    "classification": "dedicated",
+    "handler": "h_RotateThreadReadyQueue",
+    "name": "sceKernelRotateThreadReadyQueue",
+    "status": "partial"
+  },
+  "0x91de343c": {
+    "classification": "dedicated",
+    "handler": "h_SetCompiledSdkVersion",
+    "name": "sceKernelSetCompiledSdkVersion500_505",
+    "status": "complete"
+  },
+  "0x91e4f6a7": {
+    "classification": "dedicated",
+    "handler": "h_LibcClock",
+    "name": "sceKernelLibcClock",
+    "status": "unreviewed"
+  },
+  "0x91e70e35": {
+    "classification": "dedicated",
+    "handler": "h_NetDialogUpdate",
+    "name": "sceUtilityNetconfUpdate",
+    "status": "unreviewed"
+  },
+  "0x920f104a": {
+    "classification": "dedicated",
+    "handler": "h_CacheInvalidateAllOther",
+    "name": "sceKernelIcacheInvalidateAll",
+    "status": "unreviewed"
+  },
+  "0x92e41280": {
+    "classification": "dedicated",
+    "handler": "h_RegOpenRegistry",
+    "name": "sceRegOpenRegistry",
+    "status": "partial"
+  },
+  "0x93440b11": {
+    "classification": "dedicated",
+    "handler": "h_WlanOn",
+    "name": "sceWlanDevIsPowerOn",
+    "status": "unreviewed"
+  },
+  "0x93ef3843": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingStart",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x94416130": {
+    "classification": "dedicated",
+    "handler": "h_GetThreadmanIdList",
+    "name": "sceKernelGetThreadmanIdList",
+    "status": "unreviewed"
+  },
+  "0x946963f3": {
+    "classification": "dedicated",
+    "handler": "h_SharingDialogStatus",
+    "name": "sceUtilityGameSharingGetStatus",
+    "status": "unreviewed"
+  },
+  "0x94aa61ee": {
+    "classification": "dedicated",
+    "handler": "h_GetThreadPriority",
+    "name": "sceKernelGetThreadCurrentPriority",
+    "status": "unreviewed"
+  },
+  "0x95a84ee5": {
+    "classification": "dedicated",
+    "handler": "h_PsmfStart",
+    "name": "scePsmfPlayerStart",
+    "status": "unreviewed"
+  },
+  "0x95fc253b": {
+    "classification": "dedicated",
+    "handler": "h_MsgDialogUpdate",
+    "name": "sceUtilityMsgDialogUpdate",
+    "status": "unreviewed"
+  },
+  "0x95fd0c2d": {
+    "classification": "dedicated",
+    "handler": "h_AudioChangeChannelConfig",
+    "name": "sceAudioChangeChannelConfig",
+    "status": "unreviewed"
+  },
+  "0x977de386": {
+    "classification": "dedicated",
+    "handler": "h_LoadModule",
+    "name": "sceKernelLoadModule",
+    "status": "unreviewed"
+  },
+  "0x9790b33c": {
+    "classification": "dedicated",
+    "handler": "h_DlgShutdown",
+    "name": "sceUtilitySavedataShutdownStart",
+    "status": "unreviewed"
+  },
+  "0x980f4895": {
+    "classification": "dedicated",
+    "handler": "h_FontGetCharGlyphImage",
+    "name": "sceFontGetCharGlyphImage",
+    "status": "unreviewed"
+  },
+  "0x984c27e7": {
+    "classification": "dedicated",
+    "handler": "h_DisplayWaitVblankStart",
+    "name": "sceDisplayWaitVblankStart",
+    "status": "partial"
+  },
+  "0x98c204c8": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocGameModeUpdateMaster",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x9944f31f": {
+    "classification": "dedicated",
+    "handler": "h_SuspendThread",
+    "name": "sceKernelSuspendThread",
+    "status": "partial"
+  },
+  "0x99560abe": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlGetAddrByName",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x99944089": {
+    "classification": "dedicated",
+    "handler": "h_SasSetVoice",
+    "name": "__sceSasSetVoice",
+    "status": "unreviewed"
+  },
+  "0x9a1c91d7": {
+    "classification": "dedicated",
+    "handler": "h_MsgDialogStatus",
+    "name": "sceUtilityMsgDialogGetStatus",
+    "status": "unreviewed"
+  },
+  "0x9ac2eeac": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocPtpFlush",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x9ace131e": {
+    "classification": "dedicated",
+    "handler": "h_SleepThread",
+    "name": "sceKernelSleepThread",
+    "status": "partial"
+  },
+  "0x9ae849a7": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetRemainFrame",
+    "name": "sceAtracGetRemainFrame",
+    "status": "unreviewed"
+  },
+  "0x9b71a274": {
+    "classification": "dedicated",
+    "handler": "h_PsmfDelete",
+    "name": "scePsmfPlayerDelete",
+    "status": "unreviewed"
+  },
+  "0x9b745542": {
+    "classification": "dedicated",
+    "handler": "h_NpDrmClearLicenseeKey",
+    "name": "sceNpDrmClearLicenseeKey",
+    "status": "partial"
+  },
+  "0x9badb3eb": {
+    "classification": "dedicated",
+    "handler": "h_PowerGetBusClockFrequencyFloat",
+    "name": "scePowerGetBusClockFrequencyFloat",
+    "status": "partial"
+  },
+  "0x9c5cfb7d": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingGetPoolStat",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x9c6eaad7": {
+    "classification": "dedicated",
+    "handler": "h_DisplayGetVcount",
+    "name": "sceDisplayGetVcount",
+    "status": "partial"
+  },
+  "0x9cd7de03": {
+    "classification": "dedicated",
+    "handler": "h_AtracSetMOutHalfwayBufferAndGetID",
+    "name": "sceAtracSetMOutHalfwayBufferAndGetID",
+    "status": "unreviewed"
+  },
+  "0x9d689e13": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlTerm",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x9d9a5ba1": {
+    "classification": "dedicated",
+    "handler": "h_GetBlockHeadAddr",
+    "name": "sceKernelGetBlockHeadAddr",
+    "status": "partial"
+  },
+  "0x9dcfb7ea": {
+    "classification": "dedicated",
+    "handler": "h_MpegChangeGetAuMode",
+    "name": "sceMpegChangeGetAuMode",
+    "status": "partial"
+  },
+  "0x9df81198": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocPtpAccept",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0x9ec3676a": {
+    "classification": "dedicated",
+    "handler": "h_SasSetADSRmode",
+    "name": "__sceSasSetADSRmode",
+    "status": "unreviewed"
+  },
+  "0x9f9b46b9": {
+    "classification": "dedicated",
+    "handler": "h_CreateNotifyCallback",
+    "name": "sceKernelCreateNotifyCallback",
+    "status": "unreviewed"
+  },
+  "0x9fa03cd3": {
+    "classification": "dedicated",
+    "handler": "h_DeleteThread",
+    "name": "sceKernelDeleteThread",
+    "status": "partial"
+  },
+  "0xa0229362": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocGameModeDeleteMaster",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xa089eca4": {
+    "classification": "dedicated",
+    "handler": "h_Memset",
+    "name": "sceKernelMemset",
+    "status": "complete"
+  },
+  "0xa0b5a7c2": {
+    "classification": "dedicated",
+    "handler": "h_IoReadAsync",
+    "name": "sceIoReadAsync",
+    "status": "partial"
+  },
+  "0xa0b8ca55": {
+    "classification": "dedicated",
+    "handler": "h_PsmfUpdate",
+    "name": "scePsmfPlayerUpdate",
+    "status": "unreviewed"
+  },
+  "0xa0cf2fa4": {
+    "classification": "dedicated",
+    "handler": "h_SasSetKeyOff",
+    "name": "__sceSasSetKeyOff",
+    "status": "unreviewed"
+  },
+  "0xa11c7026": {
+    "classification": "dedicated",
+    "handler": "h_MpegAvcDecodeMode",
+    "name": "sceMpegAvcDecodeMode",
+    "status": "unreviewed"
+  },
+  "0xa12a0514": {
+    "classification": "dedicated",
+    "handler": "h_IoSetAsyncCallback",
+    "name": "sceIoSetAsyncCallback",
+    "status": "partial"
+  },
+  "0xa1336091": {
+    "classification": "dedicated",
+    "handler": "h_NpDrmSetLicenseeKey",
+    "name": "sceNpDrmSetLicenseeKey",
+    "status": "partial"
+  },
+  "0xa14f40b2": {
+    "classification": "dedicated",
+    "handler": "h_VolatileMemTryLock",
+    "name": "sceKernelVolatileMemTryLock",
+    "status": "unreviewed"
+  },
+  "0xa232cbe6": {
+    "classification": "controlled_unsupported",
+    "handler": "h_SasUnsupportedVoice",
+    "name": "__sceSasSetTrianglarWave",
+    "status": "controlled_unsupported"
+  },
+  "0xa291f107": {
+    "classification": "dedicated",
+    "handler": "h_MaxFreeMemSize",
+    "name": "sceKernelMaxFreeMemSize",
+    "status": "partial"
+  },
+  "0xa2bba8be": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetSoundSample",
+    "name": "sceAtracGetSoundSample",
+    "status": "unreviewed"
+  },
+  "0xa3589d81": {
+    "classification": "dedicated",
+    "handler": "h_SasCore",
+    "name": "__sceSasCore",
+    "status": "unreviewed"
+  },
+  "0xa3d81169": {
+    "classification": "dedicated",
+    "handler": "h_PsmfChangePlayMode",
+    "name": "scePsmfPlayerChangePlayMode",
+    "status": "unreviewed"
+  },
+  "0xa4fc06a4": {
+    "classification": "dedicated",
+    "handler": "h_GeSetCallback",
+    "name": "sceGeSetCallback",
+    "status": "partial"
+  },
+  "0xa554a158": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetBitrate",
+    "name": "sceAtracGetBitrate",
+    "status": "unreviewed"
+  },
+  "0xa569e425": {
+    "classification": "dedicated",
+    "handler": "h_VolatileMemUnlock",
+    "name": "sceKernelVolatileMemUnlock",
+    "status": "unreviewed"
+  },
+  "0xa5c055ce": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlCreateEnterGameMode",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xa5da2406": {
+    "classification": "dedicated",
+    "handler": "h_GetSystemParamInt",
+    "name": "sceUtilityGetSystemParamInt",
+    "status": "partial"
+  },
+  "0xa62c6f57": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocTerm",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xa66b0120": {
+    "classification": "dedicated",
+    "handler": "h_ReferEventFlagStatus",
+    "name": "sceKernelReferEventFlagStatus",
+    "status": "partial"
+  },
+  "0xa6bab2e9": {
+    "classification": "dedicated",
+    "handler": "h_StdFd",
+    "name": "sceKernelStdout",
+    "status": "unreviewed"
+  },
+  "0xa703fe0f": {
+    "classification": "dedicated",
+    "handler": "h_Mp3GetInfoToAddStreamData",
+    "name": "sceMp3GetInfoToAddStreamData",
+    "status": "unreviewed"
+  },
+  "0xa7144800": {
+    "classification": "dedicated",
+    "handler": "h_CtrlSetIdleCancelThreshold",
+    "name": "sceCtrlSetIdleCancelThreshold",
+    "status": "unreviewed"
+  },
+  "0xa780cf7e": {
+    "classification": "dedicated",
+    "handler": "h_MpegMallocAvcEsBuf",
+    "name": "sceMpegMallocAvcEsBuf",
+    "status": "unreviewed"
+  },
+  "0xa834319d": {
+    "classification": "dedicated",
+    "handler": "h_FontOpen",
+    "name": "sceFontOpen",
+    "status": "unreviewed"
+  },
+  "0xa85880d0": {
+    "classification": "fake_success",
+    "handler": "h_PowerCheckWlanCoexistenceClock",
+    "name": "scePowerCheckWlanCoexistenceClock",
+    "status": "stub"
+  },
+  "0xa8e8c846": {
+    "classification": "dedicated",
+    "handler": "h_ReferMbxStatus",
+    "name": "sceKernelReferMbxStatus",
+    "status": "partial"
+  },
+  "0xa9c2cb9a": {
+    "classification": "dedicated",
+    "handler": "h_ReferMutexStatus",
+    "name": "sceKernelReferMutexStatus",
+    "status": "partial"
+  },
+  "0xaa73c935": {
+    "classification": "dedicated",
+    "handler": "h_ExitThread",
+    "name": "sceKernelExitThread",
+    "status": "partial"
+  },
+  "0xab1abe07": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceHttpInit",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xab49e76a": {
+    "classification": "dedicated",
+    "handler": "h_GeListEnQueue",
+    "name": "sceGeListEnQueue",
+    "status": "partial"
+  },
+  "0xab96437f": {
+    "classification": "dedicated",
+    "handler": "h_IoSync",
+    "name": "sceIoSync",
+    "status": "partial"
+  },
+  "0xabed3790": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocPdpSend",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xace946e8": {
+    "classification": "dedicated",
+    "handler": "h_IoGetstat",
+    "name": "sceIoGetstat",
+    "status": "partial"
+  },
+  "0xad84d37f": {
+    "classification": "dedicated",
+    "handler": "h_SasSetPitch",
+    "name": "__sceSasSetPitch",
+    "status": "unreviewed"
+  },
+  "0xae6d2027": {
+    "classification": "dedicated",
+    "handler": "h_Mp3GetMPEGVersion",
+    "name": "sceMp3GetMPEGVersion",
+    "status": "unreviewed"
+  },
+  "0xaee7404d": {
+    "classification": "dedicated",
+    "handler": "h_UmdRegisterUMDCallBack",
+    "name": "sceUmdRegisterUMDCallBack",
+    "status": "unreviewed"
+  },
+  "0xaf36d708": {
+    "classification": "dedicated",
+    "handler": "h_TryAllocateVpl",
+    "name": "sceKernelTryAllocateVpl",
+    "status": "partial"
+  },
+  "0xb011922f": {
+    "classification": "dedicated",
+    "handler": "h_AudioRestLen",
+    "name": "sceAudioGetChannelRestLength",
+    "status": "partial"
+  },
+  "0xb011b11f": {
+    "classification": "dedicated",
+    "handler": "h_LockMutex",
+    "name": "sceKernelLockMutex",
+    "status": "partial"
+  },
+  "0xb1a52c83": {
+    "classification": "dedicated",
+    "handler": "h_PowerGetCpuClockFrequencyFloat",
+    "name": "scePowerGetCpuClockFrequencyFloat",
+    "status": "partial"
+  },
+  "0xb1d0e5cd": {
+    "classification": "dedicated",
+    "handler": "h_CtrlPeekLatch",
+    "name": "sceCtrlPeekLatch",
+    "status": "partial"
+  },
+  "0xb240a59e": {
+    "classification": "dedicated",
+    "handler": "h_MpegRingbufferPut",
+    "name": "sceMpegRingbufferPut",
+    "status": "unreviewed"
+  },
+  "0xb287bd61": {
+    "classification": "dedicated",
+    "handler": "h_GeDrawSync",
+    "name": "sceGeDrawSync",
+    "status": "partial"
+  },
+  "0xb293727f": {
+    "classification": "dedicated",
+    "handler": "h_IoChangeAsyncPriority",
+    "name": "sceIoChangeAsyncPriority",
+    "status": "partial"
+  },
+  "0xb29ddf9c": {
+    "classification": "dedicated",
+    "handler": "h_IoDopen",
+    "name": "sceIoDopen",
+    "status": "partial"
+  },
+  "0xb3a59970": {
+    "classification": "dedicated",
+    "handler": "h_GetVTimerBase",
+    "name": "sceKernelGetVTimerBase",
+    "status": "partial"
+  },
+  "0xb3b5d042": {
+    "classification": "fake_success",
+    "handler": "h_ok",
+    "name": "sceAtracGetOutputChannel",
+    "status": "stub"
+  },
+  "0xb435dec5": {
+    "classification": "dedicated",
+    "handler": "h_DcacheWritebackInvalidateAll",
+    "name": "sceKernelDcacheWritebackInvalidateAll",
+    "status": "unreviewed"
+  },
+  "0xb4432bc8": {
+    "classification": "dedicated",
+    "handler": "h_PowerGetBatteryChargingStatus",
+    "name": "scePowerGetBatteryChargingStatus",
+    "status": "partial"
+  },
+  "0xb448ec0d": {
+    "classification": "dedicated",
+    "handler": "h_GeBreak",
+    "name": "sceGeBreak",
+    "status": "partial"
+  },
+  "0xb4f378fa": {
+    "classification": "dedicated",
+    "handler": "h_DisplayIsForeground",
+    "name": "sceDisplayIsForeground",
+    "status": "partial"
+  },
+  "0xb55249d2": {
+    "classification": "dedicated",
+    "handler": "h_CpuIsIntrEnable",
+    "name": "sceKernelIsCpuIntrEnable",
+    "status": "complete"
+  },
+  "0xb57e95d9": {
+    "classification": "dedicated",
+    "handler": "h_GamedataDialogStatus",
+    "name": "sceUtilityGamedataInstallGetStatus",
+    "status": "unreviewed"
+  },
+  "0xb58e61b7": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingSetHelloOpt",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xb5d96c2a": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingGetHelloOpt",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xb5f6dc87": {
+    "classification": "dedicated",
+    "handler": "h_MpegRingbufferAvailable",
+    "name": "sceMpegRingbufferAvailableSize",
+    "status": "unreviewed"
+  },
+  "0xb6d61d02": {
+    "classification": "dedicated",
+    "handler": "h_FreePartitionMemory",
+    "name": "sceKernelFreePartitionMemory",
+    "status": "partial"
+  },
+  "0xb736e9ff": {
+    "classification": "dedicated",
+    "handler": "h_FreeVpl",
+    "name": "sceKernelFreeVpl",
+    "status": "partial"
+  },
+  "0xb7660a23": {
+    "classification": "dedicated",
+    "handler": "h_SasSetNoise",
+    "name": "__sceSasSetNoise",
+    "status": "unreviewed"
+  },
+  "0xb77905ea": {
+    "classification": "dedicated",
+    "handler": "h_GeEdramSetAddrTranslation",
+    "name": "sceGeEdramSetAddrTranslation",
+    "status": "partial"
+  },
+  "0xb7d098c6": {
+    "classification": "dedicated",
+    "handler": "h_CreateMutex",
+    "name": "sceKernelCreateMutex",
+    "status": "partial"
+  },
+  "0xb7e1d8e7": {
+    "classification": "dedicated",
+    "handler": "h_AudioChangeChannelVolume",
+    "name": "sceAudioChangeChannelVolume",
+    "status": "unreviewed"
+  },
+  "0xb7f46618": {
+    "classification": "dedicated",
+    "handler": "h_LoadModuleByID",
+    "name": "sceKernelLoadModuleByID",
+    "status": "unreviewed"
+  },
+  "0xb8a740f4": {
+    "classification": "dedicated",
+    "handler": "h_IoChstat",
+    "name": "sceIoChstat",
+    "status": "partial"
+  },
+  "0xb8d7b3fb": {
+    "classification": "dedicated",
+    "handler": "h_PowerSetBusClockFrequency",
+    "name": "scePowerSetBusClockFrequency",
+    "status": "partial"
+  },
+  "0xb9685118": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocGetPtpStat",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xb9848a74": {
+    "classification": "dedicated",
+    "handler": "h_PsmfGetAudio",
+    "name": "scePsmfPlayerGetAudioData",
+    "status": "partial"
+  },
+  "0xba4051d6": {
+    "classification": "dedicated",
+    "handler": "h_CancelCallback",
+    "name": "sceKernelCancelCallback",
+    "status": "unreviewed"
+  },
+  "0xba6b92e2": {
+    "classification": "dedicated",
+    "handler": "h_SysClock2USec",
+    "name": "sceKernelSysClock2USec",
+    "status": "partial"
+  },
+  "0xbb8e7fe6": {
+    "classification": "dedicated",
+    "handler": "h_FontOpenUserMemory",
+    "name": "sceFontOpenUserMemory",
+    "status": "unreviewed"
+  },
+  "0xbc6febc5": {
+    "classification": "dedicated",
+    "handler": "h_ReferSemaStatus",
+    "name": "sceKernelReferSemaStatus",
+    "status": "partial"
+  },
+  "0xbc75d85b": {
+    "classification": "dedicated",
+    "handler": "h_FontGetFontList",
+    "name": "sceFontGetFontList",
+    "status": "partial"
+  },
+  "0xbd11b7c2": {
+    "classification": "dedicated",
+    "handler": "h_SasGetGrain",
+    "name": "__sceSasGetGrain",
+    "status": "unreviewed"
+  },
+  "0xbd123d9e": {
+    "classification": "dedicated",
+    "handler": "h_DelaySysClockThread",
+    "name": "sceKernelDelaySysClockThread",
+    "status": "unreviewed"
+  },
+  "0xbd2bde07": {
+    "classification": "dedicated",
+    "handler": "h_UmdUnRegisterUMDCallBack",
+    "name": "sceUmdUnRegisterUMDCallBack",
+    "status": "partial"
+  },
+  "0xbd2f1094": {
+    "classification": "dedicated",
+    "handler": "h_LoadExec",
+    "name": "sceKernelLoadExec",
+    "status": "unreviewed"
+  },
+  "0xbd681969": {
+    "classification": "dedicated",
+    "handler": "h_PowerGetBusClockFrequencyInt",
+    "name": "scePowerGetBusClockFrequencyInt",
+    "status": "partial"
+  },
+  "0xbda7d894": {
+    "classification": "dedicated",
+    "handler": "h_HtmlViewerStatus",
+    "name": "sceUtilityHtmlViewerGetStatus",
+    "status": "partial"
+  },
+  "0xbea46419": {
+    "classification": "dedicated",
+    "handler": "h_LockLwMutex",
+    "name": "sceKernelLockLwMutex",
+    "status": "partial"
+  },
+  "0xbed27435": {
+    "classification": "dedicated",
+    "handler": "h_AllocateVpl",
+    "name": "sceKernelAllocateVpl",
+    "status": "partial"
+  },
+  "0xbeed3a47": {
+    "classification": "dedicated",
+    "handler": "h_UnlockLwMutex",
+    "name": "_sceKernelUnlockLwMutex",
+    "status": "partial"
+  },
+  "0xbfa98062": {
+    "classification": "dedicated",
+    "handler": "h_DcacheRangeMaintenance",
+    "name": "sceKernelDcacheInvalidateRange",
+    "status": "partial"
+  },
+  "0xc02cf6b5": {
+    "classification": "dedicated",
+    "handler": "h_MpegQueryPcmEsSize",
+    "name": "sceMpegQueryPcmEsSize",
+    "status": "partial"
+  },
+  "0xc07bb470": {
+    "classification": "dedicated",
+    "handler": "h_CreateFpl",
+    "name": "sceKernelCreateFpl",
+    "status": "partial"
+  },
+  "0xc0b3ffd2": {
+    "classification": "dedicated",
+    "handler": "h_GetVTimerTimeWide",
+    "name": "sceKernelGetVTimerTimeWide",
+    "status": "partial"
+  },
+  "0xc11ba8c4": {
+    "classification": "dedicated",
+    "handler": "h_NotifyCallback",
+    "name": "sceKernelNotifyCallback",
+    "status": "partial"
+  },
+  "0xc132e22f": {
+    "classification": "dedicated",
+    "handler": "h_MpegQueryMemSize",
+    "name": "sceMpegQueryMemSize",
+    "status": "unreviewed"
+  },
+  "0xc152080a": {
+    "classification": "dedicated",
+    "handler": "h_CtrlPeekBufferNegative",
+    "name": "sceCtrlPeekBufferNegative",
+    "status": "partial"
+  },
+  "0xc1734599": {
+    "classification": "dedicated",
+    "handler": "h_ReferLwMutexStatus",
+    "name": "sceKernelReferLwMutexStatus",
+    "status": "unreviewed"
+  },
+  "0xc2df770e": {
+    "classification": "dedicated",
+    "handler": "h_CacheInvalidateRangeOther",
+    "name": "sceKernelIcacheInvalidateRange",
+    "status": "unreviewed"
+  },
+  "0xc41c2853": {
+    "classification": "dedicated",
+    "handler": "h_RtcGetTickResolution",
+    "name": "sceRtcGetTickResolution",
+    "status": "complete"
+  },
+  "0xc45c99cc": {
+    "classification": "dedicated",
+    "handler": "h_MpegQueryUserdataEsSize",
+    "name": "sceMpegQueryUserdataEsSize",
+    "status": "partial"
+  },
+  "0xc492f751": {
+    "classification": "dedicated",
+    "handler": "h_SharingDialogInit",
+    "name": "sceUtilityGameSharingInitStart",
+    "status": "unreviewed"
+  },
+  "0xc5768d02": {
+    "classification": "dedicated",
+    "handler": "h_RegGetKeyInfoByName",
+    "name": "sceRegGetKeyInfoByName",
+    "status": "partial"
+  },
+  "0xc58bcd9e": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingGetMembers",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xc6183d47": {
+    "classification": "dedicated",
+    "handler": "h_UmdActivate",
+    "name": "sceUmdActivate",
+    "status": "partial"
+  },
+  "0xc629af26": {
+    "classification": "dedicated",
+    "handler": "h_UtilityLoadAvModule",
+    "name": "sceUtilityLoadAvModule",
+    "status": "unreviewed"
+  },
+  "0xc68d9437": {
+    "classification": "dedicated",
+    "handler": "h_StartVTimer",
+    "name": "sceKernelStartVTimer",
+    "status": "partial"
+  },
+  "0xc69bebce": {
+    "classification": "dedicated",
+    "handler": "h_OpenPSIDGetOpenPSID",
+    "name": "sceOpenPSIDGetOpenPSID",
+    "status": "unreviewed"
+  },
+  "0xc7c1fc57": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocGetPdpStat",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xc8cd158c": {
+    "classification": "dedicated",
+    "handler": "h_USec2SysClockWide",
+    "name": "sceKernelUSec2SysClockWide",
+    "status": "partial"
+  },
+  "0xca04a2b9": {
+    "classification": "dedicated",
+    "handler": "h_RegisterSubIntr",
+    "name": "sceKernelRegisterSubIntrHandler",
+    "status": "unreviewed"
+  },
+  "0xca3ca3d2": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetBufferInfoForResetting",
+    "name": "sceAtracGetBufferInfoForReseting",
+    "status": "unreviewed"
+  },
+  "0xca5eda6f": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingCreate",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xcab439df": {
+    "classification": "dedicated",
+    "handler": "h_KernelPrintf",
+    "name": "printf",
+    "status": "unreviewed"
+  },
+  "0xcb05f8d6": {
+    "classification": "dedicated",
+    "handler": "h_IoGetAsyncStat",
+    "name": "sceIoGetAsyncStat",
+    "status": "partial"
+  },
+  "0xcb2e439e": {
+    "classification": "dedicated",
+    "handler": "h_AudioSetChannelDataLen",
+    "name": "sceAudioSetChannelDataLen",
+    "status": "unreviewed"
+  },
+  "0xcbcd4f79": {
+    "classification": "dedicated",
+    "handler": "h_SasSetSimpleADSR",
+    "name": "__sceSasSetSimpleADSR",
+    "status": "unreviewed"
+  },
+  "0xcbe9f02a": {
+    "classification": "dedicated",
+    "handler": "h_UmdReplacePermit",
+    "name": "sceUmdReplacePermit",
+    "status": "unreviewed"
+  },
+  "0xcc393e48": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetGetMallocStat",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xcd203292": {
+    "classification": "dedicated",
+    "handler": "h_CancelEventFlag",
+    "name": "sceKernelCancelEventFlag",
+    "status": "partial"
+  },
+  "0xceadeb47": {
+    "classification": "dedicated",
+    "handler": "h_DelayThread",
+    "name": "sceKernelDelayThread",
+    "status": "partial"
+  },
+  "0xceb870b1": {
+    "classification": "dedicated",
+    "handler": "h_MpegFreeAvcEsBuf",
+    "name": "sceMpegFreeAvcEsBuf",
+    "status": "unreviewed"
+  },
+  "0xcf561893": {
+    "classification": "dedicated",
+    "handler": "h_RtcGetWin32FileTime",
+    "name": "sceRtcGetWin32FileTime",
+    "status": "partial"
+  },
+  "0xcf8e084d": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlExitGameMode",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xd021c0fb": {
+    "classification": "dedicated",
+    "handler": "h_Mp3Decode",
+    "name": "sceMp3Decode",
+    "status": "unreviewed"
+  },
+  "0xd0a56296": {
+    "classification": "dedicated",
+    "handler": "h_Mp3CheckStreamDataNeeded",
+    "name": "sceMp3CheckStreamDataNeeded",
+    "status": "unreviewed"
+  },
+  "0xd0aeee87": {
+    "classification": "dedicated",
+    "handler": "h_StopVTimer",
+    "name": "sceKernelStopVTimer",
+    "status": "partial"
+  },
+  "0xd13bde95": {
+    "classification": "dedicated",
+    "handler": "h_CheckThreadStack",
+    "name": "sceKernelCheckThreadStack",
+    "status": "partial"
+  },
+  "0xd1c8945e": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceHttpEnd",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xd1e0a01e": {
+    "classification": "dedicated",
+    "handler": "h_SasSetGrain",
+    "name": "__sceSasSetGrain",
+    "status": "unreviewed"
+  },
+  "0xd1f59fdb": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceAtracStartEntry",
+    "refusal_error": "0x80630004",
+    "status": "controlled_unsupported"
+  },
+  "0xd1ff982a": {
+    "classification": "dedicated",
+    "handler": "h_StopModule_Trace",
+    "name": "sceKernelStopModule",
+    "status": "unreviewed"
+  },
+  "0xd2d615ef": {
+    "classification": "dedicated",
+    "handler": "h_CancelVTimerHandler",
+    "name": "sceKernelCancelVTimerHandler",
+    "status": "partial"
+  },
+  "0xd3075926": {
+    "classification": "dedicated",
+    "handler": "h_PowerIsLowBattery",
+    "name": "scePowerIsLowBattery",
+    "status": "unreviewed"
+  },
+  "0xd4475aa8": {
+    "classification": "dedicated",
+    "handler": "h_RegGetKeyInfo",
+    "name": "sceRegGetKeyInfo",
+    "status": "partial"
+  },
+  "0xd4b95ffb": {
+    "classification": "dedicated",
+    "handler": "h_SavedataUpdate",
+    "name": "sceUtilitySavedataUpdate",
+    "status": "unreviewed"
+  },
+  "0xd59ead2f": {
+    "classification": "dedicated",
+    "handler": "h_WakeupThread",
+    "name": "sceKernelWakeupThread",
+    "status": "partial"
+  },
+  "0xd5a229c9": {
+    "classification": "dedicated",
+    "handler": "h_SasRevEVOL",
+    "name": "__sceSasRevEVOL",
+    "status": "unreviewed"
+  },
+  "0xd5c28cc0": {
+    "classification": "dedicated",
+    "handler": "h_AtracReleaseResources",
+    "name": "sceAtracReleaseResources",
+    "status": "unreviewed"
+  },
+  "0xd5ebbbcd": {
+    "classification": "controlled_unsupported",
+    "handler": "h_SasUnsupportedVoice",
+    "name": "__sceSasSetSteepWave",
+    "status": "controlled_unsupported"
+  },
+  "0xd61e6961": {
+    "classification": "dedicated",
+    "handler": "h_ReleaseSubIntr",
+    "name": "sceKernelReleaseSubIntrHandler",
+    "status": "unreviewed"
+  },
+  "0xd675ebb8": {
+    "classification": "dedicated",
+    "handler": "h_SelfStopUnloadModule",
+    "name": "sceKernelSelfStopUnloadModule",
+    "status": "unreviewed"
+  },
+  "0xd6a5f2f7": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetMaxSample",
+    "name": "sceAtracGetMaxSample",
+    "status": "unreviewed"
+  },
+  "0xd6da4ba1": {
+    "classification": "dedicated",
+    "handler": "h_CreateSema",
+    "name": "sceKernelCreateSema",
+    "status": "partial"
+  },
+  "0xd7763699": {
+    "classification": "dedicated",
+    "handler": "h_WlanOn",
+    "name": "sceWlanGetSwitchState",
+    "status": "unreviewed"
+  },
+  "0xd7a29f46": {
+    "classification": "dedicated",
+    "handler": "h_MpegRingbufferQueryMemSize",
+    "name": "sceMpegRingbufferQueryMemSize",
+    "status": "unreviewed"
+  },
+  "0xd81957b7": {
+    "classification": "dedicated",
+    "handler": "h_ScreenshotStatus",
+    "name": "sceUtilityScreenshotGetStatus",
+    "status": "partial"
+  },
+  "0xd8199e4c": {
+    "classification": "dedicated",
+    "handler": "h_ReferFplStatus",
+    "name": "sceKernelReferFplStatus",
+    "status": "partial"
+  },
+  "0xd8779ac6": {
+    "classification": "dedicated",
+    "handler": "h_CacheInvalidateAllOther",
+    "name": "sceKernelIcacheClearAll",
+    "status": "unreviewed"
+  },
+  "0xd8b299ae": {
+    "classification": "dedicated",
+    "handler": "h_SetVTimerHandler",
+    "name": "sceKernelSetVTimerHandler",
+    "status": "partial"
+  },
+  "0xd8b73127": {
+    "classification": "dedicated",
+    "handler": "h_GetModuleIdByAddress",
+    "name": "sceKernelGetModuleIdByAddress",
+    "status": "unreviewed"
+  },
+  "0xd8c5f121": {
+    "classification": "dedicated",
+    "handler": "h_MpegCreate",
+    "name": "sceMpegCreate",
+    "status": "unreviewed"
+  },
+  "0xd8f54a51": {
+    "classification": "dedicated",
+    "handler": "h_Mp3GetLoopNum",
+    "name": "sceMp3GetLoopNum",
+    "status": "unreviewed"
+  },
+  "0xd979e9bf": {
+    "classification": "dedicated",
+    "handler": "h_AllocateFpl",
+    "name": "sceKernelAllocateFpl",
+    "status": "partial"
+  },
+  "0xd97f94d8": {
+    "classification": "dedicated",
+    "handler": "h_DmacTryMemcpy",
+    "name": "sceDmacTryMemcpy",
+    "status": "partial"
+  },
+  "0xda6b76a1": {
+    "classification": "dedicated",
+    "handler": "h_CtrlGetSamplingMode",
+    "name": "sceCtrlGetSamplingMode",
+    "status": "partial"
+  },
+  "0xdb738f35": {
+    "classification": "dedicated",
+    "handler": "h_GetSystemTime",
+    "name": "sceKernelGetSystemTime",
+    "status": "partial"
+  },
+  "0xdb83a952": {
+    "classification": "dedicated",
+    "handler": "h_GetMemoryBlockAddr",
+    "name": "sceKernelGetMemoryBlockAddr",
+    "status": "partial"
+  },
+  "0xdba6c4c4": {
+    "classification": "dedicated",
+    "handler": "h_DisplayGetFramePerSec",
+    "name": "sceDisplayGetFramePerSec",
+    "status": "complete"
+  },
+  "0xdc692ee3": {
+    "classification": "dedicated",
+    "handler": "h_TryLockLwMutex",
+    "name": "sceKernelTryLockLwMutex",
+    "status": "partial"
+  },
+  "0xdc93cfef": {
+    "classification": "dedicated",
+    "handler": "h_GeGetCmd",
+    "name": "sceGeGetCmd",
+    "status": "unreviewed"
+  },
+  "0xdcc80c2f": {
+    "classification": "dedicated",
+    "handler": "h_FontGetCharInfo",
+    "name": "sceFontGetCharInfo",
+    "status": "unreviewed"
+  },
+  "0xdea197d4": {
+    "classification": "dedicated",
+    "handler": "h_DisplayGetMode",
+    "name": "sceDisplayGetMode",
+    "status": "unreviewed"
+  },
+  "0xded9d28e": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlGetParameter",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xdf089680": {
+    "classification": "dedicated",
+    "handler": "h_PsmfGetPsmfInfo",
+    "name": "scePsmfPlayerGetPsmfInfo",
+    "status": "partial"
+  },
+  "0xdf52098f": {
+    "classification": "dedicated",
+    "handler": "h_TryReceiveMsgPipe",
+    "name": "sceKernelTryReceiveMsgPipe",
+    "status": "partial"
+  },
+  "0xdfa8baf8": {
+    "classification": "dedicated",
+    "handler": "h_PowerUnregisterCallback",
+    "name": "scePowerUnregisterCallback",
+    "status": "unreviewed"
+  },
+  "0xdfe53e03": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocPdpRecv",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xe0727056": {
+    "classification": "dedicated",
+    "handler": "h_AudioSRCOutputBlocking",
+    "name": "sceAudioSRCOutputBlocking",
+    "status": "partial"
+  },
+  "0xe08bdac1": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocPtpListen",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xe0d68148": {
+    "classification": "dedicated",
+    "handler": "h_GeListUpdateStallAddr",
+    "name": "sceGeListUpdateStallAddr",
+    "status": "partial"
+  },
+  "0xe1619d7c": {
+    "classification": "dedicated",
+    "handler": "h_SysClock2USecWide",
+    "name": "sceKernelSysClock2USecWide",
+    "status": "partial"
+  },
+  "0xe162cb14": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlGetPeerList",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xe175ef66": {
+    "classification": "dedicated",
+    "handler": "h_SasGetOutputmode",
+    "name": "__sceSasGetOutputmode",
+    "status": "unreviewed"
+  },
+  "0xe1c93e47": {
+    "classification": "dedicated",
+    "handler": "h_RtcGetTime64_t",
+    "name": "sceRtcGetTime64_t",
+    "status": "partial"
+  },
+  "0xe1cd9561": {
+    "classification": "dedicated",
+    "handler": "h_SasSetVoicePCM",
+    "name": "__sceSasSetVoicePCM",
+    "status": "unreviewed"
+  },
+  "0xe1ce83a7": {
+    "classification": "dedicated",
+    "handler": "h_MpegGetAtracAu",
+    "name": "sceMpegGetAtracAu",
+    "status": "partial"
+  },
+  "0xe1d621d7": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocInit",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xe23e3a35": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetNextDecodePosition",
+    "name": "sceAtracGetNextDecodePosition",
+    "status": "unreviewed"
+  },
+  "0xe23eec33": {
+    "classification": "dedicated",
+    "handler": "h_IoWaitAsync",
+    "name": "sceIoWaitAsync",
+    "status": "partial"
+  },
+  "0xe26f226e": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlInit",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xe2d56b2d": {
+    "classification": "dedicated",
+    "handler": "h_AudioOutputPannedBlocking",
+    "name": "sceAudioOutputPanned",
+    "status": "unreviewed"
+  },
+  "0xe3eb004c": {
+    "classification": "dedicated",
+    "handler": "h_IoDread",
+    "name": "sceIoDread",
+    "status": "partial"
+  },
+  "0xe3ee2c81": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceMp3LowLevelDecode",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xe47e40e4": {
+    "classification": "dedicated",
+    "handler": "h_GeEdramGetAddr",
+    "name": "sceGeEdramGetAddr",
+    "status": "complete"
+  },
+  "0xe49bfe92": {
+    "classification": "dedicated",
+    "handler": "h_UtilityUnloadModule",
+    "name": "sceUtilityUnloadModule",
+    "status": "partial"
+  },
+  "0xe51b4b7a": {
+    "classification": "dedicated",
+    "handler": "h_RtcTickAddDays",
+    "name": "sceRtcTickAddDays",
+    "status": "partial"
+  },
+  "0xe7282cb6": {
+    "classification": "dedicated",
+    "handler": "h_AllocateFplCB",
+    "name": "sceKernelAllocateFplCB",
+    "status": "unreviewed"
+  },
+  "0xe792cd94": {
+    "classification": "dedicated",
+    "handler": "h_PsmfRelease",
+    "name": "scePsmfPlayerReleasePsmf",
+    "status": "unreviewed"
+  },
+  "0xe7c27d1b": {
+    "classification": "dedicated",
+    "handler": "h_RtcGetCurrentClockLocal",
+    "name": "sceRtcGetCurrentClockLocalTime",
+    "status": "partial"
+  },
+  "0xe81caf8f": {
+    "classification": "dedicated",
+    "handler": "h_CreateCallback",
+    "name": "sceKernelCreateCallback",
+    "status": "unreviewed"
+  },
+  "0xe83742ba": {
+    "classification": "dedicated",
+    "handler": "h_UmdDeactivate",
+    "name": "sceUmdDeactivate",
+    "status": "partial"
+  },
+  "0xe855bf76": {
+    "classification": "dedicated",
+    "handler": "h_SasSetOutputmode",
+    "name": "__sceSasSetOutputmode",
+    "status": "unreviewed"
+  },
+  "0xe88f759b": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetInternalErrorInfo",
+    "name": "sceAtracGetInternalErrorInfo",
+    "status": "unreviewed"
+  },
+  "0xe95a012b": {
+    "classification": "dedicated",
+    "handler": "h_IoIoctlAsync",
+    "name": "sceIoIoctlAsync",
+    "status": "partial"
+  },
+  "0xe9b3061e": {
+    "classification": "dedicated",
+    "handler": "h_SendMbx",
+    "name": "sceKernelSendMbx",
+    "status": "partial"
+  },
+  "0xea382a27": {
+    "classification": "dedicated",
+    "handler": "h_PowerGetPllClockFrequencyFloat",
+    "name": "scePowerGetPllClockFrequencyFloat",
+    "status": "partial"
+  },
+  "0xea3c6108": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingCancelTarget",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xea748e31": {
+    "classification": "dedicated",
+    "handler": "h_ChangeCurrentThreadAttr",
+    "name": "sceKernelChangeCurrentThreadAttr",
+    "status": "unreviewed"
+  },
+  "0xeadb1bd7": {
+    "classification": "dedicated",
+    "handler": "h_PowerLock",
+    "name": "sceKernelPowerLock",
+    "status": "unreviewed"
+  },
+  "0xeb092469": {
+    "classification": "dedicated",
+    "handler": "h_IoDclose",
+    "name": "sceIoDclose",
+    "status": "partial"
+  },
+  "0xebd177d6": {
+    "classification": "dedicated",
+    "handler": "h_PowerSetClockFrequency",
+    "name": "scePowerSetClockFrequency350",
+    "status": "partial"
+  },
+  "0xebd5c3e6": {
+    "classification": "dedicated",
+    "handler": "h_SetCompiledSdkVersion",
+    "name": "sceKernelSetCompiledSdkVersion395",
+    "status": "complete"
+  },
+  "0xec0635c1": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocctlCreate",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xec0a693f": {
+    "classification": "dedicated",
+    "handler": "h_AllocateVplCB",
+    "name": "sceKernelAllocateVplCB",
+    "status": "unreviewed"
+  },
+  "0xec19337d": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingAbortSendData",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xeca32a99": {
+    "classification": "dedicated",
+    "handler": "h_AtracIsSecondBufferNeeded",
+    "name": "sceAtracIsSecondBufferNeeded",
+    "status": "unreviewed"
+  },
+  "0xed1410e0": {
+    "classification": "dedicated",
+    "handler": "h_DeleteFpl",
+    "name": "sceKernelDeleteFpl",
+    "status": "partial"
+  },
+  "0xedba5844": {
+    "classification": "dedicated",
+    "handler": "h_DeleteCallback",
+    "name": "sceKernelDeleteCallback",
+    "status": "unreviewed"
+  },
+  "0xee232411": {
+    "classification": "dedicated",
+    "handler": "h_FontSetAltCharacterCode",
+    "name": "sceFontSetAltCharacterCode",
+    "status": "partial"
+  },
+  "0xeeda2e54": {
+    "classification": "dedicated",
+    "handler": "h_DisplayGetFrameBuf",
+    "name": "sceDisplayGetFrameBuf",
+    "status": "unreviewed"
+  },
+  "0xef9e4c70": {
+    "classification": "dedicated",
+    "handler": "h_DeleteEventFlag",
+    "name": "sceKernelDeleteEventFlag",
+    "status": "partial"
+  },
+  "0xefc6f80f": {
+    "classification": "dedicated",
+    "handler": "h_SharingDialogShutdown",
+    "name": "sceUtilityGameSharingShutdownStart",
+    "status": "unreviewed"
+  },
+  "0xf0a26395": {
+    "classification": "dedicated",
+    "handler": "h_GetModuleId",
+    "name": "sceKernelGetModuleId",
+    "status": "unreviewed"
+  },
+  "0xf0b7da1c": {
+    "classification": "dedicated",
+    "handler": "h_DeleteMsgPipe",
+    "name": "sceKernelDeleteMsgPipe",
+    "status": "partial"
+  },
+  "0xf0eb1125": {
+    "classification": "dedicated",
+    "handler": "h_MpegAvcDecodeYCbCr",
+    "name": "sceMpegAvcDecodeYCbCr",
+    "status": "partial"
+  },
+  "0xf16eaf4f": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingDelete",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xf27a9c51": {
+    "classification": "dedicated",
+    "handler": "h_IoRemove",
+    "name": "sceIoRemove",
+    "status": "complete"
+  },
+  "0xf2930c9c": {
+    "classification": "dedicated",
+    "handler": "h_MpegAvcDecodeStopYCbCr",
+    "name": "sceMpegAvcDecodeStopYCbCr",
+    "status": "partial"
+  },
+  "0xf2a4afe5": {
+    "classification": "dedicated",
+    "handler": "h_RtcTickAddSeconds",
+    "name": "sceRtcTickAddSeconds",
+    "status": "partial"
+  },
+  "0xf3986382": {
+    "classification": "dedicated",
+    "handler": "h_ReceiveMbxCB",
+    "name": "sceKernelReceiveMbxCB",
+    "status": "partial"
+  },
+  "0xf3f76017": {
+    "classification": "dedicated",
+    "handler": "h_OskGetStatus",
+    "name": "sceUtilityOskGetStatus",
+    "status": "unreviewed"
+  },
+  "0xf475845d": {
+    "classification": "dedicated",
+    "handler": "h_StartThread",
+    "name": "sceKernelStartThread",
+    "status": "partial"
+  },
+  "0xf5478233": {
+    "classification": "dedicated",
+    "handler": "h_Mp3ReleaseMp3Handle",
+    "name": "sceMp3ReleaseMp3Handle",
+    "status": "unreviewed"
+  },
+  "0xf6107f00": {
+    "classification": "controlled_unsupported",
+    "handler": "h_SasUnsupportedVoice",
+    "name": "__sceSasUnsetATRAC3",
+    "status": "controlled_unsupported"
+  },
+  "0xf6269b82": {
+    "classification": "dedicated",
+    "handler": "h_OskInitStart",
+    "name": "sceUtilityOskInitStart",
+    "status": "unreviewed"
+  },
+  "0xf6414a71": {
+    "classification": "dedicated",
+    "handler": "h_FreeFpl",
+    "name": "sceKernelFreeFpl",
+    "status": "partial"
+  },
+  "0xf64910f0": {
+    "classification": "dedicated",
+    "handler": "h_UtilityUnloadUsbModule",
+    "name": "sceUtilityUnloadUsbModule",
+    "status": "unreviewed"
+  },
+  "0xf6837a1a": {
+    "classification": "dedicated",
+    "handler": "h_AtracSetMOutData",
+    "name": "sceAtracSetMOutData",
+    "status": "unreviewed"
+  },
+  "0xf77d77cb": {
+    "classification": "dedicated",
+    "handler": "h_SetCompiledSdkVersion",
+    "name": "sceKernelSetCompilerVersion",
+    "status": "complete"
+  },
+  "0xf78ba90a": {
+    "classification": "dedicated",
+    "handler": "h_StdFd",
+    "name": "sceKernelStderr",
+    "status": "unreviewed"
+  },
+  "0xf79472d7": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocMatchingSendData",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xf7d13214": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocDiscoverStop",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xf7d8d092": {
+    "classification": "dedicated",
+    "handler": "h_UtilityUnloadAvModule",
+    "name": "sceUtilityUnloadAvModule",
+    "status": "unreviewed"
+  },
+  "0xf8170fbe": {
+    "classification": "dedicated",
+    "handler": "h_DeleteMutex",
+    "name": "sceKernelDeleteMutex",
+    "status": "unreviewed"
+  },
+  "0xf88155f6": {
+    "classification": "dedicated",
+    "handler": "h_NetDialogShutdown",
+    "name": "sceUtilityNetconfShutdownStart",
+    "status": "unreviewed"
+  },
+  "0xf8dcb679": {
+    "classification": "dedicated",
+    "handler": "h_MpegQueryAtracEsSize",
+    "name": "sceMpegQueryAtracEsSize",
+    "status": "unreviewed"
+  },
+  "0xf8ef08a6": {
+    "classification": "dedicated",
+    "handler": "h_PsmfStatus",
+    "name": "scePsmfPlayerGetCurrentStatus",
+    "status": "unreviewed"
+  },
+  "0xf8f0752e": {
+    "classification": "dedicated",
+    "handler": "h_FontPixelToPointV",
+    "name": "sceFontPixelToPointV",
+    "status": "partial"
+  },
+  "0xf919f628": {
+    "classification": "dedicated",
+    "handler": "h_TotalFreeMemSize",
+    "name": "sceKernelTotalFreeMemSize",
+    "status": "unreviewed"
+  },
+  "0xf9275d98": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceKernelLoadModuleBufferUsbWlan",
+    "refusal_error": "0x80020002",
+    "status": "controlled_unsupported"
+  },
+  "0xf983b186": {
+    "classification": "dedicated",
+    "handler": "h_SasRevVON",
+    "name": "__sceSasRevVON",
+    "status": "unreviewed"
+  },
+  "0xf9d8eb63": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceHttpsEnd",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xfa324b4e": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocGameModeUpdateReplica",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xfa835cde": {
+    "classification": "dedicated",
+    "handler": "h_GetTlsAddr",
+    "name": "sceKernelGetTlsAddr",
+    "status": "unreviewed"
+  },
+  "0xfa8a5739": {
+    "classification": "dedicated",
+    "handler": "h_RegCloseRegistry",
+    "name": "sceRegCloseRegistry",
+    "status": "partial"
+  },
+  "0xfaa4f89b": {
+    "classification": "dedicated",
+    "handler": "h_AtracGetLoopStatus",
+    "name": "sceAtracGetLoopStatus",
+    "status": "unreviewed"
+  },
+  "0xfb6425c3": {
+    "classification": "dedicated",
+    "handler": "h_SetVTimerTimeWide",
+    "name": "sceKernelSetVTimerTimeWide",
+    "status": "partial"
+  },
+  "0xfb8e22ec": {
+    "classification": "dedicated",
+    "handler": "h_EnableSubIntr",
+    "name": "sceKernelEnableSubIntr",
+    "status": "unreviewed"
+  },
+  "0xfbfa697d": {
+    "classification": "dedicated",
+    "handler": "h_ReceiveMsgPipeCB",
+    "name": "sceKernelReceiveMsgPipeCB",
+    "status": "unreviewed"
+  },
+  "0xfc6fc07b": {
+    "classification": "controlled_unsupported",
+    "handler": "h_ControlledUnsupported",
+    "name": "sceNetAdhocPtpConnect",
+    "refusal_error": "0x80010086",
+    "status": "controlled_unsupported"
+  },
+  "0xfccfad26": {
+    "classification": "dedicated",
+    "handler": "h_CancelWakeupThread",
+    "name": "sceKernelCancelWakeupThread",
+    "status": "unreviewed"
+  },
+  "0xfdb5bfe9": {
+    "classification": "dedicated",
+    "handler": "h_PowerGetCpuClockFrequencyInt",
+    "name": "scePowerGetCpuClockFrequencyInt",
+    "status": "partial"
+  },
+  "0xfe246728": {
+    "classification": "dedicated",
+    "handler": "h_MpegGetAvcAu",
+    "name": "sceMpegGetAvcAu",
+    "status": "unreviewed"
+  },
+  "0xfe707fdf": {
+    "classification": "dedicated",
+    "handler": "h_AllocMemoryBlock",
+    "name": "sceKernelAllocMemoryBlock",
+    "status": "partial"
+  },
+  "0xfee03a2f": {
+    "classification": "dedicated",
+    "handler": "h_PowerGetCpuClockFrequencyInt",
+    "name": "scePowerGetCpuClockFrequency",
+    "status": "partial"
+  },
+  "0xff5940b6": {
+    "classification": "dedicated",
+    "handler": "h_IoCloseAsync",
+    "name": "sceIoCloseAsync",
+    "status": "partial"
+  },
+  "0xffc36a14": {
+    "classification": "dedicated",
+    "handler": "h_ReferThreadRunStatus",
+    "name": "sceKernelReferThreadRunStatus",
+    "status": "unreviewed"
+  }
+}

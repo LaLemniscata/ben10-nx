@@ -1,0 +1,223 @@
+# Build products and generated native output
+/build/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*_recomp.c
+*_recomp_*.c
+*_recomp_funcs.h
+*_imports.toml
+*.spv
+# Generated *_image.bin guest images, extracted game data, and raw dumps.
+*.bin
+# Code captures a run writes under SR_CODE_CAPTURE: bytes of the user's own game (#1933).
+*.[nN][kK][cC][aA][pP]
+
+# User-supplied PSP/game data and external verification inputs
+*.[eE][lL][fF]
+*.[iI][sS][oO]
+*.[pP][rR][xX]
+*.[pP][bB][pP]
+# Source-owned profile-zero fixture (#557): only fixtures/profile_zero/prebuilt/SHA256SUMS
+# is committed. The PSPDEV build output itself is generated (by CI's profile_zero_fixture
+# job or a local PSPDEV rebuild) and stays ignored by the *.prx / *.pbp rules above (#1100).
+*.[cC][sS][oO]
+*.[zZ][sS][oO]
+*.[cC][hH][dD]
+*.[dD][aA][xX]
+*.[jJ][sS][oO]
+*.[sS][fF][oO]
+*.[pP][mM][fF]
+*.[aA][tT]3
+*.[vV][aA][gG]
+*.[gG][iI][mM]
+*.[pP][sS][aA][rR]
+*.[eE][dD][aA][tT]
+
+# Firmware font payloads: the runtime loads sceFont glyphs from SR_FONTDIR or from the
+# executable's sibling `font` directory, and tools/copy_build_assets.ps1 stages this directory next to
+# the binary on every build, so font/ is the operator's drop point. The payloads are never
+# redistributed with the public source (see font/README.md), so they must never be committed.
+/font/*.pgf
+/font/*.pgd
+/original_game/
+/place_game_here/
+/.hst/
+/oracle/
+/fixtures/psp_oracle/build/
+/src/psp_companion/build/
+*.trace
+/tools/reference_hashes.json
+
+# Local VFPU game-derived corpora — generated from private ELF inputs, never committed.
+# tools/vfpu_words.txt was originally checked in but is excluded here because it was
+# extracted from the private eboot.elf (446 words = exact distinct compute/prefix set
+# from the game ELF).  Use tools/vfpu_synth_gen.py for the public synthetic corpus.
+tools/vfpu_words.txt
+tools/vfpu_words_local.txt
+tools/vfpu_game_*.txt
+
+# Raw reverse-engineering/decompiler exports and symbol references (untracked)
+/docs/symbol_ref/
+functions.csv
+EBOOT.BIN.dec*
+
+# Local third-party checkouts and redistributable runtime binaries
+/third_party/*
+# The tracked license texts under third_party/licenses/ are the notice source of
+# truth for release packaging (assets/third_party_components.json records each
+# one's digest and where it was copied from), so they must travel with the source.
+# Git does not descend into a directory it has already excluded, so the exclusion
+# is narrowed to /third_party/* and reviewed public dependencies are re-included
+# here. Clay's, stb's, Kenney's, portable-snippets', dr_libs', Monocypher's and libchdr's pinned sources and
+# provenance must travel with the source export.
+!/third_party/licenses/
+!/third_party/clay/
+!/third_party/portable-snippets/
+!/third_party/dr_libs/
+!/third_party/stb/
+!/third_party/kenney/
+!/third_party/monocypher/
+!/third_party/libchdr/
+
+# Runtime state, logs, captures, and reports
+/logs/
+# Private flagship verifier outputs written at the worktree root; never tracked.
+/logs_*.txt
+/fs/
+/memstick/
+*.log
+*.ppm
+# SR_TEXDUMP alpha-channel texture dumps. These are decoded retail game art;
+# the matching .ppm colour dumps are already covered by the rule above.
+# Never commit these.
+tex_*.pgm
+# SR_NIDLOG writes this into the working directory. It is the guest's verbatim
+# syscall sequence for a retail title, so it is a runtime capture like the rest
+# of this section -- never commit it.
+nidseq_mine.txt
+# tools/capture_native_screenshots.py writes into docs/ui-baseline by default and
+# photographs the developer's real library (retail disc ids and titles): runtime
+# captures of private input, never documentation. Keep them unstageable by
+# `git add -A`; publish_audit's POLICY_UNCLASSIFIED is only the last line of defence.
+/docs/ui-baseline/*.png
+/docs/ui-baseline/*.bmp
+*.psess
+*.ngef
+/progress.json
+/visual_regression_report.json
+/benchmarks_report.*
+/watchpoints.json
+
+# Local scratch
+/scratch/
+/tmp/
+/.tmp/
+# Git Bash turns a Windows-style `>nul` / `2>nul` redirection into a real file
+# named nul that holds the redirected command output.
+/nul
+
+# Python caches and local environments
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Editor, IDE, debugger, and OS metadata
+/.vs/
+/.vscode/
+/.idea/
+*.user
+*.sw[op]
+*.bak
+*.dmp
+*.stackdump
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Generated, machine-specific Clang compilation database (absolute paths; refreshed by nk_manager.ps1)
+/compile_commands.json
+
+# AI tool local/personal state. AGENTS.md is the only tracked agent authority;
+# per-tool caches, settings, and personal instruction files stay local.
+/.jules/
+/.claude/
+/.codex/
+/.codex-remote-attachments/
+/.gemini/
+/.opencode/
+/.kilo/
+/.kilocode/
+/.freebuff/
+/.cursor/
+/.windsurf/
+/.codegraph/
+/.mcp.json
+/codegraph.json
+/GEMINI.md
+opencode.json
+.openignore
+/.cache/
+/.github/github-app.yml
+
+# Local secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+
+# Locally supplied PSP KIRK/amctrl constants (default keys/pgd_keys.txt, or
+# wherever SR_PGD_KEYS points). Never commit these.
+keys/
+pgd_keys.txt
+# Key files of any kind dropped outside keys/; Nakagawa reads none of them,
+# and none may be committed. These mirror the JSON,
+# text and .dat forms of KEY_FILE_NAME in tools/publish_audit.py; *.bin, *.key
+# and *.pem are ignored above, and publish_audit stays the complete,
+# case-insensitive authority for every other suffix.
+*keystore*.json
+*keystore*.txt
+*keystore*.dat
+*key[_-]store*.json
+*key[_-]store*.txt
+*key[_-]store*.dat
+*keyfile*.json
+*keyfile*.txt
+*keyfile*.dat
+*key[_-]file*.json
+*key[_-]file*.txt
+*key[_-]file*.dat
+*psp[_-]key*.json
+*psp[_-]key*.txt
+*psp[_-]key*.dat
+*kirk[_-]key*.json
+*kirk[_-]key*.txt
+*kirk[_-]key*.dat
+keys.json
+keys.txt
+keys.dat
+*.keys
+
+# Android (android/): Gradle and CMake outputs, the local SDK pointer, IDE state and the
+# generated Gradle wrapper scripts stay out of the repository; gradle-wrapper.properties is the pin.
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/app/.cxx/
+/android/local.properties
+/android/.idea/
+/android/*.iml
+/android/app/*.iml
+/android/gradlew
+/android/gradlew.bat
+/android/gradle/wrapper/gradle-wrapper.jar
+/android/.kotlin/

@@ -1,0 +1,498 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025-2026 the psp-recomp authors
+// Copyright (C) 2026 the Nakagawa Recomp authors
+// Derived from sal063/PSP-recompilation-project (GPL-2.0-or-later)
+// Modified by Nakagawa Recomp contributors, 2026-08-10.
+// See NOTICE.md for upstream lineage and modification provenance.
+//
+/*
+ * GeState/GeVtx were moved here verbatim from ge.c so the optional GPU rasterizer
+ * (src/rt/gpu_sdl3vk/ge_gpu.c) can read the live GE state without duplicating it.
+ * ge.c remains the only writer of the state and the arbiter of GE semantics; the GPU
+ * backend registers hooks at runtime (ge_set_gpu_hooks) and ge.c stays byte-identical
+ * in behaviour when no hooks are registered (the GDI build never registers any).
+ */
+#ifndef GE_SHARED_H
+#define GE_SHARED_H
+
+#include <math.h>
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct {
+    uint32_t base, offset;    /* GE_BASE raw data and GE_OFFSETADDR << 8 */
+    uint32_t fbp, fbw, fbfmt; /* framebuffer ptr/stride/format (0=5650,1=5551,2=4444,3=8888) */
+    uint32_t zbp, zbw;
+    uint32_t vaddr, iaddr;
+    uint32_t vtype;           /* vertex type bits */
+    int scis_x1, scis_y1, scis_x2, scis_y2;
+    int ztest_enable, zwrite_disable, cull_enable;
+    uint32_t ztest, cull, minz, maxz;
+    /* GE_CLIPENABLE (0x1C): PPSSPP's "depth clip" flag. OFF (common case): any vertex whose
+     * screen x/y/z falls outside the 4096x4096x65536 grid, or whose z/w passes +-1, drops the
+     * WHOLE triangle. ON: z clamps instead and only all-3-outside-same-side drops. */
+    uint32_t depth_clip;
+    /* Matrices: column-major. World/View are 4×3 (12 floats), Proj is 4×4 (16 floats).
+     * *_num is the auto-increment write cursor set by *MATRIXNUMBER commands. */
+    float world[12], view[12], proj[16];
+    int world_num, view_num, proj_num;
+    float bone[96];                          /* 8 bone matrices, 4x3 each (skinning) */
+    int bone_num;
+    float morph_weight[8];                   /* GE_MORPHWEIGHT0..7 */
+    /* Viewport: raw 24-bit float mantissa words from VIEWPORTXSCALE..VIEWPORTZCENTER. */
+    uint32_t viewport_raw[6];   /* [0]=XS [1]=YS [2]=ZS [3]=XC [4]=YC [5]=ZC */
+    uint32_t offsetx, offsety;  /* sub-pixel offset (pixels = (raw&0xFFFF)/16.0) */
+    uint32_t material;        /* flat material/ambient colour (0x00BBGGRR) */
+    int material_alpha, material_alpha_set, material_set;
+    int tex_enable, tex_swizzle, clear;
+    uint32_t clear_mode;
+    int blend_enable;
+    uint32_t blend_mode, blend_fixa, blend_fixb;
+    /* Fragment tests. PSP stencil is stored in the destination alpha channel; the
+     * three stencil ops are packed as sfail | zfail<<8 | zpass<<16. */
+    int stencil_enable; uint32_t stencil_test, stencil_op;
+    int color_test_enable; uint32_t color_test, color_ref, color_test_mask;
+    int logic_op_enable; uint32_t logic_op;
+    uint32_t tex_addr, tex_bufw, tex_fmt;   /* level-0 texture base / stride(texels) / PSM */
+    uint32_t tex_wrap, tex_func, tex_env, tex_filter;
+    int tex_w, tex_h;                        /* texture dimensions (from TEXSIZE log2) */
+    /* Mip levels 1-7 (index = level - 1), decoded like level 0's TEXADDR/TEXBUFWIDTH/TEXSIZE.
+     * Sizes stay log2 so a level never written reads as the 1x1 a zero TEXSIZE word gives. */
+    uint32_t tex_mip_addr[7], tex_mip_bufw[7];
+    uint8_t tex_mip_wlog2[7], tex_mip_hlog2[7];
+    uint32_t tex_max_level;                  /* TEXMODE bits 16-18: highest level sampled */
+    uint32_t tex_level_mode;                 /* TEXLEVEL bits 0-1: 0 auto, 1 constant, 2 slope */
+    float tex_lod_bias;                      /* TEXLEVEL bits 16-23: signed 4.4 level bias */
+    float tex_lod_slope;                     /* TEXLODSLOPE */
+    uint32_t clut_addr, clut_fmt;            /* palette base and format word */
+    /* Internal CLUT RAM, captured at GE_LOADCLUT like the hardware. Games reuse the staging
+     * buffer right after LOADCLUT, so sampling the palette live from memory reads garbage. */
+    uint8_t clutram[2048];
+    /* Texture coordinate transform (transform-mode only; through-mode UV are raw texels). */
+    float tex_scale_u, tex_scale_v, tex_off_u, tex_off_v;
+    uint32_t tex_map_mode;                   /* bits0-1: 0=UV 1=tex matrix 2=envmap; bits8-9: proj source */
+    uint32_t tex_shade_ls;                   /* envmap: light indices (bits0-1, 8-9) */
+    float tgen[12];                          /* texgen matrix, 4x3 column-major like world/view */
+    int tgen_num;
+    /* Alpha test: atest = func | ref<<8 | mask<<16 (funcs match ztest_px order). */
+    int atest_enable; uint32_t atest;
+    /* Fog: colour = mix(fog_color, frag, clamp01((view_z + fog_end) * fog_slope)). */
+    int fog_enable; float fog_end, fog_slope; uint32_t fog_color;
+    /* Shading: 1 = gouraud (default), 0 = flat (provoking vertex = last). */
+    int shade_gouraud;
+    /* Lighting (transform-mode, per-vertex). Lights are in world space. */
+    int lighting_enable, light_on[4], reverse_normal, light_mode;
+    uint32_t light_type[4];                  /* bits0-1 comp, bits8-9 type */
+    float light_pos[4][3], light_dir[4][3], light_att[4][3];
+    float light_spot_exp[4], light_spot_cut[4];
+    uint32_t light_acol[4], light_dcol[4], light_scol[4];
+    uint32_t amb_color; int amb_alpha;
+    uint32_t mat_emissive, mat_diffuse, mat_specular, mat_update;
+    float spec_coef;
+    /* Dither: 4x4 signed offsets applied to RGB before packing to 16-bit formats. */
+    int dither_enable; int8_t dith[4][4];
+    /* Patch tessellation state. */
+    uint32_t patch_division, patch_primitive, patch_facing;
+    int patch_cull_enable;
+    /* Write masks: bits set = write-disabled (per PSP semantics). */
+    uint32_t mask_rgb; int mask_alpha;
+    /* Bumped on every GE_LOADCLUT: lets the GPU backend detect palette changes without
+     * hashing clutram per draw. */
+    uint32_t clut_gen;
+    /* Block transfer (GE_TRANSFER*): raw command words; decoded at GE_TRANSFERSTART with
+     * PPSSPP's accessor masks. The GPU backend reads these on flush("xfersrc") to know
+     * which guest range is about to be read. */
+    uint32_t xf_src, xf_srcw, xf_dst, xf_dstw, xf_spos, xf_dpos, xf_size;
+} GeState;
+
+/* Mip levels are sampled (#1373) when TEXFILTER's minification field names a mipmap filter
+ * (bit 2: GU_{NEAREST,LINEAR}_MIPMAP_{NEAREST,LINEAR}) and TEXMODE's highest level is above
+ * 0, in every TEXLEVEL mode: automatic (0), constant (1), slope (2), and the unused mode 3,
+ * which a PSP-3000 treats as constant (PSP-GE-MIP-001 m3-b2, m3-b0-4x). The software
+ * sampler (ge.c tex_detail16) and the Vulkan texture cache (gpu_sdl3vk/ge_gpu.c) share this
+ * one rule so the two GE paths turn mip levels on for the same states. */
+/* Bytes per row of a linear (unswizzled) texture whose buffer width is `bufw` texels of
+ * `bits` bits: whole 16-byte lines, the width's bytes rounded down to a multiple of 16 and at
+ * least one line (PSP-GE-RASTER-001 tx-c4-4444, tx-c4-bw48, tx-c4-bw64, tx-c8-bw24,
+ * tx-8888-bw20). */
+static inline uint32_t ge_tex_row_bytes(uint32_t bufw, uint32_t bits) {
+    uint32_t bytes = ((bufw * bits) >> 3) & ~15u;
+    return bytes ? bytes : 16u;
+}
+
+static inline int ge_tex_mip_active(const GeState *g) {
+    return (g->tex_filter & 4u) != 0u && g->tex_max_level > 0u;
+}
+
+/* The GE's level arithmetic, measured on a PSP-3000 (PSP-GE-MIP-001, #1373; all 66 of its
+ * cells, docs/HARDWARE_ORACLE.md). A level of detail is an integer in 1/16 levels. Its
+ * logarithm is the float's exponent and top four mantissa bits, log2(1 + m) taken as m:
+ * 1.5 and 3 texels per pixel give 0.5 and 1.5 levels, not 0.585 and 1.585. The sign bit is
+ * dropped and 0 gives -2032. */
+static inline int ge_lod_log16(float f) {
+    union { float f; uint32_t u; } bits = { f };
+    return (int)((bits.u >> 19) & 0xFFFu) - 127 * 16;
+}
+
+/* The level and blend weight (in 1/16) a level of detail selects with highest level `max`.
+ * Up to 0 it is level 0. TEXFILTER bit 1 off (GU_*_MIPMAP_NEAREST) takes the nearest level,
+ * one half rounding up (c-b0f8); on (GU_*_MIPMAP_LINEAR) it blends level detail16 >> 4 with
+ * the next by detail16 & 15 (cl-b0f1, cl-b6ff). The highest level clamps both, with no blend
+ * (cl-b7f8, cl-max2-b2f8). */
+static inline void ge_tex_level_pick(int detail16, uint32_t tex_filter, uint32_t max,
+                                     uint32_t *level, int *frac) {
+    *level = 0u;
+    *frac = 0;
+    if (detail16 <= 0) return;
+    if (tex_filter & 2u) {
+        *level = (uint32_t)(detail16 >> 4);
+        *frac = detail16 & 15;
+    } else {
+        *level = (uint32_t)((detail16 + 8) >> 4);
+    }
+    if (*level >= max) {
+        *level = max;
+        *frac = 0;
+    }
+}
+
+/* A rasterized vertex: screen position, reciprocal clip-w (for persp-correct interp), UV,
+ * colour, and per-vertex fog factor (1 = no fog). In transform mode u/v are stored
+ * pre-multiplied by rw (texel coords over w). */
+typedef struct GeVtx { float x, y, z, rw; float u, v; float fog; int r, g, b, a; } GeVtx;
+
+/* The one fail-closed rule for a vertex that is about to be rasterized, shared by the
+ * software rasterizer (ge.c) and the Vulkan rasterizer (gpu_sdl3vk/ge_gpu.c) so the two
+ * GE paths cannot disagree: a vertex whose screen position or reciprocal clip-w is not
+ * finite drops its primitive instead of being rasterized.
+ *
+ * Why it must be explicit: every primitive-acceptance comparison in the GE is false
+ * against NaN (a NaN is neither <, == nor > anything), so a non-finite vertex would be
+ * accepted and then rasterized with NaN edge functions - unbounded garbage coverage,
+ * and on the GPU a NaN gl_Position whose fixed-function clipper verdict is undefined.
+ * The PSP's own answer for such a vertex is NOT_MEASURED (see docs/HARDWARE_ORACLE.md),
+ * so the primitive is dropped and counted rather than given an invented screen result.
+ *
+ * Scope: this is the check that belongs at the capture seam, where the clip-space
+ * position has already been projected away. The stronger per-vertex verdict - the clip
+ * position, the projected screen position AND the lit colour (CVtx::nf in ge.c) - is
+ * only available upstream, because GeVtx carries the lit colour already packed to
+ * 8 bits per channel; ge.c applies it before the seam and drops the primitive there.
+ * Texcoords are deliberately NOT part of the rule: a game may leave an infinite texgen
+ * matrix in place to force a constant s/t, exactly as it may leave infinite fog
+ * coefficients, so covering them would reject legal guest state. */
+/* 1 when the screen position (x, y, z) and the reciprocal clip-w (rw = 1/w) are all finite. */
+static inline int ge_vtx_finite(const GeVtx *v) {
+    return isfinite(v->x) && isfinite(v->y) && isfinite(v->z) && isfinite(v->rw);
+}
+
+typedef enum GeCpuPhase {
+    GE_CPU_LIST_TOTAL = 0,       /* inclusive; remaining phases partition this total */
+    GE_CPU_COMMAND_DISPATCH,
+    GE_CPU_PRIMITIVE,        /* inclusive of GE_CPU_GPU_HOOK */
+    GE_CPU_GPU_HOOK,
+    GE_CPU_BLOCK_TRANSFER,
+    GE_CPU_CLUT_LOAD,
+    GE_CPU_FLUSH,
+    GE_CPU_PHASE_COUNT,
+} GeCpuPhase;
+
+/* Sparse, opt-in primitive-front-end diagnostics.  Vertex phases are sampled at
+ * one rotating phase per sparse vertex event; clipping/assembly are sampled at
+ * one rotating phase per sparse triangle candidate.  The counters are kept
+ * separate from the inclusive GE CPU hierarchy so enabling this diagnostic does
+ * not silently turn on the coarse list timers. */
+typedef enum GePrimitiveProfilePhase {
+    GE_PRIM_PROFILE_VERTEX_FETCH_DECODE = 0,
+    GE_PRIM_PROFILE_TRANSFORM,
+    GE_PRIM_PROFILE_LIGHTING,
+    GE_PRIM_PROFILE_CLIPPING_ACCEPTANCE,
+    GE_PRIM_PROFILE_ASSEMBLY,
+    GE_PRIM_PROFILE_PHASE_COUNT,
+} GePrimitiveProfilePhase;
+
+typedef struct GeCpuPhaseStats {
+    uint64_t calls;
+    uint64_t ns;
+} GeCpuPhaseStats;
+
+typedef struct GeCpuProfileStats {
+    int enabled;
+    int primitive_profile_enabled;
+    int primitive_profile_calibration_enabled;
+    GeCpuPhaseStats phase[GE_CPU_PHASE_COUNT];
+    uint64_t commands;
+    uint64_t primitive_commands;
+    uint64_t primitive_vertices;
+    uint64_t vertex_decode_uses;
+    uint64_t strip_vertices_reused;
+    uint64_t primitive_type[8];
+    uint64_t block_transfers;
+    uint64_t clut_loads;
+    uint64_t flushes;
+
+    /* Sparse primitive-front-end profile.  `eligible` is the number of events
+     * that could contribute to a phase and `calls` is the number actually
+     * timed.  The replay reporter scales the raw samples by that ratio. */
+    uint32_t primitive_profile_stride;
+    uint64_t primitive_profile_timer_pair_ns;
+    GeCpuPhaseStats primitive_profile_draw_setup;
+    uint64_t primitive_profile_draw_setup_eligible;
+    uint64_t primitive_profile_assembly_eligible;
+    uint64_t primitive_profile_vertices;
+    uint64_t primitive_profile_transform_vertices;
+    uint64_t primitive_profile_triangle_candidates;
+    uint64_t primitive_profile_commands[8];
+    uint64_t primitive_profile_submitted[8];
+    uint64_t primitive_profile_vertex_references;
+    uint64_t primitive_profile_triangle_vertex_references;
+    uint64_t primitive_profile_non_triangle_vertex_references;
+    uint64_t primitive_profile_triangle_vertex_uses;
+    uint64_t primitive_profile_non_triangle_vertex_uses;
+    uint64_t primitive_profile_through_vertex_uses;
+    uint64_t primitive_profile_transform_vertex_uses;
+    uint64_t primitive_profile_actual_decoded_vertices;
+    uint64_t primitive_profile_actual_transformed_vertices;
+    uint64_t primitive_profile_actual_through_vertices;
+    uint64_t primitive_profile_strip_cache_commands;
+    uint64_t primitive_profile_strip_cache_hits;
+    uint64_t primitive_profile_through_triangle_candidates;
+    uint64_t primitive_profile_transform_triangle_candidates;
+    uint64_t primitive_profile_transform_triangles_drawn;
+    uint64_t primitive_profile_transform_triangles_clipped;
+    uint64_t primitive_profile_transform_triangles_rejected;
+    uint64_t primitive_profile_non_triangle_primitives;
+    uint64_t primitive_profile_vertex_rejects;
+    uint64_t primitive_profile_patch_commands;
+    uint64_t primitive_profile_patch_control_vertices;
+    uint64_t primitive_profile_eligible[GE_PRIM_PROFILE_PHASE_COUNT];
+    GeCpuPhaseStats primitive_profile_phase[GE_PRIM_PROFILE_PHASE_COUNT];
+    GeCpuPhaseStats primitive_profile_sampled_total;
+    GeCpuPhaseStats primitive_profile_empty_control;
+} GeCpuProfileStats;
+
+/* Relations that ge.c's profile producers establish by construction, checked by
+ * ge_cpu_profile_validate().  Each value is a bit index in the returned failure mask
+ * (GE_PROFILE_CHECK_MASK).  A relation between the coarse and sparse profiles is
+ * checked only when both were enabled; every relation holds for an all-zero block. */
+typedef enum GeProfileCheck {
+    GE_PROFILE_CHECK_PHASE_NESTING = 0,     /* sub-phase time exceeds its enclosing time */
+    GE_PROFILE_CHECK_PHASE_CALLS,           /* phase call counts disagree with their events */
+    GE_PROFILE_CHECK_COMMAND_BOUND,         /* per-kind command counts exceed commands */
+    GE_PROFILE_CHECK_PRIMITIVE_TYPES,       /* primitive_type[] disagrees with primitive_commands */
+    GE_PROFILE_CHECK_PROFILE_AGREEMENT,     /* coarse and sparse profiles count draws differently */
+    GE_PROFILE_CHECK_SUBMITTED_SPLIT,       /* submitted != non-triangle + triangle candidates */
+    GE_PROFILE_CHECK_TRIANGLE_MODE_SPLIT,   /* through + transform candidates != candidates */
+    GE_PROFILE_CHECK_REFERENCE_SPLIT,       /* triangle + non-triangle references != references */
+    GE_PROFILE_CHECK_USE_SPLIT,             /* a vertex-use split does not sum to vertex uses */
+    GE_PROFILE_CHECK_REFERENCES_COVER_USES, /* vertex uses exceed vertex references */
+    GE_PROFILE_CHECK_REJECT_BOUND,          /* rejects exceed non-triangle references */
+    GE_PROFILE_CHECK_DECODE_SPLIT,          /* through + transformed decodes != decodes */
+    GE_PROFILE_CHECK_DECODE_COVERAGE,       /* decodes disagree with the uses that drive them */
+    GE_PROFILE_CHECK_TRIANGLE_DECISIONS,    /* drawn + clipped + rejected != transform candidates */
+    GE_PROFILE_CHECK_SAMPLE_BOUND,          /* a sampled phase exceeds its eligible population */
+    GE_PROFILE_CHECK_CALIBRATION_BOUND,     /* a calibration sample exceeds its population */
+    GE_PROFILE_CHECK_COUNT
+} GeProfileCheck;
+
+#define GE_PROFILE_CHECK_MASK(check) (UINT32_C(1) << (unsigned)(check))
+
+/* GPU rasterizer hooks. The primitive hooks return 1 when the primitive was taken by
+ * the GPU backend (the software rasterizer is skipped) — in the full GPU renderer they
+ * always take it. flush(reason) is called at GE sync points ("listend", "loadclut");
+ * the backend decides what each requires. vram_dirty(addr,bytes) is a POST-WRITE notification:
+ * guest memory already contains the CPU's new bytes. An overlapping persistent target must
+ * merge exactly that byte span, preserve newer GPU bytes outside it, and prevent an older
+ * asynchronous readback from committing over the CPU generation. */
+struct GeTnlPrim;   /* below */
+
+typedef struct GeGpuHooks {
+    int  (*tri)(const GeVtx *a, const GeVtx *b, const GeVtx *c, int persp);
+    int  (*sprite)(const GeVtx *p0, const GeVtx *p1, int persp);
+    int  (*line)(const GeVtx *a, const GeVtx *b, int persp);
+    int  (*point)(const GeVtx *a, int persp);
+    void (*flush)(const char *reason);
+    void (*vram_dirty)(uint32_t addr, uint32_t bytes);
+    /* GE block transfer (state in xf_*): returns 1 when the copy was performed GPU-side
+     * (image-to-image; guest VRAM intentionally left stale, like any render target). 0 =
+     * not representable (RAM endpoints, format reinterpretation): caller runs the CPU copy,
+     * preceded by flush("xfersrc") and followed by vram_dirty on the destination. Games run
+     * this blit per frame (motion blur, pause capture); the CPU route costs a GPU drain +
+     * PCIe readback + re-upload each time, which dwarfs the frame itself on discrete GPUs. */
+    int  (*xfer)(uint32_t startdata);
+    /* Diagnostic capture boundary: materialize persistent color/depth images into the
+     * CPU mirrors before a standalone fixture snapshots its exact initial state. */
+    int  (*capture_boundary)(void);
+    /* CPU loads materialize only renderer-owned bytes that overlap the address. The
+     * write-prepare hook preserves a pending depth image before a CPU store replaces
+     * bytes; post-write notifications continue through vram_dirty(). */
+    int  (*vram_read)(uint32_t addr, uint32_t bytes);
+    int  (*vram_write_prepare)(uint32_t addr, uint32_t bytes);
+    int  (*vram_pending)(void);
+    /* GPU transform and lighting (#318): a whole transform-mode triangle PRIM that ge.c found
+     * eligible (see GeTnlPrim). Returns 1 when the backend drew it, 0 when it declined (an
+     * unsupported fragment state, as tri does), and ge.c then runs its own T&L for the PRIM. */
+    int  (*tnl_prim)(const struct GeTnlPrim *p);
+} GeGpuHooks;
+
+/* ---- GPU transform and lighting (#318) ----------------------------------------------------
+ *
+ * Opt-in with SR_GPU_TNL=1. ge.c stays the arbiter: it hands a transform-mode triangle PRIM to
+ * the backend only when the result is provably the one its own T&L gives through the same
+ * rasterizer. The state is a subset of transform_model_vtx_clip's (no specular or powered
+ * diffuse light while light_vertex uses the C library's powf: the shader has only ge_powf, which
+ * ge_pow_set_exact selects on both routes; texture map mode 0; gouraud shading; not clear mode),
+ * every float input is 0 or a normal number of magnitude 2^-40..2^40, and a clip-space bound of
+ * the PRIM's vertices shows that no vertex is non-finite, out of the screen grid or the depth
+ * range, or near the near plane, so every triangle is drawn whole. The vertex shader
+ * (shaders/psp_tnl.vert) then repeats ge.c's arithmetic in the same order with correctly rounded
+ * operations, and the triangles reach the rasterizer with the bits the CPU path would have
+ * given them. */
+#define GE_TNL_MAX_WEIGHTS 8
+#define GE_TNL_LIGHTS 4
+
+/* One vertex reference: the decoded vertex after morphing and before skinning. */
+typedef struct GeTnlVtx {
+    float x, y, z;                     /* model-space position */
+    float nx, ny, nz;                  /* model-space normal (0 when the format has none) */
+    float u, v;                        /* texture coordinate as read */
+    uint32_t rgba;                     /* vertex colour, r in the low byte (material if absent) */
+    float w[GE_TNL_MAX_WEIGHTS];       /* skinning weights; unused ones are 0 */
+    uint32_t param;                    /* backend-owned: the PRIM's parameter record */
+} GeTnlVtx;
+
+typedef struct GeTnlLight {
+    uint32_t on;                       /* 1 when the light is enabled */
+    uint32_t point;                    /* 1: point or spot (position), 0: directional */
+    float l[3];                        /* normalized direction or position (ge.c light_consts) */
+    float acol[3], dcol[3];            /* ambient and diffuse colour, 0..1 */
+    float att[3];                      /* constant, linear and quadratic attenuation */
+    uint32_t comp;                     /* light components: 0 diffuse, 1 + specular, 2 powered diffuse */
+    float scol[3];                     /* specular colour, 0..1 */
+} GeTnlLight;
+
+/* Everything the vertex shader reads, as ge.c's T&L uses it. 32-bit words only (std430). */
+typedef struct GeTnlParams {
+    float world[12], view[12], proj[16];   /* column-major, as GeState */
+    float bone[96];                        /* the eight bone matrices */
+    float vp[6];                           /* x, y, z scale, x, y, z centre (decoded float24) */
+    float off[2];                          /* screen offset x, y in pixels */
+    float tex[6];                          /* u scale, v scale, u offset, v offset, width, height */
+    float fog[3];                          /* end, slope (after the inf/NaN rewrite), constant */
+    uint32_t fog_mode;                     /* 0: factor 1, 1: the constant, 2: clamp((z+end)*slope) */
+    uint32_t weights;                      /* skinning weights per vertex, 0..8 */
+    uint32_t lighting;                     /* 1: lit (light_vertex), 0: the vertex colour */
+    uint32_t mat_update;                   /* MATERIALUPDATE bits */
+    uint32_t lit_alpha;                    /* lit alpha when MATERIALUPDATE bit 0 is clear */
+    uint32_t amb_alpha;                    /* scene ambient alpha */
+    float mat_amb[3], mat_dif[3], emissive[3], amb[3];
+    float mat_spe[3];                      /* material specular colour */
+    float spec_coef;                       /* the specular power, as GeState */
+    GeTnlLight light[GE_TNL_LIGHTS];
+} GeTnlParams;
+
+/* A PRIM for tnl_prim: `refs` holds `nrefs` vertex references in PRIM order, `tri` holds
+ * `ntri` index triples into refs, each in the order ge.c submits that triangle (the cull and
+ * strip-parity flips applied), so triangle k's vertices are refs[tri[3k]], refs[tri[3k+1]] and
+ * refs[tri[3k+2]]. `box` bounds the projected vertices (from ge.c's clip-space bound). */
+typedef struct GeTnlPrim {
+    const GeTnlParams *params;
+    const GeTnlVtx *refs;
+    uint32_t nrefs;
+    const uint32_t *tri;
+    uint32_t ntri;
+    float box[4];                      /* x0, y0, x1, y1: framebuffer pixels every vertex is in */
+} GeTnlPrim;
+
+/* Implemented in ge.c. */
+void      ge_set_gpu_hooks(const GeGpuHooks *h);
+/* GPU transform and lighting (#318): on with SR_GPU_TNL=1, or set here (-1 re-reads the
+ * environment). The counts are PRIMs the backend drew and PRIMs ge.c found ineligible or the
+ * backend declined, since the last reset. */
+void      ge_tnl_set_enabled(int on);
+void      ge_tnl_counts(unsigned long long *taken, unsigned long long *cpu, int reset);
+/* The specular and powered-diffuse power light_vertex uses: 0 (the default) the C library's
+ * powf, 1 ge_powf, the integer power psp_tnl.vert repeats bit for bit, which also lets the GPU
+ * T&L take those lights. The selftest seams give ge_powf and its 64 x 64-bit high product
+ * (out: C's, then the shader's limb form, each high word first). */
+void      ge_pow_set_exact(int on);
+float     ge_pow_selftest_powf(float x, float y);
+void      ge_pow_selftest_mul(const uint32_t a[2], const uint32_t b[2], uint32_t out[4]);
+/* Post-write notification for CPU-side writes that may alias GPU-cached framebuffers
+ * (movie decode, DMA memcpy). No-op when no GPU backend is registered. */
+void      sr_gpu_vram_dirty(uint32_t addr, uint32_t bytes);
+void      sr_vram_mark_renderer_pending(void);
+int       ge_zbuf_prepare_current(void);
+int       ge_zbuf_materialize_current(void);
+int       ge_zbuf_guest_span_bounds(uint32_t base, uint32_t stride,
+                                     uint32_t *first, uint32_t *end);
+void      ge_zbuf_invalidate_guest_span(uint32_t addr, uint32_t bytes);
+void      ge_zbuf_note_external_write(void);
+void      ge_zbuf_invalidate_guest_range(uint32_t addr);
+GeState  *ge_state_ptr(void);
+/* Changes whenever GE state may have changed (each list command, init, replay restore), so a
+ * consumer can keep values derived from GeState until it moves. */
+uint32_t  ge_state_serial(void);
+/* A write through ge_state_ptr() outside a list command does not move the serial by itself:
+ * the writer calls this before the next draw, or the consumers keep values derived from the
+ * old state (ge.c's lighting inputs, the Vulkan backend's per-draw state template). */
+void      ge_state_note_external_write(void);
+uint16_t *ge_zbuf_ptr(void);        /* 272*512 entries, row stride = ge_zbuf_stride() */
+uint32_t  ge_zbuf_stride(void);
+/* Colour-target pixel accesses the GE made in place and through the guest accessors. */
+void ge_fb_access_counts(unsigned long long *direct, unsigned long long *accessor);
+/* Decode the CURRENT texture (ge.tex_addr, tex_w x tex_h) to RGBA8 through the exact
+ * sampler path the software rasterizer uses (swizzle + CLUT + format). out must hold
+ * tex_w*tex_h words; layout is row-major, r|g<<8|b<<16|a<<24. */
+void      ge_decode_tex_rgba(uint32_t *out);
+/* Decode mip level `level` (1-7) of the CURRENT texture the same way: the level's own
+ * address, buffer width and size (tex_mip_*), with level 0's format, swizzle and CLUT.
+ * out must hold that level's (1 << tex_mip_wlog2) * (1 << tex_mip_hlog2) words. */
+void      ge_decode_tex_level_rgba(uint32_t level, uint32_t *out);
+/* Decode one linear surface of guest memory to RGBA8 for the developer VRAM viewer (#314):
+ * format 0-3 is a colour PSM (5650, 5551, 4444, 8888) expanded as the texture decoder does,
+ * 11 is DEPTH16 shown as the VRAMDUMP decoder shows it. `stride` is in pixels. The whole
+ * rectangle is checked readable before any byte is read, and the bytes are copied as stored
+ * (sr_guest_copy_in: no scalar accessor, GE capture or watch hook runs). Like every guest
+ * read, a span the GPU rasterizer still owns is first brought back to guest memory (the
+ * coherence step a CPU read of it takes), so the view shows what the guest would read;
+ * nothing else is written but `out` (width * height words). Returns 0, reading nothing, for
+ * an unreadable rectangle or unsupported arguments. */
+#define GE_VRAM_VIEW_MAX_WIDTH 512u
+#define GE_VRAM_VIEW_MAX_HEIGHT 512u
+int       ge_vram_decode_surface(uint32_t addr, uint32_t width, uint32_t height,
+                                 uint32_t stride, uint32_t format, uint32_t *out);
+#ifdef SR_GE_VRAM_DECODER_CLI
+/* The standalone decoder's entry into ge.c (built only with -DSR_GE_VRAM_DECODER_CLI):
+ * decodes the surface described by the arguments from the captured VRAM image. */
+int       ge_vram_cli_decode(uint32_t addr, uint32_t width, uint32_t height, uint32_t stride,
+                             uint32_t format, uint32_t swizzled, uint32_t clut_addr,
+                             uint32_t clut_format, const uint8_t *clut_ram,
+                             const uint8_t *arena, uint32_t *pixels);
+#endif
+/* Level 0 of the texture the GE state names now (tex_addr, tex_w x tex_h, any PSM, swizzle and
+ * the loaded CLUT), decoded by ge_decode_tex_rgba for the viewer. Refused (0, nothing read)
+ * while a GE capture is active, when the texture's bytes are not all readable, when it is
+ * larger than GE_VRAM_VIEW_MAX_*, or when `capacity` words cannot hold it. */
+int       ge_vram_decode_bound_texture(uint32_t *out, size_t capacity);
+void      ge_replay_restore(const GeState *state, const uint16_t *zbuf);
+void      ge_cpu_profile_reset(void);
+void      ge_cpu_profile_get(GeCpuProfileStats *out);
+/* Check a ge_cpu_profile_get() snapshot against every GeProfileCheck relation and return
+ * the mask of failed checks (0 when consistent; every bit when stats is NULL).  Pure: no
+ * I/O, environment, or global state, so it adds nothing to the GE paths that produce the
+ * counters.  Sums are compared exactly, never modulo 2^64.  The relations hold for a
+ * snapshot taken between ge_run_list() calls (ge_replay reads it after its lists end); one
+ * taken from inside a GPU hook can see a draw half counted.  When detail is non-NULL it
+ * receives a NUL-terminated description of the lowest-numbered failed check, or an empty
+ * string. */
+uint32_t  ge_cpu_profile_validate(const GeCpuProfileStats *stats, char *detail,
+                                  size_t detail_size);
+/* Stable lower-case name of a check, or "unknown". */
+const char *ge_profile_check_name(GeProfileCheck check);
+/* Capture one bounded, present-aligned VRAM image and its GE state sidecar. */
+int       ge_vramdump_write(const char *directory, uint32_t vblank,
+                            uint32_t display_addr, uint32_t display_stride,
+                            uint32_t display_format);
+
+#endif /* GE_SHARED_H */

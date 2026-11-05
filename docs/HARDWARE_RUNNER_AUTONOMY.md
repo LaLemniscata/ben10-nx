@@ -1,0 +1,401 @@
+# Hardware runner autonomy — architecture and runbook
+
+Status: source-owned v2 conformance design and simulator, plus a host campaign
+adapter for the existing scalar-probe route. The adapter starts the configured
+USBHostFS process, drives PSPSH commands, bounds each case, unloads each module,
+and records an evidence envelope. It follows the L0-L4 recovery contract tested
+in [`tools/test_hardware_runner_protocol.py`](../tools/test_hardware_runner_protocol.py).
+Dynamic `usbipd` discovery/attach and the bounded L0-L2 host recovery path are
+already implemented for this scalar adapter. Boot-time PSPLink autostart,
+standalone L3 relaunch, and the resident framed runner are not yet qualified.
+Campaigns require the source-owned `transport-write` case first. It failed in
+the 2026-09-23 W1-psplink3 live run (`HOST0_ROUNDTRIP_FAILED`, no envelope
+accepted; see the table below), and has passed on hardware since: it is
+MEASURED as `PSP-TRANSPORT-001` in the 2026-10-10 PSP-3000 campaign on
+`f6ccfb33`, and the preflight passed on every 2026-10-15 launch, including all
+32 launches of the requalified campaign queue on `f2d6c91a`
+([HARDWARE_ORACLE.md](HARDWARE_ORACLE.md#measured-to-date-index--exact-cells-only-do-not-generalize)).
+A passing preflight qualifies the transport before a case only. The host0
+round-trip after a case can still fail: the 2026-10-10 single-case HLE runs
+failed their post-unload shell qualification and host0 round-trip, and the
+900-second 2026-10-18 raw UMD read run passed the preflight but ended
+`HOST0_ROUNDTRIP_FAILED` at its host case timeout, followed by a transport loss
+([PSP-UMDRAW-001](HARDWARE_ORACLE.md#psp-umdraw-001-raw-umd-read-probe)).
+Resident runner candidate: the Nakagawa Link resident PSP agent. Its source is
+not in this repository. Its first recorded use, the 2026-10-24 `hle-issues-batch`
+and `hle-intr-cells` launches, ran through a private PSPLink driver with no
+runner envelope and no `transport-write` preflight, so neither is
+acceptance-eligible
+([HARDWARE_ORACLE.md](HARDWARE_ORACLE.md#measured-to-date-index--exact-cells-only-do-not-generalize)).
+Later launches, such as the 2026-10-27 `ge-timing` runs, run `run_psplink.py`
+unchanged, each with its `transport-write` preflight, under the agent's
+watchdog and its private recover/probe host commands. The agent does not
+execute cases itself and does not speak the v2 framing, so it is not adopted as
+the framed resident runner. The framed runner and the stream-plus-mirror
+dual-path protocol remain unbuilt here, and every PSP case still runs through
+`run_psplink.py`. [`tools/psp_oracle/oracle_matrix.py`](#10-one-command-matrix)
+now builds, stages, qualifies and runs a multi-case matrix around that runner in
+one command (issue [#352](https://github.com/Jstar269/nakagawa-recomp/issues/352); see
+[What still requires a human / build order](#9-build-order-and-open-attestation)).
+This document extends, and defers to, the implemented scalar-probe subset
+described in [HARDWARE_ORACLE.md](HARDWARE_ORACLE.md) and
+[`fixtures/psp_oracle/README.md`](../fixtures/psp_oracle/README.md).
+
+## 1. Goal and current autonomy level
+
+Ultimate goal: the maintainer connects the PSP once and a single command —
+`hardware-runner run <manifest>` conceptually — runs qualified experiment
+matrices for hours or days without anyone typing PSPLink commands: it must
+identify source/probe identity, build, hash, stage, qualify transport,
+execute approved cases with repeat contracts, capture dual-path evidence,
+classify faults, recover along a bounded ladder, record META, and stop
+rather than fabricate when evidence becomes invalid.
+
+Current autonomy level, measured in the W1-psplink campaign on 2026-09-23:
+
+| Step | State |
+| --- | --- |
+| Probe build/hash/stage | The adapter accepts prebuilt source-owned PRXs from a host0 scratch directory; it does not build them. Since issue #352, `oracle_matrix.py` builds them from a clean clone of the declared commit, stages them and records their digests ([§10](#10-one-command-matrix)). |
+| Transport qualification | Live replies identified PSPLink v3.2.1 and firmware 6.6.1. In W1-psplink3 the first `ver` exited 1, the second passed, and the post-attach verification passed; each attempt is retained in recovery events. |
+| Case execution and unload | `model-profile` `ldstart` returned a UID and left its module loaded. `modstun`, then `modinfo` `Unknown module`, confirmed unload. PSP-B3 `ldstart` returned promptly while its main thread remained parked. |
+| Result capture | `model-profile` and W1-psplink3 `transport-write` produced no schema records or host0 result file. The live envelope ended `HOST0_ROUNDTRIP_FAILED`, was not acceptance-eligible, and did not run the optional smoke case. Raw model code remains `NOT_CAPTURED`. |
+| Recovery | After the W1 reset timed out, `Shared` to attach to `Connected` restored the WSL route without a power cycle. W1-psplink2 saw the device already `Attached` and `ver` passed. In W1-psplink3 the first `ver` exited 1, the retry passed, and the attached-device verification passed; the shell stayed qualified until the transport-write result failed. |
+
+A fresh USBHostFS connection can lose its first shell command: a prior
+USBHostFS log showed `Error, unknown command 00000000` after the first
+`pspsh -e ver` timed out, and a later `ver` succeeded without PSP intervention.
+W1-psplink3 observed the same first-command loss as a `ver` process exit 1,
+followed by a successful retry. Initial shell qualification and qualification
+after each USBHostFS connect or
+re-attach now share a bounded verifier: at most three `ver` attempts, each
+limited to the remaining time or 15 seconds, within a configurable total
+deadline (`--shell-verification-timeout`, default 45 seconds). Every attempt is
+recorded in recovery events. Lost replies and USBHostFS unknown-command output
+are retryable transport events. After a probe launch, exhaustion escalates to
+`PHYSICAL_INTERVENTION_REQUIRED` with manual commands. This routine retries
+shell qualification only; semantic probe results are never retried.
+The same verifier settles the link after each case's `modstun` stop/unload
+handshake, before the S2 snapshot, the post-unload shell qualification, and the
+host0 round-trip. Its attempts are recorded with a `post-unload settle:` prefix
+and as `settle_status` and `settle_attempts` in the case's teardown report; an
+exhausted settle adds no teardown issue, so the checks after it classify the case
+unchanged ([HARDWARE_ORACLE.md](HARDWARE_ORACLE.md#probe-teardown-for-repeated-launches)).
+
+Transport start-up waits for positive readiness instead of issuing `ver` as
+soon as `usbhostfs_pc` is spawned. It waits for USBHostFS to report its device
+poll loop, finds the one PSPLink device in `usbipd list`, attaches it once when
+it is `Shared`, and then waits for `Connected to device`; all of this shares one
+bounded start budget (60 seconds by default). USBHostFS prints
+`waiting for device...` once at start-up and again after every disconnect, so
+only a wait that follows a connection counts as a device loss. A failure before
+the first launch, including initial shell-qualification exhaustion, ends as
+`TRANSPORT_START_FAILED` with the USBHostFS output tail and manual commands. The
+PSP ran nothing, so it needs no power cycle and a campaign checkpoint keeps its
+resume position.
+
+The reset command's timeout alone did not establish its outcome; the subsequent
+`Shared` to attach to `Connected` to `ver` sequence did establish restored
+PSPLink control without a power cycle. The later campaign CLI failure accepted no
+semantic result and was not retried. This measures one soft-reset recovery on
+the attached console. It does not measure a live probe hang or standalone
+PSPLink relaunch. The physical model was not read during this campaign and must
+remain `NOT_CAPTURED` in any envelope for it.
+
+The largest single autonomy blocker is fault containment: today a crashing
+experiment poisons the only control plane. Everything below is organized
+around fixing that.
+
+## 2. Process topology
+
+```text
+HOST ORCHESTRATOR (state machine, this doc §4)
+   |-- usbhostfs_pc (host0: mirror = staging/results directory)
+   |-- PSPSH process adapter (`tools/psp_oracle/run_psplink.py`)
+   |-- evidence writer (envelopes, §6)
+   '-- recovery ladder driver (§5)
+          |  qualified command protocol (framed, §3)
+          v
+   PSP RESIDENT ORACLE RUNNER (future PRX, source-owned)
+          |-- experiment cells: META, VFPU, kernel/user API, later cache
+          |-- per-case isolated execution + controlled reset between cases
+          '-- heartbeat + watchdog state
+```
+
+Design rules carried over from measured transport findings:
+
+- VSH-injected and standalone PSPLink stacks collide; duplicate user-module
+  registration produces `0x8002013B`. The runner assumes a clean standalone
+  context and the orchestrator must never "fix" a missing module by loading
+  another copy.
+- `pluser=1` is required for the proven stdout route.
+- USB replug alone does not reliably revive device USBHostFS; a full
+  standalone relaunch does. Recovery levels are ordered accordingly.
+- Crashing probes can wedge reload cycles: the runner must isolate case
+  execution from the control plane (§7).
+
+## 3. Command protocol (v2 framing)
+
+Schema-1 line protocol (`tools/psp_oracle/protocol.py`) stays the result
+payload format. v2 wraps every message in a length-prefixed frame so partial
+reads, echoes, and interleaved banner noise are detectable:
+
+```text
+frame := MAGIC(2B 'NR') | version(1B) | type(1B) | seq(2B LE) |
+         payload_len(4B LE) | payload_len ones-complement(4B LE) | payload
+```
+
+Verbs (request -> response payload):
+
+| Verb | Purpose |
+| --- | --- |
+| `HELLO` | handshake; returns protocol version, runner build SHA256, source commit |
+| `CAPABILITIES` | cell inventory + max case size + repeat limits |
+| `META` | console metadata block (raw model value, FW/CFW, clock) |
+| `LOAD_CASE` | stage one synthetic case descriptor + expected-shape hash |
+| `RUN_CASE` | execute loaded case `iteration` times under watchdog budget |
+| `RESULT` | framed schema-1 result lines + raw-result length/hash |
+| `RESET_CASE` | tear case state down without disturbing control plane |
+| `PING` | liveness only; never treated as qualification |
+| `STOP` | orderly shutdown |
+
+Every response carries: protocol version, runner build SHA256, source commit,
+case id, iteration index, status, raw-result length + sha256, and a fault
+classification field. Unframed stdout is never the sole evidence channel:
+the orchestrator records both the framed stream and the file-mirror copy of
+the same result under `host0:out/`, and compares them (dual-path rule). A
+mismatch is an evidence failure, not a semantic result.
+
+Identity binding rules (fail closed): HELLO runner SHA must match the staged
+binary's recorded SHA256; source commit must match the orchestrator run
+manifest; a mismatch aborts the epoch before any case runs.
+
+## 4. Host orchestrator state machine
+
+States: `OFFLINE, WAIT_DEVICE, USB_SERVER_START, WAIT_ATTACH, SHELL_QUALIFY,
+RUNNER_DISCOVER, RUNNER_HANDSHAKE, META, READY, RUN_CASE, VERIFY_RESULT,
+RECOVERABLE_FAULT, SESSION_WEDGED, STOPPED`.
+
+Every transition declares: entry condition, timeout, success discriminator,
+failure discriminator, bounded recovery action. Non-negotiables, each enforced
+by the reference implementation in the test suite:
+
+- **Qualification is behavioral.** `SHELL_QUALIFY` requires real responses to
+  `ver`, `usbstat`, `pwd`, and a host0 round-trip marker — command echo alone
+  is never success.
+- **No semantic result without qualification.** After any qualification loss
+  the epoch stops collecting results; already-collected results stay valid
+  only if their envelopes say `qualification_status=QUALIFIED` at capture time.
+- **Stale rejection.** Every RESULT carries epoch id + case iteration;
+  anything not matching the current epoch/case is discarded as stale.
+- **Timeouts are discriminated**: distinguish "no bytes" (transport dead),
+  "bytes but no frame" (echo/banner pollution), "complete frame, error status"
+  (semantic failure) — they recover differently.
+
+## 5. Recovery ladder (bounded)
+
+| Level | Action | Bound |
+| --- | --- | --- |
+| L0 | retry one protocol request | 1 retry, short timeout |
+| L1 | restart owned host usbhostfs_pc process; if it reports `waiting for device`, identify the PSPLink device from `usbipd list`, attach once when `Shared`, wait for `Connected to device`, and verify `pspsh -e ver` | 1 cycle and 1 attach attempt, then requalify from `WAIT_ATTACH` |
+| L2 | qualified PSPLink `reset`, followed by the same dynamic USB re-attach and `ver` check | 1 reset and 1 attach attempt; allowed only if SHELL_QUALIFY still answers |
+| L3 | standalone PSPLink relaunch boundary | not implemented by the scalar adapter. The matrix ([§10](#10-one-command-matrix)) delegates it to its configured recover and probe commands (with Nakagawa Link: kill the case over the agent's file channel, then a PC-requested reset) and accepts the outcome only through the lock's device-state attestation; [issue #352](https://github.com/Jstar269/nakagawa-recomp/issues/352) |
+| L4 | declare `PHYSICAL_INTERVENTION_REQUIRED`, preserve all state, stop | final; looping is not recovery |
+
+Additional hard rules: never load a duplicate PSPLink user module (see
+`0x8002013B` above); never continue collecting evidence after qualification is
+lost; every escalation appends a `RECOVERY_EVENTS` record to the epoch
+envelope. The ladder fails closed: exhaustion of L3 ends in L4, not in more L0s.
+The scalar adapter implements one L0 qualification/cleanup attempt, one L1 host
+USBHostFS restart or transport re-attach, and one qualified L2 `reset` followed
+by transport re-attach. A failed L1 attach or `ver` check may proceed to L2 only
+while shell qualification still answers; an exhausted attach budget or failed
+qualification withholds reset and stops at L4. An L2 attach or `ver` failure
+also stops at L4. The adapter never binds or detaches USB devices: an absent or
+unbound PSPLink device includes the exact manual command in the L4 reason.
+
+## 6. Evidence envelope
+
+One envelope per case iteration, written before the next case starts:
+
+```text
+CONSOLE_ID, PHYSICAL_MODEL_LABEL, SOFTWARE_MODEL_RAW_VALUE,
+INTERPRETED_MODEL_FAMILY, MODEL_INTERPRETATION_RULE,
+MODEL_IDENTITY_AGREEMENT, FW, CFW, CLOCK, TRANSPORT_PROFILE, SOURCE_COMMIT,
+BINARY_SHA256, RUNNER_SHA256, CASE_ID, ITERATION, RAW_RESULT, CONTROL_RESULT,
+START_TIME, END_TIME, RECOVERY_EVENTS[], QUALIFICATION_STATUS, EVIDENCE_CLASS,
+WHAT_IS_NOT_PROVEN
+```
+
+Two standing rules:
+
+- `PHYSICAL_MODEL_LABEL` is the operator-declared chassis/family observation.
+  `SOFTWARE_MODEL_RAW_VALUE` preserves the exact scalar reported by the device;
+  interpretation never changes it. Rule ID `PSPSDK_PMODEL_ORDINAL_V1` applies
+  the PSPSDK/kubridge `PspModel` ordinal mapping: raw `3` means generation
+  `04g`, in the PSP-3000 family, and raw `4` means generation `05g`, PSP-N1000.
+  It does not apply to the kernel-only `sceKernelGetModel()` original/slim
+  convention. The computed
+  `MODEL_IDENTITY_AGREEMENT` is `AGREES`, `DISAGREES`, or `UNKNOWN` when the
+  operator label, raw code, or rule cannot be compared. Thus the recorded
+  PSP-3000-series / `kuKernelGetModel()==3` pair agrees under this rule; it is
+  not a model contradiction. Older stored envelopes with
+  `MODEL_CONTRADICTION=RECORDED` remain readable as historical records and are
+  never rewritten to the new vocabulary.
+- `EVIDENCE_CLASS` uses the repository vocabulary (`PSP_HARDWARE`,
+  `PRODUCTION_DISPATCH`, ...). A runner self-test or empty-fixture pass is at
+  best `PRODUCTION_HELPER`; it is never promoted to hardware truth by the
+  tooling.
+
+## 7. Fault containment
+
+Principle: experiment failure may cost the experiment, never the control
+plane.
+
+- Cases run in child threads/modules with bounded lifecycle under the resident
+  supervisor; the control thread keeps a reserved stack and never executes
+  case code in-process.
+- User-mode risk cells are separated from kernel-risk cells into explicit
+  sessions; dangerous classes run in dedicated sessions bracketed by reboots.
+- Where PSP semantics allow, risky payloads load as child modules under the
+  supervisor rather than replacing it.
+- If an Allegrex exception or kernel panic still destroys the process, the
+  orchestrator classifies the epoch `SESSION_WEDGED` and enters the ladder at
+  the level matching the last observed heartbeat — it does not fake recovery.
+
+## 8. Zero-touch feasibility
+
+Remaining human actions, classified:
+
+| Action | Class | Software path forward |
+| --- | --- | --- |
+| USB_CABLE | physical | none; external powered-hub automation could remove replug needs but is out of scope |
+| POWER_SWITCH | physical | hard wedges need power cycling; honest answer: requires external actuation or human. Not solvable in software from PSPLink alone once USB is dead |
+| XMB_APP_LAUNCH | software-feasible, unverified | ARK-4 supports VSH plugins through `PLUGINS.TXT` and starts a plugin with its path as the module arguments. The PSPLINK entry point parses that path and uses its directory as the sidecar-module path, so a complete PSPLink file set in one Memory Stick folder is a plausible autostart route. The standard PSPDEV setup guide documents the EBOOT route; VSH startup still needs a boot-to-qualified hardware check. Back up the active Memory Stick plugin configuration before editing it; keep the change on `ms0:` and make rollback possible. ([ARK plugin loader](https://github.com/PSP-Archive/ARK-4/blob/main/core/systemctrl/src/plugin.c), [PSPLINK entry point](https://github.com/pspdev/psplinkusb/blob/master/psplink/main.c), [PSPDEV setup guide](https://pspdev.github.io/debugging.html)) |
+| PLUGIN_ENABLE/DISABLE | human-gated | same as above |
+| PSPLINK_RELAUNCH | partially automatable | L3 covers the proven relaunch shape where it can be initiated host-side |
+| HARD_WEDGE_POWER_CYCLE | physical | L4 + external actuation would be required for literal 100% |
+
+Therefore: near-zero-touch is achievable for the common crash classes
+(software relaunchable), while a hardware-level freeze fundamentally requires
+physical power intervention. The system says so plainly instead of looping.
+
+## 9. Build order and open attestation
+
+1. Conformance suite (landed): `tools/test_hardware_runner_protocol.py`
+   implements the reference state machine, codec, fake transport, and every
+   mandated fault scenario. Future implementations must pass it unchanged.
+2. PSPLink boot autostart: stage the complete, compatible PSPLink PRX set in one
+   dedicated Memory Stick folder. ARK passes the plugin path to the PRX, and
+   PSPLINK uses that path to locate its sidecars; add a VSH entry to the active
+   ARK `PLUGINS.TXT` only after backing up that file. Keep the change on `ms0:`.
+   Reboot once and qualify `ver`, `usbstat`, `pwd`, and host0 before calling
+   autostart successful. The PSPDEV setup guide documents the EBOOT launch route,
+   so VSH startup remains a hardware acceptance item despite the compatible
+   source-level path handling.
+3. Host reconnect: keep the existing dynamic `usbipd list` lookup, attach only
+   when the unique PSPLink device is `Shared`, and requalify after `Connected to
+   device`. The adapter already exercises this path; expand it only if the
+   boot-to-qualified run exposes a missing recovery transition.
+4. Software reset ladder: the host implements one bounded L0 cleanup, L1 host
+   transport restart/reattach, and qualified L2 `reset`/reattach. Verify the
+   full sequence after autostart is installed. Standalone L3 PSPLink relaunch
+   remains absent; exhaustion stops at L4 and requires physical intervention.
+5. Resident runner PRX: new implementation path; require a trusted
+   detailed-ledger record before commit (`PROVENANCE_UNRESOLVED` otherwise).
+   The resident framed protocol and per-case fault containment are still absent.
+   Campaigns use repeated `--campaign-case CASE_ID=PRX_PATH` arguments, put
+   `transport-write` first, and set one bounded `--timeout` shared by each case.
+   An optional `--out` must be inside the host0 scratch directory. Like
+   `--command`, this mode requires `--session-id` and passes the hardware-lock
+   gate before the transport starts and again before every reset and launch.
+6. REQ_002 prerequisite: an import/startup fixture that resolves ThreadManForUser
+   mutex NIDs, starts clean, emits one marker, asserts nothing — validated on
+   host/toolchain first so PSP sessions debug semantics, not linker plumbing.
+7. Additional model-source discriminator (bounded): compare plain syscall
+   paths and other identity sources with `kuKernelGetModel`. The PSPSDK ordinal
+   mapping already interprets raw value 3 as PSP-3000 generation 04g under
+   `PSPSDK_PMODEL_ORDINAL_V1`; remaining cross-API distinctions are still in
+   the works under issue #356. Measure each source first and generalize never.
+
+## 10. One-command matrix
+
+[`tools/psp_oracle/oracle_matrix.py`](../tools/psp_oracle/oracle_matrix.py)
+runs a bounded matrix of probe cases from one private plan, with no manual
+PSPLink commands in a healthy session:
+
+```powershell
+python tools/psp_oracle/oracle_matrix.py <private-matrix-plan.json> --dry-run     # validate only
+python tools/psp_oracle/oracle_matrix.py <private-matrix-plan.json> --build-only  # build and stage only
+python tools/psp_oracle/oracle_matrix.py <private-matrix-plan.json>               # build, stage, qualify, run
+```
+
+The plan (schema 1) names the matrix and lock session, the source commit (the
+clean checkout `HEAD`), the operator-declared model, the expected firmware, a
+host0 scratch directory under `fixtures/psp_oracle`, a private evidence
+directory, the ordered cases with their timeouts, and argv templates for the
+build shell, the PSPLink soft reset, the recover command, the probe command,
+and the runner's PSPSH and USBHostFS commands. A case may name a prebuilt PRX
+inside the plan directory instead, with its SHA-256 pinned, for example a
+resident-agent containment test probe.
+
+1. **Build and stage.** One shell script clones the repository, checks out the
+   exact commit, refuses a dirty tree, builds `transport-write` and each case
+   with its own build directory, and copies each PRX into host0. The host
+   re-hashes every staged PRX and refuses a digest that differs from the one
+   the build reported. The digests go into a checkpoint. A resumed matrix
+   refuses a staged PRX that has changed since.
+2. **One launch per boot.** Before each case the matrix runs the recover
+   command, issues one PSPLink soft reset, and runs the recover command again.
+   The hardware lock's device-state attestation must then name a qualified
+   boot newer than every boot the matrix has seen, including boots seen during
+   earlier launches. Otherwise the matrix stops before launching anything:
+   `PHYSICAL_INTERVENTION_REQUIRED` when the recover command could not bring
+   the device back, `RECOVERY_REFUSED` when it refused (lock or reset budget),
+   or `NO_FRESH_BOOT` when the reset produced no newer boot. Nothing ran, so a
+   later run starts again at the same case.
+3. **Launch.** The probe command runs `run_psplink.py` with `transport-write`
+   and the case, and a report path unique to the case and boot. With Nakagawa
+   Link this is the agent's guarded probe wrapper. Every reset and launch
+   re-checks the lock, and each launch and its outcome are appended to the
+   lock's `probes_run`.
+4. **Accept or reject.** A case is `ACCEPTED` only when the runner report was
+   written by this launch, names exactly `transport-write` and the case, and
+   every envelope carries the plan's source commit, the staged PRX digest, the
+   expected firmware and a host0 run window that starts after the launch, and
+   is acceptance-eligible. A report from an earlier launch, or an envelope from
+   another commit or PRX, is `REJECTED`. A launch the runner did not finish
+   cleanly is `NOT_ELIGIBLE`, with the reasons.
+5. **Contain.** A launch during which the device rebooted, or after which the
+   probe command had to recover the device (Nakagawa Link's exit 4), is
+   `CONTAINED`. Its evidence is never accepted, whatever its envelopes say, and
+   the next case still needs its own newer boot. More contained failures than
+   `max_contained_failures` (default 1, at most 4) end the matrix
+   (`CONTAINED_FAILURE_BUDGET_EXHAUSTED`). A launch the probe command could not
+   recover (exit 3), or one that outlived its wall-clock bound, ends it in
+   `PHYSICAL_INTERVENTION_REQUIRED`. The remaining cases stay `NOT_RUN`, and a
+   later run resumes at the next case without retrying the stopped one.
+
+Measured on 2026-10-29: one run on the project PSP-3000 (firmware 6.6.1, PSPLink
+v3.2.1, Nakagawa Link resident), from one command, with no person involved. It
+ran three cases in about 18 minutes, all from commit `8cbd7d51`:
+
+- `thread-k0-block` was `ACCEPTED` on boot 73.
+- A resident-agent test probe whose `module_start` never returns was
+  `CONTAINED` on boot 74. The runner timed out on it. The agent's watchdog
+  contained it, then cold-reset the PSP into boot 75, in the XMB context.
+- `vfpu-forms` was `ACCEPTED` on boot 76. The matrix's own soft reset had
+  returned the PSP to standalone PSPLink.
+
+The raw logs stay private.
+
+Exit codes: 0 when every case is `ACCEPTED`, 2 for a refusal or any other
+outcome, 3 for `PHYSICAL_INTERVENTION_REQUIRED`. The report and checkpoint stay
+in the private evidence directory.
+
+What the matrix does not do: it runs no case itself, so per-case fault
+containment on the PSP is still the resident agent's and the runner's. It adds
+no second result channel; the runner's existing check, which disqualifies a
+case whose PSPSH stdout records disagree with its host0 records, is the only
+dual-path rule today. It never retries a semantic result, never writes the
+Memory Stick or flash, and never requests or simulates a power cycle. A power
+cycle is reported as `PHYSICAL_INTERVENTION_REQUIRED` for the maintainer.

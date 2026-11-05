@@ -1,0 +1,88 @@
+# =============================================================================
+# Nakagawa Recomp .gitattributes
+# Normalise line endings for text; protect binary assets from CRLF corruption.
+# Without binary marking, git may rewrite .dll/.bin/.iso/.elf on checkout and
+# silently corrupt the loader/runtime or any accidentally-committed game data.
+# =============================================================================
+
+# Source / text: enforce LF on checkout and in the repo. Content detection
+# already classifies every tracked source, script, and document as text.
+*                 text=auto eol=lf
+
+# Binaries: never touch line endings.
+*.dll             binary
+*.exe             binary
+*.so              binary
+*.bin             binary
+*.elf             binary
+*.iso             binary
+*.cso             binary
+*.zso             binary
+*.chd             binary
+*.dax             binary
+*.jso             binary
+*.[pP][bB][pP]    binary
+*.[pP][rR][xX]    binary
+*.[vV][aA][gG]    binary
+*.[aA][tT]3       binary
+*.pgf             binary
+*.ppm             binary
+*.png             binary
+*.jpg             binary
+*.jpeg            binary
+*.webp            binary
+*.mp4             binary
+*.ogg             binary
+*.dat             binary
+*.pgm             binary
+*.gim             binary
+*.pmf             binary
+*.psar            binary
+*.edat            binary
+*.sfo             binary
+*.spv             binary
+*.o               binary
+*.obj             binary
+*.gif             binary
+*.ico             binary
+*.bmp             binary
+*.wav             binary
+*.ttf             binary
+*.otf             binary
+*.woff            binary
+*.woff2           binary
+*.zip             binary
+*.7z              binary
+*.gz              binary
+*.pdf             binary
+*.a               binary
+*.lib             binary
+*.pdb             binary
+
+# GitHub language statistics and diff display (Linguist). Headers are C, not
+# C++ or Objective-C; generated output and vendored upstream code are labelled
+# so pull request diffs collapse them and the language bar counts project code.
+*.h                                   linguist-language=C
+*.inc                                 linguist-language=C
+src/core/generated/**                 linguist-generated
+src/rt/nid_names.h                    linguist-generated
+src/rt/gpu_sdl3vk/*.inc               linguist-generated
+src/ui/shaders/*.inc                  linguist-generated
+assets/public_provenance_ledger.json  linguist-generated
+PUBLIC_EXPORT.json                    linguist-generated
+third_party/**                        linguist-vendored
+
+# Byte-exact upstream FFmpeg import (src/rt/h264_ffmpeg_sub/PROVENANCE.md): this file ends in a blank
+# line upstream, and the blob hash in the manifest must not change.
+src/rt/h264_ffmpeg_sub/libavcodec/h264_mc_template.c -whitespace
+# Byte-identical upstream import whose two whitespace-only lines end in spaces
+# (third_party/dr_libs/PROVENANCE.md): exempt it from the trailing-space check
+# so `git diff --check` and the staged-whitespace hook keep its bytes intact.
+third_party/dr_libs/dr_wav.h          whitespace=-blank-at-eol
+# libchdr and the codecs it carries (third_party/libchdr/PROVENANCE.md) keep their
+# upstream bytes apart from LF line endings, and upstream ends some lines in spaces
+# and mixes tabs and spaces: exempt the imported files from the whitespace checks so
+# `git diff --check` and the staged-whitespace hook leave them as imported. The
+# project-authored manifest keeps the normal rules.
+third_party/libchdr/**                whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+third_party/libchdr/PROVENANCE.md     whitespace=blank-at-eol,blank-at-eof,space-before-tab

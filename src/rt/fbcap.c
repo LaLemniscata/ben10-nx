@@ -1,0 +1,394 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025-2026 the psp-recomp authors
+// Copyright (C) 2026 the Nakagawa Recomp authors
+// Derived from sal063/PSP-recompilation-project (GPL-2.0-or-later)
+// Modified by Nakagawa Recomp contributors, 2026-10-08.
+// See NOTICE.md for upstream lineage and modification provenance.
+//
+// fbcap.c - presenter-neutral frame capture service (issue #57)
+//
+// The capture state machine, the parent-directory helper and the atomic P6 publisher were
+// moved here from src/rt/gpu_sdl3vk/sdl3vk.c, so this file keeps that file's notices.
+//
+// The single owner of capture state and of the P6 PPM publisher. Presenters only supply
+// the pixels they presented (see fbcap.h for the arm/service/resolve protocol); they never
+// hold capture state of their own. Host-only C: no SDL, Vulkan or guest-memory dependency,
+// so fbcap-selftest drives it directly with synthetic frames.
+
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
+#include "fbcap.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <direct.h>
+#include <windows.h>
+#endif
+
+enum {
+    CAP_IDLE = 0,  /* nothing armed */
+    CAP_ARMED,     /* armed; the presenter will service the next presented frame */
+    CAP_RECORDED,  /* GPU readback recorded in a submitted present; waiting on its fence */
+    CAP_DONE,      /* file published */
+    CAP_FAILED     /* attempted and failed */
+};
+
+static int s_state = CAP_IDLE;
+static int s_result;                 /* 1 published, 0 nothing attempted, -1 failed */
+static char s_path[1024];
+static sr_cap_source s_src = SR_CAP_SRC_NONE;
+static uint32_t s_w, s_h;
+static int s_probe;                  /* the pending request is a probe: no file */
+static int s_probe_ready;            /* a probe result is waiting to be taken */
+static uint32_t s_probe_brightest;
+static int s_probe_in_flight;        /* a deferred probe's readback is still on the GPU */
+static uint32_t s_probe_w, s_probe_h;
+static SrCaptureProbeResolver s_probe_resolver;
+
+static int cap_is_sep(char c) { return c == '/' || c == '\\'; }
+
+/* 1 when `dir` is a directory after this call, created now or already there. A failed
+ * mkdir is judged by what is on disk, not by its errno: Windows reports an existing drive
+ * root ("C:/") as EACCES, and an existing directory must never fail a publish. An existing
+ * non-directory is not a directory, so the publish then fails cleanly. */
+static int cap_dir_ready(const char *dir) {
+#ifdef _WIN32
+    struct _stat st;
+    if (_mkdir(dir) == 0) return 1;
+    return _stat(dir, &st) == 0 && (st.st_mode & _S_IFDIR) != 0;
+#else
+    struct stat st;
+    if (mkdir(dir, 0777) == 0) return 1;
+    return stat(dir, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+/* Create the parent directory of `path` (mkdir -p on the directory component only). FBSNAP
+ * publishes under build/snapshots/, which no build step creates. Every prefix is checked
+ * without a trailing separator; a root ("/", or a drive root such as "C:/") always exists
+ * and is never created. Relative and absolute paths, with either separator, behave alike. */
+static int cap_ensure_parent_dir(const char *path) {
+    char dir[1024];
+    size_t n = strlen(path);
+    if (!n || n >= sizeof dir) return 0;
+    memcpy(dir, path, n + 1);
+    char *sep = NULL;
+    for (char *q = dir; *q; q++)
+        if (cap_is_sep(*q)) sep = q;
+    if (!sep) return 1;                          /* bare file name: the current directory */
+    while (sep > dir && cap_is_sep(sep[-1])) sep--;  /* "a//file" names directory "a" */
+    *sep = '\0';
+    n = (size_t)(sep - dir);
+    if (n == 0 || (n == 2 && dir[1] == ':')) return 1;   /* a file directly under "/" or a drive root */
+    for (char *q = dir + 1; *q; q++) {
+        if (!cap_is_sep(*q) || cap_is_sep(q[-1])) continue;
+        size_t len = (size_t)(q - dir);
+        if (len == 2 && dir[1] == ':') continue;          /* drive root */
+        char save = *q;
+        *q = '\0';
+        int ready = cap_dir_ready(dir);
+        *q = save;
+        if (!ready) return 0;
+    }
+    return cap_dir_ready(dir);
+}
+
+/* The single terminal transition out of the armed/recorded states. Every failure funnels
+ * through here, so sr_capture_result() can never report a stale or invented outcome. */
+static void cap_finish(int ok, const char *why) {
+    if (s_state != CAP_ARMED && s_state != CAP_RECORDED) return;
+    if (ok) {
+        s_state = CAP_DONE;
+        s_result = 1;
+    } else {
+        s_state = CAP_FAILED;
+        s_result = -1;
+        fprintf(stderr, "fbcap: present capture failed: %s\n", why ? why : "unknown reason");
+    }
+}
+
+/* Publish w x h pixels as a P6 PPM whose name ends in .ppm: the header matches the
+ * extension and exactly w*h*3 colour bytes follow, in R,G,B order whatever the source byte
+ * order. Publication is atomic: a unique temp sibling is written completely and then renamed
+ * over the destination, so a reader never observes a half-written file. */
+static int cap_write_file(const uint8_t *px, uint32_t row_bytes, sr_cap_order order) {
+    if (!cap_ensure_parent_dir(s_path)) return 0;
+    static unsigned long s_tmp_seq;
+    char tmp[1024 + 64];
+    if (snprintf(tmp, sizeof tmp, "%s.tmp%lu", s_path, ++s_tmp_seq) >= (int)sizeof tmp)
+        return 0;
+    unsigned char *rgb = (unsigned char *)malloc((size_t)s_w * 3u);
+    if (!rgb) return 0;
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { free(rgb); return 0; }
+    int ok = fprintf(f, "P6\n%u %u\n255\n", s_w, s_h) > 0;
+    /* Byte offsets of R, G, B inside one pixel for the source byte order. */
+    const int ir = order == SR_CAP_ORDER_RGBX ? 0 : 2;
+    const int ib = order == SR_CAP_ORDER_RGBX ? 2 : 0;
+    for (uint32_t y = 0; ok && y < s_h; y++) {
+        const uint8_t *row = px + (size_t)y * row_bytes;
+        for (uint32_t x = 0; x < s_w; x++) {
+            const uint8_t *p = row + (size_t)x * 4u;
+            rgb[x * 3u + 0u] = p[ir];
+            rgb[x * 3u + 1u] = p[1];
+            rgb[x * 3u + 2u] = p[ib];
+        }
+        ok = fwrite(rgb, 1, (size_t)s_w * 3u, f) == (size_t)s_w * 3u;
+    }
+    if (ok && fflush(f) != 0) ok = 0;
+    if (fclose(f) != 0) ok = 0;
+    free(rgb);
+    if (!ok) { remove(tmp); return 0; }
+#ifdef _WIN32
+    if (!MoveFileExA(tmp, s_path, MOVEFILE_REPLACE_EXISTING)) {
+        remove(tmp);
+        fprintf(stderr, "fbcap: publish failed (MoveFileExA: %lu)\n", (unsigned long)GetLastError());
+        return 0;
+    }
+#else
+    if (rename(tmp, s_path) != 0) { remove(tmp); return 0; }
+#endif
+    return 1;
+}
+
+/* A w x h frame of row_bytes-long rows is a valid pixel description: the frame size is
+ * checked in 64-bit arithmetic and bounded like the readback buffer (at most UINT32_MAX
+ * source bytes), so no size computation that follows can wrap. */
+static int cap_pixels_valid(const void *px, uint32_t w, uint32_t h, uint32_t row_bytes,
+                            sr_cap_order order) {
+    return px && w != 0u && h != 0u && (uint64_t)row_bytes >= (uint64_t)w * 4u &&
+           (uint64_t)row_bytes * h <= UINT32_MAX &&
+           (order == SR_CAP_ORDER_BGRX || order == SR_CAP_ORDER_RGBX);
+}
+
+/* The probe's result: the brightest of the three colour bytes of any pixel. The ignored byte
+ * sits at offset 3 in both orders. Rows are scanned in order and the scan stops after the
+ * first row that holds a 255, the largest possible result. */
+static uint32_t probe_brightest(const uint8_t *px, uint32_t w, uint32_t h, uint32_t row_bytes) {
+    uint32_t brightest = 0;
+    for (uint32_t y = 0; y < h && brightest < 255u; y++) {
+        const uint8_t *row = px + (size_t)y * row_bytes;
+        uint32_t m = 0;
+        for (uint32_t x = 0; x < w; x++) {
+            const uint8_t *p = row + (size_t)x * 4u;
+            if (p[0] > m) m = p[0];
+            if (p[1] > m) m = p[1];
+            if (p[2] > m) m = p[2];
+        }
+        if (m > brightest) brightest = m;
+    }
+    return brightest;
+}
+
+/* Validate the pixel description, publish the capture, then resolve it. */
+static int cap_publish(const void *px, uint32_t row_bytes, sr_cap_order order) {
+    if (!cap_pixels_valid(px, s_w, s_h, row_bytes, order)) {
+        cap_finish(0, "invalid pixel description");
+        return -1;
+    }
+    if (s_probe) {
+        s_probe_brightest = probe_brightest((const uint8_t *)px, s_w, s_h, row_bytes);
+        s_probe_ready = 1;
+        cap_finish(1, NULL);
+        return 1;
+    }
+    if (!cap_write_file((const uint8_t *)px, row_bytes, order)) {
+        cap_finish(0, "write or publish failed");
+        return -1;
+    }
+    cap_finish(1, NULL);
+    return 1;
+}
+
+int sr_capture_arm(const char *path) {
+    /* A rejected request is a new capture attempt, not permission to reuse the last
+     * completed result. In-flight state is preserved; only the reportable outcome clears. */
+    s_result = 0;
+    if (s_state == CAP_ARMED || s_state == CAP_RECORDED) return 0;
+    if (!path || !path[0] || strlen(path) >= sizeof s_path) return 0;
+    snprintf(s_path, sizeof s_path, "%s", path);
+    s_probe = 0;
+    s_src = SR_CAP_SRC_NONE;
+    s_w = s_h = 0;
+    s_state = CAP_ARMED;
+    return 1;
+}
+
+int sr_capture_arm_probe(void) {
+    s_result = 0;
+    if (s_state == CAP_ARMED || s_state == CAP_RECORDED || s_probe_in_flight) return 0;
+    s_path[0] = '\0';
+    s_probe = 1;
+    s_src = SR_CAP_SRC_NONE;
+    s_w = s_h = 0;
+    s_state = CAP_ARMED;
+    return 1;
+}
+
+int sr_capture_probe_take(uint32_t *brightest) {
+    if (!s_probe_ready) return 0;
+    s_probe_ready = 0;
+    if (brightest) *brightest = s_probe_brightest;
+    return 1;
+}
+
+int sr_capture_pending_is_probe(void) {
+    return (s_state == CAP_ARMED || s_state == CAP_RECORDED) && s_probe;
+}
+
+void sr_capture_probe_defer(void) {
+    if (s_state != CAP_RECORDED || !s_probe) return;
+    s_probe_in_flight = 1;
+    s_probe_w = s_w;
+    s_probe_h = s_h;
+    /* The capture slot is free again; the probe has no reportable file result. */
+    s_probe = 0;
+    s_state = CAP_IDLE;
+    s_result = 0;
+}
+
+int sr_capture_probe_in_flight(void) { return s_probe_in_flight; }
+
+int sr_capture_publish_probe(const void *px, uint32_t row_bytes, sr_cap_order order) {
+    if (!s_probe_in_flight) return 0;
+    s_probe_in_flight = 0;
+    if (!cap_pixels_valid(px, s_probe_w, s_probe_h, row_bytes, order)) {
+        fprintf(stderr, "fbcap: picture probe failed: invalid pixel description\n");
+        return -1;
+    }
+    s_probe_brightest = probe_brightest((const uint8_t *)px, s_probe_w, s_probe_h, row_bytes);
+    s_probe_ready = 1;
+    return 1;
+}
+
+void sr_capture_probe_drop(const char *why) {
+    if (!s_probe_in_flight) return;
+    s_probe_in_flight = 0;
+    fprintf(stderr, "fbcap: picture probe dropped: %s\n", why ? why : "unknown reason");
+}
+
+void sr_capture_set_probe_resolver(SrCaptureProbeResolver resolver) { s_probe_resolver = resolver; }
+
+int sr_capture_probe_poll(int block) {
+    if (!s_probe_in_flight || !s_probe_resolver) return 0;
+    return s_probe_resolver(block);
+}
+
+int sr_picture_watch_probe(SrPictureWatch *w, uint32_t vcount, uint32_t brightest) {
+    if (!w) return SR_PICTURE_WATCH_NONE;
+    w->pending = 0;
+    w->last_vcount = vcount;
+    if (brightest <= SR_PICTURE_DARK_MAX) {
+        if (!w->dark) {
+            w->dark = 1;
+            w->first_vcount = vcount;
+            w->reported = 0;
+        }
+        return SR_PICTURE_WATCH_NONE;
+    }
+    int resumed = w->dark && w->reported > 0u;
+    w->dark = 0;
+    w->reported = 0;
+    return resumed ? SR_PICTURE_WATCH_RESUMED : SR_PICTURE_WATCH_NONE;
+}
+
+int sr_picture_watch_tick(SrPictureWatch *w, uint32_t vcount, uint32_t *dark_vblanks) {
+    if (!w || !w->dark) return SR_PICTURE_WATCH_NONE;
+    /* VCOUNT is monotonic for the process, so both differences are true elapsed counts. */
+    if (vcount - w->last_vcount > 2u * SR_PICTURE_PROBE_EVERY) return SR_PICTURE_WATCH_NONE;
+    uint32_t elapsed = vcount - w->first_vcount;
+    uint32_t bucket = elapsed / SR_PICTURE_REPORT_EVERY;
+    if (bucket <= w->reported) return SR_PICTURE_WATCH_NONE;
+    w->reported = bucket;
+    if (dark_vblanks) *dark_vblanks = elapsed;
+    return SR_PICTURE_WATCH_REPORT;
+}
+
+void sr_picture_watch_probe_sent(SrPictureWatch *w, uint32_t vcount) {
+    if (!w) return;
+    w->pending = 1;
+    w->pending_vcount = vcount;
+}
+
+int sr_picture_watch_tick_needs_probe(const SrPictureWatch *w, uint32_t vcount) {
+    if (!w || !w->pending) return 0;
+    /* A dark result opens a stretch at the probe, due a report once a period has passed. */
+    if (vcount - w->pending_vcount >= SR_PICTURE_REPORT_EVERY) return 1;
+    /* Fed, the result either keeps the stretch (last_vcount becomes the probe's, so the tick
+     * is not quiet) or ends it; it matters only when a new report bucket is due. */
+    return w->dark && (vcount - w->first_vcount) / SR_PICTURE_REPORT_EVERY > w->reported;
+}
+
+int sr_picture_watch_collect(SrPictureWatch *w, int block, uint32_t *brightest) {
+    if (!w || !w->pending) return SR_PICTURE_WATCH_NONE;
+    uint32_t b = 0u;
+    (void)sr_capture_probe_poll(block);
+    if (sr_capture_probe_take(&b)) {
+        if (brightest) *brightest = b;
+        return sr_picture_watch_probe(w, w->pending_vcount, b);
+    }
+    if (block) sr_capture_probe_drop("no presenter finished the readback");
+    if (!sr_capture_probe_in_flight()) w->pending = 0;
+    return SR_PICTURE_WATCH_NONE;
+}
+
+int sr_capture_result(void) { return s_result; }
+
+void sr_capture_cancel(void) {
+    if (s_state != CAP_ARMED) return;
+    s_state = CAP_IDLE;
+    s_path[0] = '\0';
+    s_src = SR_CAP_SRC_NONE;
+    s_w = s_h = 0;
+    s_result = 0;
+}
+
+void sr_capture_fail(const char *why) {
+    if (s_state != CAP_ARMED && s_state != CAP_RECORDED) return;
+    cap_finish(0, why);
+}
+
+const char *sr_capture_source_label(void) {
+    switch (s_src) {
+    case SR_CAP_SRC_CPU: return "cpu-framebuffer";
+    case SR_CAP_SRC_GPU: return "gpu-render-target";
+    default:             return "";
+    }
+}
+
+int sr_capture_is_armed(void) { return s_state == CAP_ARMED; }
+
+int sr_capture_is_recorded(void) { return s_state == CAP_RECORDED; }
+
+int sr_capture_serve_host(const void *px, uint32_t w, uint32_t h, uint32_t row_bytes,
+                          sr_cap_order order) {
+    if (s_state != CAP_ARMED) return 0;
+    s_src = SR_CAP_SRC_CPU;
+    s_w = w;
+    s_h = h;
+    return cap_publish(px, row_bytes, order);
+}
+
+void sr_capture_mark_recorded(sr_cap_source src, uint32_t w, uint32_t h) {
+    if (s_state != CAP_ARMED) return;
+    s_src = src;
+    s_w = w;
+    s_h = h;
+    s_state = CAP_RECORDED;
+}
+
+int sr_capture_publish_recorded(const void *px, uint32_t row_bytes, sr_cap_order order) {
+    if (s_state != CAP_RECORDED) return 0;
+    return cap_publish(px, row_bytes, order);
+}

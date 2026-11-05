@@ -1,0 +1,2657 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025-2026 the psp-recomp authors
+// Copyright (C) 2026 the Nakagawa Recomp authors
+// Derived from sal063/PSP-recompilation-project (GPL-2.0-or-later)
+// Modified by Nakagawa Recomp contributors, 2026-08-10.
+// See NOTICE.md for upstream lineage and modification provenance.
+//
+/*
+ * SDL3 owns the window/input path and Vulkan owns the swapchain presentation path. The
+ * module accepts both software-rendered guest frames and images produced by ge_gpu.c.
+ *
+ * Presentation uses a small frame ring.  The CPU waits only when reusing that frame's
+ * resources; vkQueuePresentKHR is otherwise non-blocking.
+ *
+ * AI disclosure: this renderer is an original implementation (it does not reuse PPSSPP's
+ * GPU) written with substantial assistance from an LLM (Anthropic Claude). See NOTICE.md.
+ * GPLv2+: it consumes ge.c, whose GE semantics are derived from PPSSPP. */
+
+/* setenv/unsetenv on the non-Windows capture/profile-test path (POSIX.1-2008). */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+#include "../ace.h"   /* Ace Mode: texture filtering asks for samplerAnisotropy */
+#include "sdl3vk.h"
+#include "nk_platform.h"
+#include "../perf.h"
+#include "../fbcap_policy.h"
+#include "../fbcap.h"
+#include "../recomp.h"   /* sr_parse_display_bounds, sr_pick_display */
+#include "../sr_coro.h"
+
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+#include <vulkan/vulkan.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+#define PSP_W 480
+#define PSP_H 272
+#define PRESENT_FRAMES 3
+#define HUD_W 240
+#define HUD_H 108
+#define LOGIC_NOTICE_H 22
+/* The developer profile HUD (#314): the live view's rows and a bar per closed interval. */
+#define PROFILE_HUD_W 560
+#define PROFILE_HUD_H 232
+#define HUD_STAGING_BYTES (PROFILE_HUD_W * (PROFILE_HUD_H + LOGIC_NOTICE_H) * 4)
+
+typedef struct PresentFrame {
+    VkCommandBuffer cmd;
+    VkFence fence;
+    VkSemaphore sem_acq;   /* its submit's wait, covered by the fence; the present's is per image */
+    VkBuffer staging;
+    VkDeviceMemory staging_mem;
+    void *staging_map;
+    VkBuffer hud_staging;
+    VkDeviceMemory hud_staging_mem;
+    void *hud_staging_map;
+    VkImage fbimg;
+    VkDeviceMemory fbimg_mem;
+    VkImage source;
+    int submitted;
+} PresentFrame;
+
+static SDL_Window      *s_win;
+static int              s_window_hidden;      /* SR_WINDOW_HIDDEN: created hidden, never raised */
+static SDL_Gamepad     *s_pad;
+static VkInstance       s_inst;
+static VkSurfaceKHR     s_surf;
+static VkPhysicalDevice s_pdev;
+static VkDevice         s_dev;
+static uint32_t         s_qfam;
+static VkQueue          s_queue;
+static VkCommandPool    s_pool;
+static VkCommandBuffer  s_cmd;              /* diagnostic capture only */
+static VkFence          s_fence;
+static PresentFrame     s_frame[PRESENT_FRAMES];
+static uint32_t         s_frame_cursor;
+static int              s_scaling = SDL3VK_SCALING_SHARP;  /* SR_PRESENT_SCALING (issue #1129) */
+static uint32_t         s_max_image_dim = 4096;  /* Vulkan's guaranteed minimum until init reads it */
+
+static VkSwapchainKHR s_swap;
+static VkFormat       s_swap_fmt;
+static VkExtent2D     s_swap_ext;
+static uint32_t       s_swap_n;
+static VkImage        s_swap_img[8];
+static VkFence        s_swap_img_fence[8];
+/* The semaphore a present of each image waits on (#1799). No fence covers that wait: it is
+ * known to be over only once the image is acquired again, so the semaphore belongs to the
+ * image, not to the frame slot that drew it, and lives as long as the swapchain does. */
+static VkSemaphore    s_swap_sem_done[8];
+
+static int      s_renderer_terminal = 0;
+static int      s_denorm_preserve_f32 = 0;   /* see sdl3vk_init: VK_KHR_shader_float_controls */
+/* A quit request (window close, SDL_EVENT_QUIT, ESC) is sticky. Two call sites drain
+ * the SDL event queue -- gui_pump's sdl3vk_poll() and every present -- and only the
+ * former exits the process. When a present consumed the quit (the common case: it
+ * polls every frame), the request was lost and the runtime kept running with no
+ * window, so the launcher could never see the game end. */
+static int      s_quit_requested = 0;
+static uint64_t s_swapchain_gen = 0;
+static uint64_t s_frame_sem_gen = 0;
+
+static int     s_present_fault_armed = 0;
+static VkResult s_present_fault_result = VK_SUCCESS;
+
+/* Present-step fault seam for the lifecycle selftest (#1377): armed for one checked step of a
+ * present, the next check of that step sees s_pstep_fault_result. A failure code stands in for
+ * the call, which is not made; a success code (VK_SUBOPTIMAL_KHR) replaces the call's own
+ * VK_SUCCESS. One-shot; PSTEP_NONE is disarmed. */
+enum { PSTEP_NONE, PSTEP_FRAME_WAIT, PSTEP_ACQUIRE, PSTEP_IMAGE_WAIT, PSTEP_RESET_CMD,
+       PSTEP_BEGIN_CMD, PSTEP_END_CMD, PSTEP_RESET_FENCE, PSTEP_SUBMIT };
+static int      s_pstep_fault = PSTEP_NONE;
+static VkResult s_pstep_fault_result = VK_SUCCESS;
+
+static int pstep_skips(int step) {
+    if (s_pstep_fault != step || s_pstep_fault_result >= 0) return 0;
+    s_pstep_fault = PSTEP_NONE;
+    return 1;
+}
+
+static VkResult pstep_after(int step, VkResult r) {
+    if (s_pstep_fault != step || r != VK_SUCCESS) return r;
+    s_pstep_fault = PSTEP_NONE;
+    return s_pstep_fault_result;
+}
+
+#define PSTEP_VK(step, expr) (pstep_skips(step) ? s_pstep_fault_result : pstep_after((step), (expr)))
+
+int sdl3vk_renderer_terminal(void) {
+    return s_renderer_terminal;
+}
+
+void sdl3vk_present_fault_inject(int vk_result) {
+    s_present_fault_armed = 1;
+    s_present_fault_result = (VkResult)vk_result;
+}
+
+void sdl3vk_present_fault_clear(void) {
+    s_present_fault_armed = 0;
+    s_present_fault_result = VK_SUCCESS;
+}
+
+uint64_t sdl3vk_swapchain_generation(void) {
+    return s_swapchain_gen;
+}
+
+uint64_t sdl3vk_frame_semaphore_generation(void) {
+    return s_frame_sem_gen;
+}
+
+/* ---- performance overlay (HUD) ------------------------------------------------------ */
+
+static int s_hud_enabled = 0;    /* SDL3VK_HUD_*: 0 off */
+static int s_developer = 0;      /* SR_DEVELOPER_MODE: the profile HUD is offered */
+static int (*s_audio_active_cb)(void) = NULL;
+static int (*s_logic_slowed_cb)(unsigned *rate) = NULL;
+static SDL_Surface  *s_hud_surf = NULL;
+static SDL_Renderer *s_hud_ren = NULL;
+static VkFormat      s_hud_fmt = VK_FORMAT_UNDEFINED;
+
+int sdl3vk_hud_is_enabled(void) {
+    return s_hud_enabled != SDL3VK_HUD_OFF;
+}
+
+int sdl3vk_hud_mode(void) {
+    return s_hud_enabled;
+}
+
+int sdl3vk_developer_mode(void) {
+    return s_developer;
+}
+
+int sdl3vk_hud_next_mode(int mode, int developer) {
+    if (mode == SDL3VK_HUD_OFF) return SDL3VK_HUD_PERF;
+    if (mode == SDL3VK_HUD_PERF && developer) return SDL3VK_HUD_PROFILE;
+    return SDL3VK_HUD_OFF;
+}
+
+static void hud_set_mode(int mode) {
+    s_hud_enabled = mode == SDL3VK_HUD_PROFILE && s_developer ? SDL3VK_HUD_PROFILE
+                  : mode != SDL3VK_HUD_OFF ? SDL3VK_HUD_PERF : SDL3VK_HUD_OFF;
+    if (s_hud_enabled != SDL3VK_HUD_OFF) {
+        sr_perf_enable_counters();
+    }
+}
+
+void sdl3vk_hud_set_enabled(int enabled) {
+    /* On keeps the profile HUD a developer already chose. */
+    hud_set_mode(!enabled ? SDL3VK_HUD_OFF
+                          : s_hud_enabled != SDL3VK_HUD_OFF ? s_hud_enabled : SDL3VK_HUD_PERF);
+}
+
+void sdl3vk_set_audio_active_cb(int (*cb)(void)) {
+    s_audio_active_cb = cb;
+}
+
+void sdl3vk_set_logic_slowed_cb(int (*cb)(unsigned *rate)) {
+    s_logic_slowed_cb = cb;
+}
+
+static void (*s_ui_pass)(const Sdl3VkUiPass *frame);
+static Sdl3VkShowPass s_show_pass;
+
+void sdl3vk_set_show_pass(Sdl3VkShowPass pass) {
+    s_show_pass = pass;
+}
+
+void sdl3vk_set_ui_pass(void (*pass)(const Sdl3VkUiPass *frame)) {
+    s_ui_pass = pass;
+}
+
+static uint32_t s_buttons;
+static uint8_t  s_lx = 128, s_ly = 128;
+static int      s_pad_present;
+
+/* ---- validation layer (issue #57) --------------------------------------------------- */
+
+static int         s_validation_on;      /* SR_VULKAN_VALIDATION requested AND enabled */
+static int         s_validation_errors;  /* ERROR-severity messages since init */
+static VkDebugUtilsMessengerEXT s_validation_msgr;
+static PFN_vkDestroyDebugUtilsMessengerEXT s_validation_destroy;
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL s_validation_cb(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT type,
+    const VkDebugUtilsMessengerCallbackDataEXT *data, void *user) {
+    (void)type; (void)user;
+    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) s_validation_errors++;
+    fprintf(stderr, "[VulkanValidation] %s: %s\n",
+            (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ? "ERROR" : "WARNING",
+            data && data->pMessage ? data->pMessage : "(no message)");
+    return VK_FALSE;
+}
+
+int sdl3vk_validation_error_count(void) { return s_validation_errors; }
+
+#define VK_TRY(expr) do { VkResult vr_ = (expr); if (vr_ != VK_SUCCESS) { \
+    fprintf(stderr, "sdl3vk: %s failed: %d\n", #expr, (int)vr_); return 0; } } while (0)
+
+static uint32_t find_mem_type(uint32_t bits, VkMemoryPropertyFlags want) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(s_pdev, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want)
+            return i;
+    return UINT32_MAX;
+}
+
+/* A failed wait (device lost, out of memory) leaves the frame's submission possibly running, so
+ * its command buffer, semaphores and staging memory can never be reused: the renderer is
+ * terminal (#1377). */
+static int wait_present_frame(PresentFrame *f) {
+    if (!f->submitted) return 1;
+    uint64_t wait_started = sr_perf_now_ns();
+    VkResult r = PSTEP_VK(PSTEP_FRAME_WAIT, vkWaitForFences(s_dev, 1, &f->fence, VK_TRUE, UINT64_MAX));
+    if (wait_started) {
+        sr_perf_vulkan_wait(wait_started, 0);
+        sr_perf_present_wait(wait_started);
+    }
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "sdl3vk: present frame fence wait failed: %d; the renderer is terminal\n",
+                (int)r);
+        s_renderer_terminal = 1;
+        return 0;
+    }
+    f->submitted=0;
+    f->source=VK_NULL_HANDLE;
+    return 1;
+}
+
+static int wait_all_present_frames(void) {
+    for(int i=0;i<PRESENT_FRAMES;i++)if(!wait_present_frame(&s_frame[i]))return 0;
+    return 1;
+}
+
+/* ---- swapchain ---------------------------------------------------------------------- */
+
+static void destroy_swapchain(void) {
+    if (s_swap) { vkDestroySwapchainKHR(s_dev, s_swap, NULL); s_swap = VK_NULL_HANDLE; }
+}
+
+/* After the swapchain whose presents waited on them is gone (#1799). */
+static void destroy_present_semaphores(void) {
+    for (size_t i = 0; i < sizeof(s_swap_sem_done) / sizeof(s_swap_sem_done[0]); i++) {
+        if (s_swap_sem_done[i]) vkDestroySemaphore(s_dev, s_swap_sem_done[i], NULL);
+        s_swap_sem_done[i] = VK_NULL_HANDLE;
+    }
+}
+
+/* Queue-idle fault seam for the selftest: a nonzero VkResult stands in for the next wait. */
+static VkResult s_idle_fault_result = VK_SUCCESS;
+
+/* A swapchain may be destroyed only once every use of the images acquired from it has completed
+ * (VUID-vkDestroySwapchainKHR-swapchain-01282). The frame fences cover the copies into those
+ * images; the queue idle also covers each present's wait on its semaphore, which no fence covers.
+ * A failed wait (device lost, out of memory) proves nothing idle: the swapchain is then neither
+ * replaced nor destroyed, and the renderer is terminal (#1377). */
+static int wait_swapchain_unused(void) {
+    if (!wait_all_present_frames()) {
+        fprintf(stderr, "sdl3vk: a present frame's fence wait failed; the swapchain is kept\n");
+    } else {
+        VkResult r = s_idle_fault_result != VK_SUCCESS ? s_idle_fault_result
+                                                       : vkQueueWaitIdle(s_queue);
+        s_idle_fault_result = VK_SUCCESS;
+        if (r == VK_SUCCESS) return 1;
+        fprintf(stderr, "sdl3vk: vkQueueWaitIdle failed: %d; the swapchain is kept\n", (int)r);
+    }
+    s_renderer_terminal = 1;
+    return 0;
+}
+
+static int init_step_fails(void);
+/* Set while sdl3vk_init creates its swapchain: each present semaphore is then one of its fallible
+ * steps, as it was when the semaphores were per frame, so the init unwind reaches every one. */
+static int s_swapchain_in_init = 0;
+
+/* Creates the swapchain, or replaces the current one: the old swapchain is retired into the new
+ * one and destroyed once its images are no longer in use, and its present semaphores with it. */
+static int create_swapchain(void) {
+    if (s_swap && !wait_swapchain_unused()) return 0;
+    VkSurfaceCapabilitiesKHR caps;
+    VK_TRY(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_pdev, s_surf, &caps));
+
+    /* Prefer BGRA8 UNORM (matches the framebuffer byte order); fall back to whatever the
+     * surface offers first. VK_INCOMPLETE is a success code here (the surface has more
+     * formats than fmts[] holds, and the entries written are valid), so it is not routed
+     * through VK_TRY (issue #884). The pick itself is sdl3vk_pick_surface_format. */
+    VkSurfaceFormatKHR fmts[SDL3VK_SURFACE_FORMAT_CAP]; uint32_t nf = SDL3VK_SURFACE_FORMAT_CAP;
+    VkResult fr = vkGetPhysicalDeviceSurfaceFormatsKHR(s_pdev, s_surf, &nf, fmts);
+    int fmt_ids[SDL3VK_SURFACE_FORMAT_CAP];
+    int nk = 0;
+    if (fr == VK_SUCCESS || fr == VK_INCOMPLETE) {
+        nk = nf < SDL3VK_SURFACE_FORMAT_CAP ? (int)nf : SDL3VK_SURFACE_FORMAT_CAP;
+        for (int i = 0; i < nk; i++) fmt_ids[i] = (int)fmts[i].format;
+    }
+    int pi = sdl3vk_pick_surface_format((int)fr, nk, fmt_ids);
+    if (pi < 0) {
+        fprintf(stderr, "sdl3vk: vkGetPhysicalDeviceSurfaceFormatsKHR gave no usable formats: "
+                        "VkResult %d, %d format(s)\n", (int)fr, nk);
+        return 0;
+    }
+    VkSurfaceFormatKHR pick = fmts[pi];
+    s_swap_fmt = pick.format;
+
+    VkExtent2D ext = caps.currentExtent;
+    if (ext.width == UINT32_MAX) {   /* surface lets us choose: use the window pixel size */
+        int w = 0, h = 0;
+        SDL_GetWindowSizeInPixels(s_win, &w, &h);
+        ext.width  = (uint32_t)w;  ext.height = (uint32_t)h;
+    }
+    if (ext.width  < caps.minImageExtent.width)  ext.width  = caps.minImageExtent.width;
+    if (ext.width  > caps.maxImageExtent.width)  ext.width  = caps.maxImageExtent.width;
+    if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
+    if (ext.height > caps.maxImageExtent.height) ext.height = caps.maxImageExtent.height;
+    if (ext.width == 0 || ext.height == 0) return 0;   /* minimized: keep old swapchain */
+    s_swap_ext = ext;
+
+    uint32_t n = caps.minImageCount + 1;
+    if (caps.maxImageCount && n > caps.maxImageCount) n = caps.maxImageCount;
+
+    VkSwapchainKHR old = s_swap;
+    VkSwapchainCreateInfoKHR sci = { .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
+    sci.surface          = s_surf;
+    sci.minImageCount    = n;
+    sci.imageFormat      = pick.format;
+    sci.imageColorSpace  = pick.colorSpace;
+    sci.imageExtent      = ext;
+    sci.imageArrayLayers = 1;
+    sci.imageUsage       = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    sci.preTransform     = caps.currentTransform;
+    sci.compositeAlpha   = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    /* Game speed is paced by the scheduler's vblank clock (sched.c vblank_pace), not by
+     * presentation. MAILBOX (no tearing, never blocks) avoids beating against the monitor
+     * refresh; FIFO is the mandated fallback. */
+    sci.presentMode      = VK_PRESENT_MODE_FIFO_KHR;
+    {
+        VkPresentModeKHR pm[8]; uint32_t npm = 8;
+        int avail[8]; int navail = 0;
+        if (vkGetPhysicalDeviceSurfacePresentModesKHR(s_pdev, s_surf, &npm, pm) >= VK_SUCCESS) {
+            for (uint32_t i = 0; i < npm && i < 8; i++) avail[navail++] = (int)pm[i];
+        }
+        const char *vs = getenv("SR_VSYNC");
+        int vsync_on = !vs || !vs[0] || atoi(vs) != 0;
+        sci.presentMode = (VkPresentModeKHR)sdl3vk_pick_present_mode(vsync_on, avail, navail);
+        if (!vsync_on && sci.presentMode == VK_PRESENT_MODE_FIFO_KHR) {
+            fprintf(stderr, "sdl3vk: SR_VSYNC=0 requested but this surface offers no "
+                            "MAILBOX/IMMEDIATE mode; falling back to FIFO (vsync)\n");
+        }
+    }
+    sci.clipped          = VK_TRUE;
+    sci.oldSwapchain     = old;
+    VkSwapchainKHR made = VK_NULL_HANDLE;
+    VkResult cr = vkCreateSwapchainKHR(s_dev, &sci, NULL, &made);
+    if (cr != VK_SUCCESS) {
+        /* The old swapchain is retired even when the new one is not created (vkCreateSwapchainKHR,
+         * oldSwapchain), so it can present nothing more; its images are unused (waited above).
+         * It is destroyed and the renderer is terminal (#1377). */
+        fprintf(stderr, "sdl3vk: vkCreateSwapchainKHR failed: %d; the renderer is terminal\n",
+                (int)cr);
+        if (old) vkDestroySwapchainKHR(s_dev, old, NULL);
+        destroy_present_semaphores();
+        s_swap = VK_NULL_HANDLE;
+        s_swap_n = 0;
+        memset(s_swap_img_fence, 0, sizeof(s_swap_img_fence));
+        s_renderer_terminal = 1;
+        return 0;
+    }
+    s_swap = made;
+    if (old) vkDestroySwapchainKHR(s_dev, old, NULL);
+    /* Every present that waited on these was to the old swapchain, and the queue was idle
+     * before it was replaced (wait_swapchain_unused). */
+    destroy_present_semaphores();
+
+    uint32_t n_img = (uint32_t)(sizeof(s_swap_img) / sizeof(s_swap_img[0]));
+    VkResult ir = vkGetSwapchainImagesKHR(s_dev, s_swap, &n_img, s_swap_img);
+    if (ir != VK_SUCCESS) {
+        /* The new swapchain exists and the old one is gone, but its images are unknown. */
+        fprintf(stderr, "sdl3vk: vkGetSwapchainImagesKHR failed: %d; the renderer is terminal\n",
+                (int)ir);
+        s_swap_n = 0;
+        memset(s_swap_img_fence, 0, sizeof(s_swap_img_fence));
+        s_renderer_terminal = 1;
+        return 0;
+    }
+    VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    for (uint32_t i = 0; i < n_img; i++) {
+        VkResult sr = s_swapchain_in_init && init_step_fails()
+                    ? VK_ERROR_INITIALIZATION_FAILED
+                    : vkCreateSemaphore(s_dev, &semi, NULL, &s_swap_sem_done[i]);
+        if (sr != VK_SUCCESS) {
+            /* Those already made are destroyed with the swapchain, by the next creation or
+             * by shutdown. */
+            fprintf(stderr, "sdl3vk: vkCreateSemaphore for swapchain image %u failed: %d; "
+                            "the renderer is terminal\n", (unsigned)i, (int)sr);
+            s_swap_sem_done[i] = VK_NULL_HANDLE;
+            s_swap_n = 0;
+            memset(s_swap_img_fence, 0, sizeof(s_swap_img_fence));
+            s_renderer_terminal = 1;
+            return 0;
+        }
+    }
+    s_swap_n = n_img;
+    memset(s_swap_img_fence,0,sizeof(s_swap_img_fence));
+    s_swapchain_gen++;
+    return 1;
+}
+
+/* Guard the plain-int present-mode contract the picker documents against the
+ * Vulkan enum actually compiled against (IMMEDIATE=0, MAILBOX=1, FIFO=2). */
+typedef char sdl3vk_present_mode_immediate_is_0[(int)VK_PRESENT_MODE_IMMEDIATE_KHR == 0 ? 1 : -1];
+typedef char sdl3vk_present_mode_mailbox_is_1[(int)VK_PRESENT_MODE_MAILBOX_KHR == 1 ? 1 : -1];
+typedef char sdl3vk_present_mode_fifo_is_2[(int)VK_PRESENT_MODE_FIFO_KHR == 2 ? 1 : -1];
+
+int sdl3vk_pick_present_mode(int vsync, const int *available, int count) {
+    const int immediate = 0;
+    const int mailbox = 1;
+    const int fifo = 2;
+    if (vsync) return fifo;
+    for (int i = 0; i < count; i++)
+        if (available[i] == mailbox) return mailbox;
+    for (int i = 0; i < count; i++)
+        if (available[i] == immediate) return immediate;
+    return fifo;
+}
+
+/* Guard the Vulkan values sdl3vk_pick_surface_format compares against (passed as plain
+ * ints, see sdl3vk.h): VK_SUCCESS, VK_INCOMPLETE and VK_FORMAT_B8G8R8A8_UNORM. */
+typedef char sdl3vk_surface_success_is_0[(int)VK_SUCCESS == 0 ? 1 : -1];
+typedef char sdl3vk_surface_incomplete_is_5[(int)VK_INCOMPLETE == 5 ? 1 : -1];
+typedef char sdl3vk_surface_bgra8_unorm_is_44[(int)VK_FORMAT_B8G8R8A8_UNORM == 44 ? 1 : -1];
+
+int sdl3vk_pick_surface_format(int query, int count, const int *formats) {
+    const int success = 0;
+    const int incomplete = 5;
+    const int bgra8_unorm = 44;
+    if (query != success && query != incomplete) return -1;
+    if (count > SDL3VK_SURFACE_FORMAT_CAP) count = SDL3VK_SURFACE_FORMAT_CAP;
+    if (count <= 0 || formats == NULL) return -1;
+    for (int i = 0; i < count; i++)
+        if (formats[i] == bgra8_unorm) return i;
+    return 0;
+}
+
+/* ---- init --------------------------------------------------------------------------- */
+
+/* Init fault seam for the lifecycle selftest (#1377): armed at step N (1-based), the Nth
+ * fallible step of sdl3vk_init fails without running, so every unwind path can be driven on a
+ * working device. One-shot; 0 is disarmed. */
+static int s_init_fault_step = 0;
+static int s_init_steps = 0;        /* fallible steps the last sdl3vk_init reached */
+static int s_sdl_subsystems = 0;    /* sdl3vk_init's SDL_Init succeeded and is not undone */
+
+static int init_step_fails(void) {
+    if (++s_init_steps != s_init_fault_step) return 0;
+    s_init_fault_step = 0;
+    return 1;
+}
+
+/* A failed step leaves sdl3vk_init through its one unwind (fail:). */
+#define INIT_VK(expr) do { VkResult vr_ = init_step_fails() ? VK_ERROR_INITIALIZATION_FAILED : (expr); \
+    if (vr_ != VK_SUCCESS) { fprintf(stderr, "sdl3vk: %s failed: %d\n", #expr, (int)vr_); goto fail; } } while (0)
+#define INIT_OK(cond, ...) do { if (init_step_fails() || !(cond)) { \
+    fprintf(stderr, __VA_ARGS__); goto fail; } } while (0)
+
+/* The display the game window opens on: the one holding the launcher window, named by
+ * SR_LAUNCHER_DISPLAY_BOUNDS (sr_pick_display in recomp.h), else the primary. A value that
+ * is set but cannot be used is reported, not ignored. Returns 0 only when SDL has no primary
+ * display either; SDL_WINDOWPOS_CENTERED_DISPLAY(0) then means the primary. */
+static SDL_DisplayID sdl3vk_launcher_display(void) {
+    SDL_DisplayID primary = SDL_GetPrimaryDisplay();
+    const char *value = getenv("SR_LAUNCHER_DISPLAY_BOUNDS");
+    int bounds[4];
+    if (!value || !value[0]) return primary;
+    if (!sr_parse_display_bounds(value, bounds)) {
+        fprintf(stderr, "sdl3vk: SR_LAUNCHER_DISPLAY_BOUNDS=%s is not x,y,w,h; "
+                        "opening on the primary display\n", value);
+        return primary;
+    }
+    int count = 0;
+    SDL_DisplayID *ids = SDL_GetDisplays(&count);
+    int *rects = (ids && count > 0) ? (int *)SDL_calloc((size_t)count, 4 * sizeof(int)) : NULL;
+    int pick = -1;
+    if (rects) {
+        for (int i = 0; i < count; i++) {
+            SDL_Rect r;
+            /* A display whose bounds cannot be read keeps a zero rectangle and never matches. */
+            if (SDL_GetDisplayBounds(ids[i], &r)) {
+                rects[4 * i] = r.x;
+                rects[4 * i + 1] = r.y;
+                rects[4 * i + 2] = r.w;
+                rects[4 * i + 3] = r.h;
+            }
+        }
+        pick = sr_pick_display(bounds, rects, count);
+    }
+    SDL_DisplayID display = pick >= 0 ? ids[pick] : primary;
+    if (pick < 0)
+        fprintf(stderr, "sdl3vk: no display contains the launcher's display %s; "
+                        "opening on the primary display\n", value);
+    SDL_free(rects);
+    SDL_free(ids);
+    return display;
+}
+
+/* The game window, created centred on the launcher's display so it never appears on
+ * another one first. */
+static SDL_Window *sdl3vk_create_window(const char *title) {
+    SDL_DisplayID display = sdl3vk_launcher_display();
+    SDL_PropertiesID props = SDL_CreateProperties();
+    if (!props) return NULL;
+    SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING,
+                          title ? title : "Nakagawa Recomp");
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER,
+                          SDL_WINDOWPOS_CENTERED_DISPLAY(display));
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER,
+                          SDL_WINDOWPOS_CENTERED_DISPLAY(display));
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, PSP_W * 2);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, PSP_H * 2);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER,
+                          SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
+                          (s_window_hidden ? SDL_WINDOW_HIDDEN : 0));
+    SDL_Window *win = SDL_CreateWindowWithProperties(props);
+    SDL_DestroyProperties(props);
+    return win;
+}
+
+int sdl3vk_init(const char *title) {
+    s_init_steps = 0;
+    INIT_OK(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD), "sdl3vk: SDL_Init failed: %s\n", SDL_GetError());
+    s_sdl_subsystems = 1;
+    /* SR_WINDOW_HIDDEN=1: the same presenter (Vulkan swapchain, keyboard, frame capture) with
+     * a window nobody sees, for headless routes. It is never raised or put in front. */
+    const char *hidden_env = getenv("SR_WINDOW_HIDDEN");
+    s_window_hidden = hidden_env && hidden_env[0] && strcmp(hidden_env, "0") != 0;
+    INIT_OK((s_win = sdl3vk_create_window(title)) != NULL,
+            "sdl3vk: SDL_CreateWindow failed: %s\n", SDL_GetError());
+    {
+        /* Settings > Fullscreen (SR_FULLSCREEN), applied before the Vulkan
+         * surface is created so the swapchain picks up the right extent. Desktop
+         * fullscreen takes the display the window is on, which is the launcher's. */
+        const char *fs = getenv("SR_FULLSCREEN");
+        if (fs && fs[0] && atoi(fs) != 0 && !SDL_SetWindowFullscreen(s_win, true)) {
+            fprintf(stderr, "sdl3vk: SR_FULLSCREEN=1 could not be applied: %s\n",
+                    SDL_GetError());
+        }
+    }
+
+    Uint32 next = 0;
+    {
+        const char *val = getenv("SR_VULKAN_VALIDATION");
+        s_validation_on = val && val[0] && atoi(val) != 0;
+    }
+    const char *sdl_ext[16];
+    {
+        const char *const *sdl = SDL_Vulkan_GetInstanceExtensions(&next);
+        if (next > 16) next = 16;
+        for (uint32_t i = 0; i < next; i++) sdl_ext[i] = sdl[i];
+    }
+    const char *layer_names[1];
+    uint32_t n_layers = 0;
+    if (s_validation_on) {
+        /* Fail closed when the layer was requested but is not installed: a silently
+         * missing layer would make a "validation-clean" evidence claim meaningless. */
+        uint32_t n = 0;
+        vkEnumerateInstanceLayerProperties(&n, NULL);
+        VkLayerProperties lp[64];
+        int have = 0;
+        if (n > 64) n = 64;
+        if (vkEnumerateInstanceLayerProperties(&n, lp) == VK_SUCCESS)
+            for (uint32_t i = 0; i < n; i++)
+                if (strcmp(lp[i].layerName, "VK_LAYER_KHRONOS_validation") == 0) { have = 1; break; }
+        INIT_OK(have, "sdl3vk: SR_VULKAN_VALIDATION set but VK_LAYER_KHRONOS_validation "
+                      "is not installed; refusing to initialize\n");
+        INIT_OK(next < 16, "sdl3vk: too many instance extensions to enable VK_EXT_debug_utils\n");
+        sdl_ext[next++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+        layer_names[0] = "VK_LAYER_KHRONOS_validation";
+        n_layers = 1;
+    }
+    VkDebugUtilsMessengerCreateInfoEXT mci =
+        { .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
+    mci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
+                          VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT;
+    mci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                      VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                      VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+    mci.pfnUserCallback = s_validation_cb;
+    /* Chained into the instance, a validation-only copy also covers vkDestroyInstance, which
+     * reports an instance child (surface, device, messenger) the unwind left alive. */
+    VkDebugUtilsMessengerCreateInfoEXT inst_mci = mci;
+    inst_mci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
+    VkApplicationInfo ai = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    ai.pApplicationName = "psp_recomp";
+    ai.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    ici.pNext = s_validation_on ? &inst_mci : NULL;
+    ici.pApplicationInfo = &ai;
+    ici.enabledExtensionCount = next;
+    ici.ppEnabledExtensionNames = sdl_ext;
+    ici.enabledLayerCount = n_layers;
+    ici.ppEnabledLayerNames = n_layers ? layer_names : NULL;
+    INIT_VK(vkCreateInstance(&ici, NULL, &s_inst));
+    if (s_validation_on) {
+        PFN_vkCreateDebugUtilsMessengerEXT create_msgr = (PFN_vkCreateDebugUtilsMessengerEXT)
+            vkGetInstanceProcAddr(s_inst, "vkCreateDebugUtilsMessengerEXT");
+        s_validation_destroy = (PFN_vkDestroyDebugUtilsMessengerEXT)
+            vkGetInstanceProcAddr(s_inst, "vkDestroyDebugUtilsMessengerEXT");
+        INIT_OK(create_msgr && create_msgr(s_inst, &mci, NULL, &s_validation_msgr) == VK_SUCCESS,
+                "sdl3vk: could not create the validation messenger\n");
+    }
+
+    INIT_OK(SDL_Vulkan_CreateSurface(s_win, s_inst, NULL, &s_surf),
+            "sdl3vk: SDL_Vulkan_CreateSurface failed: %s\n", SDL_GetError());
+
+    /* Physical device: first one with a graphics queue that can present to our surface. */
+    VkPhysicalDevice devs[16]; uint32_t nd = 16;
+    INIT_VK(vkEnumeratePhysicalDevices(s_inst, &nd, devs));
+    s_pdev = VK_NULL_HANDLE;
+    for (uint32_t d = 0; d < nd && !s_pdev; d++) {
+        VkQueueFamilyProperties qf[16]; uint32_t nq = 16;
+        vkGetPhysicalDeviceQueueFamilyProperties(devs[d], &nq, qf);
+        for (uint32_t q = 0; q < nq; q++) {
+            VkBool32 can_present = VK_FALSE;
+            vkGetPhysicalDeviceSurfaceSupportKHR(devs[d], q, s_surf, &can_present);
+            if ((qf[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) && can_present) {
+                s_pdev = devs[d]; s_qfam = q; break;
+            }
+        }
+    }
+    INIT_OK(s_pdev != VK_NULL_HANDLE, "sdl3vk: no usable Vulkan device\n");
+    {
+        VkPhysicalDeviceProperties pp;
+        vkGetPhysicalDeviceProperties(s_pdev, &pp);
+        fprintf(stderr, "sdl3vk: using %s\n", pp.deviceName);
+        s_max_image_dim = pp.limits.maxImageDimension2D;
+    }
+    {
+        const char *scaling = getenv("SR_PRESENT_SCALING");
+        s_scaling = sdl3vk_parse_present_scaling(scaling);
+        if (s_scaling < 0) {
+            fprintf(stderr, "sdl3vk: unknown SR_PRESENT_SCALING '%s' (sharp, integer or bilinear); "
+                            "using sharp\n", scaling);
+            s_scaling = SDL3VK_SCALING_SHARP;
+        }
+    }
+
+    float prio = 1.0f;
+    VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
+    qci.queueFamilyIndex = s_qfam;
+    qci.queueCount = 1;
+    qci.pQueuePriorities = &prio;
+    /* GPU T&L (#318) repeats ge.c's float arithmetic bit for bit, subnormal intermediates
+     * included, which a shader keeps only under DenormPreserve: VK_KHR_shader_float_controls
+     * with shaderDenormPreserveFloat32. Optional; a device without it keeps T&L in ge.c. */
+    s_denorm_preserve_f32 = 0;
+    {
+        uint32_t nx = 0;
+        VkExtensionProperties *xs = NULL;
+        if (vkEnumerateDeviceExtensionProperties(s_pdev, NULL, &nx, NULL) == VK_SUCCESS && nx)
+            xs = (VkExtensionProperties *)calloc(nx, sizeof(*xs));
+        int have = 0;
+        if (xs && vkEnumerateDeviceExtensionProperties(s_pdev, NULL, &nx, xs) == VK_SUCCESS)
+            for (uint32_t i = 0; i < nx; i++)
+                if (strcmp(xs[i].extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME) == 0) have = 1;
+        free(xs);
+        if (have) {
+            VkPhysicalDeviceFloatControlsPropertiesKHR fc = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES_KHR };
+            VkPhysicalDeviceProperties2 p2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                               .pNext = &fc };
+            vkGetPhysicalDeviceProperties2(s_pdev, &p2);
+            s_denorm_preserve_f32 = fc.shaderDenormPreserveFloat32 == VK_TRUE;
+        }
+    }
+    const char *dev_ext[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+                              VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME };
+    VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+    dci.queueCreateInfoCount = 1;
+    dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = s_denorm_preserve_f32 ? 2u : 1u;
+    dci.ppEnabledExtensionNames = dev_ext;
+    /* Ace Mode's texture filtering (ace.h) is the only device feature the player ever asks
+     * for, and only in an Ace run that wants it: an authentic run creates the device with no
+     * features, as before. A device without it, or with less than 2x, runs without filtering
+     * and the run says why; a lower maximum clamps the level. */
+    VkPhysicalDeviceFeatures ace_features = {0};
+    if (g_ace_on && ace_effective()->af > 0) {
+        VkPhysicalDeviceFeatures have;
+        VkPhysicalDeviceProperties pp;
+        vkGetPhysicalDeviceFeatures(s_pdev, &have);
+        vkGetPhysicalDeviceProperties(s_pdev, &pp);
+        if (have.samplerAnisotropy && pp.limits.maxSamplerAnisotropy >= 2.0f) {
+            int device_max = pp.limits.maxSamplerAnisotropy >= 16.0f ? 16
+                           : pp.limits.maxSamplerAnisotropy >= 8.0f ? 8
+                           : pp.limits.maxSamplerAnisotropy >= 4.0f ? 4 : 2;
+            ace_features.samplerAnisotropy = VK_TRUE;
+            dci.pEnabledFeatures = &ace_features;
+            ace_set_af_effective(device_max < ace_effective()->af ? device_max : ace_effective()->af, NULL);
+        } else {
+            ace_set_af_effective(0, "this GPU has no anisotropic filtering");
+        }
+    }
+    INIT_VK(vkCreateDevice(s_pdev, &dci, NULL, &s_dev));
+    vkGetDeviceQueue(s_dev, s_qfam, 0, &s_queue);
+
+    VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    cpi.queueFamilyIndex = s_qfam;
+    INIT_VK(vkCreateCommandPool(s_dev, &cpi, NULL, &s_pool));
+    VkCommandBufferAllocateInfo cbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cbi.commandPool = s_pool;
+    cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbi.commandBufferCount = 1;
+    INIT_VK(vkAllocateCommandBuffers(s_dev, &cbi, &s_cmd));
+
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    INIT_VK(vkCreateFence(s_dev, &fci, NULL, &s_fence));
+    VkSemaphoreCreateInfo sci2 = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    /* Per-frame command/sync/upload resources.  No resource is reused before its fence. */
+    for(int i=0;i<PRESENT_FRAMES;i++){
+        PresentFrame *f=&s_frame[i];
+        cbi.commandBufferCount=1;
+        INIT_VK(vkAllocateCommandBuffers(s_dev,&cbi,&f->cmd));
+        INIT_VK(vkCreateFence(s_dev,&fci,NULL,&f->fence));
+        INIT_VK(vkCreateSemaphore(s_dev,&sci2,NULL,&f->sem_acq));
+
+        VkBufferCreateInfo bci={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size=PSP_W*PSP_H*4;bci.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        INIT_VK(vkCreateBuffer(s_dev,&bci,NULL,&f->staging));
+        VkMemoryRequirements mr;vkGetBufferMemoryRequirements(s_dev,f->staging,&mr);
+        VkMemoryAllocateInfo mai={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize=mr.size;
+        mai.memoryTypeIndex=find_mem_type(mr.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        INIT_VK(vkAllocateMemory(s_dev,&mai,NULL,&f->staging_mem));
+        INIT_VK(vkBindBufferMemory(s_dev,f->staging,f->staging_mem,0));
+        INIT_VK(vkMapMemory(s_dev,f->staging_mem,0,VK_WHOLE_SIZE,0,&f->staging_map));
+
+        VkBufferCreateInfo hbci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        hbci.size = HUD_STAGING_BYTES;
+        hbci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        INIT_VK(vkCreateBuffer(s_dev, &hbci, NULL, &f->hud_staging));
+        VkMemoryRequirements hmr;
+        vkGetBufferMemoryRequirements(s_dev, f->hud_staging, &hmr);
+        VkMemoryAllocateInfo hmai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        hmai.allocationSize = hmr.size;
+        hmai.memoryTypeIndex = find_mem_type(hmr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (hmai.memoryTypeIndex == UINT32_MAX) {
+            hmai.memoryTypeIndex = find_mem_type(hmr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+        }
+        INIT_VK(vkAllocateMemory(s_dev, &hmai, NULL, &f->hud_staging_mem));
+        INIT_VK(vkBindBufferMemory(s_dev, f->hud_staging, f->hud_staging_mem, 0));
+        INIT_VK(vkMapMemory(s_dev, f->hud_staging_mem, 0, VK_WHOLE_SIZE, 0, &f->hud_staging_map));
+
+        VkImageCreateInfo imi={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imi.imageType=VK_IMAGE_TYPE_2D;imi.format=VK_FORMAT_B8G8R8A8_UNORM;
+        imi.extent.width=PSP_W;imi.extent.height=PSP_H;imi.extent.depth=1;
+        imi.mipLevels=1;imi.arrayLayers=1;imi.samples=VK_SAMPLE_COUNT_1_BIT;
+        imi.tiling=VK_IMAGE_TILING_OPTIMAL;
+        imi.usage=VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        imi.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;
+        INIT_VK(vkCreateImage(s_dev,&imi,NULL,&f->fbimg));
+        vkGetImageMemoryRequirements(s_dev,f->fbimg,&mr);
+        mai.allocationSize=mr.size;
+        mai.memoryTypeIndex=find_mem_type(mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        INIT_VK(vkAllocateMemory(s_dev,&mai,NULL,&f->fbimg_mem));
+        INIT_VK(vkBindImageMemory(s_dev,f->fbimg,f->fbimg_mem,0));
+    }
+
+    s_swapchain_in_init = 1;
+    INIT_OK(create_swapchain(), "sdl3vk: no swapchain for the new window\n");
+    s_swapchain_in_init = 0;
+
+    /* The launcher always says, so a run it starts is a developer run only when its setting
+     * is on; a run started by hand is one when SR_DEVELOPER_MODE is set and not 0. */
+    const char *developer_env = getenv("SR_DEVELOPER_MODE");
+    s_developer = developer_env && developer_env[0] && strcmp(developer_env, "0") != 0;
+    const char *hud_env = getenv("SR_HUD");
+    if (hud_env && hud_env[0] && strcmp(hud_env, "0") != 0) {
+        sdl3vk_hud_set_enabled(1);
+    }
+
+    sdl3vk_init_input_profile();
+    if (SDL_HasGamepad()) {
+        int npads = 0;
+        SDL_JoystickID *ids = SDL_GetGamepads(&npads);
+        if (ids && npads > 0) s_pad = SDL_OpenGamepad(ids[0]);
+        SDL_free(ids);
+    }
+    fprintf(stderr, "sdl3vk: init ok (%ux%u swapchain, fmt %d, gamepad=%s)\n",
+            s_swap_ext.width, s_swap_ext.height, (int)s_swap_fmt, s_pad ? "yes" : "no");
+    return 1;
+
+fail:
+    /* Release exactly what the steps above created, in reverse order, so a caller that falls
+     * back to another presenter (gui_init's GDI window) holds no SDL or Vulkan object. */
+    s_swapchain_in_init = 0;
+    sdl3vk_shutdown();
+    return 0;
+}
+#undef INIT_OK
+#undef INIT_VK
+
+bool sdl3vk_raise_window(void) {
+    if (!s_win || s_window_hidden) return false;
+
+    bool raised = SDL_RaiseWindow(s_win);
+    if (!raised) {
+        fprintf(stderr, "sdl3vk: SDL_RaiseWindow failed: %s\n", SDL_GetError());
+    }
+#ifdef _WIN32
+    SDL_PropertiesID properties = SDL_GetWindowProperties(s_win);
+    HWND window = (HWND)SDL_GetPointerProperty(
+        properties, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    if (!window) {
+        fprintf(stderr, "sdl3vk: SDL did not expose the Win32 game window handle\n");
+        raised = false;
+    } else if (!SetForegroundWindow(window)) {
+        fprintf(stderr, "sdl3vk: Win32 refused foreground activation for the game window\n");
+        raised = false;
+    }
+#endif
+    return raised;
+}
+
+/* ---- input -------------------------------------------------------------------------- */
+
+/* The profile's host enums index SDL's arrays directly; keep them numerically identical. */
+_Static_assert((int)SDL_GAMEPAD_BUTTON_SOUTH == (int)NK_HOST_BUTTON_SOUTH, "host button enum drift: SOUTH");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_EAST == (int)NK_HOST_BUTTON_EAST, "host button enum drift: EAST");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_WEST == (int)NK_HOST_BUTTON_WEST, "host button enum drift: WEST");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_NORTH == (int)NK_HOST_BUTTON_NORTH, "host button enum drift: NORTH");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_BACK == (int)NK_HOST_BUTTON_BACK, "host button enum drift: BACK");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_GUIDE == (int)NK_HOST_BUTTON_GUIDE, "host button enum drift: GUIDE");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_START == (int)NK_HOST_BUTTON_START, "host button enum drift: START");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_LEFT_STICK == (int)NK_HOST_BUTTON_LEFT_STICK, "host button enum drift: LEFT_STICK");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_RIGHT_STICK == (int)NK_HOST_BUTTON_RIGHT_STICK, "host button enum drift: RIGHT_STICK");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_LEFT_SHOULDER == (int)NK_HOST_BUTTON_LEFT_SHOULDER, "host button enum drift: LEFT_SHOULDER");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER == (int)NK_HOST_BUTTON_RIGHT_SHOULDER, "host button enum drift: RIGHT_SHOULDER");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_DPAD_UP == (int)NK_HOST_BUTTON_DPAD_UP, "host button enum drift: DPAD_UP");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_DPAD_DOWN == (int)NK_HOST_BUTTON_DPAD_DOWN, "host button enum drift: DPAD_DOWN");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_DPAD_LEFT == (int)NK_HOST_BUTTON_DPAD_LEFT, "host button enum drift: DPAD_LEFT");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_DPAD_RIGHT == (int)NK_HOST_BUTTON_DPAD_RIGHT, "host button enum drift: DPAD_RIGHT");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_MISC1 == (int)NK_HOST_BUTTON_MISC1, "host button enum drift: MISC1");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1 == (int)NK_HOST_BUTTON_RIGHT_PADDLE1, "host button enum drift: RIGHT_PADDLE1");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_LEFT_PADDLE1 == (int)NK_HOST_BUTTON_LEFT_PADDLE1, "host button enum drift: LEFT_PADDLE1");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2 == (int)NK_HOST_BUTTON_RIGHT_PADDLE2, "host button enum drift: RIGHT_PADDLE2");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_LEFT_PADDLE2 == (int)NK_HOST_BUTTON_LEFT_PADDLE2, "host button enum drift: LEFT_PADDLE2");
+_Static_assert((int)SDL_GAMEPAD_BUTTON_TOUCHPAD == (int)NK_HOST_BUTTON_TOUCHPAD, "host button enum drift: TOUCHPAD");
+_Static_assert((int)SDL_GAMEPAD_AXIS_LEFTX == (int)NK_HOST_AXIS_LEFTX, "host axis enum drift: LEFTX");
+_Static_assert((int)SDL_GAMEPAD_AXIS_LEFTY == (int)NK_HOST_AXIS_LEFTY, "host axis enum drift: LEFTY");
+_Static_assert((int)SDL_GAMEPAD_AXIS_RIGHTX == (int)NK_HOST_AXIS_RIGHTX, "host axis enum drift: RIGHTX");
+_Static_assert((int)SDL_GAMEPAD_AXIS_RIGHTY == (int)NK_HOST_AXIS_RIGHTY, "host axis enum drift: RIGHTY");
+_Static_assert((int)SDL_GAMEPAD_AXIS_LEFT_TRIGGER == (int)NK_HOST_AXIS_LEFT_TRIGGER, "host axis enum drift: LEFT_TRIGGER");
+_Static_assert((int)SDL_GAMEPAD_AXIS_RIGHT_TRIGGER == (int)NK_HOST_AXIS_RIGHT_TRIGGER, "host axis enum drift: RIGHT_TRIGGER");
+
+/* Profile key codes are USB HID keyboard usages, which SDL_Scancode shares; the input-profile
+ * selftest checks every default key's name against its SDL scancode. */
+_Static_assert((int)SDL_SCANCODE_A == 4, "SDL scancode drift from HID usage: A");
+_Static_assert((int)SDL_SCANCODE_RETURN == 40, "SDL scancode drift from HID usage: RETURN");
+_Static_assert((int)SDL_SCANCODE_UP == 82, "SDL scancode drift from HID usage: UP");
+_Static_assert((int)SDL_SCANCODE_KP_0 == 98, "SDL scancode drift from HID usage: KP_0");
+_Static_assert((int)SDL_SCANCODE_RALT == 230, "SDL scancode drift from HID usage: RALT");
+
+/* Versioned host input profile state (#357). */
+static NkInputProfile s_input_profile;
+static bool s_input_profile_loaded;
+
+static bool padscript_active(void) {
+    return nk_input_profile_padscript_active();
+}
+
+void sdl3vk_reset_input_profile(void) {
+    s_input_profile_loaded = false;
+    nk_input_profile_init_default(&s_input_profile);
+}
+
+void sdl3vk_init_input_profile(void) {
+    if (s_input_profile_loaded) return;
+    s_input_profile_loaded = true;
+    nk_input_profile_init_default(&s_input_profile);
+
+    if (padscript_active()) {
+        /* When SR_PADSCRIPT is active, the profile must not alter anything.
+         * The deterministic scripted/oracle route has highest priority. */
+        return;
+    }
+
+    char path_buf[2048] = {0};
+    const char *target_path = NULL;
+    if (nk_input_profile_resolve_path(path_buf, sizeof(path_buf)) == NK_OK) {
+        target_path = path_buf;
+    }
+
+    if (target_path && target_path[0] && nk_platform_file_exists(target_path)) {
+        char diag[NK_INPUT_DIAGNOSTIC_MAX_LEN] = {0};
+        NkResult res = nk_input_profile_load(&s_input_profile, target_path, diag, sizeof(diag));
+        if (res != NK_OK) {
+            fprintf(stderr, "input_profile: %s\n", diag[0] ? diag : "unknown error");
+            nk_input_profile_init_default(&s_input_profile);
+        }
+    }
+}
+
+const NkInputProfile *sdl3vk_get_input_profile(void) {
+    if (!s_input_profile_loaded) {
+        sdl3vk_init_input_profile();
+    }
+    return &s_input_profile;
+}
+
+void sdl3vk_map_gamepad(
+    const NkInputProfile *profile,
+    const bool host_buttons[NK_HOST_BUTTON_COUNT],
+    const int16_t host_axes[NK_HOST_AXIS_COUNT],
+    uint32_t *out_buttons,
+    uint8_t *out_lx,
+    uint8_t *out_ly
+) {
+    NkInputProfile def_profile;
+    const NkInputProfile *p = profile;
+    if (!p) {
+        nk_input_profile_init_default(&def_profile);
+        p = &def_profile;
+    }
+
+    if (out_buttons) {
+        *out_buttons = nk_input_profile_eval_buttons(p, host_buttons, host_axes);
+    }
+    if (out_lx || out_ly) {
+        nk_input_profile_eval_analog(p, host_axes, out_lx, out_ly);
+    }
+}
+
+/* Rendering can be slower than the host input event rate while translated code is still
+ * unoptimised.  A complete press+release may therefore be queued between two presents; polling
+ * SDL_GetKeyboardState()/SDL_GetGamepadButton() alone loses that edge.  Preserve button-down
+ * events until the next published PSP sample, while the ordinary state polls continue to model
+ * held buttons and axes. */
+static uint32_t s_button_pulse;
+
+/* Text entry for the in-window keyboard (sdl3vk.h). Gamepad button-down bits are kept apart
+ * from s_button_pulse, which the guest's sample consumes, so both see every press. */
+static uint32_t s_pad_pulse;
+static int      s_text_claim;
+
+/* In-game pause (sdl3vk.h). The gate hides input from the game while the overlay has it and
+ * after it lets go; the raw host state is kept for the moment the claim ends. */
+static int            s_pause_request;
+static Sdl3VkInputSink s_claim_sink;
+static void          *s_claim_user;
+static NkInputGate    s_gate;
+static uint32_t       s_raw_buttons;
+static uint8_t        s_raw_lx = 128, s_raw_ly = 128;
+static uint32_t       s_claim_saved_pulse, s_claim_saved_pad_pulse;
+#define KEY_QUEUE_CAP 64
+static Sdl3VkKeyEvent s_key_queue[KEY_QUEUE_CAP];
+static int            s_key_head, s_key_count;
+
+static void key_queue_push(int key, uint32_t codepoint) {
+    if (s_key_count == KEY_QUEUE_CAP) return;          /* a full queue drops the newest */
+    int tail = (s_key_head + s_key_count) % KEY_QUEUE_CAP;
+    s_key_queue[tail].key = key;
+    s_key_queue[tail].codepoint = codepoint;
+    s_key_count++;
+}
+
+/* The editing keys the keyboard uses. Auto-repeat is kept for the movement and backspace
+ * keys, as on a real keyboard; typing is not repeated. */
+static int text_entry_key(SDL_Keycode k, int *repeats) {
+    *repeats = 0;
+    switch (k) {
+    case SDLK_UP:        *repeats = 1; return SDL3VK_KEY_UP;
+    case SDLK_DOWN:      *repeats = 1; return SDL3VK_KEY_DOWN;
+    case SDLK_LEFT:      *repeats = 1; return SDL3VK_KEY_LEFT;
+    case SDLK_RIGHT:     *repeats = 1; return SDL3VK_KEY_RIGHT;
+    case SDLK_BACKSPACE: *repeats = 1; return SDL3VK_KEY_BACKSPACE;
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:  return SDL3VK_KEY_ENTER;
+    case SDLK_ESCAPE:    return SDL3VK_KEY_ESCAPE;
+    case SDLK_TAB:       return SDL3VK_KEY_TAB;
+    default:             return SDL3VK_KEY_NONE;
+    }
+}
+
+/* Queue each Unicode character of a UTF-8 text event. Malformed bytes are skipped. */
+static void queue_text_utf8(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        uint32_t cp;
+        int extra;
+        if (*p < 0x80)                 { cp = *p++; extra = 0; }
+        else if ((*p & 0xE0) == 0xC0)  { cp = *p++ & 0x1Fu; extra = 1; }
+        else if ((*p & 0xF0) == 0xE0)  { cp = *p++ & 0x0Fu; extra = 2; }
+        else if ((*p & 0xF8) == 0xF0)  { cp = *p++ & 0x07u; extra = 3; }
+        else                           { p++; continue; }
+        while (extra-- > 0 && (*p & 0xC0) == 0x80) cp = (cp << 6) | (*p++ & 0x3Fu);
+        key_queue_push(SDL3VK_KEY_TEXT, cp);
+    }
+}
+
+uint32_t sdl3vk_map_keyboard(const NkInputProfile *profile, const bool *key_state, int key_count) {
+    NkInputProfile def_profile;
+    const NkInputProfile *p = profile;
+    if (!p) {
+        nk_input_profile_init_default(&def_profile);
+        p = &def_profile;
+    }
+    return nk_input_profile_eval_keys(p, key_state, key_count);
+}
+
+uint32_t sdl3vk_map_key(const NkInputProfile *profile, int scancode) {
+    NkInputProfile def_profile;
+    const NkInputProfile *p = profile;
+    if (!p) {
+        nk_input_profile_init_default(&def_profile);
+        p = &def_profile;
+    }
+    return nk_input_profile_key_buttons(p, scancode);
+}
+
+static uint32_t keyboard_button(SDL_Scancode sc) {
+    const NkInputProfile *prof = padscript_active() ? NULL : sdl3vk_get_input_profile();
+    return sdl3vk_map_key(prof, (int)sc);
+}
+
+static uint32_t gamepad_button(Uint8 button) {
+    if (button >= NK_HOST_BUTTON_COUNT) return 0;
+    bool host_buttons[NK_HOST_BUTTON_COUNT] = {false};
+    int16_t host_axes[NK_HOST_AXIS_COUNT] = {0};
+    host_buttons[button] = true;
+    uint32_t psp_btn = 0;
+    const NkInputProfile *prof = padscript_active() ? NULL : sdl3vk_get_input_profile();
+    sdl3vk_map_gamepad(prof, host_buttons, host_axes, &psp_btn, NULL, NULL);
+    return psp_btn;
+}
+
+static void pause_request_latch(int request) {
+    if (s_claim_sink) return;
+    /* The person's own request wins over the pad-lost one if both arrive together. */
+    if (s_pause_request != SDL3VK_PAUSE_REQUEST_USER) s_pause_request = request;
+}
+
+static void poll_input_on_this_stack(void *arg) {
+    int *quit = (int *)arg;
+    SDL_Event ev;
+    while (SDL_PollEvent(&ev)) {
+        /* Device bookkeeping and quit are the window's own, claimed or not. */
+        switch (ev.type) {
+        case SDL_EVENT_QUIT: s_quit_requested = 1; break;
+        case SDL_EVENT_GAMEPAD_ADDED:
+            if (!s_pad) s_pad = SDL_OpenGamepad(ev.gdevice.which);
+            break;
+        case SDL_EVENT_GAMEPAD_REMOVED:
+            if (s_pad && SDL_GetGamepadID(s_pad) == ev.gdevice.which) {
+                SDL_CloseGamepad(s_pad); s_pad = NULL;
+                pause_request_latch(SDL3VK_PAUSE_REQUEST_PAD_LOST);
+            }
+            break;
+        default: break;
+        }
+        /* While the overlay has the input every event is its own; nothing reaches the game. */
+        if (s_claim_sink) {
+            s_claim_sink(&ev, s_claim_user);
+            continue;
+        }
+        switch (ev.type) {
+        case SDL_EVENT_KEY_DOWN:
+            /* Esc and F1 ask for the pause and are consumed. While the on-screen keyboard is
+             * open Esc cancels it instead; F1 still asks, and the scheduler refuses with the
+             * keyboard reason. */
+            if ((ev.key.key == SDLK_ESCAPE && !s_text_claim) || ev.key.key == SDLK_F1) {
+                if (!ev.key.repeat) pause_request_latch(SDL3VK_PAUSE_REQUEST_USER);
+                break;
+            }
+            if (ev.key.key == SDLK_F3 && !ev.key.repeat) {
+                hud_set_mode(sdl3vk_hud_next_mode(s_hud_enabled, s_developer));
+            }
+            /* While the keyboard is claimed its keys go to the keyboard only: a keyboard Enter that
+             * confirms the field must not leave a START pulse behind for the title to see. */
+            if (!ev.key.repeat && !s_text_claim) s_button_pulse |= keyboard_button(ev.key.scancode);
+            if (s_text_claim) {
+                int repeats;
+                int key = text_entry_key(ev.key.key, &repeats);
+                if (key != SDL3VK_KEY_NONE && (!ev.key.repeat || repeats))
+                    key_queue_push(key, 0);
+            }
+            break;
+        case SDL_EVENT_TEXT_INPUT:
+            if (s_text_claim) queue_text_utf8(ev.text.text);
+            break;
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
+            /* Guide asks for the pause and is consumed, whatever the profile binds to it. */
+            if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE) {
+                pause_request_latch(SDL3VK_PAUSE_REQUEST_USER);
+                break;
+            }
+            uint32_t bit = gamepad_button(ev.gbutton.button);
+            s_button_pulse |= bit;
+            s_pad_pulse |= bit;
+            break;
+        }
+        default: break;
+        }
+    }
+
+    int key_count = 0;
+    const bool *k = SDL_GetKeyboardState(&key_count);
+    /* The profile's keyboard keys (#1299). Its defaults are the GDI front-end's map
+     * (gui.c read_keys); SR_PADSCRIPT keeps the defaults, as it does for the gamepad. */
+    const NkInputProfile *key_prof = padscript_active() ? NULL : sdl3vk_get_input_profile();
+    uint32_t b = sdl3vk_map_keyboard(key_prof, k, key_count);
+
+    uint8_t lx = 128, ly = 128;
+    s_pad_present = s_pad != NULL;
+    if (s_pad) {
+        bool host_buttons[NK_HOST_BUTTON_COUNT];
+        for (int i = 0; i < NK_HOST_BUTTON_COUNT; i++) {
+            host_buttons[i] = SDL_GetGamepadButton(s_pad, (SDL_GamepadButton)i);
+        }
+        host_buttons[NK_HOST_BUTTON_GUIDE] = false;   /* the pause button, never the game's */
+        int16_t host_axes[NK_HOST_AXIS_COUNT];
+        for (int i = 0; i < NK_HOST_AXIS_COUNT; i++) {
+            host_axes[i] = SDL_GetGamepadAxis(s_pad, (SDL_GamepadAxis)i);
+        }
+        uint32_t pad_buttons = 0;
+        const NkInputProfile *prof = padscript_active() ? NULL : sdl3vk_get_input_profile();
+        sdl3vk_map_gamepad(prof, host_buttons, host_axes, &pad_buttons, &lx, &ly);
+        b |= pad_buttons;
+    }
+    /* The stick's keyboard keys (#1299): an axis with one of its two keys held goes
+     * to its edge; otherwise the controller's stick keeps it. */
+    {
+        NkInputProfile def_profile;
+        const NkInputProfile *stick_prof = key_prof;
+        if (!stick_prof) {
+            nk_input_profile_init_default(&def_profile);
+            stick_prof = &def_profile;
+        }
+        (void)nk_input_profile_eval_key_analog(stick_prof, k, key_count, &lx, &ly);
+    }
+    s_raw_buttons = b;
+    s_raw_lx = lx; s_raw_ly = ly;
+    nk_input_gate_apply(&s_gate, &b, &s_button_pulse, &lx, &ly);
+    nk_input_gate_apply(&s_gate, NULL, &s_pad_pulse, NULL, NULL);
+    uint32_t published = b | s_button_pulse;
+    if (getenv("SR_INLOG")) {
+        static uint32_t previous_published;
+        if (published != previous_published)
+        fprintf(stderr, "sdl_input: buttons 0x%04x -> 0x%04x pad=%d lx=%u ly=%u\n",
+                previous_published, published, s_pad != NULL, lx, ly);
+        previous_published = published;
+    }
+    s_buttons = b;
+    s_lx = lx; s_ly = ly;
+    if (s_quit_requested) *quit = 1;
+}
+
+/* Event pumping reaches Java on Android (SDL's device polling, text input, rumble), and the JVM
+   accepts a JNI call only from the stack it registered for the thread, so a present or a
+   controller read made from a guest coroutine pumps on the thread's own stack (sr_coro.h). On
+   the desktop backends this is a plain call. */
+static void poll_input(int *quit) {
+    sr_coro_call_on_thread_stack(poll_input_on_this_stack, quit);
+}
+
+int sdl3vk_get_vk(Sdl3VkInfo *out) {
+    if (!s_dev || !out) return 0;
+    out->instance = (void *)s_inst;
+    out->physical = (void *)s_pdev;
+    out->device   = (void *)s_dev;
+    out->queue    = (void *)s_queue;
+    out->queue_family = s_qfam;
+    out->denorm_preserve_f32 = s_denorm_preserve_f32;
+    out->get_instance_proc_addr = (void *)vkGetInstanceProcAddr;
+    return 1;
+}
+
+uint32_t sdl3vk_buttons(void) { return s_buttons | s_button_pulse; }
+void sdl3vk_consume_button_pulses(void) { s_button_pulse = 0; }
+void sdl3vk_analog(uint8_t *lx, uint8_t *ly) { if (lx) *lx = s_lx; if (ly) *ly = s_ly; }
+int  sdl3vk_pad_present(void) { return s_pad_present; }
+
+uint32_t sdl3vk_take_pad_pulses(void) {
+    uint32_t pulses = s_pad_pulse;
+    s_pad_pulse = 0;
+    return pulses;
+}
+
+int sdl3vk_take_pause_request(void) {
+    int request = s_pause_request;
+    s_pause_request = SDL3VK_PAUSE_REQUEST_NONE;
+    return request;
+}
+
+void sdl3vk_set_input_claim(Sdl3VkInputSink sink, void *user) {
+    if (sink) {
+        if (!s_claim_sink) {
+            nk_input_gate_claim(&s_gate);
+            s_claim_saved_pulse = s_button_pulse;
+            s_claim_saved_pad_pulse = s_pad_pulse;
+            s_button_pulse = 0;
+            s_pad_pulse = 0;
+            s_pause_request = SDL3VK_PAUSE_REQUEST_NONE;
+        }
+        s_claim_sink = sink;
+        s_claim_user = user;
+        s_buttons = 0;
+        s_lx = 128; s_ly = 128;
+        return;
+    }
+    if (!s_claim_sink) return;
+    s_claim_sink = NULL;
+    s_claim_user = NULL;
+    nk_input_gate_release(&s_gate, s_raw_buttons, s_raw_lx, s_raw_ly);
+    s_button_pulse = s_claim_saved_pulse & ~s_gate.hidden;
+    s_pad_pulse = s_claim_saved_pad_pulse & ~s_gate.hidden;
+    s_claim_saved_pulse = 0;
+    s_claim_saved_pad_pulse = 0;
+    uint32_t held = s_raw_buttons;
+    uint8_t lx = s_raw_lx, ly = s_raw_ly;
+    nk_input_gate_apply(&s_gate, &held, &s_button_pulse, &lx, &ly);
+    s_buttons = held;
+    s_lx = lx; s_ly = ly;
+}
+
+int sdl3vk_input_claimed(void) { return s_claim_sink != NULL; }
+
+/* Start or stop the window's text input with the keyboard. Claiming also clears any queued
+ * keys, so a keyboard opened now does not act on keys pressed before it. */
+void sdl3vk_set_text_claim(int on) {
+    on = on != 0;
+    if (on == s_text_claim) return;
+    s_text_claim = on;
+    if (on) {
+        s_key_head = 0;
+        s_key_count = 0;
+        if (s_win) SDL_StartTextInput(s_win);
+    } else if (s_win) {
+        SDL_StopTextInput(s_win);
+    }
+}
+
+int sdl3vk_take_key_events(Sdl3VkKeyEvent *out, int max) {
+    int n = 0;
+    while (n < max && s_key_count > 0) {
+        out[n++] = s_key_queue[s_key_head];
+        s_key_head = (s_key_head + 1) % KEY_QUEUE_CAP;
+        s_key_count--;
+    }
+    return n;
+}
+
+/* ---- present ------------------------------------------------------------------------ */
+
+static void barrier(VkCommandBuffer cmd, VkImage img,
+                    VkImageLayout from, VkImageLayout to,
+                    VkAccessFlags src_acc, VkAccessFlags dst_acc,
+                    VkPipelineStageFlags src_st, VkPipelineStageFlags dst_st) {
+    VkImageMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    mb.srcAccessMask = src_acc;
+    mb.dstAccessMask = dst_acc;
+    mb.oldLayout = from;
+    mb.newLayout = to;
+    mb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    mb.image = img;
+    mb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    mb.subresourceRange.levelCount = 1;
+    mb.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(cmd, src_st, dst_st, 0, 0, NULL, 0, NULL, 1, &mb);
+}
+
+/* Common present: blit `src` (already TRANSFER_SRC_OPTIMAL; srcw x srch source region)
+ * onto the swapchain with aspect-correct letterboxing. upload!=NULL additionally
+ * records the staging->s_fbimg copy first (the CPU framebuffer path). */
+int sdl3vk_poll(void) {
+    int quit = 0;
+    poll_input(&quit);
+    return quit ? 0 : 1;
+}
+
+/* ---- present-source capture (issue #57): the Vulkan readback ---------------------------
+ * The capture state machine and the P6 publisher live in fbcap.c, the one owner of capture
+ * state. This presenter owns only what is Vulkan-specific: recording a readback of the
+ * presentation source inside the presenting submit, and handing the completed readback to
+ * fbcap.c with its source label (CPU framebuffer image or GE render target) and byte order. */
+
+/* One host-mapped readback buffer. File captures and picture probes each have their own: a
+ * file capture is read back and published inside its present, while a probe is read after
+ * the present (fbcap.h, deferred probe readback), so a file capture armed for the next
+ * present must not overwrite a probe's pixels before they are read. */
+typedef struct CapBuffer {
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    void *map;
+    uint64_t alloc;              /* allocated byte capacity (grows on demand) */
+    int noncoherent;             /* memory type lacks HOST_COHERENT */
+    uint32_t mem_flags;          /* VkMemoryPropertyFlags of the chosen memory type */
+} CapBuffer;
+
+static CapBuffer s_cap;                   /* file captures */
+static CapBuffer s_probe;                 /* picture probes */
+static uint32_t s_cap_w;                  /* row width of the recorded file readback */
+static sr_cap_order s_cap_order;          /* byte order of the recorded file readback */
+static uint32_t s_probe_w;                /* row width of the deferred probe readback */
+static sr_cap_order s_probe_order;
+static PresentFrame *s_probe_frame;       /* the frame whose submit carries the probe's copy */
+
+static void cap_free_buffer(CapBuffer *c) {
+    if (c->map) vkUnmapMemory(s_dev, c->mem);
+    if (c->buf) vkDestroyBuffer(s_dev, c->buf, NULL);
+    if (c->mem) vkFreeMemory(s_dev, c->mem, NULL);
+    memset(c, 0, sizeof *c);
+}
+
+/* The memory type for a buffer the CPU reads back, from the device's per-type property flags
+ * and the buffer's allowed type bits. A HOST_CACHED type comes first, as
+ * gegpu_pick_host_mem_type (ge_gpu.c) chooses for the GE readbacks: the first
+ * HOST_VISIBLE|HOST_COHERENT type is usually uncached write-combined memory, where every CPU
+ * read goes to memory, and reading a 4x frame back from it took about a second (#1296). In
+ * order: cached and coherent; cached (*noncoherent set: invalidate after the copy fence);
+ * coherent; any host-visible type. UINT32_MAX when no type is host-visible. */
+static uint32_t cap_pick_mem_type(const uint32_t *type_flags, uint32_t type_count,
+                                  uint32_t allowed_bits, int *noncoherent) {
+    static const uint32_t want[4] = {
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+    };
+    for (unsigned k = 0; k < 4u; k++)
+        for (uint32_t i = 0; i < type_count && i < 32u; i++)
+            if ((allowed_bits & (1u << i)) && (type_flags[i] & want[k]) == want[k]) {
+                if (noncoherent)
+                    *noncoherent = (type_flags[i] & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0u;
+                return i;
+            }
+    return UINT32_MAX;
+}
+
+/* The readback buffer is allocated from THIS buffer's own VkBufferMemoryRequirements
+ * (size/alignment/memory-type bits) -- never from another object's requirements -- and is
+ * grown lazily. The memory type comes from cap_pick_mem_type; on a non-coherent type the
+ * host must invalidate the mapped range after the copy fence completes
+ * (cap_invalidate_readback). */
+static int cap_ensure(CapBuffer *c, uint32_t w, uint32_t h) {
+    uint64_t need = (uint64_t)w * (uint64_t)h * 4u;
+    if (need == 0 || need > UINT32_MAX) return 0;
+    if (c->buf && need <= c->alloc) return 1;
+    cap_free_buffer(c);
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.size = (VkDeviceSize)need;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (vkCreateBuffer(s_dev, &bci, NULL, &c->buf) != VK_SUCCESS) return 0;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(s_dev, c->buf, &mr);
+    if (need > mr.size) { cap_free_buffer(c); return 0; }
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(s_pdev, &mp);
+    uint32_t type_flags[VK_MAX_MEMORY_TYPES];
+    for (uint32_t i = 0; i < mp.memoryTypeCount && i < VK_MAX_MEMORY_TYPES; i++)
+        type_flags[i] = (uint32_t)mp.memoryTypes[i].propertyFlags;
+    uint32_t mtype = cap_pick_mem_type(type_flags, mp.memoryTypeCount, mr.memoryTypeBits,
+                                       &c->noncoherent);
+    if (mtype == UINT32_MAX) { cap_free_buffer(c); return 0; }
+    c->mem_flags = type_flags[mtype];
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = mtype;
+    if (vkAllocateMemory(s_dev, &mai, NULL, &c->mem) != VK_SUCCESS ||
+        vkBindBufferMemory(s_dev, c->buf, c->mem, 0) != VK_SUCCESS ||
+        vkMapMemory(s_dev, c->mem, 0, VK_WHOLE_SIZE, 0, &c->map) != VK_SUCCESS) {
+        cap_free_buffer(c);
+        return 0;
+    }
+    c->alloc = need;
+    return 1;
+}
+
+/* Recorded in the SAME command buffer that presents the frame, after the present blit.
+ * The source image is still TRANSFER_SRC_OPTIMAL -- its content is what the presentation
+ * engine receives -- so no layout transition is needed and nothing is discarded. The
+ * buffer rows are tightly packed (no bufferRowLength), so the mapped pitch is w*4. */
+static int cap_record(VkCommandBuffer cmd, const CapBuffer *c, VkImage src, int srcw, int srch) {
+    if (!src || !c->buf) return 0;
+    VkBufferImageCopy bic = {0};
+    bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bic.imageSubresource.layerCount = 1;
+    bic.imageExtent.width = (uint32_t)srcw;
+    bic.imageExtent.height = (uint32_t)srch;
+    bic.imageExtent.depth = 1;
+    vkCmdCopyImageToBuffer(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           c->buf, 1, &bic);
+    VkBufferMemoryBarrier bb = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+    bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.buffer = c->buf;
+    bb.offset = 0;
+    bb.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, NULL, 1, &bb, 0, NULL);
+    return 1;
+}
+
+/* Invalidate the mapped readback range after the copy fence completes, so the host reads
+ * the GPU's writes on non-coherent memory. The pixels are then handed to fbcap.c. */
+static int cap_invalidate_readback(const CapBuffer *c) {
+    if (!c->buf || !c->map) return 0;
+    if (!c->noncoherent) return 1;
+    VkMappedMemoryRange rng = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+    rng.memory = c->mem;
+    rng.offset = 0;
+    rng.size = VK_WHOLE_SIZE;
+    return vkInvalidateMappedMemoryRanges(s_dev, 1, &rng) == VK_SUCCESS;
+}
+
+/* Finish the in-flight picture probe (fbcap.h, deferred probe readback): publish its
+ * readback once the fence of the frame that carries the copy has signalled. Without block it
+ * never waits: a frame still on the GPU leaves the probe in flight (0). With block it waits on
+ * that frame's fence, as present_common's slot reuse would. A failed wait or invalidate drops
+ * the probe without a result. Returns 1 when the probe is no longer in flight. Every present
+ * calls it right after waiting its own slot, before the slot's fence is reset for reuse, so
+ * the probe is published before the frame that carries it is recorded again. */
+static int cap_probe_resolve(int block) {
+    if (!sr_capture_probe_in_flight()) return 0;
+    PresentFrame *f = s_probe_frame;
+    if (!f) {
+        sr_capture_probe_drop("no frame carries the readback");
+        return 1;
+    }
+    if (f->submitted) {
+        if (block) {
+            if (!wait_present_frame(f)) {
+                s_probe_frame = NULL;
+                sr_capture_probe_drop("readback fence wait failed");
+                return 1;
+            }
+        } else {
+            VkResult st = vkGetFenceStatus(s_dev, f->fence);
+            if (st == VK_NOT_READY) return 0;
+            if (st != VK_SUCCESS) {
+                s_probe_frame = NULL;
+                sr_capture_probe_drop("readback fence status failed");
+                return 1;
+            }
+        }
+    }
+    s_probe_frame = NULL;
+    if (!cap_invalidate_readback(&s_probe)) {
+        sr_capture_probe_drop("readback invalidate failed");
+        return 1;
+    }
+    (void)sr_capture_publish_probe(s_probe.map, s_probe_w * 4u, s_probe_order);
+    return 1;
+}
+
+typedef enum PresentDisposition {
+    PRESENT_OK,
+    PRESENT_ENQUEUED_REBUILD,
+    PRESENT_OUT_OF_DATE,
+    PRESENT_SURFACE_LOST,
+    PRESENT_NOT_ENQUEUED,
+    PRESENT_TERMINAL,
+    PRESENT_UNCLASSIFIED
+} PresentDisposition;
+
+static int is_enqueued_present(PresentDisposition disp) {
+    return (disp == PRESENT_OK ||
+            disp == PRESENT_ENQUEUED_REBUILD ||
+            disp == PRESENT_OUT_OF_DATE ||
+            disp == PRESENT_SURFACE_LOST);
+}
+
+static PresentDisposition classify_present(VkResult pr, int *out_presented, const char **out_why) {
+    switch (pr) {
+    case VK_SUCCESS:
+        *out_presented = 1;
+        *out_why = "vkQueuePresentKHR succeeded";
+        return PRESENT_OK;
+
+    case VK_SUBOPTIMAL_KHR:
+        *out_presented = 1;
+        *out_why = "swapchain suboptimal; enqueued rebuild requested";
+        return PRESENT_ENQUEUED_REBUILD;
+
+    case VK_ERROR_OUT_OF_DATE_KHR:
+        *out_presented = 0;
+        *out_why = "swapchain out of date";
+        return PRESENT_OUT_OF_DATE;
+
+    case VK_ERROR_SURFACE_LOST_KHR:
+        *out_presented = 0;
+        *out_why = "vkQueuePresentKHR failed with VK_ERROR_SURFACE_LOST_KHR";
+        return PRESENT_SURFACE_LOST;
+
+    case VK_ERROR_OUT_OF_HOST_MEMORY:
+        *out_presented = 0;
+        *out_why = "vkQueuePresentKHR failed with VK_ERROR_OUT_OF_HOST_MEMORY";
+        return PRESENT_NOT_ENQUEUED;
+
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+        *out_presented = 0;
+        *out_why = "vkQueuePresentKHR failed with VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        return PRESENT_NOT_ENQUEUED;
+
+    case VK_ERROR_DEVICE_LOST:
+        *out_presented = 0;
+        *out_why = "vkQueuePresentKHR failed with VK_ERROR_DEVICE_LOST";
+        return PRESENT_TERMINAL;
+
+    default:
+        *out_presented = 0;
+        *out_why = "vkQueuePresentKHR failed with unclassified error";
+        return PRESENT_UNCLASSIFIED;
+    }
+}
+
+/* A present that was not enqueued left image idx's present semaphore signalled with no wait
+ * pending: once the frame's submit (the signal) is done, the semaphore is replaced. */
+static int recover_unenqueued_present(PresentFrame *f, uint32_t idx) {
+    if (!s_dev) return 0;
+    if (f->submitted) {
+        if (vkWaitForFences(s_dev, 1, &f->fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+            s_renderer_terminal = 1;
+            return 0;
+        }
+        f->submitted = 0;
+        f->source = VK_NULL_HANDLE;
+    }
+    if (s_swap_sem_done[idx]) {
+        vkDestroySemaphore(s_dev, s_swap_sem_done[idx], NULL);
+        s_swap_sem_done[idx] = VK_NULL_HANDLE;
+    }
+    VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    if (vkCreateSemaphore(s_dev, &sci, NULL, &s_swap_sem_done[idx]) != VK_SUCCESS) {
+        s_renderer_terminal = 1;
+        return 0;
+    }
+    s_frame_sem_gen++;
+    return 1;
+}
+
+/* Presentation filter selection policy (issue #68): nearest filtering for exact integer
+ * source->viewport scaling (1:1, 2x, 3x, etc.), which eliminates bilinear blur on 2x/integer
+ * scaling while preserving pixel crispness; linear filtering for fractional/non-integer scaling
+ * to avoid uneven pixel stepping/aliasing. */
+static VkFilter sdl3vk_present_filter(int srcw, int srch, int vw, int vh) {
+    if (srcw > 0 && srch > 0 && vw > 0 && vh > 0 &&
+        (vw % srcw == 0) && (vh % srch == 0) &&
+        (vw / srcw == vh / srch)) {
+        return VK_FILTER_NEAREST;
+    }
+    return VK_FILTER_LINEAR;
+}
+
+int sdl3vk_parse_present_scaling(const char *value) {
+    if (!value || !value[0] || strcmp(value, "sharp") == 0) return SDL3VK_SCALING_SHARP;
+    if (strcmp(value, "integer") == 0) return SDL3VK_SCALING_INTEGER;
+    if (strcmp(value, "bilinear") == 0) return SDL3VK_SCALING_BILINEAR;
+    return -1;
+}
+
+Sdl3VkPresentPlan sdl3vk_present_plan(int mode, int srcw, int srch, int dw, int dh, int max_dim) {
+    Sdl3VkPresentPlan p = { 0, 0, 0, 0, 1, 0 };
+    if (srcw <= 0 || srch <= 0 || dw <= 0 || dh <= 0) return p;
+    /* Aspect-correct fit of the PSP picture, letterboxed. */
+    int vw = dw, vh = dw * PSP_H / PSP_W;
+    if (vh > dh) { vh = dh; vw = dh * PSP_W / PSP_H; }
+    if (mode == SDL3VK_SCALING_INTEGER) {
+        int k = dw / srcw < dh / srch ? dw / srcw : dh / srch;
+        if (k >= 1) { vw = k * srcw; vh = k * srch; p.nearest = 1; }
+    } else if (sdl3vk_present_filter(srcw, srch, vw, vh) == VK_FILTER_NEAREST) {
+        p.nearest = 1;
+    } else if (mode == SDL3VK_SCALING_SHARP && vw > srcw && vh > srch) {
+        /* The next integer multiple at or above the fit, so the linear pass shrinks. The fit
+         * rounds each axis on its own, so when one axis is just past a multiple (961x544) the
+         * smaller multiple wins: a stretch of under two pixels beats shrinking the other axis 1.5x. */
+        int k = (vw + srcw - 1) / srcw, ky = (vh + srch - 1) / srch;
+        if (ky < k) k = ky;
+        if ((long long)k * srcw <= max_dim && (long long)k * srch <= max_dim) p.prescale = k;
+    }
+    p.x = (dw - vw) / 2; p.y = (dh - vh) / 2; p.w = vw; p.h = vh;
+    return p;
+}
+
+/* The sharp-scaling intermediate image, shared by the frame ring: each use transitions it from
+ * UNDEFINED behind a transfer-stage barrier, which also orders the write after the previous
+ * frame's read on this queue. */
+static VkImage        s_prescale_img;
+static VkDeviceMemory s_prescale_mem;
+static int            s_prescale_w, s_prescale_h;
+
+static void prescale_free(void) {
+    if (s_prescale_img) vkDestroyImage(s_dev, s_prescale_img, NULL);
+    if (s_prescale_mem) vkFreeMemory(s_dev, s_prescale_mem, NULL);
+    s_prescale_img = VK_NULL_HANDLE;
+    s_prescale_mem = VK_NULL_HANDLE;
+    s_prescale_w = s_prescale_h = 0;
+}
+
+/* A w x h prescale image, recreated only when the size changes (a window resize). Returns 0
+ * when it cannot be made; the caller then presents with one linear blit. */
+static int prescale_ensure(int w, int h) {
+    static int failed_w, failed_h;
+    if (s_prescale_img && s_prescale_w == w && s_prescale_h == h) return 1;
+    if (failed_w == w && failed_h == h) return 0;
+    failed_w = w; failed_h = h;  /* cleared below on success */
+    if (s_prescale_img) {
+        if (!wait_all_present_frames()) return 0;  /* an in-flight frame may still read it */
+        prescale_free();
+    }
+    VkImageCreateInfo imi = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    imi.imageType = VK_IMAGE_TYPE_2D;
+    imi.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imi.extent.width = (uint32_t)w; imi.extent.height = (uint32_t)h; imi.extent.depth = 1;
+    imi.mipLevels = 1; imi.arrayLayers = 1; imi.samples = VK_SAMPLE_COUNT_1_BIT;
+    imi.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imi.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imi.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(s_dev, &imi, NULL, &s_prescale_img) != VK_SUCCESS) {
+        s_prescale_img = VK_NULL_HANDLE;
+        fprintf(stderr, "sdl3vk: no %dx%d sharp-scaling image; presenting with linear filtering\n", w, h);
+        return 0;
+    }
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(s_dev, s_prescale_img, &mr);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = find_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mai.memoryTypeIndex == UINT32_MAX ||
+        vkAllocateMemory(s_dev, &mai, NULL, &s_prescale_mem) != VK_SUCCESS ||
+        vkBindImageMemory(s_dev, s_prescale_img, s_prescale_mem, 0) != VK_SUCCESS) {
+        prescale_free();
+        fprintf(stderr, "sdl3vk: no memory for the %dx%d sharp-scaling image; presenting with linear "
+                        "filtering\n", w, h);
+        return 0;
+    }
+    s_prescale_w = w;
+    s_prescale_h = h;
+    failed_w = failed_h = 0;
+    return 1;
+}
+
+/* The developer profile HUD (#314): the live view's rows for the newest closed telemetry
+ * interval (sr_perf_live_rows, the PERF line's definitions), the hottest AOT-to-interpreter
+ * PC of the run, and one bar per closed interval, newest on the right, splitting its wall
+ * time into cpu, GE wait, present and idle. Updated once a second, when an interval closes. */
+static void draw_profile_hud(SDL_Renderer *ren, int w, int h, double game_fps, double per_frame,
+                             double vblank_hz) {
+    static const Uint8 part_rgb[4][3] = {
+        {107, 159, 240},  /* cpu: the accent */
+        {219, 176, 36},   /* GE wait: warning */
+        {194, 154, 244},  /* present: info */
+        {70, 80, 95},     /* idle */
+    };
+    const SrPerfHistory *history = sr_perf_history();
+    const SrPerfLiveInterval *newest = sr_perf_history_at(history, 0);
+    SrPerfLiveRow rows[SR_PERF_LIVE_ROWS];
+    SrPerfTopPc top;
+    char line[96];
+    float y = 8.0f;
+    unsigned count;
+
+    SDL_SetRenderDrawColor(ren, 240, 240, 240, 255);
+    snprintf(line, sizeof(line), "Profile  %.1f game fps  %.1f VBlanks/frame  %.1f Hz", game_fps,
+             per_frame, vblank_hz);
+    SDL_RenderDebugText(ren, 12, y, line);
+    y += 16.0f;
+    count = sr_perf_live_rows(newest, rows, SR_PERF_LIVE_ROWS);
+    SDL_SetRenderDrawColor(ren, 200, 206, 214, 255);
+    if (!count) {
+        SDL_RenderDebugText(ren, 12, y, "Collecting: an interval closes every second");
+        y += 14.0f;
+    }
+    for (unsigned i = 0; i < count; i++) {
+        snprintf(line, sizeof(line), "%-11s %s", rows[i].label, rows[i].value);
+        SDL_RenderDebugText(ren, 12, y, line);
+        y += 14.0f;
+    }
+    if (sr_perf_top_transitions(0, &top, 1)) {
+        snprintf(line, sizeof(line), "%-11s 0x%08X x%llu %s", "Hot PC", (unsigned)top.pc,
+                 (unsigned long long)top.count, top.reason);
+        SDL_RenderDebugText(ren, 12, y, line);
+    }
+
+    /* The graph: 4 px bars with a 1 px gap along the bottom. */
+    const float graph_h = 36.0f, base = (float)h - 8.0f;
+    unsigned fit = (unsigned)((w - 24) / 5);
+    for (unsigned age = 0; history && age < history->count && age < fit; age++) {
+        const SrPerfLiveInterval *iv = sr_perf_history_at(history, age);
+        if (!iv || !iv->wall_ns) continue;
+        const uint64_t parts[4] = {iv->cpu_ns, iv->ge_wait_ns, iv->present_ns, iv->idle_ns};
+        float x = (float)(w - 12) - (float)(age + 1u) * 5.0f;
+        float top_y = base;
+        for (int p = 0; p < 4; p++) {
+            float share = (float)((double)parts[p] / (double)iv->wall_ns);
+            float bar = share > 1.0f ? graph_h : share * graph_h;
+            if (bar <= 0.0f) continue;
+            if (top_y - bar < base - graph_h) bar = top_y - (base - graph_h);
+            if (bar <= 0.0f) break;
+            SDL_FRect r = { x, top_y - bar, 4.0f, bar };
+            SDL_SetRenderDrawColor(ren, part_rgb[p][0], part_rgb[p][1], part_rgb[p][2], 255);
+            SDL_RenderFillRect(ren, &r);
+            top_y -= bar;
+        }
+    }
+}
+
+static void draw_hud_overlay(VkCommandBuffer cmd, PresentFrame *f, VkImage dst_img, int swap_w, int swap_h) {
+    /* The profile HUD needs a window it fits in; a smaller one shows the performance HUD. */
+    /* 60 FPS logic that has fallen behind plays slower than the original game; say so even
+     * with the HUD off (section 9.5 of docs/ENHANCEMENT_CONTRACT.md). */
+    unsigned slow_rate = 0;
+    int slowed = s_logic_slowed_cb && s_logic_slowed_cb(&slow_rate);
+    int notice_only = !s_hud_enabled;
+    int profile = s_hud_enabled == SDL3VK_HUD_PROFILE && swap_w >= PROFILE_HUD_W &&
+                  swap_h >= PROFILE_HUD_H + LOGIC_NOTICE_H;
+    int hud_w = profile ? PROFILE_HUD_W : HUD_W;
+    int hud_h = notice_only ? 0 : profile ? PROFILE_HUD_H : HUD_H;
+    if (!slowed && notice_only) return;
+    if (slowed) hud_h += LOGIC_NOTICE_H;
+    if (!f || !f->hud_staging_map || swap_w < hud_w || swap_h < hud_h) return;
+
+    if (!s_hud_surf || s_hud_fmt != s_swap_fmt || s_hud_surf->w != hud_w || s_hud_surf->h != hud_h) {
+        if (s_hud_ren) { SDL_DestroyRenderer(s_hud_ren); s_hud_ren = NULL; }
+        if (s_hud_surf) { SDL_DestroySurface(s_hud_surf); s_hud_surf = NULL; }
+        s_hud_fmt = s_swap_fmt;
+        SDL_PixelFormat sdl_fmt = (s_swap_fmt == VK_FORMAT_R8G8B8A8_UNORM || s_swap_fmt == VK_FORMAT_R8G8B8A8_SRGB)
+                                  ? SDL_PIXELFORMAT_RGBA32 : SDL_PIXELFORMAT_BGRA32;
+        s_hud_surf = SDL_CreateSurface(hud_w, hud_h, sdl_fmt);
+        if (s_hud_surf) {
+            s_hud_ren = SDL_CreateSoftwareRenderer(s_hud_surf);
+        }
+    }
+    if (!s_hud_surf || !s_hud_ren) return;
+
+    /* Game FPS counts new frames (a present of a buffer other than the previous one's), the
+     * figure a player feels; Presents counts every frame handed to the window, re-presents of
+     * the same finished frame included. Per frame is the mean VBLANKs between new frames:
+     * 2.0 is a 30-frame title on time, 1.0 a 60-frame one. */
+    double presents = 0.0, frame_ms = 0.0, vblank_hz = 0.0, game_fps = 0.0, per_frame = 0.0;
+    sr_perf_get_hud_metrics(&presents, &frame_ms, &vblank_hz);
+    sr_perf_get_hud_frames(&game_fps, &per_frame);
+
+    SDL_SetRenderDrawColor(s_hud_ren, 20, 24, 32, 230);
+    SDL_FRect bg = { 0, 0, (float)hud_w, (float)hud_h };
+    SDL_RenderFillRect(s_hud_ren, &bg);
+    SDL_SetRenderDrawColor(s_hud_ren, 70, 90, 130, 255);
+    SDL_RenderRect(s_hud_ren, &bg);
+
+    if (profile) {
+        draw_profile_hud(s_hud_ren, hud_w, hud_h, game_fps, per_frame, vblank_hz);
+    } else {
+        /* -1: no backend query registered, so the status is unknown. */
+        int audio_active = s_audio_active_cb ? (s_audio_active_cb() ? 1 : 0) : -1;
+        char line[64];
+        SDL_SetRenderDrawColor(s_hud_ren, 240, 240, 240, 255);
+        snprintf(line, sizeof(line), "Game FPS:  %.1f", game_fps);
+        SDL_RenderDebugText(s_hud_ren, 12, 10, line);
+
+        if (per_frame > 0.0)
+            snprintf(line, sizeof(line), "Per frame: %.1f VBlanks", per_frame);
+        else
+            snprintf(line, sizeof(line), "Per frame: -");
+        SDL_RenderDebugText(s_hud_ren, 12, 30, line);
+
+        snprintf(line, sizeof(line), "Presents:  %.1f/s", presents);
+        SDL_RenderDebugText(s_hud_ren, 12, 50, line);
+
+        snprintf(line, sizeof(line), "VBlank:    %.1f Hz", vblank_hz);
+        SDL_RenderDebugText(s_hud_ren, 12, 70, line);
+
+        if (audio_active > 0) {
+            SDL_SetRenderDrawColor(s_hud_ren, 80, 240, 120, 255);
+        } else {
+            SDL_SetRenderDrawColor(s_hud_ren, 200, 200, 200, 255);
+        }
+        snprintf(line, sizeof(line), "Audio:     %s",
+                 audio_active > 0 ? "Active" : (audio_active == 0 ? "Inactive" : "Unknown"));
+        SDL_RenderDebugText(s_hud_ren, 12, 90, line);
+    }
+    if (slowed) {
+        char notice[64];
+        snprintf(notice, sizeof(notice), "60 FPS logic: %u/s - SLOWED", slow_rate);
+        SDL_SetRenderDrawColor(s_hud_ren, 255, 90, 80, 255);
+        SDL_RenderDebugText(s_hud_ren, 12, (float)(hud_h - LOGIC_NOTICE_H + 6), notice);
+    }
+
+    SDL_RenderPresent(s_hud_ren);
+
+    const uint8_t *src_px = (const uint8_t *)s_hud_surf->pixels;
+    uint8_t *dst_px = (uint8_t *)f->hud_staging_map;
+    int pitch = s_hud_surf->pitch;
+    for (int y = 0; y < hud_h; y++) {
+        memcpy(dst_px + y * hud_w * 4, src_px + y * pitch, (size_t)hud_w * 4);
+    }
+
+    int ox = 16, oy = 16;
+    if (swap_w < hud_w + ox || swap_h < hud_h + oy) {
+        ox = 0; oy = 0;
+    }
+
+    VkBufferImageCopy bic = {0};
+    bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bic.imageSubresource.layerCount = 1;
+    bic.imageOffset.x = ox;
+    bic.imageOffset.y = oy;
+    bic.imageOffset.z = 0;
+    bic.imageExtent.width = (uint32_t)hud_w;
+    bic.imageExtent.height = (uint32_t)hud_h;
+    bic.imageExtent.depth = 1;
+
+    /* The frame blit just wrote this region; order the overlay write after it. */
+    barrier(cmd, dst_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    vkCmdCopyBufferToImage(cmd, f->hud_staging, dst_img,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+}
+
+static int present_common(VkImage src, int srcw, int srch, const uint32_t *upload) {
+    if (s_renderer_terminal) { sr_capture_fail("renderer is terminal"); return -1; }
+    const char *why = NULL;
+    int quit = 0;
+    int presented = 0;
+    poll_input(&quit);
+    if (quit) { why = "window closed during present"; goto fail_quit; }
+    PresentFrame *f = &s_frame[s_frame_cursor];
+    if (!wait_present_frame(f)) { why = "present frame fence wait failed"; goto fail; }
+    /* A picture probe read back by an earlier present is published once its frame's fence
+     * has signalled; never waited for here, and always before this slot is reused. */
+    (void)cap_probe_resolve(0);
+    if (upload) { memcpy(f->staging_map, upload, PSP_W * PSP_H * 4); src = f->fbimg; }
+    VkCommandBuffer cmd = f->cmd;
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        uint32_t idx = 0;
+        VkResult ar = PSTEP_VK(PSTEP_ACQUIRE, vkAcquireNextImageKHR(s_dev, s_swap, UINT64_MAX,
+                                                                    f->sem_acq, VK_NULL_HANDLE, &idx));
+        if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
+            if (!create_swapchain()) { why = "swapchain recreation failed"; goto fail; }
+            continue;
+        }
+        /* VK_SUBOPTIMAL_KHR has acquired an image and will signal f->sem_acq, so the frame is
+         * shown and the present, which reports it again, rebuilds the swapchain. Rebuilding here
+         * would leave that image acquired and the semaphore signalled for the next acquire
+         * (#1377). A failed acquire acquired nothing; a lost device or surface is terminal. */
+        if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
+            if (ar == VK_ERROR_DEVICE_LOST || ar == VK_ERROR_SURFACE_LOST_KHR)
+                s_renderer_terminal = 1;
+            why = "swapchain acquire failed"; goto fail;
+        }
+        if (s_swap_img_fence[idx] && s_swap_img_fence[idx] != f->fence) {
+            uint64_t wait_started = sr_perf_now_ns();
+            VkResult iw = PSTEP_VK(PSTEP_IMAGE_WAIT, vkWaitForFences(s_dev, 1, &s_swap_img_fence[idx],
+                                                                     VK_TRUE, UINT64_MAX));
+            if (wait_started) {
+                sr_perf_vulkan_wait(wait_started, 0);
+                sr_perf_present_wait(wait_started);
+            }
+            if (iw != VK_SUCCESS) { why = "swapchain image fence wait failed"; goto fail_acquired; }
+        }
+        s_swap_img_fence[idx] = f->fence;
+
+        VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (PSTEP_VK(PSTEP_RESET_CMD, vkResetCommandBuffer(cmd, 0)) != VK_SUCCESS) {
+            why = "vkResetCommandBuffer failed"; goto fail_acquired;
+        }
+        if (PSTEP_VK(PSTEP_BEGIN_CMD, vkBeginCommandBuffer(cmd, &bi)) != VK_SUCCESS) {
+            why = "vkBeginCommandBuffer failed"; goto fail_acquired;
+        }
+
+        if (upload) {
+            /* staging buffer -> fb image */
+            barrier(cmd, f->fbimg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferImageCopy bic = {0};
+            bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            bic.imageSubresource.layerCount = 1;
+            bic.imageExtent.width = PSP_W; bic.imageExtent.height = PSP_H; bic.imageExtent.depth = 1;
+            vkCmdCopyBufferToImage(cmd, f->staging, f->fbimg,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+            barrier(cmd, f->fbimg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        }
+
+        /* Ace Mode's smooth motion may show another image; the capture below still reads src. */
+        VkImage show = src;
+        int showw = srcw, showh = srch;
+        if (s_show_pass) {
+            VkImage alt = (VkImage)s_show_pass((void *)cmd, (void *)src, &showw, &showh);
+            if (alt) show = alt;
+            else { showw = srcw; showh = srch; }
+        }
+        if (!show) { why = "nothing to show"; goto fail_acquired; }
+
+        /* fb image -> swapchain, aspect-correct letterbox blit. */
+        barrier(cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        {
+            VkClearColorValue black = {{0, 0, 0, 1}};
+            VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vkCmdClearColorImage(cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 &black, 1, &rng);
+        }
+        barrier(cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        int dw = (int)s_swap_ext.width, dh = (int)s_swap_ext.height;
+        Sdl3VkPresentPlan plan = sdl3vk_present_plan(s_scaling, showw, showh, dw, dh,
+                                                     (int)s_max_image_dim);
+        VkImage blit_src = show;
+        int bw = showw, bh = showh;
+        VkImageBlit blt = {0};
+        blt.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blt.srcSubresource.layerCount = 1;
+        blt.dstSubresource = blt.srcSubresource;
+        blt.srcOffsets[1].z = 1;
+        blt.dstOffsets[1].z = 1;
+        if (plan.prescale > 1 && prescale_ensure(plan.prescale * showw, plan.prescale * showh)) {
+            /* Sharp scaling, pass 1: nearest enlargement to the integer multiple. */
+            barrier(cmd, s_prescale_img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            blt.srcOffsets[1].x = showw;         blt.srcOffsets[1].y = showh;
+            blt.dstOffsets[1].x = s_prescale_w;  blt.dstOffsets[1].y = s_prescale_h;
+            vkCmdBlitImage(cmd, show, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           s_prescale_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &blt, VK_FILTER_NEAREST);
+            barrier(cmd, s_prescale_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            blit_src = s_prescale_img;
+            bw = s_prescale_w;
+            bh = s_prescale_h;
+        }
+        if (plan.w > 0 && plan.h > 0) {
+            blt.srcOffsets[1].x = bw;              blt.srcOffsets[1].y = bh;
+            blt.dstOffsets[0].x = plan.x;          blt.dstOffsets[0].y = plan.y;
+            blt.dstOffsets[1].x = plan.x + plan.w; blt.dstOffsets[1].y = plan.y + plan.h;
+            vkCmdBlitImage(cmd, blit_src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &blt, plan.nearest ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+        }
+
+        if ((s_hud_enabled || s_logic_slowed_cb) && f->hud_staging_map) {
+            draw_hud_overlay(cmd, f, s_swap_img[idx], dw, dh);
+        }
+        if (s_ui_pass) {
+            Sdl3VkUiPass ui;
+            ui.cmd = (void *)cmd;
+            ui.frame_slot = (uint32_t)s_frame_cursor;
+            ui.frames_in_flight = PRESENT_FRAMES;
+            ui.format = (int)s_swap_fmt;
+            ui.width = (uint32_t)dw;
+            ui.height = (uint32_t)dh;
+            ui.images = (void *const *)s_swap_img;
+            ui.image_count = s_swap_n;
+            ui.image_index = idx;
+            ui.swapchain_gen = s_swapchain_gen;
+            s_ui_pass(&ui);
+        }
+
+        barrier(cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+
+        int cap_in_submit = 0;
+        if (sr_capture_is_armed()) {
+            CapBuffer *cb = sr_capture_pending_is_probe() ? &s_probe : &s_cap;
+            if (!cap_ensure(cb, (uint32_t)srcw, (uint32_t)srch)) {
+                why = "capture buffer allocation failed"; goto fail;
+            }
+            /* fbimg is B8G8R8A8_UNORM; a GE render target is R8G8B8A8_UNORM. */
+            sr_cap_order order = upload ? SR_CAP_ORDER_BGRX : SR_CAP_ORDER_RGBX;
+            if (cb == &s_probe) {
+                s_probe_w = (uint32_t)srcw;
+                s_probe_order = order;
+            } else {
+                s_cap_w = (uint32_t)srcw;
+                s_cap_order = order;
+            }
+            if (!cap_record(cmd, cb, src, srcw, srch)) { why = "capture record failed"; goto fail; }
+            cap_in_submit = 1;
+        }
+        if (PSTEP_VK(PSTEP_END_CMD, vkEndCommandBuffer(cmd)) != VK_SUCCESS) {
+            why = "vkEndCommandBuffer failed"; goto fail_acquired;
+        }
+
+        VkPipelineStageFlags wait_st = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &f->sem_acq;
+        si.pWaitDstStageMask = &wait_st;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &s_swap_sem_done[idx];
+        if (PSTEP_VK(PSTEP_RESET_FENCE, vkResetFences(s_dev, 1, &f->fence)) != VK_SUCCESS) {
+            why = "vkResetFences failed"; goto fail_acquired;
+        }
+        uint64_t perf_submit_started = sr_perf_now_ns();
+        if (PSTEP_VK(PSTEP_SUBMIT, vkQueueSubmit(s_queue, 1, &si, f->fence)) != VK_SUCCESS) {
+            why = "vkQueueSubmit failed"; goto fail_acquired;
+        }
+        if (perf_submit_started) sr_perf_vulkan_submit(perf_submit_started);
+        if (sr_perf_enabled) sr_perf_present_submit();
+        f->submitted = 1;
+        f->source = upload ? VK_NULL_HANDLE : src;
+        if (cap_in_submit)
+            sr_capture_mark_recorded(upload ? SR_CAP_SRC_CPU : SR_CAP_SRC_GPU,
+                                     (uint32_t)srcw, (uint32_t)srch);
+
+        VkPresentInfoKHR pi = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+        pi.waitSemaphoreCount = 1;
+        pi.pWaitSemaphores = &s_swap_sem_done[idx];
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &s_swap;
+        pi.pImageIndices = &idx;
+
+        VkResult pr = VK_SUCCESS;
+        if (s_present_fault_armed) {
+            s_present_fault_armed = 0;
+            pr = s_present_fault_result;
+            int fake_presented = 0;
+            const char *fake_why = NULL;
+            PresentDisposition fd = classify_present(pr, &fake_presented, &fake_why);
+            if (is_enqueued_present(fd)) {
+                VkPipelineStageFlags wstage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+                VkSubmitInfo esi = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                esi.waitSemaphoreCount = 1;
+                esi.pWaitSemaphores = &s_swap_sem_done[idx];
+                esi.pWaitDstStageMask = &wstage;
+                if (vkQueueSubmit(s_queue, 1, &esi, VK_NULL_HANDLE) != VK_SUCCESS) {
+                    fprintf(stderr, "sdl3vk: fault harness could not emulate semaphore wait\n");
+                }
+            }
+        } else {
+            pr = vkQueuePresentKHR(s_queue, &pi);
+        }
+
+        int did_present = 0;
+        const char *disp_why = NULL;
+        PresentDisposition disp = classify_present(pr, &did_present, &disp_why);
+
+        switch (disp) {
+        case PRESENT_OK:
+            presented = 1;
+            break;
+
+        case PRESENT_ENQUEUED_REBUILD:
+            presented = 1;
+            if (!create_swapchain()) {
+                s_renderer_terminal = 1;
+                why = "swapchain rebuild after presentation failed";
+                goto fail;
+            }
+            break;
+
+        case PRESENT_OUT_OF_DATE:
+            presented = 0;
+            create_swapchain();
+            why = disp_why;
+            goto fail;
+
+        case PRESENT_SURFACE_LOST:
+            presented = 0;
+            s_renderer_terminal = 1;
+            /* Surface is lost: present request was enqueued (semaphore waited), but surface is gone.
+             * Do NOT call recover_unenqueued_present because the image's present semaphore WAS
+             * consumed. */
+            why = disp_why;
+            goto fail;
+
+        case PRESENT_NOT_ENQUEUED:
+            presented = 0;
+            /* The image is still acquired: only a present or the swapchain's destruction hands
+             * it back, and a few such failures in a row would leave no image to acquire (#1377).
+             * The frame is recovered (its fence waited, the image's present semaphore replaced)
+             * and the swapchain rebuilt; if either fails, the renderer is terminal. */
+            if (!recover_unenqueued_present(f, idx) || !create_swapchain()) s_renderer_terminal = 1;
+            why = disp_why;
+            goto fail;
+
+        case PRESENT_UNCLASSIFIED:
+            presented = 0;
+            s_renderer_terminal = 1;
+            /* Unclassified result: queue and wait-semaphore state are unknown.
+             * Latch terminal state and do NOT perform per-frame semaphore recovery. */
+            why = disp_why;
+            goto fail;
+
+        case PRESENT_TERMINAL:
+            presented = 0;
+            s_renderer_terminal = 1;
+            /* Device lost: leaves affected execution state unreliable.
+             * Latch terminal state and do NOT attempt normal per-frame renderer recovery. */
+            why = disp_why;
+            goto fail;
+        }
+
+        if (!presented) { why = disp_why; goto fail; }
+
+        s_frame_cursor = (s_frame_cursor + 1) % PRESENT_FRAMES;
+        break;
+    }
+    if (!presented) { why = "swapchain still out of date after recreation"; goto fail; }
+
+    /* Complete the armed capture only now that this frame is known to have reached the
+     * presentation engine, so a published file always corresponds to a presented frame.
+     * The fence covers this submission; presentation itself stays asynchronous. */
+    if (sr_capture_is_recorded() && sr_capture_pending_is_probe()) {
+        /* A picture probe is not waited for: it is published by a later present (or a
+         * VBLANK that needs its result) once this frame's fence has signalled. */
+        s_probe_frame = f;
+        sr_capture_set_probe_resolver(cap_probe_resolve);
+        sr_capture_probe_defer();
+    } else if (sr_capture_is_recorded()) {
+        if (f->submitted) {
+            uint64_t perf_wait_started = sr_perf_now_ns();
+            if (vkWaitForFences(s_dev, 1, &f->fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+                why = "capture fence wait failed"; goto fail;
+            }
+            if (perf_wait_started) sr_perf_vulkan_wait(perf_wait_started, 0);
+            f->submitted = 0;
+            f->source = VK_NULL_HANDLE;
+        }
+        /* The frame reached the presentation engine (vkQueuePresentKHR succeeded above):
+         * a readback/publication failure must not make the frame itself look unpresented,
+         * because gui.c would otherwise re-present it through the CPU fallback. The
+         * capture resolves as attempted-and-failed (-1) inside fbcap.c, never as a
+         * fabricated success. */
+        if (!cap_invalidate_readback(&s_cap))
+            sr_capture_fail("capture readback invalidate failed");
+        else
+            sr_capture_publish_recorded(s_cap.map, s_cap_w * 4u, s_cap_order);
+    }
+    return 1;
+
+fail_acquired:
+    /* Between a successful acquire and the submit: the image stays acquired and f->sem_acq
+     * stays to be signalled, and neither is handed back without a present, so the renderer is
+     * terminal (#1377). */
+    fprintf(stderr, "sdl3vk: %s; the renderer is terminal\n", why);
+    s_renderer_terminal = 1;
+fail:
+    /* One exit for every failure above: the armed capture resolves as failed, never as
+     * an invented success. */
+    sr_capture_fail(why);
+    return -1;
+fail_quit:
+    sr_capture_fail(why);
+    return 0;
+}
+
+int sdl3vk_present_rgba(const uint32_t *px) {
+    uint64_t started = sr_perf_now_ns();
+    int result = present_common(VK_NULL_HANDLE, PSP_W, PSP_H, px);
+    if (started) sr_perf_present_done(started, result);
+    return result;
+}
+
+int sdl3vk_present_image(void *vk_image) {
+    /* 512x272 GE target: only the visible 480x272 region is shown */
+    uint64_t started = sr_perf_now_ns();
+    int result = present_common((VkImage)vk_image, PSP_W, PSP_H, NULL);
+    if (started) sr_perf_present_done(started, result);
+    return result;
+}
+
+int sdl3vk_present_image_ex(void *vk_image, int srcw, int srch) {
+    /* render-scaled GE target: the visible region scales with the internal resolution */
+    uint64_t started = sr_perf_now_ns();
+    int result = present_common((VkImage)vk_image, srcw, srch, NULL);
+    if (started) sr_perf_present_done(started, result);
+    return result;
+}
+
+int sdl3vk_present_held(void) {
+    if (!s_show_pass) return 0;
+    uint64_t started = sr_perf_now_ns();
+    int result = present_common(VK_NULL_HANDLE, PSP_W, PSP_H, NULL);
+    if (started) sr_perf_present_done(started, result);
+    return result;
+}
+
+int sdl3vk_wait_image(void *vk_image) {
+    VkImage image=(VkImage)vk_image;
+    if(!image)return 1;
+    for(int i=0;i<PRESENT_FRAMES;i++)
+        if(s_frame[i].submitted&&s_frame[i].source==image&&!wait_present_frame(&s_frame[i]))
+            return 0;
+    return 1;
+}
+
+/* ---- pause overlay (#1159) ----------------------------------------------------------
+ * While the game is stopped the pause presenter shows one image the size of the swapchain,
+ * composed on the CPU (the frozen game frame, the scrim and the overlay screens). It is
+ * uploaded once per change into a device-local image and copied to each acquired swapchain
+ * image, so a present that shows the same image again costs no upload. None of this is a
+ * game frame: it never serves a capture or counts as a present. */
+
+static VkImage        s_ovl_img;
+static VkDeviceMemory s_ovl_img_mem;
+static VkBuffer       s_ovl_buf;
+static VkDeviceMemory s_ovl_buf_mem;
+static void          *s_ovl_buf_map;
+static uint32_t       s_ovl_w, s_ovl_h;
+static VkFormat       s_ovl_fmt = VK_FORMAT_UNDEFINED;
+static int            s_ovl_valid;
+
+/* The CPU layouts the overlay image can be composed in: 8-bit channels, R,G,B,A or B,G,R,A. */
+static int overlay_format_order(VkFormat fmt, int *rgba) {
+    switch (fmt) {
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB: *rgba = 0; return 1;
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB: *rgba = 1; return 1;
+    default: return 0;
+    }
+}
+
+int sdl3vk_window_minimized(void) {
+    return s_win && (SDL_GetWindowFlags(s_win) & SDL_WINDOW_MINIMIZED) != 0;
+}
+
+int sdl3vk_fullscreen(void) {
+#ifdef SDL_PLATFORM_ANDROID
+    return -1;
+#else
+    if (!s_win || s_window_hidden) return -1;
+    return (SDL_GetWindowFlags(s_win) & SDL_WINDOW_FULLSCREEN) != 0;
+#endif
+}
+
+int sdl3vk_set_fullscreen(int on) {
+    if (sdl3vk_fullscreen() < 0) return 0;
+    if (!SDL_SetWindowFullscreen(s_win, on != 0)) {
+        fprintf(stderr, "sdl3vk: fullscreen %s could not be applied: %s\n",
+                on ? "on" : "off", SDL_GetError());
+        return 0;
+    }
+    /* SDL applies the mode asynchronously; wait for it so the next overlay frame reads the
+     * state the person chose. A window manager that never confirms only costs SDL's timeout. */
+    (void)SDL_SyncWindow(s_win);
+    fprintf(stderr, "sdl3vk: fullscreen %s\n", on ? "on" : "off");
+    return 1;
+}
+
+void sdl3vk_wait_events(uint32_t timeout_ms) {
+    (void)SDL_WaitEventTimeout(NULL, timeout_ms > (uint32_t)INT32_MAX ? INT32_MAX : (Sint32)timeout_ms);
+}
+
+int sdl3vk_present_scaling(void) { return s_scaling; }
+
+int sdl3vk_window_scales(float *display_scale, float *pixels_per_point) {
+    if (!s_win) return 0;
+    int pw = 0, ph = 0, ww = 0, wh = 0;
+    float scale = SDL_GetWindowDisplayScale(s_win);
+    if (!(scale > 0.0f)) scale = 1.0f;
+    (void)SDL_GetWindowSizeInPixels(s_win, &pw, &ph);
+    (void)SDL_GetWindowSize(s_win, &ww, &wh);
+    if (display_scale) *display_scale = scale;
+    if (pixels_per_point) *pixels_per_point = ww > 0 && pw > 0 ? (float)pw / (float)ww : scale;
+    return 1;
+}
+
+int sdl3vk_set_present_scaling(int mode) {
+    if (mode != SDL3VK_SCALING_SHARP && mode != SDL3VK_SCALING_INTEGER &&
+        mode != SDL3VK_SCALING_BILINEAR) return 0;
+    s_scaling = mode;
+    return 1;
+}
+
+uint64_t sdl3vk_display_period_ns(void) {
+    if (!s_win) return 0;
+    const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(s_win));
+    if (!mode || mode->refresh_rate <= 0.0f) return 0;
+    return (uint64_t)(1000000000.0 / (double)mode->refresh_rate);
+}
+
+int sdl3vk_overlay_extent(int *w, int *h, int *rgba) {
+    int order = 0;
+    if (!s_dev || !s_swap || s_renderer_terminal || sdl3vk_window_minimized() ||
+        !s_swap_ext.width || !s_swap_ext.height || !overlay_format_order(s_swap_fmt, &order))
+        return 0;
+    if (w) *w = (int)s_swap_ext.width;
+    if (h) *h = (int)s_swap_ext.height;
+    if (rgba) *rgba = order;
+    return 1;
+}
+
+void sdl3vk_overlay_release(void) {
+    if (!s_dev) return;
+    if (s_ovl_img || s_ovl_buf) (void)wait_all_present_frames();
+    if (s_ovl_buf_map) vkUnmapMemory(s_dev, s_ovl_buf_mem);
+    if (s_ovl_buf)     vkDestroyBuffer(s_dev, s_ovl_buf, NULL);
+    if (s_ovl_buf_mem) vkFreeMemory(s_dev, s_ovl_buf_mem, NULL);
+    if (s_ovl_img)     vkDestroyImage(s_dev, s_ovl_img, NULL);
+    if (s_ovl_img_mem) vkFreeMemory(s_dev, s_ovl_img_mem, NULL);
+    s_ovl_buf_map = NULL;
+    s_ovl_buf = VK_NULL_HANDLE;
+    s_ovl_buf_mem = VK_NULL_HANDLE;
+    s_ovl_img = VK_NULL_HANDLE;
+    s_ovl_img_mem = VK_NULL_HANDLE;
+    s_ovl_w = s_ovl_h = 0;
+    s_ovl_fmt = VK_FORMAT_UNDEFINED;
+    s_ovl_valid = 0;
+}
+
+static int overlay_ensure(uint32_t w, uint32_t h) {
+    if (s_ovl_img && s_ovl_w == w && s_ovl_h == h && s_ovl_fmt == s_swap_fmt) return 1;
+    sdl3vk_overlay_release();
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.size = (VkDeviceSize)w * h * 4u;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VkMemoryRequirements mr;
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    if (vkCreateBuffer(s_dev, &bci, NULL, &s_ovl_buf) != VK_SUCCESS) goto fail;
+    vkGetBufferMemoryRequirements(s_dev, s_ovl_buf, &mr);
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = find_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mai.memoryTypeIndex == UINT32_MAX ||
+        vkAllocateMemory(s_dev, &mai, NULL, &s_ovl_buf_mem) != VK_SUCCESS ||
+        vkBindBufferMemory(s_dev, s_ovl_buf, s_ovl_buf_mem, 0) != VK_SUCCESS ||
+        vkMapMemory(s_dev, s_ovl_buf_mem, 0, VK_WHOLE_SIZE, 0, &s_ovl_buf_map) != VK_SUCCESS)
+        goto fail;
+
+    VkImageCreateInfo imi = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    imi.imageType = VK_IMAGE_TYPE_2D;
+    imi.format = s_swap_fmt;
+    imi.extent.width = w; imi.extent.height = h; imi.extent.depth = 1;
+    imi.mipLevels = 1; imi.arrayLayers = 1; imi.samples = VK_SAMPLE_COUNT_1_BIT;
+    imi.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imi.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imi.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(s_dev, &imi, NULL, &s_ovl_img) != VK_SUCCESS) goto fail;
+    vkGetImageMemoryRequirements(s_dev, s_ovl_img, &mr);
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = find_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mai.memoryTypeIndex == UINT32_MAX ||
+        vkAllocateMemory(s_dev, &mai, NULL, &s_ovl_img_mem) != VK_SUCCESS ||
+        vkBindImageMemory(s_dev, s_ovl_img, s_ovl_img_mem, 0) != VK_SUCCESS)
+        goto fail;
+    s_ovl_w = w; s_ovl_h = h;
+    s_ovl_fmt = s_swap_fmt;
+    return 1;
+fail:
+    fprintf(stderr, "sdl3vk: pause overlay image (%ux%u) could not be created\n", w, h);
+    sdl3vk_overlay_release();
+    return 0;
+}
+
+/* Copies the composed pixels into the overlay image. It runs once per change, so a blocking
+ * one-off submission is fine; every present that read the old image has finished first. */
+static int overlay_upload(const void *px, int pitch) {
+    const size_t row = (size_t)s_ovl_w * 4u;
+    if (pitch < 0 || (size_t)pitch < row) return 0;
+    if (!wait_all_present_frames()) return 0;
+    for (uint32_t y = 0; y < s_ovl_h; y++)
+        memcpy((uint8_t *)s_ovl_buf_map + y * row, (const uint8_t *)px + (size_t)y * (size_t)pitch, row);
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkResetCommandBuffer(s_cmd, 0) != VK_SUCCESS) return 0;
+    if (vkBeginCommandBuffer(s_cmd, &bi) != VK_SUCCESS) return 0;
+    barrier(s_cmd, s_ovl_img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy bic = {0};
+    bic.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bic.imageSubresource.layerCount = 1;
+    bic.imageExtent.width = s_ovl_w; bic.imageExtent.height = s_ovl_h; bic.imageExtent.depth = 1;
+    vkCmdCopyBufferToImage(s_cmd, s_ovl_buf, s_ovl_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+    barrier(s_cmd, s_ovl_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    if (vkEndCommandBuffer(s_cmd) != VK_SUCCESS) return 0;
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &s_cmd;
+    if (vkResetFences(s_dev, 1, &s_fence) != VK_SUCCESS) return 0;
+    if (vkQueueSubmit(s_queue, 1, &si, s_fence) != VK_SUCCESS) return 0;
+    if (vkWaitForFences(s_dev, 1, &s_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        /* The upload may still be running: s_cmd and s_fence cannot be reused (#1377). */
+        fprintf(stderr, "sdl3vk: pause overlay upload fence wait failed; the renderer is terminal\n");
+        s_renderer_terminal = 1;
+        return 0;
+    }
+    s_ovl_valid = 1;
+    return 1;
+}
+
+int sdl3vk_present_overlay(const void *px, int pitch) {
+    if (s_renderer_terminal || !s_dev || !s_swap) return -1;
+    if (s_quit_requested) return 0;
+    int order = 0;
+    const uint32_t w = s_swap_ext.width, h = s_swap_ext.height;
+    if (!overlay_format_order(s_swap_fmt, &order)) return -1;
+    if (px) {
+        if (!overlay_ensure(w, h) || !overlay_upload(px, pitch)) {
+            s_ovl_valid = 0;
+            return -1;
+        }
+    }
+    if (!s_ovl_valid || s_ovl_w != w || s_ovl_h != h || s_ovl_fmt != s_swap_fmt) return 2;
+
+    PresentFrame *f = &s_frame[s_frame_cursor];
+    if (!wait_present_frame(f)) return -1;
+    uint32_t idx = 0;
+    VkResult ar = vkAcquireNextImageKHR(s_dev, s_swap, UINT64_MAX, f->sem_acq, VK_NULL_HANDLE, &idx);
+    if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
+        if (!create_swapchain() && !sdl3vk_window_minimized()) return -1;
+        return 2;
+    }
+    /* VK_SUBOPTIMAL_KHR acquired an image that can still be shown; the present below
+     * reports it again and the swapchain is rebuilt there. A lost device or surface is
+     * terminal; any other failed acquire acquired nothing. */
+    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) {
+        if (ar == VK_ERROR_DEVICE_LOST || ar == VK_ERROR_SURFACE_LOST_KHR) s_renderer_terminal = 1;
+        return -1;
+    }
+    /* From here to the submit a failure leaves the image acquired and f->sem_acq to be
+     * signalled, as in present_common: the renderer is terminal (#1377). */
+    const char *fail_why = NULL;
+    if (s_swap_img_fence[idx] && s_swap_img_fence[idx] != f->fence &&
+        vkWaitForFences(s_dev, 1, &s_swap_img_fence[idx], VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+        fail_why = "swapchain image fence wait failed";
+    s_swap_img_fence[idx] = f->fence;
+
+    VkCommandBuffer cmd = f->cmd;
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (!fail_why && vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) fail_why = "vkResetCommandBuffer failed";
+    if (!fail_why && vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) fail_why = "vkBeginCommandBuffer failed";
+    if (fail_why) {
+        fprintf(stderr, "sdl3vk: pause overlay: %s; the renderer is terminal\n", fail_why);
+        s_renderer_terminal = 1;
+        return -1;
+    }
+    barrier(cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkImageCopy ic = {0};
+    ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ic.srcSubresource.layerCount = 1;
+    ic.dstSubresource = ic.srcSubresource;
+    ic.extent.width = w; ic.extent.height = h; ic.extent.depth = 1;
+    vkCmdCopyImage(cmd, s_ovl_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+    barrier(cmd, s_swap_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) fail_why = "vkEndCommandBuffer failed";
+
+    VkPipelineStageFlags wait_st = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.waitSemaphoreCount = 1;
+    si.pWaitSemaphores = &f->sem_acq;
+    si.pWaitDstStageMask = &wait_st;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &s_swap_sem_done[idx];
+    if (!fail_why && vkResetFences(s_dev, 1, &f->fence) != VK_SUCCESS) fail_why = "vkResetFences failed";
+    if (!fail_why && vkQueueSubmit(s_queue, 1, &si, f->fence) != VK_SUCCESS) fail_why = "vkQueueSubmit failed";
+    if (fail_why) {
+        fprintf(stderr, "sdl3vk: pause overlay: %s; the renderer is terminal\n", fail_why);
+        s_renderer_terminal = 1;
+        return -1;
+    }
+    f->submitted = 1;
+    f->source = VK_NULL_HANDLE;
+
+    VkPresentInfoKHR pi = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &s_swap_sem_done[idx];
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &s_swap;
+    pi.pImageIndices = &idx;
+    int did_present = 0;
+    const char *why = NULL;
+    switch (classify_present(vkQueuePresentKHR(s_queue, &pi), &did_present, &why)) {
+    case PRESENT_OK:
+        s_frame_cursor = (s_frame_cursor + 1) % PRESENT_FRAMES;
+        return 1;
+    case PRESENT_ENQUEUED_REBUILD:
+    case PRESENT_OUT_OF_DATE:
+        s_frame_cursor = (s_frame_cursor + 1) % PRESENT_FRAMES;
+        if (!create_swapchain() && !sdl3vk_window_minimized()) {
+            s_renderer_terminal = 1;
+            fprintf(stderr, "sdl3vk: pause overlay: swapchain rebuild failed\n");
+            return -1;
+        }
+        return 2;
+    case PRESENT_NOT_ENQUEUED:
+        /* The image is still acquired: recover the frame and rebuild the swapchain to hand it
+         * back, as present_common does (#1377). */
+        if (!recover_unenqueued_present(f, idx) || !create_swapchain()) s_renderer_terminal = 1;
+        fprintf(stderr, "sdl3vk: pause overlay present failed: %s\n", why ? why : "not enqueued");
+        return -1;
+    case PRESENT_SURFACE_LOST:
+    case PRESENT_TERMINAL:
+    case PRESENT_UNCLASSIFIED:
+    default:
+        s_renderer_terminal = 1;
+        fprintf(stderr, "sdl3vk: pause overlay present failed: %s\n", why ? why : "terminal");
+        return -1;
+    }
+}
+
+/* The self-tests (capture, input profile, pause input, lifecycle) live in sdl3vk_selftest.inc; they
+ * use this file's state directly, so they are included here rather than compiled separately. */
+#include "sdl3vk_selftest.inc"
+
+/* Releases everything sdl3vk_init and the presenter created, in reverse creation order (each
+ * child before its parent), and clears every handle and the renderer state. It is also
+ * sdl3vk_init's unwind, so it acts only on what exists; a second call does nothing (#1377). Its
+ * SDL_Init is undone with SDL_QuitSubSystem, not SDL_Quit, so the audio backend's subsystem
+ * (audio_sdl3.c) stays up until that backend's own cleanup. */
+void sdl3vk_shutdown(void) {
+    sdl3vk_overlay_release();
+    if (s_dev) {
+        (void)wait_all_present_frames();
+        /* Presentation-engine ownership is not covered by a submit fence.  A queue-idle
+         * at final teardown is therefore still required before destroying the swapchain;
+         * unlike vkDeviceWaitIdle this does not stall unrelated device queues. A failed wait
+         * (a lost device) is reported; teardown goes on, as nothing else can be done. */
+        VkResult idle = vkQueueWaitIdle(s_queue);
+        if (idle != VK_SUCCESS)
+            fprintf(stderr, "sdl3vk: shutdown vkQueueWaitIdle failed: %d\n", (int)idle);
+    }
+    destroy_swapchain();
+    destroy_present_semaphores();
+    s_swap_n = 0;
+    memset(s_swap_img_fence, 0, sizeof(s_swap_img_fence));
+    if (s_hud_ren)  { SDL_DestroyRenderer(s_hud_ren); s_hud_ren = NULL; }
+    if (s_hud_surf) { SDL_DestroySurface(s_hud_surf); s_hud_surf = NULL; }
+    s_hud_fmt = VK_FORMAT_UNDEFINED;
+    /* Every frame was waited above, so an in-flight probe is published, not lost; one this
+     * renderer can no longer finish is dropped without a result. */
+    if (s_dev) (void)cap_probe_resolve(0);
+    s_probe_frame = NULL;
+    sr_capture_probe_drop("renderer shut down");
+    sr_capture_set_probe_resolver(NULL);
+    cap_free_buffer(&s_cap);
+    cap_free_buffer(&s_probe);
+    prescale_free();
+    for (int i = PRESENT_FRAMES - 1; i >= 0; i--) {
+        PresentFrame *f = &s_frame[i];
+        if (f->fbimg)       vkDestroyImage(s_dev, f->fbimg, NULL);
+        if (f->fbimg_mem)   vkFreeMemory(s_dev, f->fbimg_mem, NULL);
+        if (f->hud_staging_map) vkUnmapMemory(s_dev, f->hud_staging_mem);
+        if (f->hud_staging)     vkDestroyBuffer(s_dev, f->hud_staging, NULL);
+        if (f->hud_staging_mem) vkFreeMemory(s_dev, f->hud_staging_mem, NULL);
+        if (f->staging_map) vkUnmapMemory(s_dev, f->staging_mem);
+        if (f->staging)     vkDestroyBuffer(s_dev, f->staging, NULL);
+        if (f->staging_mem) vkFreeMemory(s_dev, f->staging_mem, NULL);
+        if (f->sem_acq)     vkDestroySemaphore(s_dev, f->sem_acq, NULL);
+        if (f->fence)       vkDestroyFence(s_dev, f->fence, NULL);
+        memset(f, 0, sizeof(*f));   /* its command buffer is freed with the pool */
+    }
+    s_frame_cursor = 0;
+    if (s_fence)       vkDestroyFence(s_dev, s_fence, NULL);
+    if (s_pool)        vkDestroyCommandPool(s_dev, s_pool, NULL);
+    if (s_dev)         vkDestroyDevice(s_dev, NULL);
+    s_fence = VK_NULL_HANDLE;
+    s_cmd = VK_NULL_HANDLE;
+    s_pool = VK_NULL_HANDLE;
+    s_queue = VK_NULL_HANDLE;
+    s_dev = VK_NULL_HANDLE;
+    s_pdev = VK_NULL_HANDLE;
+    if (s_surf)        vkDestroySurfaceKHR(s_inst, s_surf, NULL);
+    s_surf = VK_NULL_HANDLE;
+    if (s_validation_msgr && s_validation_destroy) {
+        s_validation_destroy(s_inst, s_validation_msgr, NULL);
+        s_validation_msgr = VK_NULL_HANDLE;
+    }
+    s_validation_destroy = NULL;
+    if (s_inst) {
+        vkDestroyInstance(s_inst, NULL);
+        s_inst = VK_NULL_HANDLE;
+    }
+    if (s_pad)         { SDL_CloseGamepad(s_pad); s_pad = NULL; }
+    if (s_win)         { SDL_DestroyWindow(s_win); s_win = NULL; }
+    if (s_sdl_subsystems) {
+        SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD);
+        s_sdl_subsystems = 0;
+    }
+    s_renderer_terminal = 0;
+    s_denorm_preserve_f32 = 0;
+    s_quit_requested = 0;
+    s_pstep_fault = PSTEP_NONE;
+    sdl3vk_reset_input_profile();
+}

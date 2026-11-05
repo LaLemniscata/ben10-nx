@@ -1,0 +1,127 @@
+minimum_pre_commit_version: "4.0.0"
+default_install_hook_types: [pre-commit, pre-push]
+
+# Keep shared hooks away from generated output, private game inputs, local third-party
+# checkouts, runtime state, and package-manager build products. Most of these paths are
+# already ignored by Git; the explicit exclusions make the policy visible here too.
+exclude: |
+  (?x)^(
+      build/|
+      third_party/|
+      place_game_here/|
+      original_game/|
+      oracle/|
+      fs/|
+      memstick/|
+      logs/
+  )
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        # The pinned VFPU .dat files are binary lookup tables even though
+        # identify/pre-commit classifies them as text. Three larger legacy
+        # source/test files also contain a handful of pre-existing whitespace-only
+        # blank lines; leave those historical lines untouched to avoid an unrelated
+        # mass-format diff. Preserve the third-party license
+        # copies listed below byte-for-byte; the formatter
+        # removes recorded trailing whitespace from those imported files. The local
+        # staged-diff hook below still rejects any *new* whitespace in every file.
+        exclude: >-
+          ^(assets/vfpu/.*\.dat|tests/native/sched_selftest\.c|tools/gen_microtest\.py|tools/test_codegen_gate_b_encoding\.py|src/rt/atrac3p/LICENSE\.LGPLv2\.1\.txt|src/rt/h264_ffmpeg_sub/LICENSE\.LGPLv2\.1\.txt|THIRD_PARTY_LICENSES/GPL-2\.0\.txt|THIRD_PARTY_LICENSES/Graphite2\.txt|THIRD_PARTY_LICENSES/bzip2\.txt|THIRD_PARTY_LICENSES/libiconv\.txt|THIRD_PARTY_LICENSES/libintl\.txt|src/core/nk_psp_aes\.c|src/core/nk_psp_aes\.h|src/core/nk_psp_sha1\.c|src/core/nk_psp_sha1\.h|fixtures/fonts/gudea/OFL\.txt)$
+      - id: end-of-file-fixer
+        # Never mutate pinned binary LUT bytes, the byte-identical minimp3 licence, or the byte-exact FFmpeg import that ends in a blank line.
+        exclude: ^(assets/vfpu/.*\.dat|src/rt/minimp3/LICENSE|src/rt/h264_ffmpeg_sub/libavcodec/h264_mc_template\.c)$
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-added-large-files
+        # Match tools/publish_audit.py's existing 25 MiB publication ceiling.
+        args: [--maxkb=25600]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: 25bcf95026b96e2dd3c0aec3090c3d6ef6ca2e6c # v0.17.3
+    hooks:
+      - id: ruff-check
+
+  # Betterleaks is the actively developed successor from the Gitleaks maintainers.
+  # The project-owned native config keeps default detection enabled and limits
+  # the synthetic history-audit exception to its exact value and path.
+  - repo: https://github.com/betterleaks/betterleaks
+    rev: 81aff7a638638aae3a659845d089043e1d8fe9ac # v1.9.0
+    hooks:
+      - id: betterleaks
+        # Directory mode over the hook's file list. pre-commit stashes unstaged
+        # changes before hooks run, so these files hold exactly the staged
+        # content. The upstream entry uses git mode, which exports
+        # GIT_CONFIG_GLOBAL=NUL; Git for Windows only special-cases lowercase
+        # "nul", so every git call failed and the hook scanned nothing on
+        # Windows. Hosted CI still scans reachable history in git mode.
+        # Commit stage only: pre-commit passes no file names at the pre-push stage,
+        # so directory mode there would either walk the whole working tree (including
+        # the private input directories) or fail on a missing path. Every commit is
+        # scanned here and the pushed history is scanned in hosted CI.
+        entry: betterleaks dir --redact --verbose
+        pass_filenames: true
+        stages: [pre-commit]
+
+  - repo: local
+    hooks:
+      - id: staged-whitespace-check
+        name: reject new trailing whitespace
+        entry: git diff --cached --check
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+      - id: documentation-freshness
+        name: documentation freshness audit
+        entry: python tools/lint_docs.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit, pre-push]
+      - id: publication-policy-sync
+        name: canonical publication policy covers every tracked path
+        # Reports any tracked path the canonical policy does not classify. Runs
+        # before the audit so the failure names the missing decision rather than
+        # surfacing as a generic audit finding. Adding a file to the public
+        # surface is a publication decision and must be made deliberately.
+        entry: python tools/policy_sync.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit, pre-push]
+      - id: publication-audit
+        name: publication safety audit
+        # Policy findings (excluded path present, unclassified path, stale policy
+        # digest, manifest contradiction) are unconditional and do not depend on
+        # --public-scope; that flag adds the softer asset-scope checks on top.
+        # --provenance-self-consistency: pre-commit runs in this checkout and has no access to
+        # the externally trusted provenance ledger, so it asserts candidate-internal consistency
+        # (coverage, resolution, content hashes) and explicitly does not attest authenticity.
+        # Attestation is asserted only by the release flow via --provenance-ledger; a bare audit
+        # without either flag fails with PROVENANCE_UNVERIFIED rather than self-authorizing.
+        entry: python tools/publish_audit.py --tracked-only --public-scope --provenance-self-consistency
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit, pre-push]
+      - id: modified-file-notice-audit
+        name: inherited modified-file notice audit
+        entry: python tools/modified_file_notice_audit.py --tracked-only
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit, pre-push]
+      - id: provenance-record-gap-check
+        name: upstream-derived production path disposition gap check
+        entry: python tools/provenance_record_gap.py --check
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit, pre-push]

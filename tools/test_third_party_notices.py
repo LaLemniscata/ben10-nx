@@ -1,0 +1,322 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+"""Release gate: no bundled binary or declared component ships without a license.
+
+The gate answers one question for the native package: does every DLL a
+packaging route can copy, and every component in
+``assets/third_party_components.json``, carry an SPDX identifier and a license
+text that is actually in the tree?
+
+It builds the notices from the source of truth rather than from a second literal,
+so adding a component without a notice is a failing test rather than a silent gap.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tools"))
+
+import package_notices
+from package_notices import PackageRouteError
+
+INVENTORY_IDENTITY = "assets/third_party_components.json"
+PY_LOCKFILE = "tools/requirements-lock.txt"
+
+
+def inventory() -> dict:
+    returned: dict[str, Any] = package_notices.load_component_inventory()
+    return returned
+
+
+def all_component_records(data: dict) -> dict[str, dict]:
+    """Return every recorded component keyed by a stable identifier."""
+    records: dict[str, dict] = {}
+    native = data["native"]
+    for dll_name, record in native["dlls"].items():
+        records[f"native.dlls.{dll_name}"] = record
+    for index, record in enumerate(native.get("linked_components", [])):
+        records[f"native.linked_components[{index}]"] = record
+    for index, record in enumerate(native.get("host_resolved_components", [])):
+        records[f"native.host_resolved_components[{index}]"] = record
+    if "project_output" in native:
+        records["native.project_output"] = native["project_output"]
+    return records
+
+
+class TestThirdPartyComponentInventory(unittest.TestCase):
+    """Every declared component is complete enough to ship a notice for."""
+
+    def setUp(self) -> None:
+        self.data = inventory()
+        self.records = all_component_records(self.data)
+
+    def test_inventory_declares_components(self) -> None:
+        self.assertGreaterEqual(len(self.records), 6, "the inventory must describe the shipped set")
+
+    def test_every_component_has_a_resolved_license_identifier(self) -> None:
+        for key, record in self.records.items():
+            with self.subTest(component=key):
+                spdx_id = record.get("spdx_id")
+                self.assertTrue(spdx_id, f"{key} has no spdx_id")
+                self.assertNotIn("NOASSERTION", str(spdx_id), f"{key} resolves to NOASSERTION")
+                self.assertNotIn("UNKNOWN", str(spdx_id), f"{key} resolves to UNKNOWN")
+
+    def test_every_component_license_text_is_present_and_nonempty(self) -> None:
+        for key, record in self.records.items():
+            with self.subTest(component=key):
+                texts = record.get("license_texts")
+                self.assertTrue(texts, f"{key} declares no license_texts")
+                for entry in texts:
+                    path = ROOT / entry["file"]
+                    self.assertTrue(path.is_file(), f"{key} license text missing: {entry['file']}")
+                    self.assertTrue(
+                        path.read_text(encoding="utf-8", errors="replace").strip(),
+                        f"{key} license text is empty: {entry['file']}",
+                    )
+
+    def test_recorded_license_texts_match_their_recorded_digest(self) -> None:
+        """A license text may not be edited into the tree without re-recording it."""
+        for key, record in self.records.items():
+            for entry in record.get("license_texts", []):
+                digest = entry.get("sha256")
+                if digest is None:
+                    continue
+                with self.subTest(component=key, text=entry["file"]):
+                    actual = hashlib.sha256((ROOT / entry["file"]).read_bytes()).hexdigest()
+                    self.assertEqual(
+                        actual, digest,
+                        f"{entry['file']} no longer matches the digest recorded in {INVENTORY_IDENTITY}",
+                    )
+
+    def test_every_dll_a_copy_route_can_copy_has_a_record(self) -> None:
+        """The obligation follows the copy list, not the conditional that guards it."""
+        dll_records = {name.lower() for name in self.data["native"]["dlls"]}
+        for route in self.data["native"]["copy_routes"]:
+            for dll_name in route["copies"]:
+                with self.subTest(route=route["id"], dll=dll_name):
+                    self.assertIn(
+                        dll_name.lower(), dll_records,
+                        f"copy route {route['id']} copies {dll_name} but no license record exists for it",
+                    )
+                    record = self.data["native"]["dlls"][dll_name.lower()]
+                    self.assertEqual(record["disposition"], "copied_into_package")
+
+    def test_every_copy_route_names_a_tracked_script(self) -> None:
+        """A relocated or deleted copy script must not leave a stale route behind."""
+        import subprocess
+        tracked = set(subprocess.run(
+            ["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True,
+        ).stdout.decode("utf-8").split("\0"))
+        self.assertGreater(len(tracked), 1, "git ls-files returned no tracked paths")
+        for route in self.data["native"]["copy_routes"]:
+            with self.subTest(route=route["id"]):
+                self.assertIn(
+                    route["file"], tracked,
+                    f"copy route {route['id']} names an untracked or missing file: {route['file']}",
+                )
+
+    def test_host_resolved_dlls_are_not_also_copied_into_a_package(self) -> None:
+        """A host-resolved loader is recorded for attribution, never staged for redistribution."""
+        staged = package_notices.packaged_dll_names()
+        for record in self.data["native"].get("host_resolved_components", []):
+            dll = record.get("dll", "").lower()
+            if dll:
+                with self.subTest(dll=dll):
+                    self.assertNotIn(dll, staged)
+        copied = {name.lower() for name in self.data["native"]["dlls"]}
+        for host_dll in (d.lower() for d in self.data["native"].get("host_resolved_dlls", [])):
+            if host_dll in copied:
+                self.fail(f"{host_dll} is declared both host-resolved and copied into a package")
+
+    def test_system_dll_patterns_cover_the_measured_player_imports(self) -> None:
+        """Every DLL the measured player imports is either a system library or recorded."""
+        recorded = package_notices.known_runtime_dlls()
+        for dll_name in (
+            "KERNEL32.dll", "SHELL32.dll", "api-ms-win-crt-runtime-l1-1-0.dll",
+            "SDL3.dll", "vulkan-1.dll", "libwinpthread-1.dll", "libgcc_s_seh-1.dll",
+            "libstdc++-6.dll",
+        ):
+            with self.subTest(dll=dll_name):
+                self.assertTrue(
+                    package_notices.is_system_dll(dll_name) or dll_name.lower() in recorded,
+                    f"{dll_name} is neither a recognized system library nor a recorded component",
+                )
+
+
+class TestNativePackageNoticesGate(unittest.TestCase):
+    """The native package gate fails closed for an unrecorded or textless DLL."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.pkg_dir = Path(self.tmpdir.name)
+
+    def tearDown(self) -> None:
+        self.tmpdir.cleanup()
+
+    def test_every_dll_the_copy_route_ships_generates_a_notice(self) -> None:
+        """Each DLL from the inventory's copy list gets a notice, version and text."""
+        for dll_name in sorted(package_notices.packaged_dll_names()):
+            with self.subTest(dll=dll_name):
+                (self.pkg_dir / dll_name).write_bytes(b"MZ\0\0synthetic")
+                result = package_notices.generate_package_notices(self.pkg_dir, repo_root=ROOT)
+                entry = next(
+                    c for c in result["components"] if c.get("binary", "").lower() == dll_name
+                )
+                self.assertNotIn("NOASSERTION", entry["spdx_id"])
+                notices = self.pkg_dir / "THIRD_PARTY_NOTICES"
+                self.assertTrue((notices / entry["license_file"]).is_file())
+                for extra in entry.get("additional_license_files", []):
+                    self.assertTrue((notices / extra).is_file())
+                (self.pkg_dir / dll_name).unlink()
+
+    def test_host_resolved_loader_present_in_a_package_gets_a_notice(self) -> None:
+        """A user-supplied Vulkan loader is named, not waved through as a system library."""
+        (self.pkg_dir / "vulkan-1.dll").write_bytes(b"MZ\0\0synthetic")
+        result = package_notices.generate_package_notices(self.pkg_dir, repo_root=ROOT)
+        entry = next(
+            c for c in result["components"] if c.get("binary", "").lower() == "vulkan-1.dll"
+        )
+        self.assertEqual(entry["spdx_id"], "Apache-2.0")
+        self.assertEqual(entry["disposition"], "host_resolved_not_redistributed")
+        self.assertTrue((self.pkg_dir / "THIRD_PARTY_NOTICES" / "Vulkan-loader.txt").is_file())
+
+    def test_unrecorded_dll_still_refuses_the_package(self) -> None:
+        (self.pkg_dir / "mystery.dll").write_bytes(b"MZ\0\0synthetic")
+        with self.assertRaises(PackageRouteError) as ctx:
+            package_notices.generate_package_notices(self.pkg_dir, repo_root=ROOT)
+        self.assertEqual(ctx.exception.code, "PACKAGE_LICENSE_RECORD_MISSING")
+
+    def test_component_without_a_license_text_refuses_the_package(self) -> None:
+        """Removing an in-tree license text stops packaging instead of shipping a bare DLL."""
+        with tempfile.TemporaryDirectory() as repo_dir:
+            fake_repo = Path(repo_dir)
+            (fake_repo / "LICENSE").write_text("GPL-3.0-or-later project text", encoding="utf-8")
+            atrac3p_lic = ROOT / "src" / "rt" / "atrac3p" / "LICENSE.LGPLv2.1.txt"
+            (fake_repo / "src" / "rt" / "atrac3p").mkdir(parents=True)
+            with self.assertRaises(PackageRouteError) as ctx:
+                package_notices.generate_package_notices(self.pkg_dir, repo_root=fake_repo)
+            self.assertEqual(ctx.exception.code, "PACKAGE_LICENSE_TEXT_MISSING")
+            self.assertIn("FFmpeg ATRAC3+ subset", str(ctx.exception))
+            self.assertTrue(atrac3p_lic.is_file(), "the real tree must still carry the LGPL text")
+
+    def test_missing_inventory_fails_closed(self) -> None:
+        """No inventory means no license record, not a silently empty record set."""
+        with tempfile.TemporaryDirectory() as empty:
+            with self.assertRaises(PackageRouteError) as ctx:
+                package_notices.load_component_inventory(Path(empty) / "missing.json")
+        self.assertEqual(ctx.exception.code, "PACKAGE_LICENSE_RECORD_MISSING")
+        self.assertIn(INVENTORY_IDENTITY, str(ctx.exception))
+
+    def test_component_with_unresolved_spdx_id_refuses_the_package(self) -> None:
+        """A component or binary with an unresolved or missing SPDX identity refuses packaging."""
+        (self.pkg_dir / "custom_lib.dll").write_bytes(bytes([0x4D, 0x5A, 0x00, 0x00]) + b"synthetic")
+        custom_lic = self.pkg_dir / "custom_lic.txt"
+        custom_lic.write_text("Verbatim license text", encoding="utf-8")
+
+        for bad_spdx in ("NOASSERTION", "UNKNOWN", "", None):
+            with self.subTest(spdx_id=bad_spdx):
+                custom_map = {
+                    "custom_lib.dll": {
+                        "name": "Custom Lib",
+                        "spdx_id": bad_spdx,
+                        "license_path": str(custom_lic),
+                        "version": "1.0.0",
+                    }
+                }
+                with self.assertRaises(PackageRouteError) as ctx:
+                    package_notices.generate_package_notices(
+                        self.pkg_dir, repo_root=ROOT, custom_license_map=custom_map
+                    )
+                self.assertEqual(ctx.exception.code, "PACKAGE_LICENSE_RECORD_MISSING")
+                self.assertIn("lacks a valid SPDX license identifier", str(ctx.exception))
+
+        # The linked-component and project-output gates read the native inventory, not
+        # the custom map. Each is killed only by corrupting its own record, so each gets
+        # its own subtests against a copy of the real inventory.
+        real_inventory = package_notices.load_component_inventory()
+        for bad_spdx in ("NOASSERTION", "UNKNOWN", "", None):
+            with self.subTest(gate="linked component", spdx_id=bad_spdx):
+                inventory = copy.deepcopy(real_inventory)
+                inventory["native"]["linked_components"][0]["spdx_id"] = bad_spdx
+                with patch.object(package_notices, "load_component_inventory", return_value=inventory):
+                    with self.assertRaises(PackageRouteError) as ctx:
+                        package_notices.generate_package_notices(self.pkg_dir, repo_root=ROOT)
+                self.assertEqual(ctx.exception.code, "PACKAGE_LICENSE_RECORD_MISSING")
+                self.assertIn("linked component", str(ctx.exception))
+                self.assertIn("lacks a valid SPDX license identifier", str(ctx.exception))
+
+        with tempfile.TemporaryDirectory() as exe_root:
+            exe_dir = Path(exe_root)
+            (exe_dir / "probe_runtime.exe").write_bytes(bytes([0x4D, 0x5A, 0x00, 0x00]) + b"synthetic")
+            for bad_spdx in ("NOASSERTION", "UNKNOWN", "", None):
+                with self.subTest(gate="project output", spdx_id=bad_spdx):
+                    inventory = copy.deepcopy(real_inventory)
+                    inventory["native"]["project_output"]["spdx_id"] = bad_spdx
+                    with patch.object(package_notices, "load_component_inventory", return_value=inventory):
+                        with self.assertRaises(PackageRouteError) as ctx:
+                            package_notices.generate_package_notices(exe_dir, repo_root=ROOT)
+                    self.assertEqual(ctx.exception.code, "PACKAGE_LICENSE_RECORD_MISSING")
+                    self.assertIn("project output", str(ctx.exception))
+                    self.assertIn("lacks a valid SPDX license identifier", str(ctx.exception))
+
+
+class TestNoDashboardRoute(unittest.TestCase):
+    """The web dashboard is retired: no release artifact carries npm packages."""
+
+    def test_inventory_declares_no_dashboard_component_set(self) -> None:
+        self.assertNotIn("dashboard", inventory())
+
+    def test_no_dashboard_notice_generator_or_lockfile(self) -> None:
+        self.assertFalse((ROOT / "tools" / "dashboard_notices.py").exists())
+        self.assertFalse((ROOT / "interface").exists())
+
+
+class TestPythonToolLicenses(unittest.TestCase):
+    """Every entry in the Python lockfile has a recorded license in the source of truth."""
+
+    def setUp(self) -> None:
+        self.recorded = inventory()["python_packages"]["packages"]
+
+    def test_lockfile_identity_matches_the_recorded_lockfile(self) -> None:
+        self.assertEqual(inventory()["python_packages"]["lockfile"], PY_LOCKFILE)
+
+    def test_every_locked_python_package_has_a_recorded_license(self) -> None:
+        import generate_sbom
+
+        packages = generate_sbom.parse_python_lockfile(ROOT / PY_LOCKFILE)
+        self.assertTrue(packages)
+        for package in packages:
+            name = generate_sbom._normalize_python_name(package["name"])
+            with self.subTest(package=name):
+                self.assertIn(name, self.recorded, f"{name} has no recorded license in {INVENTORY_IDENTITY}")
+                self.assertNotEqual(
+                    generate_sbom._resolve_python_package_license(package["name"]), "NOASSERTION"
+                )
+
+    def test_recorded_version_matches_the_pinned_lockfile_version(self) -> None:
+        import generate_sbom
+
+        for package in generate_sbom.parse_python_lockfile(ROOT / PY_LOCKFILE):
+            name = generate_sbom._normalize_python_name(package["name"])
+            with self.subTest(package=name):
+                self.assertEqual(self.recorded[name]["version"], package["version"])
+
+    def test_issue_421_packages_are_recorded(self) -> None:
+        for name, expected in (("compiledb", "GPL-3.0-or-later"), ("ruff", "MIT")):
+            with self.subTest(package=name):
+                self.assertEqual(self.recorded[name]["spdx_id"], expected)
+                self.assertTrue(self.recorded[name]["recorded_from"])
+
+
+if __name__ == "__main__":
+    unittest.main()

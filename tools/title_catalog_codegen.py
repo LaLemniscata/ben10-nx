@@ -1,0 +1,967 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+"""Deterministic C code generator for the native public title catalog.
+
+Single source of truth: assets/titles/*.json filtered strictly by the canonical
+publication policy (assets/public_source_profile.json).
+Emits:
+  src/core/generated/nk_title_catalog.h
+  src/core/generated/nk_title_catalog.c
+
+Guarantees:
+  - Unknown, unclassified, or excluded manifests (such as hst-ucus98701.json)
+    are NEVER included in the public catalog.
+  - Generates an in-memory runtime overlay hook for local private testing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+from pathlib import Path
+import re
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tools"))
+
+import publication_policy
+import title_manifest
+from nk_core import synthetic_disc_ids
+from nk_core.launcher import (
+    EXE_CANDIDATES,
+    IMAGE_CANDIDATES,
+    IMAGE_SUFFIX,
+    NAME_SOURCES,
+)
+
+# Re-exported from the single home so this module and
+# tools/nk_core/title_registry.py cannot drift apart again.
+SYNTHETIC_DISC_ID_MAP = synthetic_disc_ids.SYNTHETIC_DISC_IDS
+
+
+def _launch_c_pattern(pattern: str) -> str:
+    """Project a planner candidate pattern onto its C printf form.
+
+    The Python planner instantiates ``{name}`` with the selected title's
+    validated identity; the generated C formats the same pattern with ``%s``.
+    Patterns are layout-only, so anything outside portable path characters is
+    refused here rather than emitted into a format string.
+    """
+    if pattern.count("{name}") != 2:
+        raise ValueError(
+            f"launch candidate pattern {pattern!r} must contain exactly two "
+            "{name} placeholders (directory and file stem)"
+        )
+    if re.fullmatch(r"[a-z0-9._/{}-]+", pattern) is None:
+        raise ValueError(
+            f"launch candidate pattern {pattern!r} contains characters that "
+            "are not portable path layout"
+        )
+    return pattern.replace("{name}", "%s")
+
+
+def _launch_contract_header_lines() -> List[str]:
+    """Shared generic launch-resolution contract block for the header (#366).
+
+    Projected from the Python planner's single source of truth
+    (tools/nk_core/launcher.py) so src/core/nk_launch.c and the Python
+    RuntimeLauncher consume one ordered candidate contract instead of two
+    hard-coded lists; ``--verify`` fails closed on drift.
+    """
+    if '"' in IMAGE_SUFFIX or chr(92) in IMAGE_SUFFIX:
+        raise ValueError(f"IMAGE_SUFFIX {IMAGE_SUFFIX!r} is not C-literal safe")
+    # Fail closed on a contract native cannot bind mechanically: a source
+    # that is not a macro-safe identifier could not produce a
+    # NK_LAUNCH_NAME_SOURCE_<SOURCE>_INDEX macro, and a duplicate would
+    # silently alias two names onto one generated slot.
+    seen_sources = set()
+    for source in NAME_SOURCES:
+        if re.fullmatch(r"[a-z][a-z0-9_]*", source) is None:
+            raise ValueError(
+                f"name source {source!r} must be a lowercase macro-safe "
+                "identifier to emit NK_LAUNCH_NAME_SOURCE_<SOURCE>_INDEX"
+            )
+        if source in seen_sources:
+            raise ValueError(f"duplicate name source {source!r} in NAME_SOURCES")
+        seen_sources.add(source)
+    return [
+        "",
+        "/* Generic launch-resolution candidate contract (#366).",
+        " *",
+        " * Projected from the Python planner's single source of truth",
+        " * (tools/nk_core/launcher.py: NAME_SOURCES / EXE_CANDIDATES /",
+        " * IMAGE_CANDIDATES / IMAGE_SUFFIX) so src/core/nk_launch.c and the",
+        " * Python RuntimeLauncher consume one ordered candidate contract",
+        " * instead of two hard-coded lists. title_catalog_codegen.py --verify",
+        " * fails closed on drift; tools/test_nk_core.py proves machine parity",
+        " * of the selected title/runtime/image/base/entry outcome.",
+        " *",
+        " * Contract: name sources are consulted in array order (currently",
+        " * manager-selected game_name first, then the title id), and for each",
+        " * name the candidate patterns are probed in array order. Each source",
+        " * also gets a generated NK_LAUNCH_NAME_SOURCE_<SOURCE>_INDEX macro so",
+        " * src/core/nk_launch.c binds its native name array through generated",
+        " * indices only: a planner-side NAME_SOURCES reorder changes the",
+        " * indices and native follows mechanically, while --verify fails",
+        " * closed on drift. Patterns are instantiated with strings from the",
+        " * validated catalog entry only; no retail title name, disc id, or",
+        " * title-specific path belongs here. */",
+        f"#define NK_LAUNCH_NAME_SOURCE_COUNT {len(NAME_SOURCES)}",
+        *[
+            f"#define NK_LAUNCH_NAME_SOURCE_{source.upper()}_INDEX {index}"
+            for index, source in enumerate(NAME_SOURCES)
+        ],
+        f"#define NK_LAUNCH_EXE_CANDIDATE_COUNT {len(EXE_CANDIDATES)}",
+        f"#define NK_LAUNCH_IMAGE_CANDIDATE_COUNT {len(IMAGE_CANDIDATES)}",
+        f'#define NK_LAUNCH_IMAGE_SUFFIX "{IMAGE_SUFFIX}"',
+        "extern const char *const nk_launch_name_sources[NK_LAUNCH_NAME_SOURCE_COUNT];",
+        "extern const char *const nk_launch_exe_candidates[NK_LAUNCH_EXE_CANDIDATE_COUNT];",
+        "extern const char *const nk_launch_image_candidates[NK_LAUNCH_IMAGE_CANDIDATE_COUNT];",
+        "",
+    ]
+
+
+def _launch_contract_source_lines() -> List[str]:
+    """Definitions for the shared launch-resolution contract arrays (#366)."""
+    return [
+        "/* Generic launch-resolution candidate contract (#366): see the header",
+        " * block; these values are projected from tools/nk_core/launcher.py. */",
+        "const char *const nk_launch_name_sources[NK_LAUNCH_NAME_SOURCE_COUNT] = { "
+        + ", ".join(f'\"{name}\"' for name in NAME_SOURCES)
+        + " };",
+        "const char *const nk_launch_exe_candidates[NK_LAUNCH_EXE_CANDIDATE_COUNT] = { "
+        + ", ".join(f'\"{_launch_c_pattern(p)}\"' for p in EXE_CANDIDATES)
+        + " };",
+        "const char *const nk_launch_image_candidates[NK_LAUNCH_IMAGE_CANDIDATE_COUNT] = { "
+        + ", ".join(f'\"{_launch_c_pattern(p)}\"' for p in IMAGE_CANDIDATES)
+        + " };",
+        "",
+    ]
+
+
+def _c_string_escape(value: str) -> str:
+    """Escape a value for a C string literal.
+
+    Backslashes must be escaped BEFORE quotes: escaping quotes first would
+    then re-escape the backslash this function just introduced. The manifest
+    schema permits both characters in display_name, so a name containing
+    either previously emitted a broken or misinterpreted literal.
+    """
+    return value.replace(chr(92), chr(92) * 2).replace('"', chr(92) + '"')
+
+
+def _default_game_name(title_id: str) -> str:
+    """Derive the portable build name used by the generic manager.
+
+    The manifest's optional ``game_name`` is authoritative when present.  For
+    older manifests, keep the manager's documented ``-v<digits>`` suffix
+    derivation in the native catalog so launch discovery and build planning
+    share one name even when the title id is versioned.
+    """
+    derived = re.sub(r"-v\d+$", "", title_id)
+    return derived or title_id
+
+
+def _manifest_game_name(manifest: Dict[str, Any]) -> str:
+    explicit = manifest.get("game_name")
+    return str(explicit) if explicit else _default_game_name(manifest["id"])
+
+
+def compute_manifest_digest(manifest_files: List[Path]) -> str:
+    h = hashlib.sha256()
+    for mf in sorted(manifest_files, key=lambda p: p.name):
+        h.update(mf.name.encode("utf-8"))
+        h.update(mf.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def collect_public_manifests(
+    manifest_dir: Path,
+    policy: Optional[publication_policy.Policy] = None,
+    policy_dir: Optional[Path] = None,
+) -> Tuple[List[Path], List[Dict[str, Any]]]:
+    """Collect ONLY public-eligible title manifests according to publication policy.
+
+    Publication policy is decided per tracked repository PATH. A manifest that
+    lives outside ROOT has no policy identity at all, so this fails closed.
+    Synthesising ``assets/titles/<filename>`` for such a file handed it the
+    inclusion decision recorded for the tracked manifest of the same name: a
+    modified copy of ``synthetic.json`` staged in a scratch directory borrowed
+    the decision for ``assets/titles/synthetic.json`` and could be emitted into
+    the public generated catalog with no path-specific trusted record of its
+    own.
+
+    ``policy_dir`` is the explicit opt-in for callers that deliberately stage
+    copies of tracked manifests elsewhere -- the isolation tests do exactly
+    this. It names the in-repository directory whose policy decisions apply to
+    the staged copies, must itself be inside ROOT, and is never passed by
+    ``main``, so the command-line path always fails closed.
+    """
+    if policy is None:
+        policy_path = ROOT / "assets" / "public_source_profile.json"
+        policy = publication_policy.load_policy(policy_path)
+
+    staged_under: Optional[str] = None
+    if policy_dir is not None:
+        try:
+            staged_under = policy_dir.resolve().relative_to(ROOT).as_posix()
+        except ValueError as exc:
+            raise ValueError(
+                f"policy_dir {policy_dir} is not inside the repository root {ROOT}; "
+                "an out-of-repository directory carries no publication policy to lend."
+            ) from exc
+
+    all_json = sorted(manifest_dir.glob("*.json"))
+    public_files: List[Path] = []
+
+    for mf in all_json:
+        try:
+            rel = mf.resolve().relative_to(ROOT).as_posix()
+        except ValueError as exc:
+            if staged_under is None:
+                raise ValueError(
+                    f"manifest {mf} lies outside the repository root {ROOT}; "
+                    "publication policy is decided per tracked path and must not be "
+                    "inferred from a file name. Point --manifest-dir at a directory "
+                    "inside the repository, or pass an explicit policy_dir."
+                ) from exc
+            rel = f"{staged_under}/{mf.name}"
+
+        res = policy.resolve(rel)
+        if res.is_excluded:
+            # Explicitly excluded by policy (e.g. retail titles)
+            continue
+        if res.disposition != publication_policy.INCLUDED:
+            # Unclassified manifests fail closed
+            continue
+        public_files.append(mf)
+
+    results: List[Dict[str, Any]] = []
+    for mf in public_files:
+        try:
+            raw = title_manifest.load_manifest(mf)
+            validated = title_manifest.validate_manifest(raw)
+            results.append(validated)
+        except Exception as exc:
+            print(f"ERROR validating public manifest {mf}: {exc}", file=sys.stderr)
+            raise
+
+    # Sort deterministically by ID
+    results.sort(key=lambda item: item["id"])
+
+    seen_ids: set[str] = set()
+    seen_disc_ids: set[str] = set()
+    for item in results:
+        t_id = item["id"]
+        if t_id in seen_ids:
+            raise ValueError(f"catalog contains duplicate title identity {t_id!r}")
+        seen_ids.add(t_id)
+
+        kind = item["kind"]
+        if kind == "retail":
+            disc_info = item.get("disc", {})
+            disc_ids = [disc_info["id"]] + disc_info.get("compatible_revisions", [])
+        elif kind == "synthetic":
+            assigned = synthetic_disc_ids.SYNTHETIC_DISC_IDS.get(t_id)
+            disc_ids = [assigned] if assigned else []
+        else:
+            disc_ids = []
+
+        for disc_id in disc_ids:
+            norm = "".join(c for c in disc_id if c not in "-_ ").upper()
+            if norm in seen_disc_ids:
+                raise ValueError(
+                    f"catalog contains duplicate disc identity {disc_id!r} for title {t_id!r}"
+                )
+            seen_disc_ids.add(norm)
+
+    return public_files, results
+
+
+def generate_header(digest: str, titles: List[Dict[str, Any]]) -> str:
+    lines = [
+        "/* SPDX-License-Identifier: GPL-3.0-or-later */",
+        "/* Copyright (C) 2026 the Nakagawa Recomp authors */",
+        "/* AUTOGENERATED FILE - DO NOT EDIT DIRECTLY */",
+        "/* Generated by tools/title_catalog_codegen.py from public assets/titles/ manifests */",
+        "",
+        "#ifndef NK_TITLE_CATALOG_H",
+        "#define NK_TITLE_CATALOG_H",
+        "",
+        "#include <stdbool.h>",
+        "#include <stdint.h>",
+        "",
+        "#define NK_TITLE_CATALOG_SCHEMA_VERSION 1",
+        "#define NK_TITLE_MAX_LOOSE_CONTENT_ROOTS 16",
+        "#define NK_TITLE_MAX_LOOSE_CONTENT_EXCLUDES 2",
+        f'#define NK_TITLE_CATALOG_DIGEST "{digest}"',
+        "",
+        "typedef enum {",
+        "    NK_TITLE_KIND_RETAIL = 0,",
+        "    NK_TITLE_KIND_SYNTHETIC,",
+        "    NK_TITLE_KIND_HOMEBREW",
+        "} NkTitleKind;",
+        "",
+        "typedef struct {",
+        "    const char *name;",
+        "    uint32_t load_address;",
+        "    bool required;",
+        "} NkModuleDefinition;",
+        "",
+        "typedef struct {",
+        "    const char *root;       /* Relative to the resolved data root's parent; '.' names that parent. */",
+        "    const char *mount;      /* Guest-relative prefix; empty mounts at the namespace root. */",
+        "    uint32_t precedence;   /* Lower values win duplicate guest-file keys. */",
+        "    bool skip_primary_root;",
+        "    const char * const *exclude;",
+        "    int exclude_count;",
+        "} NkLooseContentRoot;",
+        "",
+        "typedef struct {",
+        "    const char *id;                     /* e.g. \"synthetic-allegrex-v1\" */",
+        "    const char *game_name;              /* portable build/launch name */",
+        "    const char *display_name;",
+        "    NkTitleKind kind;",
+        "    const char *primary_disc_id;",
+        "    const char * const *compatible_disc_ids; /* NULL-terminated array of alias disc IDs */",
+        "    uint32_t executable_base;",
+        "    uint32_t executable_entry;",
+        "    bool has_executable_base;",
+        "    bool has_executable_entry;",
+        "    uint32_t run_entry;                 /* where a run starts: runtime_bindings.fallback_entry when declared, else executable_entry (title_codegen_plan._resolve_run_entry) */",
+        "    const char *bss_metadata_source;",
+        "    const char *data_root;",
+        "    const NkLooseContentRoot *loose_content_roots;",
+        "    int loose_content_root_count;",
+        "    const char *memory_stick_root;",
+        "    const char *hle_profile;",
+        "    const char *codegen_profile;",
+        "    uint32_t expected_data_file_count;",
+        "    bool requires_font_firmware;",
+        "    bool requires_psmf;",
+        "    const NkModuleDefinition *modules;",
+        "    int module_count;",
+        "} NkTitleEntry;",
+        "",
+        "/* An owned title snapshot remains valid across overlay reloads until released. */",
+        "typedef struct {",
+        "    NkTitleEntry entry;",
+        "    void *owned_storage;",
+        "} NkTitleEntrySnapshot;",
+        "",
+        "/* Total public titles in static catalog */",
+        "extern const int nk_title_catalog_count;",
+        "extern const NkTitleEntry nk_title_catalog_entries[];",
+        "",
+        "/* Public lookup functions return owned copies. Release each successful",
+        " * snapshot with nk_title_catalog_snapshot_release(). */",
+        "bool nk_title_catalog_find_by_disc_id(const char *disc_id, NkTitleEntrySnapshot *out_snapshot);",
+        "bool nk_title_catalog_find_by_id(const char *title_id, NkTitleEntrySnapshot *out_snapshot);",
+        "bool nk_title_catalog_get_overlay(NkTitleEntrySnapshot *out_snapshot);",
+        "bool nk_title_catalog_snapshot_copy_locked(const NkTitleEntry *entry, NkTitleEntrySnapshot *out_snapshot);",
+        "void nk_title_catalog_snapshot_release(NkTitleEntrySnapshot *snapshot);",
+        "",
+        "/* The overlay registry and parser-owned storage share this lock. The",
+        " * package-validation cache has a separate lock; callers snapshot the",
+        " * catalog epoch here and pass it by value to that cache. */",
+        "void nk_title_catalog_lock(void);",
+        "void nk_title_catalog_unlock(void);",
+        "uint64_t nk_title_catalog_epoch(void);",
+        "uint64_t nk_title_catalog_epoch_locked(void);",
+        "void nk_title_catalog_advance_epoch_locked(void);",
+        "",
+        "/* These borrowed-pointer lookup variants require the caller to hold",
+        " * nk_title_catalog_lock() until every field read is complete. The lock",
+        " * is not recursive; use the owned snapshot APIs when data must live",
+        " * beyond the critical section. */",
+        "const NkTitleEntry *nk_title_catalog_find_by_disc_id_locked(const char *disc_id);",
+        "const NkTitleEntry *nk_title_catalog_find_by_id_locked(const char *title_id);",
+        "const NkTitleEntry *nk_title_catalog_get_overlay_locked(void);",
+        "",
+        "/* Runtime private overlay registration (for local private acceptance testing) */",
+        "/* The registry holds POINTERS to overlay entries whose storage belongs",
+        " * to the manifest parser. Clearing the registry has to release that",
+        " * storage too, or a later manifest reusing a cleared overlay's disc ID",
+        " * is still refused as colliding with it and the fixed overlay-slot",
+        " * capacity stays consumed. This generated catalog is a standalone data",
+        " * table and must not depend on the parser, so the parser installs this",
+        " * hook when it first stores an overlay. The hook runs while the",
+        " * non-recursive catalog lock is held, must not call catalog APIs, and",
+        " * returns true only if it released parser-owned storage. */",
+        "typedef bool (*NkOverlayStorageResetFn)(void);",
+        "void nk_title_catalog_set_overlay_storage_reset(NkOverlayStorageResetFn reset_fn);",
+        "void nk_title_catalog_set_overlay_storage_reset_locked(NkOverlayStorageResetFn reset_fn);",
+        "",
+        "void nk_title_catalog_register_overlay(const NkTitleEntry *overlay_entry);",
+        "void nk_title_catalog_register_overlay_locked(const NkTitleEntry *overlay_entry);",
+        "void nk_title_catalog_clear_overlay(void);",
+        "",
+        *_launch_contract_header_lines(),
+        "#endif /* NK_TITLE_CATALOG_H */",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def generate_source(digest: str, titles: List[Dict[str, Any]]) -> str:
+    lines = [
+        "/* SPDX-License-Identifier: GPL-3.0-or-later */",
+        "/* Copyright (C) 2026 the Nakagawa Recomp authors */",
+        "/* AUTOGENERATED FILE - DO NOT EDIT DIRECTLY */",
+        "/* Generated by tools/title_catalog_codegen.py from public assets/titles/ manifests */",
+        "",
+        "#if !defined(_WIN32) && !defined(_WIN64) && !defined(_POSIX_C_SOURCE)",
+        "#define _POSIX_C_SOURCE 200809L",
+        "#endif",
+        '#include "nk_title_catalog.h"',
+        "#include <ctype.h>",
+        "#include <stdlib.h>",
+        "#include <string.h>",
+        "#if defined(_WIN32) || defined(_WIN64)",
+        "#include <windows.h>",
+        "#else",
+        "#include <pthread.h>",
+        "#endif",
+        "",
+        "#define NK_CATALOG_MAX_OVERLAYS 8",
+        "#define NK_CATALOG_MAX_COMPATIBLE_DISC_IDS 16",
+        "#define NK_CATALOG_MAX_MODULES 32",
+        "static const NkTitleEntry *s_private_overlay_entries[NK_CATALOG_MAX_OVERLAYS];",
+        "static int s_private_overlay_count = 0;",
+        "static NkOverlayStorageResetFn s_overlay_storage_reset = NULL;",
+        "static uint64_t s_catalog_epoch = 1;",
+        "#if defined(_WIN32) || defined(_WIN64)",
+        "static SRWLOCK s_catalog_lock = SRWLOCK_INIT;",
+        "void nk_title_catalog_lock(void) { AcquireSRWLockExclusive(&s_catalog_lock); }",
+        "void nk_title_catalog_unlock(void) { ReleaseSRWLockExclusive(&s_catalog_lock); }",
+        "#else",
+        "static pthread_mutex_t s_catalog_lock = PTHREAD_MUTEX_INITIALIZER;",
+        "void nk_title_catalog_lock(void) { (void)pthread_mutex_lock(&s_catalog_lock); }",
+        "void nk_title_catalog_unlock(void) { (void)pthread_mutex_unlock(&s_catalog_lock); }",
+        "#endif",
+        "",
+        "typedef struct {",
+        "    char *scalar_strings[9];",
+        "    const char **compatible_disc_ids;",
+        "    size_t compatible_count;",
+        "    NkLooseContentRoot *loose_content_roots;",
+        "    const char ***loose_excludes;",
+        "    size_t loose_root_count;",
+        "    int loose_exclude_counts[NK_TITLE_MAX_LOOSE_CONTENT_ROOTS];",
+        "    NkModuleDefinition *modules;",
+        "    size_t module_count;",
+        "} NkTitleCatalogSnapshotStorage;",
+        "",
+        "static char *nk_title_catalog_copy_string(const char *source) {",
+        "    if (!source) return NULL;",
+        "    size_t length = strlen(source) + 1;",
+        "    char *copy = (char *)malloc(length);",
+        "    if (copy) memcpy(copy, source, length);",
+        "    return copy;",
+        "}",
+        "",
+        "void nk_title_catalog_snapshot_release(NkTitleEntrySnapshot *snapshot) {",
+        "    if (!snapshot) return;",
+        "    NkTitleCatalogSnapshotStorage *owned =",
+        "        (NkTitleCatalogSnapshotStorage *)snapshot->owned_storage;",
+        "    if (owned) {",
+        "        for (size_t i = 0; i < 9; i++) free(owned->scalar_strings[i]);",
+        "        if (owned->compatible_disc_ids) {",
+        "            for (size_t i = 0; i < owned->compatible_count; i++)",
+        "                free((void *)owned->compatible_disc_ids[i]);",
+        "            free(owned->compatible_disc_ids);",
+        "        }",
+        "        if (owned->loose_content_roots) {",
+        "            for (size_t i = 0; i < owned->loose_root_count; i++) {",
+        "                free((void *)owned->loose_content_roots[i].root);",
+        "                free((void *)owned->loose_content_roots[i].mount);",
+        "                if (owned->loose_excludes && owned->loose_excludes[i]) {",
+        "                    for (int j = 0; j < owned->loose_exclude_counts[i]; j++)",
+        "                        free((void *)owned->loose_excludes[i][j]);",
+        "                    free((void *)owned->loose_excludes[i]);",
+        "                }",
+        "            }",
+        "            free(owned->loose_content_roots);",
+        "        }",
+        "        free(owned->loose_excludes);",
+        "        if (owned->modules) {",
+        "            for (size_t i = 0; i < owned->module_count; i++)",
+        "                free((void *)owned->modules[i].name);",
+        "            free(owned->modules);",
+        "        }",
+        "        free(owned);",
+        "    }",
+        "    memset(snapshot, 0, sizeof(*snapshot));",
+        "}",
+        "",
+        "bool nk_title_catalog_snapshot_copy_locked(const NkTitleEntry *source,",
+        "                                              NkTitleEntrySnapshot *out_snapshot) {",
+        "    if (!out_snapshot) return false;",
+        "    memset(out_snapshot, 0, sizeof(*out_snapshot));",
+        "    if (!source) return false;",
+        "    NkTitleCatalogSnapshotStorage *owned =",
+        "        (NkTitleCatalogSnapshotStorage *)calloc(1, sizeof(*owned));",
+        "    if (!owned) return false;",
+        "    out_snapshot->entry = *source;",
+        "    out_snapshot->owned_storage = owned;",
+        "    const char *scalar_sources[9] = { source->id, source->game_name,",
+        "        source->display_name, source->primary_disc_id,",
+        "        source->bss_metadata_source, source->data_root,",
+        "        source->memory_stick_root, source->hle_profile,",
+        "        source->codegen_profile };",
+        "    for (size_t i = 0; i < 9; i++) {",
+        "        if (scalar_sources[i]) {",
+        "            owned->scalar_strings[i] =",
+        "                nk_title_catalog_copy_string(scalar_sources[i]);",
+        "            if (!owned->scalar_strings[i]) goto failed;",
+        "        }",
+        "    }",
+        "    out_snapshot->entry.id = owned->scalar_strings[0];",
+        "    out_snapshot->entry.game_name = owned->scalar_strings[1];",
+        "    out_snapshot->entry.display_name = owned->scalar_strings[2];",
+        "    out_snapshot->entry.primary_disc_id = owned->scalar_strings[3];",
+        "    out_snapshot->entry.bss_metadata_source = owned->scalar_strings[4];",
+        "    out_snapshot->entry.data_root = owned->scalar_strings[5];",
+        "    out_snapshot->entry.memory_stick_root = owned->scalar_strings[6];",
+        "    out_snapshot->entry.hle_profile = owned->scalar_strings[7];",
+        "    out_snapshot->entry.codegen_profile = owned->scalar_strings[8];",
+        "    if (source->compatible_disc_ids) {",
+        "        size_t count = 0;",
+        "        while (count <= NK_CATALOG_MAX_COMPATIBLE_DISC_IDS &&",
+        "               source->compatible_disc_ids[count]) count++;",
+        "        if (count > NK_CATALOG_MAX_COMPATIBLE_DISC_IDS) goto failed;",
+        "        owned->compatible_count = count;",
+        "        owned->compatible_disc_ids = (const char **)calloc(",
+        "            count + 1, sizeof(*owned->compatible_disc_ids));",
+        "        if (!owned->compatible_disc_ids) goto failed;",
+        "        for (size_t i = 0; i < count; i++) {",
+        "            owned->compatible_disc_ids[i] =",
+        "                nk_title_catalog_copy_string(source->compatible_disc_ids[i]);",
+        "            if (!owned->compatible_disc_ids[i]) goto failed;",
+        "        }",
+        "        out_snapshot->entry.compatible_disc_ids = owned->compatible_disc_ids;",
+        "    }",
+        "    if (source->loose_content_root_count < 0 ||",
+        "        source->loose_content_root_count > NK_TITLE_MAX_LOOSE_CONTENT_ROOTS ||",
+        "        (source->loose_content_root_count > 0 && !source->loose_content_roots)) goto failed;",
+        "    owned->loose_root_count = (size_t)source->loose_content_root_count;",
+        "    if (owned->loose_root_count) {",
+        "        owned->loose_content_roots = (NkLooseContentRoot *)calloc(",
+        "            owned->loose_root_count, sizeof(*owned->loose_content_roots));",
+        "        owned->loose_excludes = (const char ***)calloc(",
+        "            owned->loose_root_count, sizeof(*owned->loose_excludes));",
+        "        if (!owned->loose_content_roots || !owned->loose_excludes) goto failed;",
+        "        for (size_t i = 0; i < owned->loose_root_count; i++) {",
+        "            const NkLooseContentRoot *root = &source->loose_content_roots[i];",
+        "            NkLooseContentRoot *copy = &owned->loose_content_roots[i];",
+        "            *copy = *root;",
+        "            if (root->root) {",
+        "                copy->root = nk_title_catalog_copy_string(root->root);",
+        "                if (!copy->root) goto failed;",
+        "            }",
+        "            if (root->mount) {",
+        "                copy->mount = nk_title_catalog_copy_string(root->mount);",
+        "                if (!copy->mount) goto failed;",
+        "            }",
+        "            if (root->exclude_count < 0 ||",
+        "                root->exclude_count > NK_TITLE_MAX_LOOSE_CONTENT_EXCLUDES ||",
+        "                (root->exclude_count > 0 && !root->exclude)) goto failed;",
+        "            owned->loose_exclude_counts[i] = root->exclude_count;",
+        "            if (root->exclude_count) {",
+        "                owned->loose_excludes[i] = (const char **)calloc(",
+        "                    (size_t)root->exclude_count + 1, sizeof(*owned->loose_excludes[i]));",
+        "                if (!owned->loose_excludes[i]) goto failed;",
+        "                for (int j = 0; j < root->exclude_count; j++) {",
+        "                    owned->loose_excludes[i][j] =",
+        "                        nk_title_catalog_copy_string(root->exclude[j]);",
+        "                    if (!owned->loose_excludes[i][j]) goto failed;",
+        "                }",
+        "                copy->exclude = owned->loose_excludes[i];",
+        "            }",
+        "        }",
+        "        out_snapshot->entry.loose_content_roots = owned->loose_content_roots;",
+        "    }",
+        "    else out_snapshot->entry.loose_content_roots = NULL;",
+        "    if (source->module_count < 0 ||",
+        "        source->module_count > NK_CATALOG_MAX_MODULES ||",
+        "        (source->module_count > 0 && !source->modules)) goto failed;",
+        "    owned->module_count = (size_t)source->module_count;",
+        "    if (owned->module_count) {",
+        "        owned->modules = (NkModuleDefinition *)calloc(",
+        "            owned->module_count, sizeof(*owned->modules));",
+        "        if (!owned->modules) goto failed;",
+        "        for (size_t i = 0; i < owned->module_count; i++) {",
+        "            owned->modules[i] = source->modules[i];",
+        "            if (source->modules[i].name) {",
+        "                owned->modules[i].name =",
+        "                    nk_title_catalog_copy_string(source->modules[i].name);",
+        "                if (!owned->modules[i].name) goto failed;",
+        "            }",
+        "        }",
+        "        out_snapshot->entry.modules = owned->modules;",
+        "    }",
+        "    else out_snapshot->entry.modules = NULL;",
+        "    return true;",
+        "failed:",
+        "    nk_title_catalog_snapshot_release(out_snapshot);",
+        "    return false;",
+        "}",
+        "",
+        "uint64_t nk_title_catalog_epoch_locked(void) { return s_catalog_epoch; }",
+        "uint64_t nk_title_catalog_epoch(void) {",
+        "    nk_title_catalog_lock();",
+        "    uint64_t epoch = s_catalog_epoch;",
+        "    nk_title_catalog_unlock();",
+        "    return epoch;",
+        "}",
+        "void nk_title_catalog_advance_epoch_locked(void) { s_catalog_epoch++; }",
+        "",
+        "void nk_title_catalog_set_overlay_storage_reset_locked(NkOverlayStorageResetFn reset_fn) {",
+        "    s_overlay_storage_reset = reset_fn;",
+        "}",
+        "",
+        "void nk_title_catalog_register_overlay_locked(const NkTitleEntry *overlay_entry) {",
+        "    if (!overlay_entry) return;",
+        "    for (int i = 0; i < s_private_overlay_count; i++) {",
+        "        if (s_private_overlay_entries[i] == overlay_entry) return;",
+        "        if (s_private_overlay_entries[i]->id && overlay_entry->id &&",
+        "             strcmp(s_private_overlay_entries[i]->id, overlay_entry->id) == 0) {",
+        "            s_private_overlay_entries[i] = overlay_entry;",
+        "            nk_title_catalog_advance_epoch_locked();",
+        "            return;",
+        "        }",
+        "    }",
+        "    if (s_private_overlay_count < NK_CATALOG_MAX_OVERLAYS) {",
+        "        s_private_overlay_entries[s_private_overlay_count++] = overlay_entry;",
+        "        nk_title_catalog_advance_epoch_locked();",
+        "    }",
+        "}",
+        "",
+        "void nk_title_catalog_set_overlay_storage_reset(NkOverlayStorageResetFn reset_fn) {",
+        "    nk_title_catalog_lock();",
+        "    nk_title_catalog_set_overlay_storage_reset_locked(reset_fn);",
+        "    nk_title_catalog_unlock();",
+        "}",
+        "",
+        "void nk_title_catalog_register_overlay(const NkTitleEntry *overlay_entry) {",
+        "    nk_title_catalog_lock();",
+        "    nk_title_catalog_register_overlay_locked(overlay_entry);",
+        "    nk_title_catalog_unlock();",
+        "}",
+        "",
+        "void nk_title_catalog_clear_overlay(void) {",
+        "    nk_title_catalog_lock();",
+        "    bool registry_changed = s_private_overlay_count > 0;",
+        "    s_private_overlay_count = 0;",
+        "    /* Release the parser-owned storage the cleared pointers referred to. */",
+        "    bool storage_changed = s_overlay_storage_reset &&",
+        "                           s_overlay_storage_reset();",
+        "    if (registry_changed || storage_changed)",
+        "        nk_title_catalog_advance_epoch_locked();",
+        "    nk_title_catalog_unlock();",
+        "}",
+        "",
+        "const NkTitleEntry *nk_title_catalog_get_overlay_locked(void) {",
+        "    return s_private_overlay_count > 0 ? s_private_overlay_entries[s_private_overlay_count - 1] : NULL;",
+        "}",
+        "",
+        "bool nk_title_catalog_get_overlay(NkTitleEntrySnapshot *out_snapshot) {",
+        "    if (!out_snapshot) return false;",
+        "    memset(out_snapshot, 0, sizeof(*out_snapshot));",
+        "    nk_title_catalog_lock();",
+        "    const NkTitleEntry *entry = nk_title_catalog_get_overlay_locked();",
+        "    bool found = entry && nk_title_catalog_snapshot_copy_locked(entry, out_snapshot);",
+        "    nk_title_catalog_unlock();",
+        "    return found;",
+        "}",
+        "",
+    ]
+
+    # Emit modules arrays
+    for idx, t in enumerate(titles):
+        modules = t.get("modules", [])
+        if modules:
+            lines.append(f"static const NkModuleDefinition s_modules_title_{idx}[] = {{")
+            for m in modules:
+                req_str = "true" if m.get("required") else "false"
+                # A runtime-placed module has no manifest address and records 0; a
+                # fixed guest-module base always lies in user RAM, so 0 is unambiguous.
+                lines.append(f'    {{ "{m["name"]}", 0x{m.get("load_address", 0):08x}U, {req_str} }},')
+            lines.append("};")
+            lines.append("")
+
+    # Emit compatible disc ID arrays
+    for idx, t in enumerate(titles):
+        disc_info = t.get("disc", {})
+        compat = disc_info.get("compatible_revisions", [])
+        if compat:
+            lines.append(f"static const char * const s_compat_discs_{idx}[] = {{")
+            for cid in compat:
+                lines.append(f'    "{cid}",')
+            lines.append("    NULL")
+            lines.append("};")
+            lines.append("")
+        loose_roots = t["filesystem"].get("loose_content_roots", [])
+        if loose_roots:
+            for root_index, root in enumerate(loose_roots):
+                excludes = root.get("exclude", [])
+                if excludes:
+                    exclude_ref = f"s_loose_excludes_title_{idx}_{root_index}"
+                    lines.append(f"static const char * const {exclude_ref}[] = {{")
+                    for exclude_path in excludes:
+                        lines.append(f'    "{_c_string_escape(exclude_path)}",')
+                    lines.append("};")
+                    lines.append("")
+            lines.append(f"static const NkLooseContentRoot s_loose_roots_title_{idx}[] = {{")
+            for root_index, root in enumerate(loose_roots):
+                excludes = root.get("exclude", [])
+                exclude_ref = (
+                    f"s_loose_excludes_title_{idx}_{root_index}" if excludes else "NULL"
+                )
+                root_path = _c_string_escape(root["root"])
+                mount = _c_string_escape(root["mount"])
+                skip_primary = "true" if root["skip_primary_root"] else "false"
+                lines.append(
+                    f'    {{ "{root_path}", "{mount}", {root["precedence"]}U, '
+                    f'{skip_primary}, {exclude_ref}, {len(excludes)} }},'
+                )
+            lines.append("};")
+            lines.append("")
+
+    # Emit main public catalog array
+    lines.append(f"const int nk_title_catalog_count = {len(titles)};")
+    lines.append("const NkTitleEntry nk_title_catalog_entries[] = {")
+
+    for idx, t in enumerate(titles):
+        t_id = t["id"]
+        t_game_name = _c_string_escape(_manifest_game_name(t))
+        t_name = _c_string_escape(t["display_name"])
+        kind = t["kind"]
+        if kind == "retail":
+            kind_enum = "NK_TITLE_KIND_RETAIL"
+            disc_id = t["disc"]["id"]
+        elif kind == "synthetic":
+            kind_enum = "NK_TITLE_KIND_SYNTHETIC"
+            disc_id = synthetic_disc_ids.synthetic_disc_id(t_id)
+        else:
+            kind_enum = "NK_TITLE_KIND_HOMEBREW"
+            disc_id = ""
+
+        exe_base = t["executable"]["base"]
+        exe_entry = t["executable"]["entry"]
+        bss_source = t["executable"]["bss_metadata_source"]
+        data_root = t["filesystem"]["data_root"]
+        ms_root = t["filesystem"]["memory_stick_root"]
+        hle = t["hle_profile"]
+        codegen = t.get("codegen_profile", "none")
+        expected_files = t.get("runtime_bindings", {}).get("expected_data_file_count", 0)
+        # Same rule as title_codegen_plan._resolve_run_entry: a declared fallback entry
+        # is where a run of this title starts.
+        run_entry = t.get("runtime_bindings", {}).get("fallback_entry", exe_entry)
+
+        feats = t.get("feature_requirements", [])
+        req_font = "true" if ("font-firmware" in feats or "font" in feats) else "false"
+        req_psmf = "true" if ("psmf" in feats) else "false"
+
+        num_mods = len(t.get("modules", []))
+        mod_ref = f"s_modules_title_{idx}" if num_mods > 0 else "NULL"
+        compat_ref = f"s_compat_discs_{idx}" if t.get("disc", {}).get("compatible_revisions") else "NULL"
+        loose_roots = t["filesystem"].get("loose_content_roots", [])
+        loose_roots_ref = f"s_loose_roots_title_{idx}" if loose_roots else "NULL"
+
+        lines.append("    {")
+        lines.append(f'        "{t_id}",')
+        lines.append(f'        "{t_game_name}",')
+        lines.append(f'        "{t_name}",')
+        lines.append(f"        {kind_enum},")
+        lines.append(f'        "{disc_id}",')
+        lines.append(f"        {compat_ref},")
+        lines.append(f"        0x{exe_base:08x}U,")
+        lines.append(f"        0x{exe_entry:08x}U,")
+        lines.append("        true,")
+        lines.append("        true,")
+        lines.append(f"        0x{run_entry:08x}U,")
+        lines.append(f'        "{bss_source}",')
+        lines.append(f'        "{data_root}",')
+        lines.append(f"        {loose_roots_ref},")
+        lines.append(f"        {len(loose_roots)},")
+        lines.append(f'        "{ms_root}",')
+        lines.append(f'        "{hle}",')
+        lines.append(f'        "{codegen}",')
+        lines.append(f"        {expected_files}U,")
+        lines.append(f"        {req_font},")
+        lines.append(f"        {req_psmf},")
+        lines.append(f"        {mod_ref},")
+        lines.append(f"        {num_mods}")
+        lines.append("    },")
+
+    lines.append("};")
+    lines.append("")
+
+    # Emit helper normalize function
+    lines.extend([
+        "static void normalize_disc_id(const char *src, char *dst, size_t dst_size) {",
+        "    size_t d = 0;",
+        "    if (!src || !dst || dst_size == 0) return;",
+        "    for (size_t s = 0; src[s] != '\\0' && d + 1 < dst_size; s++) {",
+        "        char c = src[s];",
+        "        if (c == '-' || c == '_' || c == ' ') continue;",
+        "        dst[d++] = (char)toupper((unsigned char)c);",
+        "    }",
+        "    dst[d] = '\\0';",
+        "}",
+        "",
+        "const NkTitleEntry *nk_title_catalog_find_by_disc_id_locked(const char *disc_id) {",
+        "    if (!disc_id || !*disc_id) return NULL;",
+        "    char norm[32];",
+        "    normalize_disc_id(disc_id, norm, sizeof(norm));",
+        "    if (!norm[0]) return NULL;",
+        "",
+        "    /* 1. Check in-memory private overlays first (most recently registered first) */",
+        "    for (int i = s_private_overlay_count - 1; i >= 0; i--) {",
+        "        const NkTitleEntry *ov = s_private_overlay_entries[i];",
+        "        if (!ov) continue;",
+        "        if (ov->primary_disc_id) {",
+        "            char ov_norm[32];",
+        "            normalize_disc_id(ov->primary_disc_id, ov_norm, sizeof(ov_norm));",
+        "            if (strcmp(norm, ov_norm) == 0) {",
+        "                return ov;",
+        "            }",
+        "        }",
+        "        if (ov->compatible_disc_ids) {",
+        "            for (int c = 0; ov->compatible_disc_ids[c]; c++) {",
+        "                char cp_norm[32];",
+        "                normalize_disc_id(ov->compatible_disc_ids[c], cp_norm, sizeof(cp_norm));",
+        "                if (strcmp(norm, cp_norm) == 0) {",
+        "                    return ov;",
+        "                }",
+        "            }",
+        "        }",
+        "    }",
+        "",
+        "    /* 2. Check static public catalog */",
+        "    for (int i = 0; i < nk_title_catalog_count; i++) {",
+        "        const NkTitleEntry *e = &nk_title_catalog_entries[i];",
+        "        if (e->primary_disc_id && e->primary_disc_id[0]) {",
+        "            char entry_norm[32];",
+        "            normalize_disc_id(e->primary_disc_id, entry_norm, sizeof(entry_norm));",
+        "            if (strcmp(norm, entry_norm) == 0) {",
+        "                return e;",
+        "            }",
+        "        }",
+        "        if (e->compatible_disc_ids) {",
+        "            for (int c = 0; e->compatible_disc_ids[c]; c++) {",
+        "                char compat_norm[32];",
+        "                normalize_disc_id(e->compatible_disc_ids[c], compat_norm, sizeof(compat_norm));",
+        "                if (strcmp(norm, compat_norm) == 0) {",
+        "                    return e;",
+        "                }",
+        "            }",
+        "        }",
+        "    }",
+        "    return NULL;",
+        "}",
+        "",
+        "bool nk_title_catalog_find_by_disc_id(const char *disc_id,",
+        "                                         NkTitleEntrySnapshot *out_snapshot) {",
+        "    if (!out_snapshot) return false;",
+        "    memset(out_snapshot, 0, sizeof(*out_snapshot));",
+        "    nk_title_catalog_lock();",
+        "    const NkTitleEntry *entry = nk_title_catalog_find_by_disc_id_locked(disc_id);",
+        "    bool found = entry && nk_title_catalog_snapshot_copy_locked(entry, out_snapshot);",
+        "    nk_title_catalog_unlock();",
+        "    return found;",
+        "}",
+        "",
+        "const NkTitleEntry *nk_title_catalog_find_by_id_locked(const char *title_id) {",
+        "    if (!title_id || !*title_id) return NULL;",
+        "    for (int i = s_private_overlay_count - 1; i >= 0; i--) {",
+        "        const NkTitleEntry *ov = s_private_overlay_entries[i];",
+        "        if (ov && ov->id && strcmp(title_id, ov->id) == 0) {",
+        "            return ov;",
+        "        }",
+        "    }",
+        "    for (int i = 0; i < nk_title_catalog_count; i++) {",
+        "        if (strcmp(title_id, nk_title_catalog_entries[i].id) == 0) {",
+        "            return &nk_title_catalog_entries[i];",
+        "        }",
+        "    }",
+        "    return NULL;",
+        "}",
+        "",
+        "bool nk_title_catalog_find_by_id(const char *title_id,",
+        "                                    NkTitleEntrySnapshot *out_snapshot) {",
+        "    if (!out_snapshot) return false;",
+        "    memset(out_snapshot, 0, sizeof(*out_snapshot));",
+        "    nk_title_catalog_lock();",
+        "    const NkTitleEntry *entry = nk_title_catalog_find_by_id_locked(title_id);",
+        "    bool found = entry && nk_title_catalog_snapshot_copy_locked(entry, out_snapshot);",
+        "    nk_title_catalog_unlock();",
+        "    return found;",
+        "}",
+        "",
+    ])
+
+    lines += _launch_contract_source_lines()
+
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate native C catalog from public assets/titles/*.json")
+    parser.add_argument("--manifest-dir", type=Path, default=ROOT / "assets" / "titles")
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "src" / "core" / "generated")
+    parser.add_argument("--verify", action="store_true", help="Check if existing output matches live public manifests")
+    args = parser.parse_args()
+
+    policy_path = ROOT / "assets" / "public_source_profile.json"
+    policy = publication_policy.load_policy(policy_path)
+
+    try:
+        manifest_files, titles = collect_public_manifests(args.manifest_dir, policy=policy)
+    except ValueError as exc:
+        # Fail closed with a readable message rather than a traceback: this is
+        # the publication-policy refusal, not an internal error.
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    if not manifest_files:
+        print(f"ERROR: No public .json title manifests found in {args.manifest_dir}", file=sys.stderr)
+        return 1
+
+    digest = compute_manifest_digest(manifest_files)
+
+    header_content = generate_header(digest, titles)
+    source_content = generate_source(digest, titles)
+
+    out_h = args.output_dir / "nk_title_catalog.h"
+    out_c = args.output_dir / "nk_title_catalog.c"
+
+    if args.verify:
+        if not out_h.is_file() or not out_c.is_file():
+            print("ERROR: Generated public catalog files do not exist.", file=sys.stderr)
+            return 1
+        curr_h = out_h.read_text(encoding="utf-8")
+        curr_c = out_c.read_text(encoding="utf-8")
+        if curr_h != header_content or curr_c != source_content:
+            print("ERROR: Native public title catalog is out of date. Run python tools/regen_all.py.", file=sys.stderr)
+            return 1
+        print(f"OK: Native public title catalog is up to date (digest {digest}, {len(titles)} public titles).")
+        return 0
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    # newline="" keeps the emitted LF bytes exactly as generated. Without it a
+    # Windows regeneration writes CRLF, which the publication audit rejects as
+    # TEXT_LINE_ENDING_CRLF -- so the generated catalog could not be refreshed on
+    # a Windows host without hand-renormalising it afterwards.
+    out_h.write_text(header_content, encoding="utf-8", newline="")
+    out_c.write_text(source_content, encoding="utf-8", newline="")
+    print(f"Generated {out_h} and {out_c} (digest {digest}, {len(titles)} public titles).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

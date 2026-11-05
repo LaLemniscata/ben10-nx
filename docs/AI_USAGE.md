@@ -1,0 +1,97 @@
+# AI-assisted development
+
+AI tools can help with research, review, tests, and implementation, but their output is treated
+like any other untrusted contribution: a human must understand it, verify it, and preserve
+licensing and provenance.
+
+## Information boundaries
+
+- Never send proprietary game or firmware files, decrypted modules, extracted assets, oracle
+  traces, raw memory/framebuffer dumps, credentials, private keys, private vulnerability reports,
+  or embargoed material to a public AI service.
+- Keep authorized game inputs local. When assistance is needed, provide the smallest sanitized
+  source excerpt or diagnostic message that demonstrates the problem.
+- Remove usernames, absolute paths, account details, tokens, and unrelated log content before
+  sharing a diagnostic excerpt.
+- Diagnostic bundles that contain local databases, execution telemetry, extracted game inventory, or similar title-derived information are PRIVATE DIAGNOSTIC DATA. Do not upload them to public AI services, issue trackers, or public repositories.
+- Follow the provider and organization policies that apply to the chosen tool. Prefer approved
+  local or private processing when the task necessarily touches non-public inputs.
+
+## Review and provenance
+
+- Review AI-assisted changes line by line and run checks proportional to their risk.
+- Do not use generated text or code to conceal copying or to bypass a third party's license.
+  AI assistance does not erase derivative-work obligations.
+- Preserve SPDX identifiers, attribution, notices, and exact upstream hashes. Record any new
+  third-party source or material AI-assisted translation in the pull request.
+- Treat legal/provenance packets produced with AI assistance as engineering evidence for qualified
+  review, not as legal clearance. Open publication blockers remain open until their actual
+  acceptance criteria and human review are complete.
+- Do not let an automated tool publish releases, disclose vulnerabilities, merge changes, or
+  alter repository security settings without explicit human review and authorization.
+
+## Evidence and completion claims
+
+AI-generated summaries must describe what the exact diff and tests actually prove.
+
+- Distinguish registered production-NID/entry execution from helper-level, white-box, model, and
+  source-shape tests. Do not promote a weaker test category into a public-behavior claim.
+- A test that manually seeds a postcondition does not prove the production operation created that
+  state. A defined-but-uninvoked NID does not prove that variant was tested.
+- Map each claimed issue/acceptance criterion to a concrete code change and a concrete assertion or
+  recorded route. State residual criteria explicitly.
+- Before proposing a merge, compare the PR against its intended base and inspect the changed-file
+  list. If the branch contains an unmerged parent PR, either make the stack explicit or split/rebase
+  the focused work.
+- Local test success is not GitHub CI. When Actions are blocked, skipped, or fail before steps run,
+  report the exact local gates and the CI limitation separately.
+- Dependency/security remediation must be checked against the current advisory's affected/fixed
+  range and the resolved lock graph. Changing a manifest version without synchronizing the lockfile
+  and exercising the real consumer is not a verified fix.
+
+## DCO and commit identity
+
+A `Signed-off-by:` trailer is a contributor rights certification, not decoration.
+
+- AI tools and automated agents must not invent a human, vendor, or tool identity for DCO sign-off
+  and must not add a sign-off on the maintainer's behalf.
+- When an AI-capable connector creates an otherwise unsigned commit, leave the attestation for the
+  actual contributor/maintainer to make deliberately after reviewing the final diff. Squash/recommit
+  or amend with `git commit -s` only when that person is prepared to certify the contribution.
+- Do not retroactively fabricate sign-offs for historical commits.
+- Keep AI-assistance disclosure separate from DCO: disclosure records how work was produced; DCO
+  records the contributor's rights/authority to submit it.
+
+## Disclosing AI help in commits
+
+Every commit that an AI tool helped produce says so in its last lines, one line per tool:
+
+```text
+Assisted-by: Claude Code (Claude Opus 5.5)
+Assisted-by: Codex (GPT-6 Luna)
+```
+
+- Name the tool and, in parentheses, the model it ran. Both are required: a line without the model
+  is incomplete, so find out which model a tool used before you commit. A contributor names
+  whatever tool they used, such as Cursor or Gemini CLI. The tools the maintainer's own agents use
+  are Claude Code, Codex, Antigravity, OpenCode, Kilo, Cline, Codebuff, GitHub Copilot,
+  Android Studio, and Jules (Google's coding agent); the maintainer adds a new tool to this list before using it.
+- Use the same form for every tool. A uniform, honest record is the point: it lets anyone
+  see which changes had AI help without inferring it.
+- `Assisted-by:` is a disclosure, not authorship. Do not add `Co-Authored-By:` for an AI
+  tool: an AI is not a contributor of record and cannot certify anything.
+- `Assisted-by:` never replaces DCO. A sign-off is optional; a human contributor who wants one
+  adds their own `Signed-off-by:` after reviewing the final diff, and no tool adds it for them.
+- A commit written entirely by a person carries no `Assisted-by:` line.
+
+## How each tool reads these rules
+
+[`AGENTS.md`](../AGENTS.md) holds the rules. Codex, Cursor, Jules and most other agents read it on
+their own. Claude Code reaches it through `CLAUDE.md`, and Copilot through
+`.github/copilot-instructions.md`. Gemini CLI reads only `GEMINI.md` unless told otherwise: set
+`"context": {"fileName": ["AGENTS.md"]}` in your own `.gemini/settings.json`. With Aider, pass
+`--read AGENTS.md`.
+
+Repository-specific contribution and disclosure rules remain authoritative:
+[AGENTS.md](../AGENTS.md), [CONTRIBUTING.md](../CONTRIBUTING.md), [NOTICE.md](../NOTICE.md), and
+[SECURITY.md](../SECURITY.md).

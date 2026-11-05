@@ -1,0 +1,1290 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 the Nakagawa Recomp authors
+
+#ifndef SR_FLIGHT_RECORDER_LINKED
+#define SR_FLIGHT_RECORDER_LINKED
+#endif
+#include "flight_recorder.h"
+#include "recomp.h"  /* SR_CPUSTATE_ABI_VERSION, stamped into the bundle header */
+
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(__clang__)
+#define SR_FLIGHT_COMPILER "clang"
+#elif defined(__GNUC__)
+#define SR_FLIGHT_COMPILER "gcc"
+#else
+#define SR_FLIGHT_COMPILER "other"
+#endif
+
+/* Reproducible build identity. The bundle's build block used to stamp __DATE__
+ * and __TIME__, which made two compiles of identical inputs differ in the
+ * compile clock -- the one project-owned source of variation between two builds
+ * of the same package. The build now forwards a stable identity instead (the
+ * Makefile passes these as -D defines): SR_SOURCE_DATE_EPOCH, the
+ * reproducible-builds.org epoch, and SR_BUILD_ID, the source commit. Neither is
+ * a clock reading, so binaries stay byte-for-byte reproducible. A compile that
+ * forwards neither records nulls, and tools/flight_diff.py refuses such a
+ * bundle fail closed rather than accepting a clock stamp.
+ */
+#define SR_FLIGHT_STRINGIFY_RAW(text) #text
+#define SR_FLIGHT_STRINGIFY(text) SR_FLIGHT_STRINGIFY_RAW(text)
+
+#if defined(SR_SOURCE_DATE_EPOCH)
+static const char s_flight_source_date_epoch[] = SR_FLIGHT_STRINGIFY(SR_SOURCE_DATE_EPOCH);
+#else
+static const char s_flight_source_date_epoch[] = "";
+#endif
+#if defined(SR_BUILD_ID)
+static const char s_flight_build_id[] = SR_BUILD_ID;
+#else
+static const char s_flight_build_id[] = "";
+#endif
+
+typedef struct {
+    uint32_t mask;
+    const char *name;
+} SrFlightClassName;
+
+/* ---- SR_TRACE_PC: the address window over the instruction trace ----
+ * The contract is documented in flight_recorder.h. The stream is opened here so
+ * this diagnostic does not depend on the trace writer being linked, which every
+ * host of the runtime links instead. */
+static FILE *s_tw_fp;
+static int s_tw_configured;
+static int s_tw_armed;
+static int s_tw_skip;
+static uint32_t s_tw_lo, s_tw_hi;
+static SrTraceWindowIndices s_tw_indices;
+static unsigned long s_tw_limit, s_tw_count;
+
+static int s_watch_configured;
+static uint64_t s_watch_start;
+static uint64_t s_watch_end;
+static uint32_t s_watch_vblank;
+static uint64_t s_watch_matches;
+int g_sr_watch_enabled;
+
+/* Watch-class byte shadow (schema 7): the last value the recorder saw stored to each watched
+ * byte. A byte is unknown until a store covers it; the shadow is never filled from guest
+ * memory. */
+static uint8_t s_watch_shadow[SR_FLIGHT_WATCH_SHADOW_MAX];
+static uint8_t s_watch_known[SR_FLIGHT_WATCH_SHADOW_MAX];
+static void watch_flight_note(uint32_t pc, uint32_t addr, uint32_t value, uint32_t width);
+
+void sr_watch_configure(void) {
+    if (s_watch_configured) return;
+    s_watch_configured = 1;
+    const char *spec = getenv("SR_WATCH");
+    if (!spec || !spec[0]) return;
+
+    const char *separator = strchr(spec, ':');
+    if (!separator || separator == spec || separator[1] == '\0' || spec[0] == '-') {
+        fprintf(stderr, "SR_WATCH: expected ADDR:LEN (a non-negative address and a nonzero length)\n");
+        return;
+    }
+    errno = 0;
+    char *addr_end = NULL;
+    unsigned long long start = strtoull(spec, &addr_end, 0);
+    if (errno != 0 || addr_end != separator || start > UINT32_MAX) {
+        fprintf(stderr, "SR_WATCH: invalid address in ADDR:LEN\n");
+        return;
+    }
+    errno = 0;
+    char *len_end = NULL;
+    unsigned long long length = strtoull(separator + 1, &len_end, 0);
+    if (errno != 0 || len_end == separator + 1 || *len_end != '\0' || length == 0u ||
+        length > (UINT32_MAX + 1ULL) - start) {
+        fprintf(stderr, "SR_WATCH: invalid length in ADDR:LEN\n");
+        return;
+    }
+
+    s_watch_start = (uint64_t)start;
+    s_watch_end = s_watch_start + (uint64_t)length;
+    g_sr_watch_enabled = 1;
+    fprintf(stderr, "SR_WATCH: armed addr=0x%08" PRIx32 " len=0x%llx\n",
+            (uint32_t)s_watch_start, length);
+}
+
+/* The vblank note and the match counter are plain diagnostics shared between the GE
+ * thread and the storing thread without synchronization: a report may carry the
+ * previous vblank, and the counter is exact only single-threaded (the selftest). */
+void sr_watch_note_vblank(uint32_t vblank) {
+    s_watch_vblank = vblank;
+}
+
+void sr_watch_store(uint32_t pc, uint32_t addr, uint32_t value, uint32_t width) {
+    if (!g_sr_watch_enabled || width == 0u) return;
+    const uint64_t store_start = (uint64_t)addr;
+    const uint64_t store_end = store_start + (uint64_t)width;
+    if (store_start >= s_watch_end || store_end <= s_watch_start) return;
+    s_watch_matches++;
+    fprintf(stderr,
+            "SR_WATCH: pc=0x%08" PRIx32 " addr=0x%08" PRIx32 " val=0x%08" PRIx32 " width=%" PRIu32 " vblank=%" PRIu32 "\n",
+            pc, addr, value, width, s_watch_vblank);
+    watch_flight_note(pc, addr, value, width);
+}
+
+uint64_t sr_watch_match_count(void) { return s_watch_matches; }
+
+static void sr_trace_window_list(const char *text, uint8_t *out, unsigned *count) {
+    *count = 0;
+    if (!text || !text[0]) return;
+    while (*text && *count < SR_TRACE_WINDOW_MAX_INDEX) {
+        char *end = NULL;
+        const unsigned long value = strtoul(text, &end, 0);
+        if (end == text) return;
+        if (value < 128u) out[(*count)++] = (uint8_t)value;
+        text = end;
+        while (*text == ',' || *text == ' ') text++;
+    }
+}
+
+void sr_trace_window_configure(void) {
+    if (s_tw_configured) return;
+    s_tw_configured = 1;
+    const char *window = getenv("SR_TRACE_PC");
+    if (!window || !window[0]) return;
+    const char *path = getenv("SR_TRACE");
+    if (!path || !path[0]) path = "logs/trace_window.txt";
+    const char *sep = strchr(window, ':');
+    if (!sep) sep = strchr(window, '-');
+    if (!sep) {
+        fprintf(stderr, "TRACE_WINDOW: SR_TRACE_PC needs LO:HI, got '%s'\n", window);
+        return;
+    }
+    const uint32_t lo = (uint32_t)strtoul(window, NULL, 0);
+    const uint32_t hi = (uint32_t)strtoul(sep + 1, NULL, 0);
+    if (hi < lo) {
+        fprintf(stderr, "TRACE_WINDOW: empty window %s\n", window);
+        return;
+    }
+    sr_trace_window_list(getenv("SR_TRACE_V"), s_tw_indices.v, &s_tw_indices.vn);
+    sr_trace_window_list(getenv("SR_TRACE_F"), s_tw_indices.f, &s_tw_indices.fn);
+    const char *limit = getenv("SR_TRACE_LIMIT");
+    s_tw_limit = limit && limit[0] ? strtoul(limit, NULL, 0) : 0ul;
+    s_tw_fp = fopen(path, "wb");
+    if (!s_tw_fp) {
+        fprintf(stderr, "TRACE_WINDOW: cannot open '%s'\n", path);
+        return;
+    }
+    fprintf(s_tw_fp, "# trace-window v1 lo=0x%08" PRIx32 " hi=0x%08" PRIx32 " limit=%lu v=%u f=%u\n",
+            lo, hi, s_tw_limit, s_tw_indices.vn, s_tw_indices.fn);
+    s_tw_lo = lo;
+    s_tw_hi = hi;
+    s_tw_armed = 1;
+    fprintf(stderr, "TRACE_WINDOW: armed lo=0x%08" PRIx32 " hi=0x%08" PRIx32 " limit=%lu v=%u f=%u path=%s\n",
+            lo, hi, s_tw_limit, s_tw_indices.vn, s_tw_indices.fn, path);
+}
+
+void sr_trace_note_frame(uint32_t frame) {
+    if (!s_tw_armed || !s_tw_fp) return;
+    fprintf(s_tw_fp, "frame %" PRIu32 "\n", frame);
+}
+
+int sr_trace_window_armed(void) { return s_tw_armed; }
+
+int sr_trace_window_begin_instruction(uint32_t pc) {
+    s_tw_skip = pc < s_tw_lo || pc > s_tw_hi;
+    return !s_tw_skip;
+}
+
+const SrTraceWindowIndices *sr_trace_window_indices(void) {
+    return s_tw_armed ? &s_tw_indices : 0;
+}
+
+void sr_trace_window_record(uint32_t pc, const char *text) {
+    (void)pc;
+    if (!s_tw_armed || s_tw_skip || !s_tw_fp) return;
+    fprintf(s_tw_fp, "%s\n", text);
+    if (s_tw_limit && ++s_tw_count >= s_tw_limit) {
+        fprintf(s_tw_fp, "# window complete records=%lu\n", s_tw_count);
+        fflush(s_tw_fp);
+        /* Disarm rather than close: the trace writer's own stream is untouched,
+         * and the gate stops admitting in-window instructions, so the rest of
+         * the run executes uninstrumented. */
+        s_tw_armed = 0;
+    }
+}
+
+static SrFlightEvent s_flight_events[SR_FLIGHT_MAX_EVENTS];
+static uint32_t s_flight_classes;
+static uint32_t s_flight_limit = 256u;
+static uint64_t s_flight_recorded;
+static uint64_t s_flight_last_sequence;
+static uint32_t s_flight_last_kind;
+static int s_flight_init_state;
+static char s_flight_ace[96];          /* Ace Mode's line for an enhanced run, else empty */
+static int s_flight_exit_registered;
+static int s_flight_dumped;
+static uint32_t s_flight_dump_count;
+static uint64_t s_flight_trigger_count;
+static uint32_t s_flight_terminal_reason;
+static uint32_t s_flight_terminal_kind;
+static uint32_t s_flight_terminal_arg;
+static uint64_t s_flight_terminal_sequence;
+
+/* Named refusals: calls answered with a registered error while the guest kept running.
+ * They are counted here and never make the terminal record. The first one keeps its own
+ * fields; distinct NIDs are listed up to a fixed cap, and refusals past it are counted in
+ * s_refusal_unlisted so the list plus that count always equals the total. */
+#define SR_FLIGHT_REFUSAL_NIDS_MAX 32u
+static uint64_t s_refusal_count;
+static uint32_t s_refusal_first_nid;
+static uint32_t s_refusal_first_pc;
+static uint64_t s_refusal_first_sequence;
+static uint32_t s_refusal_distinct;
+static uint32_t s_refusal_nids[SR_FLIGHT_REFUSAL_NIDS_MAX];
+static uint64_t s_refusal_nid_counts[SR_FLIGHT_REFUSAL_NIDS_MAX];
+static uint64_t s_refusal_unlisted;
+
+/* The scheduler's thread table, snapshotted into every bundle (schema 6). */
+static SrFlightThreadSource s_flight_thread_source;
+
+/* Trigger mode (schema 7), armed by SR_FLIGHT_TRIGGER; the contract is in flight_recorder.h.
+ * s_trig_seen counts the matching events a ge-draw or checkpoint mode has seen so far. A
+ * checkpoint with an AFTER window opens it at the match and freezes when it is full. */
+static uint32_t s_trig_mode;
+static uint32_t s_trig_pc;
+static uint32_t s_trig_ge_draw;
+static uint32_t s_trig_kind;
+static uint32_t s_trig_occurrence;
+static uint32_t s_trig_after;
+static uint64_t s_trig_seen;
+static uint64_t s_trig_match_sequence;
+static uint32_t s_trig_after_remaining;
+static int s_trig_window_open;
+static int s_trig_frozen;
+
+static const SrFlightClassName s_flight_class_names[] = {
+    {SR_FLIGHT_CLASS_HLE, "hle"},
+    {SR_FLIGHT_CLASS_UNSUPPORTED, "unsupported"},
+    {SR_FLIGHT_CLASS_SCHED, "sched"},
+    {SR_FLIGHT_CLASS_PRX, "prx"},
+    {SR_FLIGHT_CLASS_FAULT, "fault"},
+    {SR_FLIGHT_CLASS_FATAL, "fatal"},
+    {SR_FLIGHT_CLASS_MEDIA, "media"},
+    {SR_FLIGHT_CLASS_GE, "ge"},
+    {SR_FLIGHT_CLASS_PRESENT, "present"},
+    {SR_FLIGHT_CLASS_WATCH, "watch"},
+};
+
+static int token_is(const char *text, size_t length, const char *name) {
+    return strlen(name) == length && memcmp(text, name, length) == 0;
+}
+
+static int parse_limit(const char *text, uint32_t *limit_out) {
+    uint32_t value = 0u;
+    if (!text || !*text) return 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+        if (*p < '0' || *p > '9') return 0;
+        if (value > (SR_FLIGHT_MAX_EVENTS - (uint32_t)(*p - '0')) / 10u) return 0;
+        value = value * 10u + (uint32_t)(*p - '0');
+    }
+    if (value == 0u || value > SR_FLIGHT_MAX_EVENTS) return 0;
+    *limit_out = value;
+    return 1;
+}
+
+static int parse_classes(const char *text, size_t length, uint32_t *mask_out) {
+    uint32_t mask = 0u;
+    size_t start = 0u;
+    if (length == 0u) return 0;
+    for (size_t i = 0u; i <= length; ++i) {
+        int matched = 0;
+        if (i != length && text[i] != ',') continue;
+        if (i == start) return 0;
+        for (size_t j = 0u; j < sizeof(s_flight_class_names) / sizeof(s_flight_class_names[0]); ++j) {
+            if (token_is(text + start, i - start, s_flight_class_names[j].name)) {
+                mask |= s_flight_class_names[j].mask;
+                matched = 1;
+                break;
+            }
+        }
+        if (!matched) return 0;
+        if (i == length) {
+            if (mask == 0u) return 0;
+            *mask_out = mask;
+            return 1;
+        }
+        start = i + 1u;
+    }
+    return 0;
+}
+
+static const char *class_name(uint32_t event_class) {
+    for (size_t i = 0u; i < sizeof(s_flight_class_names) / sizeof(s_flight_class_names[0]); ++i) {
+        if (s_flight_class_names[i].mask == event_class) return s_flight_class_names[i].name;
+    }
+    return "unknown";
+}
+
+/* The class each event kind belongs to, or 0 for a number that names no kind. */
+static uint32_t kind_class(uint32_t kind) {
+    if (kind == SR_FLIGHT_KIND_HLE_IMPORT) return SR_FLIGHT_CLASS_HLE;
+    if (kind == SR_FLIGHT_KIND_UNSUPPORTED_NID) return SR_FLIGHT_CLASS_UNSUPPORTED;
+    if (kind >= SR_FLIGHT_KIND_SCHED_PICK && kind <= SR_FLIGHT_KIND_SCHED_WAKE) return SR_FLIGHT_CLASS_SCHED;
+    if (kind >= SR_FLIGHT_KIND_PRX_LOAD && kind <= SR_FLIGHT_KIND_PRX_UNLOAD) return SR_FLIGHT_CLASS_PRX;
+    if (kind == SR_FLIGHT_KIND_FAULT_EXCEPTION || kind == SR_FLIGHT_KIND_NAN_ORIGIN) return SR_FLIGHT_CLASS_FAULT;
+    if (kind >= SR_FLIGHT_KIND_FATAL_BREAK && kind <= SR_FLIGHT_KIND_FATAL_HOST) return SR_FLIGHT_CLASS_FATAL;
+    if (kind == SR_FLIGHT_KIND_MEDIA_TEST_MILESTONE || kind == SR_FLIGHT_KIND_MEDIA_STREAM_REJECTED)
+        return SR_FLIGHT_CLASS_MEDIA;
+    if (kind >= SR_FLIGHT_KIND_GE_LIST_ENQUEUE && kind <= SR_FLIGHT_KIND_GE_FINISH_COMMAND) return SR_FLIGHT_CLASS_GE;
+    if (kind == SR_FLIGHT_KIND_PRESENT_SET_FRAMEBUF || kind == SR_FLIGHT_KIND_PRESENT_FRAME)
+        return SR_FLIGHT_CLASS_PRESENT;
+    if (kind == SR_FLIGHT_KIND_WATCH_CHANGE) return SR_FLIGHT_CLASS_WATCH;
+    return 0u;
+}
+
+/* One unsigned field of a trigger spec: the whole of [text, end) must be a number in
+ * [minimum, maximum]. Decimal or 0x hex. */
+static int parse_trigger_number(const char *text, const char *end, uint32_t minimum,
+                                uint32_t maximum, uint32_t *out) {
+    if (text == end || *text == '-' || *text == '+' || *text == ' ') return 0;
+    errno = 0;
+    char *stop = NULL;
+    unsigned long long value = strtoull(text, &stop, 0);
+    if (errno != 0 || stop != end || value < minimum || value > maximum) return 0;
+    *out = (uint32_t)value;
+    return 1;
+}
+
+static void trigger_clear(void) {
+    s_trig_mode = SR_FLIGHT_TRIGGER_NONE;
+    s_trig_pc = 0u;
+    s_trig_ge_draw = 0u;
+    s_trig_kind = 0u;
+    s_trig_occurrence = 0u;
+    s_trig_after = 0u;
+    s_trig_seen = 0u;
+    s_trig_match_sequence = 0u;
+    s_trig_after_remaining = 0u;
+    s_trig_window_open = 0;
+    s_trig_frozen = 0;
+}
+
+/* Parses one SR_FLIGHT_TRIGGER spec against the armed classes and limit. On refusal it names
+ * the reason and returns 0; the caller disables the recorder rather than run a capture whose
+ * stop condition is not the one asked for. */
+static int trigger_configure(const char *spec, uint32_t classes, uint32_t limit) {
+    trigger_clear();
+    if (!spec || !*spec) return 1;
+    const char *end = spec + strlen(spec);
+    if (strcmp(spec, "watch") == 0) {
+        if (!(classes & SR_FLIGHT_CLASS_WATCH)) {
+            fprintf(stderr, "SR_FLIGHT_TRIGGER: watch needs the watch class in SR_FLIGHT; recorder disabled\n");
+            return 0;
+        }
+        s_trig_mode = SR_FLIGHT_TRIGGER_WATCH;
+        return 1;
+    }
+    if (strncmp(spec, "pc:", 3u) == 0) {
+        if (!parse_trigger_number(spec + 3, end, 0u, UINT32_MAX, &s_trig_pc)) {
+            fprintf(stderr, "SR_FLIGHT_TRIGGER: pc:ADDR needs a 32-bit address; recorder disabled\n");
+            return 0;
+        }
+        s_trig_mode = SR_FLIGHT_TRIGGER_PC;
+        return 1;
+    }
+    if (strncmp(spec, "ge-draw:", 8u) == 0) {
+        if (!parse_trigger_number(spec + 8, end, 1u, UINT32_MAX, &s_trig_ge_draw)) {
+            fprintf(stderr, "SR_FLIGHT_TRIGGER: ge-draw:N needs a draw ordinal of at least 1; recorder disabled\n");
+            return 0;
+        }
+        if (!(classes & SR_FLIGHT_CLASS_GE)) {
+            fprintf(stderr, "SR_FLIGHT_TRIGGER: ge-draw needs the ge class in SR_FLIGHT; recorder disabled\n");
+            s_trig_ge_draw = 0u;
+            return 0;
+        }
+        s_trig_mode = SR_FLIGHT_TRIGGER_GE_DRAW;
+        return 1;
+    }
+    if (strncmp(spec, "checkpoint:", 11u) == 0) {
+        const char *kind_text = spec + 11;
+        const char *first = strchr(kind_text, ':');
+        const char *second = first ? strchr(first + 1, ':') : NULL;
+        uint32_t kind = 0u, occurrence = 0u, after = 0u;
+        if (!first || !second ||
+            !parse_trigger_number(kind_text, first, 1u, SR_FLIGHT_KIND_WATCH_CHANGE, &kind) ||
+            !parse_trigger_number(first + 1, second, 1u, UINT32_MAX, &occurrence) ||
+            !parse_trigger_number(second + 1, end, 0u, limit - 1u, &after)) {
+            fprintf(stderr, "SR_FLIGHT_TRIGGER: checkpoint:KIND:N:AFTER needs a known kind, an "
+                            "occurrence of at least 1 and AFTER below the limit; recorder disabled\n");
+            return 0;
+        }
+        uint32_t event_class = kind_class(kind);
+        if (event_class == 0u || event_class == SR_FLIGHT_CLASS_FATAL) {
+            fprintf(stderr, "SR_FLIGHT_TRIGGER: checkpoint kind %" PRIu32 " is not a checkpoint "
+                            "(fatal kinds end the record on their own); recorder disabled\n", kind);
+            return 0;
+        }
+        if (!(classes & event_class)) {
+            fprintf(stderr, "SR_FLIGHT_TRIGGER: checkpoint kind %" PRIu32 " belongs to the %s class, "
+                            "which SR_FLIGHT does not enable; recorder disabled\n",
+                    kind, class_name(event_class));
+            return 0;
+        }
+        s_trig_kind = kind;
+        s_trig_occurrence = occurrence;
+        s_trig_after = after;
+        s_trig_mode = SR_FLIGHT_TRIGGER_CHECKPOINT;
+        return 1;
+    }
+    fprintf(stderr, "SR_FLIGHT_TRIGGER: expected pc:ADDR, ge-draw:N, watch or "
+                    "checkpoint:KIND:N:AFTER; recorder disabled\n");
+    return 0;
+}
+
+/* The watch class needs an armed SR_WATCH range its shadow can hold. */
+static int watch_class_configured(uint32_t classes) {
+    if (!(classes & SR_FLIGHT_CLASS_WATCH)) return 1;
+    if (!g_sr_watch_enabled || s_watch_end - s_watch_start > SR_FLIGHT_WATCH_SHADOW_MAX) {
+        fprintf(stderr, "SR_FLIGHT: the watch class needs SR_WATCH=ADDR:LEN with LEN at most %u; "
+                        "recorder disabled\n", (unsigned)SR_FLIGHT_WATCH_SHADOW_MAX);
+        return 0;
+    }
+    return 1;
+}
+
+static int write_bundle(int reason);
+static void flight_exit(void);
+static void mode_freeze(void);
+
+static void register_exit(void) {
+    if (s_flight_exit_registered || s_flight_classes == 0u) return;
+    if (atexit(flight_exit) != 0) {
+        fprintf(stderr, "SR_FLIGHT: could not register exit bundle; recorder disabled\n");
+        s_flight_classes = 0u;
+        return;
+    }
+    s_flight_exit_registered = 1;
+}
+
+void sr_flight_set_enhancements(const char *ace_line) {
+    size_t n = 0;
+    /* The launch line is "off" or "v1;key=value;...": copy only those characters, so the
+     * bundle's JSON string needs no escaping. */
+    for (; ace_line && ace_line[n] && n + 1 < sizeof(s_flight_ace); n++) {
+        char ch = ace_line[n];
+        int plain = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == ';' || ch == '=';
+        s_flight_ace[n] = plain ? ch : '?';
+    }
+    s_flight_ace[n] = '\0';
+}
+
+void sr_flight_init(void) {
+    sr_watch_configure();
+    if (s_flight_init_state == 2) return;
+    if (s_flight_init_state == 1) return;
+    s_flight_init_state = 1;
+
+    const char *spec = getenv("SR_FLIGHT");
+    if (spec && *spec) {
+        const char *separator = strchr(spec, ';');
+        size_t class_length = separator ? (size_t)(separator - spec) : 0u;
+        uint32_t classes = 0u;
+        uint32_t limit = 0u;
+        if (!separator || !parse_classes(spec, class_length, &classes) ||
+            !parse_limit(separator + 1, &limit)) {
+            fprintf(stderr, "SR_FLIGHT: expected named classes and limit (for example hle,sched;256); "
+                            "recorder disabled\n");
+        } else if (!watch_class_configured(classes) ||
+                   !trigger_configure(getenv("SR_FLIGHT_TRIGGER"), classes, limit)) {
+            trigger_clear();
+        } else {
+            s_flight_classes = classes;
+            s_flight_limit = limit;
+            register_exit();
+        }
+    }
+    s_flight_init_state = 2;
+}
+
+int sr_flight_class_enabled(uint32_t event_class) {
+    return (s_flight_classes & event_class) != 0u;
+}
+
+static uint64_t record_locked(uint32_t event_class, uint32_t kind, uint32_t arg0, uint32_t arg1,
+                              uint32_t arg2, uint32_t arg3) {
+    if (s_flight_classes == 0u || s_flight_limit == 0u || s_flight_trigger_count != 0u) return 0u;
+    if (s_flight_recorded == UINT64_MAX) return 0u;
+    uint64_t sequence = s_flight_recorded + 1u;
+    uint32_t slot = (uint32_t)((sequence - 1u) % s_flight_limit);
+    s_flight_events[slot] = (SrFlightEvent){
+        SR_FLIGHT_SCHEMA_VERSION,
+        sequence,
+        event_class,
+        kind,
+        arg0,
+        arg1,
+        arg2,
+        arg3,
+        {0u, 0u, 0u, 0u},
+        0u,
+        0u,
+    };
+    s_flight_recorded = sequence;
+    s_flight_last_sequence = sequence;
+    s_flight_last_kind = kind;
+    if (s_trig_window_open && --s_trig_after_remaining == 0u) mode_freeze();
+    return sequence;
+}
+
+/* A mode froze the record: the bundle is written now, so a run that dies later still has it,
+ * and s_flight_dumped stays clear for one final rewrite (mode_finalize) that adds the
+ * arguments and return value of an HLE import the freeze caught mid-call. */
+static void mode_freeze(void) {
+    s_trig_window_open = 0;
+    s_trig_after_remaining = 0u;
+    s_trig_frozen = 1;
+    s_flight_trigger_count = 1u;
+    (void)write_bundle(SR_FLIGHT_TERMINAL_TRIGGER);
+}
+
+static void mode_finalize(void) {
+    if (!s_trig_frozen || s_flight_dumped) return;
+    if (write_bundle(SR_FLIGHT_TERMINAL_TRIGGER)) s_flight_dumped = 1;
+}
+
+/* A run that ends inside a checkpoint window keeps the trigger terminal: the window is shorter
+ * than asked, and the bundle says where the checkpoint was. Returns 1 when it handled the end. */
+static int mode_end_of_run(void) {
+    if (s_trig_window_open) {
+        s_trig_window_open = 0;
+        s_trig_after_remaining = 0u;
+        s_trig_frozen = 1;
+        s_flight_trigger_count = 1u;
+    }
+    if (!s_trig_frozen) return 0;
+    mode_finalize();
+    return 1;
+}
+
+/* The guest pc an event carries, for the pc mode. Only kinds a non-terminal path records are
+ * listed; the LLE exception entry records its fault pc in arg1. */
+static int event_pc(uint32_t kind, uint32_t arg0, uint32_t arg1, uint32_t arg2, uint32_t arg3,
+                    uint32_t *pc) {
+    switch (kind) {
+    case SR_FLIGHT_KIND_HLE_IMPORT: *pc = arg2; return 1;
+    case SR_FLIGHT_KIND_UNSUPPORTED_NID: *pc = arg3; return 1;
+    case SR_FLIGHT_KIND_GE_LIST_DEQUEUE: *pc = arg1; return 1;
+    case SR_FLIGHT_KIND_FAULT_EXCEPTION: *pc = arg1; return 1;
+    case SR_FLIGHT_KIND_NAN_ORIGIN: *pc = arg0; return 1;
+    case SR_FLIGHT_KIND_WATCH_CHANGE: *pc = arg0; return 1;
+    default: return 0;
+    }
+}
+
+static void check_trigger(uint64_t sequence, uint32_t event_class, uint32_t kind, uint32_t arg0,
+                          uint32_t arg1, uint32_t arg2, uint32_t arg3) {
+    uint32_t argument = 0u;
+    uint32_t pc = 0u;
+    switch (s_trig_mode) {
+    case SR_FLIGHT_TRIGGER_PC:
+        if (!event_pc(kind, arg0, arg1, arg2, arg3, &pc) || pc != s_trig_pc) return;
+        argument = pc;
+        break;
+    case SR_FLIGHT_TRIGGER_GE_DRAW:
+        if (event_class != SR_FLIGHT_CLASS_GE || kind != SR_FLIGHT_KIND_GE_DRAW) return;
+        if (++s_trig_seen != s_trig_ge_draw) return;
+        argument = s_trig_ge_draw;
+        break;
+    case SR_FLIGHT_TRIGGER_WATCH:
+        if (event_class != SR_FLIGHT_CLASS_WATCH || kind != SR_FLIGHT_KIND_WATCH_CHANGE) return;
+        argument = arg1;
+        break;
+    case SR_FLIGHT_TRIGGER_CHECKPOINT:
+        if (kind != s_trig_kind) return;
+        if (++s_trig_seen != s_trig_occurrence) return;
+        argument = s_trig_occurrence;
+        break;
+    default:
+        return;
+    }
+    s_trig_match_sequence = sequence;
+    s_flight_terminal_reason = SR_FLIGHT_TERMINAL_TRIGGER;
+    s_flight_terminal_kind = kind;
+    s_flight_terminal_arg = argument;
+    s_flight_terminal_sequence = sequence;
+    if (s_trig_mode == SR_FLIGHT_TRIGGER_CHECKPOINT && s_trig_after != 0u) {
+        s_trig_window_open = 1;
+        s_trig_after_remaining = s_trig_after;
+        return;
+    }
+    mode_freeze();
+}
+
+/* Every non-terminal producer records through here, so a trigger mode sees exactly the events
+ * the bundle retains. Terminal paths call record_locked and keep their own trigger. */
+static uint64_t record_checked(uint32_t event_class, uint32_t kind, uint32_t arg0, uint32_t arg1,
+                               uint32_t arg2, uint32_t arg3) {
+    uint64_t sequence = record_locked(event_class, kind, arg0, arg1, arg2, arg3);
+    if (sequence != 0u && s_trig_mode != SR_FLIGHT_TRIGGER_NONE && s_trig_match_sequence == 0u)
+        check_trigger(sequence, event_class, kind, arg0, arg1, arg2, arg3);
+    return sequence;
+}
+
+void sr_flight_record(uint32_t event_class, uint32_t kind, uint32_t arg0, uint32_t arg1,
+                      uint32_t arg2, uint32_t arg3) {
+    if (!sr_flight_class_enabled(event_class)) return;
+    (void)record_checked(event_class, kind, arg0, arg1, arg2, arg3);
+}
+
+/* Watch class (schema 7): a store inside the SR_WATCH range becomes a watch-change event when
+ * it changes a byte the shadow knows, or covers a byte it has not seen yet. Bytes past the
+ * 32-bit value of a wider store are unknown, so they count as changed. */
+static void watch_flight_note(uint32_t pc, uint32_t addr, uint32_t value, uint32_t width) {
+    if (!(s_flight_classes & SR_FLIGHT_CLASS_WATCH)) return;
+    if (s_watch_end - s_watch_start > SR_FLIGHT_WATCH_SHADOW_MAX) return;
+    int changed = 0;
+    int known = 1;
+    for (uint32_t i = 0u; i < width; ++i) {
+        uint64_t byte_addr = (uint64_t)addr + i;
+        if (byte_addr < s_watch_start || byte_addr >= s_watch_end) continue;
+        uint32_t index = (uint32_t)(byte_addr - s_watch_start);
+        if (i >= 4u) {
+            s_watch_known[index] = 0u;
+            changed = 1;
+            known = 0;
+            continue;
+        }
+        uint8_t byte = (uint8_t)(value >> (8u * i));
+        if (!s_watch_known[index]) {
+            known = 0;
+            changed = 1;
+        } else if (s_watch_shadow[index] != byte) {
+            changed = 1;
+        }
+        s_watch_known[index] = 1u;
+        s_watch_shadow[index] = byte;
+    }
+    if (!changed) return;
+    (void)record_checked(SR_FLIGHT_CLASS_WATCH, SR_FLIGHT_KIND_WATCH_CHANGE, pc, addr,
+                         (width & 0xffu) | (known ? SR_FLIGHT_WATCH_KNOWN : 0u), value);
+}
+
+uint64_t sr_flight_hle_import(uint32_t nid, uint32_t uid, uint32_t object_uid, uint32_t pc,
+                              uint32_t ra) {
+    uint32_t classes = s_flight_classes;
+    uint64_t sequence = 0u;
+    if (classes & SR_FLIGHT_CLASS_HLE) {
+        sequence = record_checked(SR_FLIGHT_CLASS_HLE, SR_FLIGHT_KIND_HLE_IMPORT, nid, uid, pc, ra);
+    }
+    if ((classes & SR_FLIGHT_CLASS_GE) && nid == 0x5fb86ab0u) {
+        /* sceGeListDeQueue is an HLE boundary even on builds where its guest
+         * operation has no registered implementation. Preserve the submitted
+         * list id and call site without changing dispatch behavior. */
+        (void)record_checked(SR_FLIGHT_CLASS_GE, SR_FLIGHT_KIND_GE_LIST_DEQUEUE,
+                            object_uid, pc, 0u, 0u);
+    }
+    if (!(classes & SR_FLIGHT_CLASS_PRX)) return sequence;
+    uint32_t kind = 0u;
+    switch (nid) {
+    case 0x977de386u: kind = SR_FLIGHT_KIND_PRX_LOAD; object_uid = 0u; break;
+    case 0x50f0c1ecu: kind = SR_FLIGHT_KIND_PRX_START; break;
+    case 0xd1ff982au: kind = SR_FLIGHT_KIND_PRX_STOP; break;
+    case 0x2e0911aau: kind = SR_FLIGHT_KIND_PRX_UNLOAD; break;
+    default: return sequence;
+    }
+    (void)record_checked(SR_FLIGHT_CLASS_PRX, kind, object_uid, pc, 0u, 0u);
+    return sequence;
+}
+
+static SrFlightEvent *event_for_sequence(uint64_t sequence) {
+    if (sequence == 0u || s_flight_limit == 0u || sequence > s_flight_recorded) return NULL;
+    uint64_t first = s_flight_recorded > s_flight_limit ? s_flight_recorded - s_flight_limit : 0u;
+    if (sequence <= first) return NULL;
+    uint32_t slot = (uint32_t)((sequence - 1u) % s_flight_limit);
+    SrFlightEvent *event = &s_flight_events[slot];
+    return event->sequence == sequence && event->event_class == SR_FLIGHT_CLASS_HLE &&
+                   event->kind == SR_FLIGHT_KIND_HLE_IMPORT
+               ? event
+               : NULL;
+}
+
+void sr_flight_hle_arguments(uint64_t sequence, uint32_t arg0, uint32_t arg1, uint32_t arg2,
+                             uint32_t arg3) {
+    if (!(s_flight_classes & SR_FLIGHT_CLASS_HLE)) return;
+    SrFlightEvent *event = event_for_sequence(sequence);
+    if (!event) return;
+    event->arguments[0] = arg0;
+    event->arguments[1] = arg1;
+    event->arguments[2] = arg2;
+    event->arguments[3] = arg3;
+}
+
+void sr_flight_hle_return(uint64_t sequence, uint32_t return_value) {
+    if (!(s_flight_classes & SR_FLIGHT_CLASS_HLE)) return;
+    SrFlightEvent *event = event_for_sequence(sequence);
+    if (!event) return;
+    event->has_return = 1u;
+    event->return_value = return_value;
+    /* A mode that froze on this import wrote its bundle before the call returned. */
+    if (sequence == s_flight_recorded) mode_finalize();
+}
+
+static void trigger(int reason, uint32_t kind, uint32_t arg) {
+    if (s_flight_trigger_count != 0u) {
+        mode_finalize();
+        return;
+    }
+    /* A terminal inside an open checkpoint window ends the window and wins the terminal. */
+    s_trig_window_open = 0;
+    s_trig_after_remaining = 0u;
+    s_flight_trigger_count = 1u;
+    s_flight_terminal_reason = (uint32_t)reason;
+    s_flight_terminal_kind = kind;
+    s_flight_terminal_arg = arg;
+    s_flight_terminal_sequence = s_flight_last_sequence;
+    if (write_bundle(reason)) s_flight_dumped = 1;
+}
+
+static void note_refusal(uint32_t nid, uint32_t pc, uint64_t sequence) {
+    if (s_flight_trigger_count != 0u || s_flight_dumped) return;
+    s_refusal_count++;
+    if (s_refusal_count == 1u) {
+        s_refusal_first_nid = nid;
+        s_refusal_first_pc = pc;
+        s_refusal_first_sequence = sequence;
+    }
+    uint32_t index = 0u;
+    while (index < s_refusal_distinct && s_refusal_nids[index] != nid) index++;
+    if (index < s_refusal_distinct) {
+        s_refusal_nid_counts[index]++;
+    } else if (s_refusal_distinct < SR_FLIGHT_REFUSAL_NIDS_MAX) {
+        s_refusal_nids[s_refusal_distinct] = nid;
+        s_refusal_nid_counts[s_refusal_distinct] = 1u;
+        s_refusal_distinct++;
+    } else {
+        s_refusal_unlisted++;
+    }
+    /* Until a terminal the record is provisional and says the run is still running, so a run
+     * that is killed later is not reported under its first refusal. It is rewritten at each
+     * power of two of the refusal count: the counts on disk are at least half the live total. */
+    if (!s_trig_window_open && (s_refusal_count & (s_refusal_count - 1u)) == 0u) {
+        s_flight_terminal_reason = SR_FLIGHT_TERMINAL_RUNNING;
+        s_flight_terminal_kind = 0u;
+        s_flight_terminal_arg = 0u;
+        s_flight_terminal_sequence = s_flight_last_sequence;
+        (void)write_bundle(SR_FLIGHT_TERMINAL_RUNNING);
+    }
+}
+
+void sr_flight_unsupported(uint32_t nid, uint32_t error, uint32_t uid, uint32_t pc) {
+    uint64_t sequence = 0u;
+    if (s_flight_classes == 0u) return;
+    if (s_flight_classes & SR_FLIGHT_CLASS_UNSUPPORTED) {
+        sequence = record_checked(SR_FLIGHT_CLASS_UNSUPPORTED, SR_FLIGHT_KIND_UNSUPPORTED_NID,
+                                  nid, error, uid, pc);
+    }
+    note_refusal(nid, pc, sequence);
+}
+
+void sr_flight_unsupported_fatal(uint32_t nid, uint32_t uid, uint32_t pc) {
+    uint32_t classes = s_flight_classes;
+    if (classes == 0u) return;
+    if (classes & SR_FLIGHT_CLASS_UNSUPPORTED) {
+        record_locked(SR_FLIGHT_CLASS_UNSUPPORTED, SR_FLIGHT_KIND_UNSUPPORTED_NID, nid, 0u, uid, pc);
+    }
+    if (classes & SR_FLIGHT_CLASS_FATAL) {
+        record_locked(SR_FLIGHT_CLASS_FATAL, SR_FLIGHT_KIND_FATAL_DISPATCH, pc, nid, uid, 0u);
+    }
+    trigger((classes & SR_FLIGHT_CLASS_UNSUPPORTED) ? SR_FLIGHT_TERMINAL_UNSUPPORTED_NID
+                                                    : SR_FLIGHT_TERMINAL_FATAL,
+            SR_FLIGHT_KIND_FATAL_DISPATCH, nid);
+}
+
+void sr_flight_prx_load(uint32_t base, uint32_t result, uint32_t entry, uint32_t imports,
+                        uint32_t exports) {
+    if (!sr_flight_class_enabled(SR_FLIGHT_CLASS_PRX)) return;
+    (void)record_checked(SR_FLIGHT_CLASS_PRX, SR_FLIGHT_KIND_PRX_LOAD, base, result, entry,
+                         (imports & 0xffffu) | ((exports & 0xffffu) << 16));
+}
+
+void sr_flight_fatal(uint32_t kind, uint32_t pc, uint32_t detail, uint32_t aux) {
+    if (s_flight_classes == 0u) return;
+    if (s_flight_classes & SR_FLIGHT_CLASS_FATAL) {
+        record_locked(SR_FLIGHT_CLASS_FATAL, kind, pc, detail, aux, 0u);
+    }
+    trigger(SR_FLIGHT_TERMINAL_FATAL, kind, detail);
+}
+
+void sr_flight_exit(uint32_t status) {
+    if (s_flight_classes == 0u || s_flight_dumped) return;
+    if (mode_end_of_run() || s_flight_trigger_count != 0u) return;
+    s_flight_terminal_reason = SR_FLIGHT_TERMINAL_EXIT;
+    s_flight_terminal_kind = 0u;
+    s_flight_terminal_arg = status;
+    s_flight_terminal_sequence = s_flight_last_sequence;
+    if (write_bundle(SR_FLIGHT_TERMINAL_EXIT)) s_flight_dumped = 1;
+}
+
+/* The vblank budget (SR_EXIT_AT_VBLANK) is a deliberate, successful stop. It is not a trigger:
+ * the record ends as budget and the process exits 0. */
+void sr_flight_budget(uint32_t vblank) {
+    if (s_flight_classes == 0u || s_flight_dumped) return;
+    if (mode_end_of_run() || s_flight_trigger_count != 0u) return;
+    s_flight_terminal_reason = SR_FLIGHT_TERMINAL_BUDGET;
+    s_flight_terminal_kind = 0u;
+    s_flight_terminal_arg = vblank;
+    s_flight_terminal_sequence = s_flight_last_sequence;
+    if (write_bundle(SR_FLIGHT_TERMINAL_BUDGET)) s_flight_dumped = 1;
+}
+
+/* The no-frame watchdog aborts the run. Its fatal event is kept, and the terminal names the
+ * hang with the vblanks that passed without a new frame. */
+void sr_flight_hang(uint32_t vblanks_without_frame, uint32_t limit) {
+    if (s_flight_classes == 0u) return;
+    if (s_flight_classes & SR_FLIGHT_CLASS_FATAL) {
+        record_locked(SR_FLIGHT_CLASS_FATAL, SR_FLIGHT_KIND_FATAL_HOST, 0u,
+                      vblanks_without_frame, limit, 0u);
+    }
+    trigger(SR_FLIGHT_TERMINAL_HANG, SR_FLIGHT_KIND_FATAL_HOST, vblanks_without_frame);
+}
+
+void sr_flight_fault(uint32_t kind, uint32_t pc, uint32_t detail, uint32_t aux) {
+    if (s_flight_classes == 0u) return;
+    if (s_flight_classes & SR_FLIGHT_CLASS_FAULT) {
+        record_locked(SR_FLIGHT_CLASS_FAULT, kind, pc, detail, aux, 0u);
+    }
+    /* First-exception trigger: the retained prefix ends at the first fault and
+     * the bundle is dumped with terminal reason "fatal" carrying the fault
+     * kind, mirroring sr_flight_fatal. The LLE exception entry keeps its own
+     * non-triggering record so recoverable guest exceptions do not freeze it. */
+    trigger(SR_FLIGHT_TERMINAL_FATAL, kind, detail);
+}
+
+void sr_flight_host_fault(uint32_t guest_pc, uint32_t exception_code, uint32_t guest_fault_addr) {
+    sr_flight_fault(SR_FLIGHT_KIND_FAULT_EXCEPTION, guest_pc, exception_code, guest_fault_addr);
+}
+
+/* SR_NAN_TRAP origin (#320). Unlike sr_flight_fault this never arms the first-exception
+ * trigger: the trap reports many origins in one run and the recorder must keep going past
+ * them. The only record is the fault-class event, packed as the kind documents. */
+void sr_flight_nan_origin(uint32_t guest_pc, uint32_t domain, uint32_t dst, uint32_t result,
+                          uint32_t lane, uint32_t vbl) {
+    if (!sr_flight_class_enabled(SR_FLIGHT_CLASS_FAULT)) return;
+    (void)record_checked(SR_FLIGHT_CLASS_FAULT, SR_FLIGHT_KIND_NAN_ORIGIN, guest_pc,
+                         (domain & 0xffu) | ((result & 0xffu) << 8) | ((dst & 0xffu) << 16),
+                         lane, vbl);
+}
+
+static uint32_t retained_count(void) {
+    if (s_flight_recorded < s_flight_limit) return (uint32_t)s_flight_recorded;
+    return s_flight_limit;
+}
+
+void sr_flight_snapshot(SrFlightSnapshot *out) {
+    if (!out) return;
+    if (s_flight_init_state != 2) sr_flight_init();
+    uint32_t retained = retained_count();
+    *out = (SrFlightSnapshot){
+        s_flight_classes,
+        s_flight_limit,
+        retained,
+        s_flight_recorded,
+        s_flight_recorded - retained,
+        s_flight_trigger_count,
+        s_flight_dump_count,
+        s_flight_terminal_reason,
+        s_flight_terminal_kind,
+        s_flight_terminal_arg,
+        s_flight_terminal_sequence,
+        s_refusal_count,
+        s_refusal_first_nid,
+        s_refusal_first_pc,
+        s_refusal_first_sequence,
+        s_refusal_distinct,
+        s_refusal_unlisted,
+        s_trig_mode,
+        s_trig_match_sequence,
+        s_trig_after_remaining,
+    };
+}
+
+int sr_flight_event_count(void) {
+    if (s_flight_init_state != 2) sr_flight_init();
+    return (int)retained_count();
+}
+
+int sr_flight_event_at(uint32_t index, SrFlightEvent *out) {
+    if (!out || s_flight_init_state != 2) return 0;
+    uint32_t count = retained_count();
+    if (index >= count) return 0;
+    uint64_t first = s_flight_recorded > s_flight_limit ? s_flight_recorded - s_flight_limit : 0u;
+    uint32_t slot = (uint32_t)((first + index) % s_flight_limit);
+    *out = s_flight_events[slot];
+    return 1;
+}
+
+void sr_flight_set_thread_source(SrFlightThreadSource source) {
+    s_flight_thread_source = source;
+}
+
+/* A build identity is emitted only in a shape the schema can express: a decimal
+ * Unix timestamp for source_date_epoch and hex digits for build_id. Anything
+ * else (a hand-compile with a malformed -D) is recorded as null with a visible
+ * diagnostic, never as a value that would corrupt the evidence bundle.
+ */
+/* Upper bound of the schema's source_date_epoch: 9999-12-31T23:59:59Z. */
+#define SR_FLIGHT_EPOCH_MAX 253402300799ULL
+
+static int decimal_epoch_text(const char *text) {
+    size_t length;
+    unsigned long long value = 0u;
+    if (!text || !*text) return 0;
+    length = strlen(text);
+    if (length > 12u) return 0;
+    for (const char *p = text; *p; ++p) {
+        if (*p < '0' || *p > '9') return 0;
+        value = value * 10u + (unsigned long long)(*p - '0');
+    }
+    return value <= SR_FLIGHT_EPOCH_MAX;
+}
+
+/* Accepts hex digits in either case and writes the lowercase form the schema
+ * requires into out (at least 65 bytes). */
+static int hex_identity_text(const char *text, char *out) {
+    size_t length;
+    size_t i;
+    if (!text) return 0;
+    length = strlen(text);
+    if (length < 7u || length > 64u) return 0;
+    for (i = 0; i < length; ++i) {
+        char c = text[i];
+        if (c >= 'A' && c <= 'F') c = (char)(c - 'A' + 'a');
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return 0;
+        out[i] = c;
+    }
+    out[length] = '\0';
+    return 1;
+}
+
+static int write_enabled_classes(FILE *file, uint32_t classes) {
+    int wrote = 0;
+    if (fputc('[', file) == EOF) return 0;
+    for (size_t i = 0u; i < sizeof(s_flight_class_names) / sizeof(s_flight_class_names[0]); ++i) {
+        if (!(classes & s_flight_class_names[i].mask)) continue;
+        if (wrote && fputc(',', file) == EOF) return 0;
+        if (fprintf(file, "\"%s\"", s_flight_class_names[i].name) < 0) return 0;
+        wrote = 1;
+    }
+    return fputc(']', file) != EOF;
+}
+
+static const char *trigger_mode_name(uint32_t mode) {
+    switch (mode) {
+    case SR_FLIGHT_TRIGGER_PC: return "pc";
+    case SR_FLIGHT_TRIGGER_GE_DRAW: return "ge-draw";
+    case SR_FLIGHT_TRIGGER_WATCH: return "watch";
+    case SR_FLIGHT_TRIGGER_CHECKPOINT: return "checkpoint";
+    default: return "none";
+    }
+}
+
+/* Schema 7 capture policy, the rest of the recorder block: the SR_WATCH range the watch class
+ * records (null without that class) and the armed triggers. Every field is configuration, so
+ * tools/flight_diff.py compares all of them except "fired" before it trusts a pair. */
+static int write_recorder_policy(FILE *file) {
+    char pc[16];
+    char ge_draw[16];
+    char checkpoint[96];
+    if (s_flight_classes & SR_FLIGHT_CLASS_WATCH) {
+        if (fprintf(file, "\"watch_range\": {\"address\": %" PRIu32 ", \"length\": %llu}, ",
+                    (uint32_t)s_watch_start,
+                    (unsigned long long)(s_watch_end - s_watch_start)) < 0) {
+            return 0;
+        }
+    } else if (fputs("\"watch_range\": null, ", file) == EOF) {
+        return 0;
+    }
+    if (s_trig_mode == SR_FLIGHT_TRIGGER_PC) snprintf(pc, sizeof(pc), "%" PRIu32, s_trig_pc);
+    else snprintf(pc, sizeof(pc), "null");
+    if (s_trig_mode == SR_FLIGHT_TRIGGER_GE_DRAW) snprintf(ge_draw, sizeof(ge_draw), "%" PRIu32, s_trig_ge_draw);
+    else snprintf(ge_draw, sizeof(ge_draw), "null");
+    if (s_trig_mode == SR_FLIGHT_TRIGGER_CHECKPOINT) {
+        snprintf(checkpoint, sizeof(checkpoint),
+                 "{\"kind\": %" PRIu32 ", \"occurrence\": %" PRIu32 ", \"after\": %" PRIu32 "}",
+                 s_trig_kind, s_trig_occurrence, s_trig_after);
+    } else {
+        snprintf(checkpoint, sizeof(checkpoint), "null");
+    }
+    return fprintf(file,
+                   "\"triggers\": {\"first_fatal\": true, \"first_unsupported_nid\": true, "
+                   "\"mode\": \"%s\", \"pc\": %s, \"ge_draw\": %s, \"checkpoint\": %s, "
+                   "\"fired\": %llu}},\n",
+                   trigger_mode_name(s_trig_mode), pc, ge_draw, checkpoint,
+                   (unsigned long long)s_flight_trigger_count) >= 0;
+}
+
+static int write_refusals(FILE *file) {
+    char first_nid[16];
+    char first_pc[16];
+    if (s_refusal_count != 0u) {
+        snprintf(first_nid, sizeof(first_nid), "%" PRIu32, s_refusal_first_nid);
+        snprintf(first_pc, sizeof(first_pc), "%" PRIu32, s_refusal_first_pc);
+    } else {
+        snprintf(first_nid, sizeof(first_nid), "null");
+        snprintf(first_pc, sizeof(first_pc), "null");
+    }
+    if (fprintf(file,
+                "  \"refusals\": {\"count\": %llu, \"first_nid\": %s, \"first_pc\": %s, "
+                "\"first_sequence\": %llu, \"nids\": [",
+                (unsigned long long)s_refusal_count, first_nid, first_pc,
+                (unsigned long long)s_refusal_first_sequence) < 0) {
+        return 0;
+    }
+    for (uint32_t i = 0u; i < s_refusal_distinct; ++i) {
+        if (fprintf(file, "%s{\"nid\": %" PRIu32 ", \"count\": %llu}", i ? ", " : "", s_refusal_nids[i],
+                    (unsigned long long)s_refusal_nid_counts[i]) < 0) {
+            return 0;
+        }
+    }
+    return fprintf(file, "], \"nids_unlisted\": %llu},\n",
+                   (unsigned long long)s_refusal_unlisted) >= 0;
+}
+
+static const char *thread_state_name(uint32_t state) {
+    switch (state) {
+    case SR_FLIGHT_THREAD_DORMANT: return "dormant";
+    case SR_FLIGHT_THREAD_READY: return "ready";
+    case SR_FLIGHT_THREAD_RUNNING: return "running";
+    case SR_FLIGHT_THREAD_WAIT_DELAY: return "wait-delay";
+    case SR_FLIGHT_THREAD_WAIT_OBJECT: return "wait-object";
+    default: return NULL;
+    }
+}
+
+static const char *thread_why_name(uint32_t why) {
+    switch (why) {
+    case SR_FLIGHT_WHY_NONE: return "none";
+    case SR_FLIGHT_WHY_SLEEP: return "sleep";
+    case SR_FLIGHT_WHY_DELAY: return "delay";
+    case SR_FLIGHT_WHY_VBLANK: return "vblank";
+    case SR_FLIGHT_WHY_CTRL: return "ctrl";
+    case SR_FLIGHT_WHY_THREAD_END: return "thread-end";
+    case SR_FLIGHT_WHY_OBJECT: return "object";
+    default: return NULL;
+    }
+}
+
+/* Schema 6 terminal thread snapshot: one line per existing guest thread, scalars only. An
+ * entry whose state or reason the recorder cannot name fails the bundle rather than writing
+ * a value the schema does not define. */
+static int write_threads(FILE *file) {
+    if (fputs("  \"threads\": [", file) == EOF) return 0;
+    uint32_t written = 0u;
+    for (uint32_t index = 0u; s_flight_thread_source && index < SR_FLIGHT_MAX_THREADS; ++index) {
+        SrFlightThread thread;
+        memset(&thread, 0, sizeof(thread));
+        if (!s_flight_thread_source(index, &thread)) break;
+        const char *state = thread_state_name(thread.state);
+        const char *why = thread_why_name(thread.why);
+        if (!state || !why) {
+            fprintf(stderr, "SR_FLIGHT: thread snapshot entry has an unknown state; bundle not written\n");
+            return 0;
+        }
+        char block_nid[16];
+        char waited[24];
+        char deadline[24];
+        if (thread.has_block_nid) snprintf(block_nid, sizeof(block_nid), "%" PRIu32, thread.block_nid);
+        else snprintf(block_nid, sizeof(block_nid), "null");
+        if (thread.has_waited) snprintf(waited, sizeof(waited), "%llu", (unsigned long long)thread.waited_us);
+        else snprintf(waited, sizeof(waited), "null");
+        if (thread.has_deadline) snprintf(deadline, sizeof(deadline), "%llu", (unsigned long long)thread.deadline_us);
+        else snprintf(deadline, sizeof(deadline), "null");
+        if (fprintf(file,
+                    "%s    {\"uid\": %" PRIu32 ", \"priority\": %" PRId32 ", \"state\": \"%s\", "
+                    "\"suspended\": %s, \"why\": \"%s\", \"wait_type\": %" PRIu32 ", "
+                    "\"wait_object\": %" PRIu32 ", \"block_nid\": %s, \"pc\": %" PRIu32 ", "
+                    "\"ra\": %" PRIu32 ", \"waited_us\": %s, \"deadline_us\": %s}",
+                    written ? ",\n" : "\n", thread.uid, thread.priority, state,
+                    thread.suspended ? "true" : "false", why, thread.wait_type,
+                    thread.wait_object, block_nid, thread.pc, thread.ra, waited, deadline) < 0) {
+            return 0;
+        }
+        written++;
+    }
+    return fputs(written ? "\n  ],\n" : "],\n", file) != EOF;
+}
+
+static int write_bundle(int reason) {
+    if (s_flight_dumped || s_flight_classes == 0u) return 0;
+    const char *output = getenv("SR_FLIGHT_OUTPUT");
+    if (!output || !*output) output = "flight-recorder.json";
+    char temporary[512];
+    int length = snprintf(temporary, sizeof(temporary), "%s.tmp", output);
+    if (length < 0 || (size_t)length >= sizeof(temporary)) {
+        fprintf(stderr, "SR_FLIGHT: output path is too long; bundle not written\n");
+        return 0;
+    }
+
+    FILE *file = fopen(temporary, "wb");
+    if (!file) {
+        fprintf(stderr, "SR_FLIGHT: could not open evidence output; bundle not written\n");
+        return 0;
+    }
+    int ok = 1;
+    const char *epoch_json = "null";
+    const char *build_id_json = "null";
+    char build_id_buffer[80];
+    char build_id_hex[65];
+    if (s_flight_source_date_epoch[0]) {
+        if (decimal_epoch_text(s_flight_source_date_epoch)) {
+            epoch_json = s_flight_source_date_epoch;
+        } else {
+            fprintf(stderr, "SR_FLIGHT: SR_SOURCE_DATE_EPOCH is not a decimal Unix timestamp; "
+                            "recording source_date_epoch null\n");
+        }
+    }
+    if (s_flight_build_id[0]) {
+        if (hex_identity_text(s_flight_build_id, build_id_hex)) {
+            int length = snprintf(build_id_buffer, sizeof(build_id_buffer), "\"%s\"",
+                                  build_id_hex);
+            if (length >= 0 && (size_t)length < sizeof(build_id_buffer)) {
+                build_id_json = build_id_buffer;
+            }
+        } else {
+            fprintf(stderr, "SR_FLIGHT: SR_BUILD_ID is not a hex build identity; "
+                            "recording build_id null\n");
+        }
+    }
+    ok = ok && fprintf(file, "{\n  \"schema_version\": %u,\n", SR_FLIGHT_SCHEMA_VERSION) >= 0;
+    /* An authentic run writes the same bytes as before; an Ace Mode run adds its line. */
+    ok = ok && fputs("  \"runtime\": {\"name\": \"nakagawa-recomp\", ", file) != EOF;
+    if (s_flight_ace[0])
+        ok = ok && fprintf(file, "\"enhancements\": {\"ace\": \"%s\"}, ", s_flight_ace) >= 0;
+    ok = ok && fprintf(file, "\"cpu_state_abi\": %u},\n",
+                       (unsigned)SR_CPUSTATE_ABI_VERSION) >= 0;
+    ok = ok && fprintf(file,
+                       "  \"build\": {\"compiler\": \"%s\", \"source_date_epoch\": %s, "
+                       "\"build_id\": %s, \"pointer_bits\": %u},\n",
+                       SR_FLIGHT_COMPILER, epoch_json, build_id_json,
+                       (unsigned)(sizeof(void *) * 8u)) >= 0;
+    ok = ok && fputs("  \"recorder\": {\"enabled_classes\": ", file) != EOF;
+    ok = ok && write_enabled_classes(file, s_flight_classes);
+    ok = ok && fprintf(file,
+                       ", \"limit\": %" PRIu32 ", \"recorded\": %llu, \"dropped\": %llu, ",
+                       s_flight_limit, (unsigned long long)s_flight_recorded,
+                       (unsigned long long)(s_flight_recorded - retained_count())) >= 0;
+    ok = ok && write_recorder_policy(file);
+    const char *terminal = reason == SR_FLIGHT_TERMINAL_FATAL ? "fatal" :
+                           reason == SR_FLIGHT_TERMINAL_UNSUPPORTED_NID ? "unsupported-nid" :
+                           reason == SR_FLIGHT_TERMINAL_EXIT ? "exit" :
+                           reason == SR_FLIGHT_TERMINAL_BUDGET ? "budget" :
+                           reason == SR_FLIGHT_TERMINAL_HANG ? "hang" :
+                           reason == SR_FLIGHT_TERMINAL_TRIGGER ? "trigger" : "running";
+    ok = ok && fprintf(file,
+                       "  \"terminal\": {\"reason\": \"%s\", \"sequence\": %llu, "
+                       "\"kind\": %" PRIu32 ", \"arg0\": %" PRIu32 "},\n",
+                       terminal, (unsigned long long)s_flight_terminal_sequence,
+                       s_flight_terminal_kind, s_flight_terminal_arg) >= 0;
+    ok = ok && write_refusals(file);
+    ok = ok && write_threads(file);
+    ok = ok && fputs("  \"events\": [", file) != EOF;
+    uint32_t count = retained_count();
+    uint64_t first = s_flight_recorded > s_flight_limit ? s_flight_recorded - s_flight_limit : 0u;
+    for (uint32_t i = 0u; ok && i < count; ++i) {
+        uint32_t slot = (uint32_t)((first + i) % s_flight_limit);
+        const SrFlightEvent *event = &s_flight_events[slot];
+        ok = fprintf(file,
+                     "%s    {\"schema_version\": %u, \"sequence\": %llu, \"class\": \"%s\", "
+                     "\"kind\": %" PRIu32 ", \"arg0\": %" PRIu32 ", \"arg1\": %" PRIu32 ", \"arg2\": %" PRIu32 ", \"arg3\": %" PRIu32,
+                     i ? ",\n" : "\n", (unsigned)event->schema_version, (unsigned long long)event->sequence,
+                     class_name(event->event_class), event->kind, event->arg0, event->arg1,
+                     event->arg2, event->arg3) >= 0;
+        if (ok && event->event_class == SR_FLIGHT_CLASS_HLE &&
+            event->kind == SR_FLIGHT_KIND_HLE_IMPORT) {
+            ok = fprintf(file, ", \"arguments\": [%" PRIu32 ", %" PRIu32 ", %" PRIu32 ", %" PRIu32 "], \"return_value\": ",
+                         event->arguments[0], event->arguments[1], event->arguments[2],
+                         event->arguments[3]) >= 0;
+            if (ok) {
+                if (event->has_return) {
+                    ok = fprintf(file, "%" PRIu32, event->return_value) >= 0;
+                } else {
+                    ok = fputs("null", file) != EOF;
+                }
+            }
+        }
+        ok = ok && fputc('}', file) != EOF;
+    }
+    ok = ok && fputs(count ? "\n  ]\n}\n" : "]\n}\n", file) != EOF;
+    int file_error = ferror(file);
+    int close_error = fclose(file);
+    if (file_error || close_error) ok = 0;
+    if (!ok) {
+        remove(temporary);
+        fprintf(stderr, "SR_FLIGHT: evidence output failed; bundle not written\n");
+        return 0;
+    }
+    if (remove(output) != 0 && errno != ENOENT) {
+        remove(temporary);
+        fprintf(stderr, "SR_FLIGHT: could not replace evidence output; bundle not written\n");
+        return 0;
+    }
+    if (rename(temporary, output) != 0) {
+        remove(temporary);
+        fprintf(stderr, "SR_FLIGHT: could not publish evidence output; bundle not written\n");
+        return 0;
+    }
+    s_flight_dump_count++;
+    return 1;
+}
+
+static void flight_exit(void) {
+    if (s_flight_classes == 0u || s_flight_dumped) return;
+    if (mode_end_of_run()) return;
+    if (s_flight_trigger_count == 0u) {
+        s_flight_terminal_reason = SR_FLIGHT_TERMINAL_EXIT;
+        s_flight_terminal_kind = 0u;
+        s_flight_terminal_arg = 0u;
+        s_flight_terminal_sequence = s_flight_last_sequence;
+    }
+    if (write_bundle((int)s_flight_terminal_reason)) s_flight_dumped = 1;
+}
+
+#if defined(SR_HLE_THREAD_SELFTEST) || defined(SR_SCHED_LIVENESS_TEST)
+void sr_flight_test_reset(uint32_t enabled_classes, uint32_t limit) {
+    s_flight_classes = enabled_classes & SR_FLIGHT_CLASS_ALL;
+    s_flight_limit = limit == 0u ? 1u : (limit > SR_FLIGHT_MAX_EVENTS ? SR_FLIGHT_MAX_EVENTS : limit);
+    memset(s_flight_events, 0, sizeof(s_flight_events));
+    s_flight_recorded = 0u;
+    s_flight_last_sequence = 0u;
+    s_flight_last_kind = 0u;
+    s_flight_init_state = 2;
+    s_flight_dumped = 0;
+    s_flight_dump_count = 0u;
+    s_flight_trigger_count = 0u;
+    s_flight_terminal_reason = SR_FLIGHT_TERMINAL_RUNNING;
+    s_flight_terminal_kind = 0u;
+    s_flight_terminal_arg = 0u;
+    s_flight_terminal_sequence = 0u;
+    s_refusal_count = 0u;
+    s_refusal_first_nid = 0u;
+    s_refusal_first_pc = 0u;
+    s_refusal_first_sequence = 0u;
+    s_refusal_distinct = 0u;
+    memset(s_refusal_nids, 0, sizeof(s_refusal_nids));
+    memset(s_refusal_nid_counts, 0, sizeof(s_refusal_nid_counts));
+    s_refusal_unlisted = 0u;
+    trigger_clear();
+    memset(s_watch_shadow, 0, sizeof(s_watch_shadow));
+    memset(s_watch_known, 0, sizeof(s_watch_known));
+    register_exit();
+}
+
+int sr_flight_test_trigger(const char *spec) {
+    if (trigger_configure(spec, s_flight_classes, s_flight_limit)) return 1;
+    trigger_clear();
+    s_flight_classes = 0u;
+    return 0;
+}
+
+void sr_flight_test_disable(void) {
+    s_flight_classes = 0u;
+    s_flight_init_state = 2;
+}
+#endif

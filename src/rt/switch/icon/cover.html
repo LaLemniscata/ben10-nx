@@ -1,0 +1,286 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>Capa</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 1024px; height: 1024px; overflow: hidden; background: #000; }
+  svg { display: block; position: absolute; left: 0; top: 0; }
+  .display { font-family: Impact, Haettenschweiler, sans-serif; }
+  .sub { font-family: Bahnschrift, 'Segoe UI', sans-serif; font-weight: 700; font-stretch: 75%; }
+</style>
+</head>
+<body>
+<svg id="art" xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="space" cx="0.6" cy="0.42" r="0.85">
+      <stop offset="0" stop-color="#114a3a"/>
+      <stop offset="0.32" stop-color="#07261f"/>
+      <stop offset="0.68" stop-color="#030d11"/>
+      <stop offset="1" stop-color="#010306"/>
+    </radialGradient>
+
+    <linearGradient id="earth" x1="0" y1="716" x2="0" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0c7d84"/>
+      <stop offset="0.14" stop-color="#0a5a78"/>
+      <stop offset="0.5" stop-color="#062f58"/>
+      <stop offset="1" stop-color="#020f24"/>
+    </linearGradient>
+    <radialGradient id="earthShade" cx="512" cy="760" r="620" gradientUnits="userSpaceOnUse">
+      <stop offset="0.3" stop-color="#000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#000" stop-opacity="0.82"/>
+    </radialGradient>
+    <clipPath id="earthClip"><circle cx="512" cy="1616" r="900"/></clipPath>
+
+    <filter id="land" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.0046 0.0175" numOctaves="6" seed="31" result="n"/>
+      <feColorMatrix in="n" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  14 14 0 0 -14.5" result="shape"/>
+      <feFlood flood-color="#17795a"/>
+      <feComposite in2="shape" operator="in"/>
+      <feGaussianBlur stdDeviation="0.7"/>
+    </filter>
+    <filter id="clouds" x="0" y="0" width="100%" height="100%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.008 0.04" numOctaves="5" seed="9" result="n"/>
+      <feColorMatrix in="n" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 16 16 0 -18.2" result="shape"/>
+      <feFlood flood-color="#dcfff2"/>
+      <feComposite in2="shape" operator="in"/>
+      <feGaussianBlur stdDeviation="1.3"/>
+    </filter>
+    <filter id="grain" x="0" y="0" width="100%" height="100%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" seed="3"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.09 0"/>
+    </filter>
+
+    <filter id="blur3" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="3"/></filter>
+    <filter id="blur7" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="7"/></filter>
+    <filter id="blur16" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="16"/></filter>
+    <filter id="blur34" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="34"/></filter>
+    <filter id="blur70" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="70"/></filter>
+    <filter id="streak" x="-60%" y="-1000%" width="220%" height="2100%"><feGaussianBlur stdDeviation="26 3"/></filter>
+
+    <pattern id="hex" width="52" height="90" patternUnits="userSpaceOnUse">
+      <path d="M26 0 L52 15 L52 45 L26 60 L0 45 L0 15 Z M26 60 L26 90 M0 45 L0 45 M52 45 L52 45" fill="none" stroke="#7dffc3" stroke-width="2.2"/>
+    </pattern>
+    <radialGradient id="domeFade" cx="512" cy="1616" r="1040" gradientUnits="userSpaceOnUse">
+      <stop offset="0.862" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="0.872" stop-color="#fff" stop-opacity="1"/>
+      <stop offset="0.93" stop-color="#fff" stop-opacity="0.62"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0.1"/>
+    </radialGradient>
+    <linearGradient id="domeSides" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#000"/>
+      <stop offset="0.2" stop-color="#999"/>
+      <stop offset="0.5" stop-color="#fff"/>
+      <stop offset="0.8" stop-color="#999"/>
+      <stop offset="1" stop-color="#000"/>
+    </linearGradient>
+    <mask id="domeMask">
+      <rect width="1024" height="1024" fill="url(#domeFade)"/>
+    </mask>
+    <mask id="domeSideMask"><rect width="1024" height="1024" fill="url(#domeSides)"/></mask>
+
+    <linearGradient id="chrome" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.38" stop-color="#dcfbe8"/>
+      <stop offset="0.495" stop-color="#8ff0b8"/>
+      <stop offset="0.515" stop-color="#0d5a3a"/>
+      <stop offset="0.66" stop-color="#1aa765"/>
+      <stop offset="0.86" stop-color="#6df5a8"/>
+      <stop offset="1" stop-color="#e6fff0"/>
+    </linearGradient>
+
+    <linearGradient id="bezel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6d8580"/>
+      <stop offset="0.28" stop-color="#232f30"/>
+      <stop offset="0.55" stop-color="#101819"/>
+      <stop offset="0.8" stop-color="#2b3a3a"/>
+      <stop offset="1" stop-color="#90a8a2"/>
+    </linearGradient>
+    <radialGradient id="dialFace" cx="0.5" cy="0.42" r="0.62">
+      <stop offset="0" stop-color="#14362b"/>
+      <stop offset="0.6" stop-color="#071611"/>
+      <stop offset="1" stop-color="#020806"/>
+    </radialGradient>
+    <linearGradient id="facetLight" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#eafff2"/>
+      <stop offset="0.35" stop-color="#8dffbd"/>
+      <stop offset="1" stop-color="#35f08a"/>
+    </linearGradient>
+    <linearGradient id="facetDark" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3fe58a"/>
+      <stop offset="1" stop-color="#0d9a55"/>
+    </linearGradient>
+    <linearGradient id="facetLowLight" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#b9ffd4"/>
+      <stop offset="0.4" stop-color="#5cf79f"/>
+      <stop offset="1" stop-color="#22dc7a"/>
+    </linearGradient>
+    <linearGradient id="facetLowDark" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#22c673"/>
+      <stop offset="1" stop-color="#087a42"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.26"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="vignette" cx="0.5" cy="0.46" r="0.76">
+      <stop offset="0.62" stop-color="#000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#000" stop-opacity="0.72"/>
+    </radialGradient>
+    <linearGradient id="rule" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#7dffbe" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#b6ffd9"/>
+      <stop offset="1" stop-color="#7dffbe" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- space -->
+  <rect width="1024" height="1024" fill="url(#space)"/>
+  <g id="stars"></g>
+  <g id="rays" style="mix-blend-mode:screen"></g>
+
+  <!-- Earth, under its shield -->
+  <g clip-path="url(#earthClip)">
+    <rect y="680" width="1024" height="344" fill="url(#earth)"/>
+    <rect y="680" width="1024" height="344" filter="url(#land)" opacity="0.92"/>
+    <rect y="680" width="1024" height="344" filter="url(#clouds)" opacity="0.32"/>
+    <rect y="680" width="1024" height="344" fill="url(#earthShade)"/>
+  </g>
+  <g style="mix-blend-mode:screen">
+    <circle cx="512" cy="1616" r="900" fill="none" stroke="#19d6a0" stroke-width="150" filter="url(#blur70)" opacity="0.5"/>
+    <circle cx="512" cy="1616" r="900" fill="none" stroke="#3dffa8" stroke-width="44" filter="url(#blur16)" opacity="0.9"/>
+    <circle cx="512" cy="1616" r="900" fill="none" stroke="#d8fff0" stroke-width="5" filter="url(#blur3)"/>
+    <ellipse cx="540" cy="718" rx="170" ry="10" fill="#eafff5" filter="url(#blur16)" opacity="0.75"/>
+  </g>
+  <g mask="url(#domeSideMask)"><g mask="url(#domeMask)" style="mix-blend-mode:screen">
+    <rect y="470" width="1024" height="554" fill="url(#hex)"/>
+  </g></g>
+
+  <!-- the lockup: BEN over a 10 whose zero is the dial -->
+  <g transform="translate(-36,-4)">
+    <g id="ben">
+      <g transform="translate(232,250) skewX(-8)">
+        <text class="display" x="9" y="11" font-size="262" textLength="598" lengthAdjust="spacingAndGlyphs" fill="#031c12" stroke="#031c12" stroke-width="10">BEN</text>
+        <text class="display" x="0" y="0" font-size="262" textLength="598" lengthAdjust="spacingAndGlyphs" fill="#28ff92" stroke="#28ff92" stroke-width="12" filter="url(#blur16)" opacity="0.55">BEN</text>
+        <text class="display" x="0" y="0" font-size="262" textLength="598" lengthAdjust="spacingAndGlyphs" fill="url(#chrome)" stroke="#04150e" stroke-width="5" paint-order="stroke">BEN</text>
+      </g>
+    </g>
+
+    <g id="one">
+      <g transform="translate(246,694) skewX(-8)">
+        <text class="display" x="10" y="12" font-size="540" fill="#031c12" stroke="#031c12" stroke-width="10">1</text>
+        <text class="display" x="0" y="0" font-size="540" fill="#28ff92" stroke="#28ff92" stroke-width="12" filter="url(#blur16)" opacity="0.55">1</text>
+        <text class="display" x="0" y="0" font-size="540" fill="url(#chrome)" stroke="#04150e" stroke-width="6" paint-order="stroke">1</text>
+      </g>
+    </g>
+
+    <g id="dial" transform="translate(632,478)">
+      <circle r="240" fill="#2bff93" filter="url(#blur34)" opacity="0.5"/>
+      <!-- bezel with four clamps -->
+      <circle r="222" fill="#04100c"/>
+      <circle r="216" fill="url(#bezel)" stroke="#a9c7bd" stroke-width="2.5"/>
+      <g id="clamps"></g>
+      <circle r="186" fill="#040c0a" stroke="#0a1f18" stroke-width="3"/>
+      <g id="ticks"></g>
+      <circle r="168" fill="none" stroke="#2dff94" stroke-width="16" filter="url(#blur7)" opacity="0.95"/>
+      <circle r="168" fill="none" stroke="#c9ffe2" stroke-width="5"/>
+      <circle r="158" fill="url(#dialFace)"/>
+
+      <!-- the core: two faceted wedges that meet at a point of light -->
+      <g id="core">
+        <path d="M-108,-126 L108,-126 L9,-10 L-9,-10 Z" fill="#2bff93" filter="url(#blur16)" opacity="0.75"/>
+        <path d="M-108,126 L108,126 L9,10 L-9,10 Z" fill="#2bff93" filter="url(#blur16)" opacity="0.75"/>
+        <path d="M-108,-126 L0,-126 L0,-10 L-9,-10 Z" fill="url(#facetLight)"/>
+        <path d="M108,-126 L0,-126 L0,-10 L9,-10 Z" fill="url(#facetDark)"/>
+        <path d="M-108,126 L0,126 L0,10 L-9,10 Z" fill="url(#facetLowDark)"/>
+        <path d="M108,126 L0,126 L0,10 L9,10 Z" fill="url(#facetLowLight)"/>
+        <path d="M-108,-126 L108,-126" stroke="#f4fff8" stroke-width="3.5"/>
+        <path d="M-108,126 L108,126" stroke="#b6ffd5" stroke-width="3"/>
+      </g>
+      <ellipse cx="0" cy="-74" rx="146" ry="82" fill="url(#glass)"/>
+
+      <g style="mix-blend-mode:screen">
+        <circle r="44" fill="#baffda" filter="url(#blur16)"/>
+        <circle r="13" fill="#ffffff" filter="url(#blur3)"/>
+        <ellipse rx="300" ry="4.5" fill="#d5ffe8" filter="url(#streak)"/>
+        <ellipse rx="118" ry="1.8" fill="#ffffff" filter="url(#blur3)" opacity="0.95"/>
+      </g>
+    </g>
+  </g>
+
+  <g id="sparks" style="mix-blend-mode:screen"></g>
+
+  <rect width="1024" height="1024" fill="url(#vignette)"/>
+  <rect width="1024" height="1024" filter="url(#grain)" opacity="0.55" style="mix-blend-mode:overlay"/>
+
+  <!-- subtitle -->
+  <g>
+    <text class="sub" x="512" y="908" font-size="72" text-anchor="middle" textLength="826" fill="#010b0a" stroke="#010b0a" stroke-width="18" stroke-linejoin="round" filter="url(#blur7)" opacity="0.95">PROTECTOR OF EARTH</text>
+    <text class="sub" x="512" y="908" font-size="72" text-anchor="middle" textLength="826" fill="#f6fffb" stroke="#03130e" stroke-width="3" paint-order="stroke">PROTECTOR OF EARTH</text>
+    <rect x="132" y="932" width="760" height="3" fill="url(#rule)"/>
+    <path d="M512,924 L522,933.5 L512,943 L502,933.5 Z" fill="#c9ffe2"/>
+  </g>
+</svg>
+
+<script>
+  /* Everything random comes from one seed, so each render is the same picture. */
+  let seed = 90210;
+  const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+  const NS = 'http://www.w3.org/2000/svg';
+  const add = (parent, tag, attrs) => {
+    const el = document.createElementNS(NS, tag);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    parent.appendChild(el);
+    return el;
+  };
+
+  const stars = document.getElementById('stars');
+  for (let i = 0; i < 300; i++) {
+    const x = rnd() * 1024, y = rnd() * 760, big = rnd();
+    const r = big > 0.985 ? 2.6 : big > 0.9 ? 1.6 : 0.5 + rnd() * 0.6;
+    add(stars, 'circle', { cx: x, cy: y, r, fill: rnd() > 0.72 ? '#9dffcf' : '#eafff6', opacity: 0.25 + rnd() * 0.65 });
+  }
+
+  /* Rays from the dial's core. */
+  const rays = document.getElementById('rays');
+  const cx = 596, cy = 474;
+  for (let i = 0; i < 40; i++) {
+    const a = rnd() * Math.PI * 2, spread = 0.004 + rnd() * rnd() * 0.05, len = 620 + rnd() * 620;
+    const p = (angle, d) => `${cx + Math.cos(angle) * d},${cy + Math.sin(angle) * d}`;
+    add(rays, 'polygon', {
+      points: `${cx},${cy} ${p(a - spread, len)} ${p(a + spread, len)}`,
+      fill: rnd() > 0.5 ? '#2bff93' : '#14c9a6', opacity: 0.05 + rnd() * 0.12, filter: 'url(#blur3)',
+    });
+  }
+
+  /* Bezel clamps at the diagonals. */
+  const clamps = document.getElementById('clamps');
+  for (const deg of [45, 135, 225, 315]) {
+    const g = add(clamps, 'g', { transform: `rotate(${deg})` });
+    add(g, 'path', { d: 'M-34,-226 L34,-226 L25,-194 L-25,-194 Z', fill: '#0b1414', stroke: '#b4d3c8', 'stroke-width': 2.5 });
+    add(g, 'rect', { x: -14, y: -219, width: 28, height: 6, rx: 3, fill: '#4dffa6' });
+  }
+
+  /* The dial's scale: long ticks on the quarters. */
+  const ticks = document.getElementById('ticks');
+  for (let i = 0; i < 60; i++) {
+    const major = i % 15 === 0, mid = i % 5 === 0;
+    add(ticks, 'rect', {
+      x: major ? -3.5 : -1.3, y: major ? -184 : -183, width: major ? 7 : 2.6, height: major ? 15 : mid ? 11 : 6,
+      fill: major ? '#d8ffe9' : '#46e893', opacity: major ? 1 : mid ? 0.9 : 0.55, transform: `rotate(${i * 6})`,
+    });
+  }
+
+  /* Embers thrown off the dial. */
+  const sparks = document.getElementById('sparks');
+  for (let i = 0; i < 46; i++) {
+    const a = rnd() * Math.PI * 2, d = 230 + rnd() * rnd() * 460;
+    const x = cx + Math.cos(a) * d, y = cy + Math.sin(a) * d * 0.9, r = 0.8 + rnd() * rnd() * 3.2;
+    if (y > 760) continue;
+    add(sparks, 'circle', { cx: x, cy: y, r: r * 3, fill: '#2bff93', opacity: 0.32, filter: 'url(#blur3)' });
+    add(sparks, 'circle', { cx: x, cy: y, r, fill: '#eafff4', opacity: 0.95 });
+  }
+</script>
+</body>
+</html>

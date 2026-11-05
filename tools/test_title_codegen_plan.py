@@ -1,0 +1,997 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+from __future__ import annotations
+
+import contextlib
+import copy
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tools"))
+
+import title_codegen_plan
+import title_manifest
+import test_public_title_isolation
+from test_import_name_safety import build_synthetic_import_prx
+from import_fixtures import build_module_elf
+import nk_cli
+from nk_core import package_cache
+
+
+class TitleCodegenPlanTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.hst_path = ROOT / "assets" / "titles" / "hst-ucus98701.json"
+        self.synthetic_path = ROOT / "assets" / "titles" / "synthetic.json"
+        self.synthetic = title_manifest.validate_manifest(
+            title_manifest.load_manifest(self.synthetic_path)
+        )
+        # Opt-in by *tracked bytes*, never by directory presence (#335): a
+        # developer's gitignored lookalike must not silently stand in for the
+        # private fixture, and validating an arbitrary private file in setUp
+        # must not error unrelated tests.
+        self.hst = (
+            title_manifest.validate_manifest(title_manifest.load_manifest(self.hst_path))
+            if test_public_title_isolation.is_tracked("assets/titles/hst-ucus98701.json")
+            else None
+        )
+
+    def plan(self, manifest=None, **overrides):
+        values = {
+            "game_name": "synthetic",
+            "game_elf": Path("fixtures/synthetic.elf"),
+            "build_dir": Path("build/synthetic"),
+            "module_dir": None,
+            "psp_header": None,
+            "codegen_profile": None,
+            "include_optional_modules": set(),
+            "funcs_per_chunk": 2000,
+        }
+        values.update(overrides)
+        selected = self.synthetic if manifest is None else manifest
+        return title_codegen_plan.build_plan(selected, **values)
+
+    def test_package_build_command_runs_the_chosen_job_count(self) -> None:
+        self.assertEqual(
+            title_codegen_plan._make_build_command("mingw32-make", "compile", jobs=6),
+            ["mingw32-make", "--no-print-directory", "-j6", "compile"],
+        )
+        self.assertEqual(
+            title_codegen_plan._make_build_command("make", "compile", jobs=3, dry_run=True),
+            ["make", "--no-print-directory", "-j3", "-n", "compile"],
+        )
+
+    def test_package_build_targets_split_generation_from_compilation(self) -> None:
+        targets = title_codegen_plan._make_build_targets
+        self.assertEqual(targets(native_only=False), ("pipeline", "compile"))
+        self.assertEqual(targets(native_only=True), ("compile",))
+        self.assertEqual(targets(native_only=False, aot_stage=True), ("pipeline",))
+        self.assertEqual(targets(native_only=True, aot_stage=True), ("pipeline",))
+
+    def test_package_build_jobs_follow_memory_and_cpus(self) -> None:
+        gib = 1024**3
+        jobs = title_codegen_plan.package_build_jobs
+        cases = (
+            # (logical CPUs, available bytes, expected jobs)
+            (24, 22 * gib, 6),          # the measured PC: memory bound
+            (24, 28 * gib, 8),          # never above eight jobs
+            (24, 64 * gib, 8),
+            (4, 64 * gib, 4),           # CPU bound
+            (24, 10 * gib, 2),
+            (24, 10 * gib - 1, 1),      # floor((10 GiB - 1 - 4 GiB) / 3 GiB) = 1
+            (24, 6 * gib, 1),           # never below one job
+            (24, 3 * gib, 1),           # less than the reserve
+            (1, 64 * gib, 1),
+            (0, 64 * gib, 1),           # an unknown CPU count is one CPU
+            (None, 64 * gib, 1),
+        )
+        for cpus, available, expected in cases:
+            with self.subTest(cpus=cpus, available=available):
+                chosen, reason = jobs(cpu_count=cpus, available_bytes=available)
+                self.assertEqual(chosen, expected)
+                self.assertIn("GB memory available", reason)
+
+    def test_package_build_jobs_without_a_memory_reading_keep_two(self) -> None:
+        jobs = title_codegen_plan.package_build_jobs
+        self.assertEqual(jobs(cpu_count=24, available_bytes=None)[0], 2)
+        self.assertEqual(jobs(cpu_count=1, available_bytes=None)[0], 1)
+        self.assertIn("unknown", jobs(cpu_count=24, available_bytes=None)[1])
+
+    def test_package_build_jobs_override_is_clamped(self) -> None:
+        jobs = title_codegen_plan.package_build_jobs
+        gib = 1024**3
+        for override, expected in (("3", 3), (" 5 ", 5), ("8", 8), ("32", 8), ("0", 1), ("-4", 1)):
+            with self.subTest(override=override):
+                chosen, reason = jobs(cpu_count=2, available_bytes=5 * gib, override=override)
+                self.assertEqual(chosen, expected)
+                self.assertIn("NK_PACKAGE_JOBS=", reason)
+        # An empty or unreadable override is ignored, and the log says so.
+        self.assertEqual(jobs(cpu_count=24, available_bytes=22 * gib, override="")[0], 6)
+        chosen, reason = jobs(cpu_count=24, available_bytes=22 * gib, override="many")
+        self.assertEqual(chosen, 6)
+        self.assertIn("ignored NK_PACKAGE_JOBS='many'", reason)
+
+    def test_object_key_workers_follow_cpus_not_memory(self) -> None:
+        workers = title_codegen_plan.object_key_workers
+        self.assertEqual(workers(24), title_codegen_plan.OBJECT_KEY_MAX_WORKERS)
+        self.assertEqual(workers(6), 6)
+        self.assertEqual(workers(1), 1)
+        self.assertEqual(workers(None), 1)
+        self.assertEqual(workers(0), 1)
+
+    def test_package_job_bytes_follow_the_chunk_target(self) -> None:
+        job_bytes = title_codegen_plan.package_job_bytes
+        gib = 1024**3
+        self.assertEqual(job_bytes("4000000"), gib)            # floor
+        self.assertEqual(job_bytes("8000000"), 8_000_000 * 256)
+        self.assertEqual(job_bytes("50000000"), 3 * gib)       # ceiling
+        for unbounded in (None, "", "0", "-1", "many"):
+            with self.subTest(target=unbounded):
+                self.assertEqual(job_bytes(unbounded), title_codegen_plan.PACKAGE_BUILD_JOB_BYTES)
+
+    def test_size_bounded_chunks_let_a_loaded_host_run_more_jobs(self) -> None:
+        # 7.6 GB free (measured on a busy host): one 3 GB job for count-based chunks, three
+        # 1 GB jobs for 4 MB chunks.
+        jobs = title_codegen_plan.package_build_jobs
+        free = int(7.6 * 1024**3)
+        self.assertEqual(jobs(cpu_count=24, available_bytes=free)[0], 1)
+        self.assertEqual(jobs(cpu_count=24, available_bytes=free,
+                              job_bytes=title_codegen_plan.package_job_bytes("4000000"))[0], 3)
+
+    def test_an_oversized_unit_raises_the_compile_job_budget(self) -> None:
+        # #1730: a body over the unit budget is a unit of its own; its job is budgeted from
+        # its own size, past the 3 GiB cap, so a host runs fewer such jobs at once.
+        job_bytes = title_codegen_plan.compile_job_bytes
+        per_byte = title_codegen_plan.PACKAGE_BUILD_JOB_BYTES_PER_CHUNK_BYTE
+        target = title_codegen_plan.package_job_bytes("4000000")
+        self.assertEqual(job_bytes("4000000", 0), target)
+        self.assertEqual(job_bytes("4000000", 3_900_000), target)
+        self.assertEqual(job_bytes("4000000", 20_000_000), 20_000_000 * per_byte)
+        self.assertGreater(job_bytes("4000000", 20_000_000), title_codegen_plan.PACKAGE_BUILD_JOB_BYTES)
+        jobs = title_codegen_plan.package_build_jobs
+        free = 16 * 1024**3
+        self.assertEqual(jobs(cpu_count=24, available_bytes=free,
+                              job_bytes=job_bytes("4000000", 0))[0], 8)
+        self.assertEqual(jobs(cpu_count=24, available_bytes=free,
+                              job_bytes=job_bytes("4000000", 20_000_000))[0], 2)
+        with tempfile.TemporaryDirectory() as temp:
+            build = Path(temp)
+            (build / "g_recomp_0.c").write_bytes(b"x" * 10)
+            (build / "g_recomp_1.c").write_bytes(b"x" * 30)
+            (build / "nk_lib_0123456789abcdef_2.c").write_bytes(b"x" * 50)
+            (build / "nk_lib_other.c").write_bytes(b"x" * 90)
+            (build / "h_recomp_0.c").write_bytes(b"x" * 70)
+            self.assertEqual(title_codegen_plan._largest_generated_unit(build, "g"), 50)
+            self.assertEqual(title_codegen_plan._largest_generated_unit(build / "none", "g"), 0)
+
+    def test_host_package_build_jobs_reads_the_environment(self) -> None:
+        with mock.patch.dict(os.environ, {"NK_PACKAGE_JOBS": "3"}):
+            self.assertEqual(title_codegen_plan._host_package_build_jobs()[0], 3)
+        available = title_codegen_plan.available_physical_memory()
+        if available is not None:
+            self.assertGreater(available, 0)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NK_PACKAGE_JOBS", None)
+            chosen, _reason = title_codegen_plan._host_package_build_jobs()
+        self.assertGreaterEqual(chosen, 1)
+        self.assertLessEqual(chosen, title_codegen_plan.PACKAGE_BUILD_MAX_JOBS)
+
+    def test_planned_compile_objects_reads_a_make_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cwd = Path(temp)
+            absolute = (cwd / "abs").as_posix()
+            listing = "\n".join((
+                '"python" tools/shader_embed.py verify',
+                "gcc -O2 -MMD -MP -c src/rt/hle.c -o build/x/hle.o",
+                f"gcc -O2 -I{absolute} -c {absolute}/game_recomp_0.c -o {absolute}/game_recomp_0.o",
+                "gcc -O2 -c src/rt/hle.c -o build/x/hle.o",  # repeated: counted once
+                "gcc -O2 -o build/x/game.exe @build/x/link-objects.rsp -lm",  # the link
+                "gcc -c src/rt/ge.c -o \"build/x/ge.o\"",
+            ))
+            objects = title_codegen_plan.planned_compile_objects(listing, cwd)
+        self.assertEqual(
+            objects,
+            [cwd / "build/x/hle.o", Path(absolute) / "game_recomp_0.o", cwd / "build/x/ge.o"],
+        )
+        self.assertEqual(title_codegen_plan.planned_compile_objects("make: Nothing to be done", cwd), [])
+
+    def test_compile_progress_counter_counts_written_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fresh = root / "fresh.o"
+            in_flight = root / "in_flight.o"
+            stale = root / "stale.o"
+            stale.write_bytes(b"old object")
+            os.utime(stale, ns=(1_000_000_000, 1_000_000_000))
+            counter = title_codegen_plan.CompileProgressCounter([fresh, in_flight, stale])
+            self.assertEqual(counter.total, 3)
+            self.assertEqual(counter.completed(), 0)
+            in_flight.write_bytes(b"")  # created by the assembler, not yet filled
+            self.assertEqual(counter.completed(), 0)
+            fresh.write_bytes(b"\x7fELF")
+            self.assertEqual(counter.completed(), 1)
+            stale.write_bytes(b"new object")
+            self.assertEqual(counter.completed(), 2)
+            in_flight.write_bytes(b"\x7fELF")
+            self.assertEqual(counter.completed(), 3)
+
+    def test_make_with_progress_appends_each_new_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            objects = [root / f"part{index}.o" for index in range(3)]
+            progress = root / "progress.jsonl"
+            # A stand-in for Make that writes the objects one at a time.
+            script = (
+                "import sys, time\n"
+                "for path in sys.argv[1:]:\n"
+                "    time.sleep(0.2)\n"
+                "    open(path, 'wb').write(b'obj')\n"
+                "time.sleep(0.2)\n"
+            )
+            returncode = title_codegen_plan._run_make_with_progress(
+                [sys.executable, "-c", script, *map(str, objects)],
+                cwd=root,
+                env=os.environ.copy(),
+                counter=title_codegen_plan.CompileProgressCounter(objects),
+                progress_file=progress,
+                jobs=4,
+                cpus=24,
+                poll_seconds=0.05,
+            )
+            rows = [json.loads(line) for line in progress.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(returncode, 0)
+        self.assertEqual(rows[0], {"completed": 0, "total": 3, "jobs": 4, "cpus": 24})
+        self.assertEqual(rows[-1], {"completed": 3, "total": 3, "jobs": 4, "cpus": 24})
+        completed = [row["completed"] for row in rows]
+        self.assertEqual(completed, sorted(set(completed)), "each count is written once, in order")
+        self.assertTrue(all(row["total"] == 3 for row in rows))
+
+    def test_unconfigured_data_root_has_no_invalid_local_asset_record(self) -> None:
+        manifest = copy.deepcopy(self.synthetic)
+        manifest["filesystem"]["data_root"] = ""
+        manifest["runtime_contract"]["resources"] = {
+            "mode": "none", "locators": [],
+        }
+
+        assets = title_codegen_plan._required_local_assets(
+            manifest, set(), {}, Path("build/synthetic"),
+        )
+        kinds = [asset["kind"] for asset in assets]
+        self.assertNotIn("title-data-root", kinds)
+        self.assertNotIn("runtime-resource-locator", kinds)
+
+    def test_hst_plan_matches_current_makefile_contract(self) -> None:
+        if self.hst is None:
+            self.skipTest("PRIVATE_INPUT: private HST title manifest is unavailable in the sanitized public tree")
+        plan = self.plan(
+            self.hst,
+            game_name="hst",
+            game_elf=Path("place_game_here/EBOOT.elf"),
+            build_dir=Path("build/hst"),
+            module_dir=Path("place_game_here/EXTRACTED/decrypted"),
+            psp_header=Path("place_game_here/EXTRACTED/PSP_GAME/SYSDIR/EBOOT.BIN"),
+            codegen_profile="hst",
+        )
+        self.assertEqual(plan["game_base"], 0)
+        self.assertEqual(plan["game_entry"], 0)
+        self.assertEqual(plan["codegen_profile"], "hst")
+        # TITLE_EXTRA_SPANS is the sole host-portable planner projection.
+        self.assertEqual(plan["environment"]["GAME_BASE"], "0x00000000")
+        self.assertEqual(plan["environment"]["GAME_ENTRY"], "0x00000000")
+        self.assertEqual(plan["environment"]["TITLE_EXTRA_SPANS"], "0x00303194,0x00306e24")
+        self.assertNotIn("HST_EXTRA_SPANS", plan["environment"])
+        self.assertEqual(plan["commands"]["prxload"], [
+            "python", "tools/prxload.py", "place_game_here/EBOOT.elf", "0x00000000",
+            "--psp-header=place_game_here/EXTRACTED/PSP_GAME/SYSDIR/EBOOT.BIN",
+            "--out=build/hst/hst_image.bin",
+        ])
+        self.assertEqual(plan["commands"]["codegen"], [
+            "python", "tools/codegen.py", "place_game_here/EBOOT.elf",
+            "build/hst/hst_recomp.c", "--base=0x00000000", "--profile=hst",
+            "--extra-elf=place_game_here/EXTRACTED/decrypted/libfont.prx@0x09ebfc00",
+            "--extra-elf=place_game_here/EXTRACTED/decrypted/scePsmf_library.prx@0x09ed6000",
+            "--extra-elf=place_game_here/EXTRACTED/decrypted/scePsmfP_library.prx@0x09ec7f00",
+            "--funcs-per-chunk=2000",
+        ])
+        self.assertEqual(plan["commands"]["imports"], [
+            "python", "tools/imports.py", "place_game_here/EBOOT.elf", "0x00000000",
+            "--toml=build/hst/hst_imports.toml",
+        ])
+
+    def test_generic_plan_explicitly_disables_hst_default_span(self) -> None:
+        manifest = copy.deepcopy(self.synthetic)
+        manifest["id"] = "synthetic-test-v1"
+        manifest["executable"] = {
+            "base": 0x08804000,
+            "entry": 0x08804128,
+            "bss_metadata_source": "elf",
+            "extra_executable_spans": [],
+        }
+        manifest["modules"] = []
+        manifest["codegen_profile"] = "none"
+        plan = self.plan(
+            manifest,
+            game_name="synthetic",
+            module_dir=None,
+            psp_header=None,
+            codegen_profile="none",
+        )
+        self.assertEqual(plan["environment"]["GAME_BASE"], "0x08804000")
+        self.assertEqual(plan["environment"]["GAME_ENTRY"], "0x08804128")
+        self.assertEqual(plan["environment"]["TITLE_EXTRA_SPANS"], "")
+        self.assertNotIn("HST_EXTRA_SPANS", plan["environment"])
+        self.assertEqual(plan["codegen_profile"], "none")
+        self.assertNotIn("--profile=hst", plan["commands"]["codegen"])
+
+    def test_psp_header_is_required_only_by_manifest_policy(self) -> None:
+        psp_manifest = copy.deepcopy(self.synthetic)
+        psp_manifest["executable"] = dict(psp_manifest["executable"])
+        psp_manifest["executable"]["bss_metadata_source"] = "psp-header"
+        with self.assertRaisesRegex(ValueError, "psp_header is required"):
+            self.plan(psp_manifest, psp_header=None)
+        generic = copy.deepcopy(self.synthetic)
+        generic["executable"] = dict(generic["executable"])
+        generic["executable"]["bss_metadata_source"] = "elf"
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            self.plan(generic, psp_header=Path("unexpected.bin"))
+
+    def test_module_directory_is_required_for_guest_modules(self) -> None:
+        manifest = copy.deepcopy(self.synthetic)
+        manifest["modules"] = [{
+            "name": "required.prx",
+            "load_address": 0x08C00000,
+            "required": True,
+            "role": "guest-prx",
+        }]
+        with self.assertRaisesRegex(ValueError, "module_dir is required"):
+            self.plan(manifest, module_dir=None)
+
+    def test_runtime_placed_modules_translate_position_independently(self) -> None:
+        manifest = copy.deepcopy(self.synthetic)
+        manifest["modules"] = [
+            {"name": "fixed.prx", "load_address": 0x08C00000, "required": True,
+             "role": "guest-prx"},
+            {"name": "level01.prx", "required": True, "role": "guest-prx",
+             "placement": "runtime", "guest_path": "disc0:/PSP_GAME/USRDIR/level01.prx"},
+        ]
+        plan = self.plan(manifest, module_dir=Path("modules"))
+        extra = [arg for arg in plan["commands"]["codegen"] if arg.startswith("--extra-elf=")]
+        self.assertEqual(extra, [
+            "--extra-elf=modules/fixed.prx@0x08c00000",
+            "--extra-elf=modules/level01.prx@runtime",
+        ])
+        manager = title_codegen_plan.build_manager_plan(
+            manifest, game_name="synthetic", game_elf=Path("fixtures/synthetic.elf"),
+            build_dir=Path("build/synthetic"), module_dir=Path("modules"))
+        self.assertEqual(manager["required_guest_modules"], [
+            {"name": "fixed.prx", "load_address": 0x08C00000},
+            {"name": "level01.prx", "placement": "runtime"},
+        ])
+
+    def test_runtime_placed_module_is_analyzed_in_its_link_space(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="title_codegen_link_space_") as temp_dir:
+            prx = Path(temp_dir) / "level01.prx"
+            prx.write_bytes(b"\x7fELF\x01\x01\x01" + b"\0" * 9 + (0xFFA0).to_bytes(2, "little"))
+            image = Path(temp_dir) / "fixed.elf"
+            image.write_bytes(b"\x7fELF\x01\x01\x01" + b"\0" * 9 + (2).to_bytes(2, "little"))
+            runtime = {"name": "level01.prx", "placement": "runtime"}
+            self.assertEqual(title_codegen_plan._analysis_base(runtime, prx), 0)
+            self.assertIsNone(title_codegen_plan._analysis_base(runtime, image))
+            self.assertEqual(title_codegen_plan._analysis_base(
+                {"name": "fixed.prx", "load_address": 0x08C00000}, prx), 0x08C00000)
+
+    def test_runtime_module_fallbacks_are_attributed_by_name(self) -> None:
+        class FakeElf:
+            def read_at_vaddr(self, address, size):
+                return (0x24020000 | address).to_bytes(4, "little")
+
+        sources = [
+            {"name": "executable", "ranges": [(0x0, 0x1000)], "elf": FakeElf()},
+            {"name": "level01.prx", "ranges": [(0x0, 0x800)], "elf": FakeElf()},
+        ]
+        with tempfile.TemporaryDirectory(prefix="title_codegen_fallbacks_") as temp_dir:
+            report = Path(temp_dir) / "g_recomp_stubs.txt"
+            report.write_text(
+                "0x00000100 opcode 0x13 at 0x00000104\n"
+                "level01.prx@0x00000100 opcode 0x13 at 0x00000108\n",
+                encoding="ascii")
+            regions, instructions = title_codegen_plan._read_codegen_fallbacks(report, sources)
+            self.assertEqual(sorted((row["module"], row["entry_address"]) for row in regions), [
+                ("executable", "0x00000100"), ("level01.prx", "0x00000100")])
+            self.assertEqual(sorted((row["module"], row["address"]) for row in instructions), [
+                ("executable", "0x00000104"), ("level01.prx", "0x00000108")])
+            report.write_text("absent.prx@0x00000100 opcode 0x13\n", encoding="ascii")
+            with self.assertRaises(title_codegen_plan.PackageRouteError):
+                title_codegen_plan._read_codegen_fallbacks(report, sources)
+
+    def test_hle_capabilities_are_not_passed_as_guest_elf_files(self) -> None:
+        manifest = copy.deepcopy(self.synthetic)
+        manifest["modules"] = [
+            {
+                "name": "kernel-capability",
+                "load_address": 0x08C00000,
+                "required": True,
+                "role": "hle-capability",
+            }
+        ]
+        plan = self.plan(manifest, module_dir=None)
+        self.assertFalse(any(arg.startswith("--extra-elf=") for arg in plan["commands"]["codegen"]))
+
+    def test_missing_import_boundary_points_to_open_product_issue(self) -> None:
+        base = self.synthetic["executable"]["base"]
+        elf_bytes, _stub = build_synthetic_import_prx(b"sceUntrackedSynthetic", base)
+        with tempfile.TemporaryDirectory(prefix="title_codegen_missing_import_") as temp_dir:
+            elf_path = Path(temp_dir) / "synthetic-prx.elf"
+            elf_path.write_bytes(elf_bytes)
+            _sources, _summary, unsupported_imports, _diagnostics = (
+                title_codegen_plan._make_input_images(
+                    self.synthetic, elf_path, None, None, set()
+                )
+            )
+        self.assertEqual(unsupported_imports, [{
+            "boundary": "PSP import sceUntrackedSynthetic:0x12345678",
+            "module": "executable",
+            "library": "sceUntrackedSynthetic",
+            "nid": "0x12345678",
+            "name": None,
+            "classification": "missing",
+            "status": "in the works",
+            "tracking_issue": 308,
+        }])
+
+    def test_player_and_planner_cache_keys_include_planner_source(self) -> None:
+        captured = []
+
+        def capture_cache_key(**kwargs):
+            captured.append(kwargs)
+            return {}
+
+        with mock.patch.object(
+            package_cache, "build_cache_key", side_effect=capture_cache_key
+        ), mock.patch.object(
+            package_cache, "compiler_identity", return_value="synthetic-compiler"
+        ), mock.patch.object(
+            package_cache, "compiler_target", return_value="synthetic-target"
+        ):
+            identity = package_cache.build_title_input_identity(
+                manifest={"id": "synthetic-cache-test", "schema_version": 1},
+                executable_name="EBOOT.BIN",
+                executable_sha256="2" * 64,
+                modules=[],
+            )
+            title_codegen_plan._cache_key_for_build(
+                input_hashes={}, title_input_identity=identity, plan=self.plan(),
+                selected_optional=set(), funcs_per_chunk=64, public_safe=True,
+                compiler_name="gcc",
+            )
+            nk_cli._current_package_cache_key(
+                self.synthetic,
+                self.synthetic_path,
+                "synthetic-executable-hash",
+                None,
+                None,
+                identity,
+                public_safe=True,
+            )
+
+        expected = package_cache.sha256_file(ROOT / "tools" / "title_codegen_plan.py")
+        self.assertEqual(len(captured), 2)
+        for call in captured:
+            self.assertEqual(call["codegen_options"].get("planner_sha256"), expected)
+
+    def test_player_and_planner_hash_a_runtime_placed_module_alike(self) -> None:
+        manifest = copy.deepcopy(self.synthetic)
+        module = {"name": "level01.prx", "required": True, "role": "guest-prx",
+                  "placement": "runtime", "guest_path": "disc0:/PSP_GAME/USRDIR/level01.prx"}
+        manifest["modules"] = [module]
+        captured = []
+
+        def capture_cache_key(**kwargs):
+            captured.append(kwargs)
+            return {}
+
+        with tempfile.TemporaryDirectory(prefix="title_codegen_runtime_hash_") as temp_dir:
+            module_dir = Path(temp_dir)
+            (module_dir / "level01.prx").write_bytes(b"synthetic runtime-placed module")
+            game_elf = module_dir / "game.elf"
+            game_elf.write_bytes(b"synthetic executable")
+            with mock.patch.object(
+                package_cache, "build_cache_key", side_effect=capture_cache_key
+            ), mock.patch.object(
+                package_cache, "compiler_identity", return_value="synthetic-compiler"
+            ), mock.patch.object(
+                package_cache, "compiler_target", return_value="synthetic-target"
+            ):
+                nk_cli._current_package_cache_key(
+                    manifest, self.synthetic_path, "synthetic-executable-hash",
+                    module_dir, None, {}, public_safe=True,
+                )
+            planned = title_codegen_plan._hash_package_inputs(
+                self.synthetic_path, game_elf, [module],
+                {"level01.prx": module_dir / "level01.prx"}, None,
+            )
+        self.assertEqual(len(captured), 1)
+        player_modules = captured[0]["input_hashes"]["modules"]
+        self.assertEqual(player_modules, planned["modules"])
+        self.assertEqual(player_modules[0]["load_address"], "runtime")
+
+    def test_optional_guest_modules_require_explicit_selection(self) -> None:
+        manifest = copy.deepcopy(self.synthetic)
+        manifest["modules"] = [
+            {
+                "name": "required.prx",
+                "load_address": 0x08C00000,
+                "required": True,
+                "role": "guest-prx",
+            },
+            {
+                "name": "optional.prx",
+                "load_address": 0x08C10000,
+                "required": False,
+                "role": "optional-guest-prx",
+            },
+        ]
+        default = self.plan(manifest, module_dir=Path("modules"))
+        self.assertTrue(any("required.prx@" in arg for arg in default["commands"]["codegen"]))
+        self.assertFalse(any("optional.prx@" in arg for arg in default["commands"]["codegen"]))
+        selected = self.plan(
+            manifest,
+            module_dir=Path("modules"),
+            include_optional_modules={"optional.prx"},
+        )
+        self.assertTrue(any("optional.prx@" in arg for arg in selected["commands"]["codegen"]))
+        with self.assertRaisesRegex(ValueError, "unknown optional"):
+            self.plan(
+                manifest,
+                module_dir=Path("modules"),
+                include_optional_modules={"missing.prx"},
+            )
+
+    def test_module_binding_rejects_ambiguous_separator(self) -> None:
+        manifest = copy.deepcopy(self.synthetic)
+        manifest["modules"] = [{
+            "name": "required.prx",
+            "load_address": 0x08C00000,
+            "required": True,
+            "role": "guest-prx",
+        }]
+        with self.assertRaisesRegex(ValueError, "must not contain '@'"):
+            self.plan(manifest, module_dir=Path("private@modules"))
+
+    def test_current_analyzer_limit_fails_closed(self) -> None:
+        manifest = copy.deepcopy(self.synthetic)
+        manifest["executable"] = dict(manifest["executable"])
+        manifest["executable"]["extra_executable_spans"] = [
+            {"start": 1, "end": 2}, {"start": 3, "end": 4}
+        ]
+        with self.assertRaisesRegex(ValueError, "at most one"):
+            self.plan(manifest)
+        manifest["executable"]["extra_executable_spans"] = [{"start": 1, "end": 2}]
+        manifest["executable"]["base"] = 0x08804000
+        manifest["codegen_profile"] = "none"
+        plan = self.plan(manifest, codegen_profile="none")
+        self.assertEqual(plan["environment"]["TITLE_EXTRA_SPANS"], "0x00000001,0x00000002")
+        manifest["executable"]["extra_executable_spans"] = []
+        manifest["codegen_profile"] = "hst"
+        with self.assertRaisesRegex(ValueError, "hst codegen profile requires"):
+            self.plan(manifest)
+
+    def test_profiles_and_chunk_bounds_fail_closed(self) -> None:
+        for profile in ("unknown", " HST", "hst/unsafe", ""):
+            with self.subTest(profile=profile):
+                with self.assertRaises(ValueError):
+                    self.plan(codegen_profile=profile)
+        for count in (0, -1, 100001, True):
+            with self.subTest(count=count):
+                with self.assertRaises(ValueError):
+                    self.plan(funcs_per_chunk=count)
+
+    def test_unused_module_binding_and_bad_paths_fail_closed(self) -> None:
+        manifest = copy.deepcopy(self.synthetic)
+        manifest["modules"] = []
+        with self.assertRaisesRegex(ValueError, "no guest modules"):
+            self.plan(manifest, module_dir=Path("unused"))
+        with self.assertRaisesRegex(ValueError, "control characters"):
+            self.plan(game_elf=Path("bad\nelf"))
+        with self.assertRaisesRegex(ValueError, "identify a file"):
+            self.plan(build_dir=Path("."))
+        with self.assertRaisesRegex(ValueError, "must be strings"):
+            self.plan(include_optional_modules={1})
+
+    def test_windows_style_bindings_are_rendered_with_forward_slashes(self) -> None:
+        manifest = copy.deepcopy(self.synthetic)
+        manifest["modules"] = [{
+            "name": "required.prx",
+            "load_address": 0x08C00000,
+            "required": True,
+            "role": "guest-prx",
+        }]
+        plan = self.plan(
+            manifest,
+            game_elf=Path(r"C:\private\EBOOT.elf"),
+            build_dir=Path(r"C:\repo\build\synthetic"),
+            module_dir=Path(r"C:\private\modules"),
+        )
+        rendered = json.dumps(plan)
+        self.assertNotIn("\\\\", rendered)
+        self.assertIn("C:/private/EBOOT.elf", rendered)
+        self.assertIn("C:/repo/build/synthetic/synthetic_recomp.c", rendered)
+
+    def test_plan_json_is_deterministic(self) -> None:
+        first = title_codegen_plan.canonical_json(self.plan())
+        second = title_codegen_plan.canonical_json(self.plan())
+        self.assertEqual(first, second)
+        self.assertEqual(json.loads(first)["title_manifest_id"], "synthetic-allegrex-v1")
+
+    def test_manifest_profile_is_authoritative_when_cli_profile_is_omitted(self) -> None:
+        plan = title_codegen_plan.build_plan(
+            self.synthetic,
+            game_name="synthetic",
+            game_elf=Path("fixtures/synthetic.elf"),
+            build_dir=Path("build/synthetic"),
+            module_dir=None,
+            psp_header=None,
+            codegen_profile=None,
+        )
+        self.assertEqual(plan["codegen_profile"], "none")
+        with self.assertRaisesRegex(ValueError, "conflicts with the manifest"):
+            self.plan(codegen_profile="hst")
+
+    def test_cli_emits_json_and_never_executes_codegen(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            out_c = Path(temp) / "build" / "synthetic" / "synthetic_recomp.c"
+            proc = subprocess.run([
+                sys.executable, str(ROOT / "tools" / "title_codegen_plan.py"),
+                str(self.synthetic_path), "--game-name=synthetic",
+                "--game-elf=fixtures/synthetic.elf", "--build-dir=build/synthetic",
+                "--profile=none",
+            ], cwd=ROOT, capture_output=True, text=True, check=False)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(proc.stdout)["game_name"], "synthetic")
+            self.assertFalse(out_c.exists())
+
+    def test_resolve_make_safe_build_root_priority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            spaced_dest = temp_path / "spaced folder" / "output_package"
+            spaced_dest.parent.mkdir(parents=True)
+            safe_env_root = temp_path / "safe_env_root"
+            safe_env_root.mkdir()
+            short_mock = temp_path / "SHORTP~1"
+            short_mock.mkdir()
+
+            # Priority 1: NK_BUILD_ROOT wins when set and safe
+            with mock.patch.dict(os.environ, {"NK_BUILD_ROOT": str(safe_env_root)}):
+                with mock.patch("title_codegen_plan._windows_short_path", return_value=short_mock):
+                    res = title_codegen_plan._resolve_make_safe_build_root(spaced_dest)
+                    self.assertEqual(res, safe_env_root.resolve())
+
+            # Priority 2: When NK_BUILD_ROOT contains spaces, it is skipped and short_path wins
+            unsafe_env_root = temp_path / "unsafe env root"
+            with mock.patch.dict(os.environ, {"NK_BUILD_ROOT": str(unsafe_env_root)}):
+                with mock.patch("title_codegen_plan._windows_short_path", return_value=short_mock):
+                    res = title_codegen_plan._resolve_make_safe_build_root(spaced_dest)
+                    self.assertEqual(res, short_mock.resolve())
+
+            # Priority 3: When NK_BUILD_ROOT is unset, short_path wins
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("NK_BUILD_ROOT", None)
+                with mock.patch("title_codegen_plan._windows_short_path", return_value=short_mock):
+                    res = title_codegen_plan._resolve_make_safe_build_root(spaced_dest)
+                    self.assertEqual(res, short_mock.resolve())
+
+            # Priority 4: When neither is available, fails with actionable PACKAGE_UNSUPPORTED_PATH
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("NK_BUILD_ROOT", None)
+                with mock.patch("title_codegen_plan._windows_short_path", return_value=None):
+                    with self.assertRaises(title_codegen_plan.PackageRouteError) as caught:
+                        title_codegen_plan._resolve_make_safe_build_root(spaced_dest)
+                    self.assertEqual(caught.exception.code, "PACKAGE_UNSUPPORTED_PATH")
+                    self.assertIn("contains spaces", str(caught.exception))
+                    self.assertIn("8.3 short names are unavailable on this volume", str(caught.exception))
+                    self.assertIn("set NK_BUILD_ROOT to a folder without spaces", str(caught.exception))
+
+
+class CompileObjectReuseTests(unittest.TestCase):
+    """#1306: the compile phase takes objects from the shared cache and stores new ones."""
+
+    MAKEFILE = (
+        "OBJS := $(BUILD_DIR)/a.o $(BUILD_DIR)/b.o $(EXTRA)\n"
+        "compile: $(BUILD_DIR)/out.txt\n"
+        "compile-inputs: $(BUILD_DIR)/gen.h\n"
+        "$(BUILD_DIR)/gen.h:\n"
+        "\t@mkdir -p $(BUILD_DIR)\n"
+        "\t@echo '#define GENERATED 2' > $@\n"
+        "$(BUILD_DIR)/out.txt: $(OBJS)\n"
+        "\t@echo linked > $@\n"
+        "$(BUILD_DIR)/b.o: $(BUILD_DIR)/gen.h\n"
+        "$(BUILD_DIR)/%.o: %.c\n"
+        "\t@mkdir -p $(BUILD_DIR)\n"
+        "\tgcc $(OPT) -I$(BUILD_DIR) -MMD -MP -MF $(@:.o=.d) -MT $@ -c $< -o $@\n"
+        "-include $(OBJS:.o=.d)\n"
+    )
+
+    def setUp(self) -> None:
+        self.make = shutil.which("mingw32-make") or shutil.which("make")
+        if self.make is None or shutil.which("gcc") is None:
+            self.skipTest("the compile-phase reuse test needs make and gcc")
+        scratch = tempfile.TemporaryDirectory(prefix="nk-object-reuse-")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        (self.root / "Makefile").write_text(self.MAKEFILE, encoding="utf-8", newline="\n")
+        (self.root / "shared.h").write_text("#define VALUE 1\n", encoding="utf-8")
+        (self.root / "a.c").write_text('#include "shared.h"\nint a(void) { return VALUE; }\n',
+                                       encoding="utf-8")
+        # b.c reads a header the build generates, which compile-inputs writes first.
+        (self.root / "b.c").write_text('#include "gen.h"\nint b(void) { return GENERATED; }\n',
+                                       encoding="utf-8")
+        self.cache = package_cache.ObjectCache(self.root / "cache")
+
+    def compile(self, build: str, opt: str = "-O0", *, extra: str = "",
+                library_cache=None, jobs: int = 2) -> tuple[int, str]:
+        build_dir = (self.root / build).as_posix()
+        env = dict(os.environ, BUILD_DIR=build_dir, OPT=opt,
+                   EXTRA=f"{build_dir}/{extra}" if extra else "")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            returncode = title_codegen_plan._run_compile_phase(
+                self.make,
+                env=env,
+                jobs=jobs,
+                progress_file=None,
+                object_cache=self.cache,
+                library_cache=library_cache,
+                build_dir=env["BUILD_DIR"],
+                cwd=self.root,
+            )
+        return returncode, output.getvalue()
+
+    def test_a_fresh_build_folder_reuses_every_unchanged_object(self) -> None:
+        returncode, log = self.compile("one")
+        self.assertEqual(returncode, 0, log)
+        self.assertIn("OBJECT_CACHE: reused 0 of 2 objects", log)
+        self.assertIn("OBJECT_CACHE: stored 2 objects", log)
+
+        returncode, log = self.compile("two")
+        self.assertEqual(returncode, 0, log)
+        self.assertIn("OBJECT_CACHE: reused 2 of 2 objects", log)
+        self.assertNotIn("OBJECT_CACHE: compiling", log)
+        self.assertEqual((self.root / "two" / "a.o").read_bytes(), (self.root / "one" / "a.o").read_bytes())
+        # The reused object keeps its dependency record, so Make still follows its header.
+        self.assertIn("shared.h", (self.root / "two" / "a.d").read_text(encoding="utf-8"))
+
+        # A changed header recompiles only the object that includes it.
+        (self.root / "shared.h").write_text("#define VALUE 3\n", encoding="utf-8")
+        returncode, log = self.compile("three")
+        self.assertEqual(returncode, 0, log)
+        self.assertIn("OBJECT_CACHE: reused 1 of 2 objects", log)
+        self.assertIn("OBJECT_CACHE: compiling a.o", log)
+
+        # Another optimization level is another object.
+        returncode, log = self.compile("four", opt="-O2")
+        self.assertEqual(returncode, 0, log)
+        self.assertIn("OBJECT_CACHE: reused 0 of 2 objects", log)
+
+    def test_keys_are_taken_concurrently_when_make_runs_one_job(self) -> None:
+        # A key only preprocesses, so a build that memory limits to one Make job still
+        # keys its objects on several CPUs: each key here waits for the other one.
+        together = threading.Barrier(2, timeout=20)
+        take_key = title_codegen_plan.CompiledObjectReuse._key
+
+        def key_together(reuse, command):
+            together.wait()
+            return take_key(reuse, command)
+
+        with mock.patch.object(title_codegen_plan.CompiledObjectReuse, "_key", key_together),                 mock.patch("title_codegen_plan.os.process_cpu_count", return_value=4):
+            returncode, log = self.compile("one", jobs=1)
+        self.assertEqual(returncode, 0, log)
+        self.assertIn("OBJECT_CACHE: reused 0 of 2 objects", log)
+        self.assertIn("OBJECT_CACHE: stored 2 objects", log)
+        returncode, log = self.compile("two", jobs=1)
+        self.assertEqual(returncode, 0, log)
+        self.assertIn("OBJECT_CACHE: reused 2 of 2 objects", log)
+
+    def test_system_libraries_use_their_own_cache_and_are_named(self) -> None:
+        library = "nk_lib_0123456789abcdef"
+        (self.root / f"{library}.c").write_text(
+            "/* Generated by tools/codegen.py. Do not edit by hand. */\n"
+            "/* system library libfont.prx */\nint l(void) { return 7; }\n",
+            encoding="utf-8",
+        )
+        libraries = package_cache.ObjectCache(self.root / "libraries")
+
+        # Sharing off: the library compiles for this game and no cache keeps it.
+        returncode, log = self.compile("off", extra=f"{library}.o")
+        self.assertEqual(returncode, 0, log)
+        self.assertIn("SHARED_LIBRARY: libfont.prx compiled for this game only (sharing is off)", log)
+        self.assertEqual(len(self.cache.entries()), 2)
+        self.assertEqual(libraries.entries(), [])
+
+        returncode, log = self.compile("one", extra=f"{library}.o", library_cache=libraries)
+        self.assertEqual(returncode, 0, log)
+        self.assertIn("SHARED_LIBRARY: compiling libfont.prx", log)
+        self.assertEqual(len(libraries.entries()), 1)
+        self.assertEqual(len(self.cache.entries()), 2, "the library object stays out of the object cache")
+
+        returncode, log = self.compile("two", extra=f"{library}.o", library_cache=libraries)
+        self.assertEqual(returncode, 0, log)
+        self.assertIn("OBJECT_CACHE: reused 3 of 3 objects", log)
+        self.assertIn("SHARED_LIBRARY: reused libfont.prx", log)
+
+        # Clearing the shared library cache leaves the other objects reusable.
+        self.assertEqual(libraries.clear(), 1)
+        returncode, log = self.compile("three", extra=f"{library}.o", library_cache=libraries)
+        self.assertEqual(returncode, 0, log)
+        self.assertIn("OBJECT_CACHE: reused 2 of 3 objects", log)
+        self.assertIn(f"OBJECT_CACHE: compiling {library}.o", log)
+
+    def test_a_system_library_in_several_units_is_one_library(self) -> None:
+        # #1730: codegen cuts a library over its budget into nk_lib_<fnv>_<n>.c units. Each
+        # unit is a library object in the library cache, and the log names the library once.
+        library = "nk_lib_0123456789abcdef"
+        for n in range(2):
+            (self.root / f"{library}_{n}.c").write_text(
+                "/* Generated by tools/codegen.py. Do not edit by hand. */\n"
+                f"/* system library libfont.prx */\nint l{n}(void) {{ return {n}; }}\n",
+                encoding="utf-8",
+            )
+        libraries = package_cache.ObjectCache(self.root / "libraries")
+
+        def units(build: str) -> str:
+            return f"{library}_0.o {(self.root / build).as_posix()}/{library}_1.o"
+
+        returncode, log = self.compile("one", extra=units("one"), library_cache=libraries)
+        self.assertEqual(returncode, 0, log)
+        self.assertEqual(log.count("SHARED_LIBRARY:"), 1, log)
+        self.assertIn("SHARED_LIBRARY: compiling libfont.prx", log)
+        self.assertEqual(len(libraries.entries()), 2)
+        self.assertEqual(len(self.cache.entries()), 2, "the units stay out of the object cache")
+
+        returncode, log = self.compile("two", extra=units("two"), library_cache=libraries)
+        self.assertEqual(returncode, 0, log)
+        self.assertEqual(log.count("SHARED_LIBRARY:"), 1, log)
+        self.assertIn("SHARED_LIBRARY: reused libfont.prx", log)
+
+        libraries.entries()[0].unlink()
+        returncode, log = self.compile("three", extra=units("three"), library_cache=libraries)
+        self.assertEqual(returncode, 0, log)
+        self.assertIn("SHARED_LIBRARY: compiling libfont.prx (1 of 2 units; the rest reused)", log)
+
+    def test_a_fallback_unit_compiles_at_its_own_level(self) -> None:
+        # #1730: <game>_recomp_opt.mk gives a unit holding one oversized body codegen's
+        # fallback level, after RECOMP_FLAGS, in the real Makefile's command for that object
+        # only; the build report gets one row per unit.
+        stem = "nk_lib_0123456789abcdef_0"
+        build = self.root / "levels"
+        build.mkdir()
+
+        def write(text: str) -> Path:
+            path = build / "probe_opt.mk"
+            path.write_text(text, encoding="ascii")
+            return path
+        for name in ("g_recomp_0.c", "g_recomp_1.c", f"{stem}.c", "g_recomp_funcs.h"):
+            (build / name).write_text("/* generated */\n", encoding="ascii")
+        (build / "g_recomp_opt.mk").write_text(
+            "# Generated by tools/codegen.py. Do not edit by hand.\n"
+            "# unit g_recomp_1 body f_00001000 bytes 5000000\n"
+            "RECOMP_UNIT_OPT_g_recomp_1 := -O0\n"
+            f"# unit {stem} body l0123456789abcdef_00000000 bytes 4500000\n"
+            f"RECOMP_UNIT_OPT_{stem} := -O0\n",
+            encoding="ascii",
+        )
+        objects = [f"{build.as_posix()}/{name}.o" for name in ("g_recomp_0", "g_recomp_1", stem)]
+        # Parsing the Makefile writes beneath BUILD_ROOT and LOG_DIR: keep both in scratch.
+        proc = subprocess.run(
+            [self.make, "-n", "--no-print-directory", f"BUILD_ROOT={self.root.as_posix()}",
+             f"LOG_DIR={(self.root / 'logs').as_posix()}", f"BUILD_DIR={build.as_posix()}",
+             "GAME_NAME=g", "RECOMP_OPT=-O2", *objects],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        commands = {name: next(line for line in proc.stdout.splitlines()
+                               if f"{name}.c -o" in line)
+                    for name in ("g_recomp_0", "g_recomp_1", stem)}
+        self.assertNotIn(" -O0 ", commands["g_recomp_0"])
+        for name in ("g_recomp_1", stem):
+            command = commands[name]
+            self.assertLess(command.index("-O2"), command.index(" -O0 "), command)
+        self.assertEqual(
+            title_codegen_plan._read_unit_fallbacks(build / "g_recomp_opt.mk"),
+            [{"unit": "g_recomp_1", "body": "f_00001000", "bytes": 5000000, "level": "-O0"},
+             {"unit": stem, "body": "l0123456789abcdef_00000000", "bytes": 4500000, "level": "-O0"}],
+        )
+        self.assertEqual(title_codegen_plan._read_unit_fallbacks(write("# Generated.\n")), [])
+        self.assertTrue(title_codegen_plan._is_aot_output("g_recomp_opt.mk", "g"))
+        self.assertIn("g_recomp_opt.mk", title_codegen_plan._aot_required_outputs("g"))
+        self.assertFalse(title_codegen_plan._is_aot_output("g_recomp_extra.mk", "g"))
+        # Make executes the file: anything codegen does not write is refused before it runs.
+        for text in (
+            None,                                                     # missing
+            "# unit g_recomp_1 body f bytes 1\n",                     # a row with no level
+            "RECOMP_UNIT_OPT_g_recomp_1 := -O0\n",                    # a level with no row
+            "# unit g_recomp_1 body f bytes 1\nRECOMP_UNIT_OPT_g_recomp_1 := -O0\n"
+            "RECOMP_UNIT_OPT_g_recomp_1 := -O1\n",                    # two levels
+            "# unit g_recomp_1 body f bytes 1\nRECOMP_UNIT_OPT_g_recomp_1 := -O0 $(shell x)\n",
+            "# unit g_recomp_1 body f bytes 1\nRECOMP_UNIT_OPT_g_recomp_1 := -O0\nall: ; x\n",
+            "#unit g_recomp_1 body f bytes 1\n",
+        ):
+            with self.subTest(text=text):
+                path = build / "missing.mk" if text is None else write(text)
+                with self.assertRaises(title_codegen_plan.PackageRouteError):
+                    title_codegen_plan._read_unit_fallbacks(path)
+        # Codegen writes ASCII; bytes it never writes are refused by name, not decoded.
+        path = build / "probe_opt.mk"
+        path.write_bytes(b"# unit g_recomp_1 body f bytes 1\xff\n")
+        with self.assertRaises(title_codegen_plan.PackageRouteError) as raised:
+            title_codegen_plan._read_unit_fallbacks(path)
+        self.assertEqual(raised.exception.code, "PACKAGE_INVALID_CODEGEN_REPORT")
+        self.assertIn("unreadable", str(raised.exception))
+
+    def test_a_reused_copy_leaves_no_earlier_generated_unit_behind(self) -> None:
+        # #1730: a package can build in its output folder; an earlier build's single library
+        # unit beside the copy's cut units would define the module's bodies twice.
+        source, destination = self.root / "source", self.root / "destination"
+        source.mkdir()
+        destination.mkdir()
+        for name in title_codegen_plan._aot_required_outputs("g") | {
+                "g_recomp_0.c", "nk_lib_0123456789abcdef_0.c", "nk_lib_0123456789abcdef_1.c"}:
+            (source / name).write_text("new\n", encoding="ascii")
+        for name in ("nk_lib_0123456789abcdef.c", "g_recomp_7.c", "g_recomp_0.c",
+                     "build-report.json", "notes.txt"):
+            (destination / name).write_text("old\n", encoding="ascii")
+        title_codegen_plan._copy_reusable_aot(source, destination, "g")
+        names = {path.name for path in destination.iterdir()}
+        self.assertEqual(names, {path.name for path in source.iterdir()} |
+                         {"build-report.json", "notes.txt"})
+        self.assertEqual((destination / "g_recomp_0.c").read_text(encoding="ascii"), "new\n")
+
+    def test_library_unit_names_are_generated_code_and_one_pattern(self) -> None:
+        import codegen
+
+        self.assertEqual(title_codegen_plan.SHARED_LIBRARY_SOURCE_RE.pattern,
+                         codegen.SHARED_LIBRARY_SOURCE_RE.pattern)
+        for name in ("nk_lib_0123456789abcdef.c", "nk_lib_0123456789abcdef_0.c",
+                     "nk_lib_0123456789abcdef_12.c"):
+            self.assertTrue(title_codegen_plan._is_aot_output(name, "game"), name)
+        for name in ("nk_lib_0123456789abcde.c", "nk_lib_0123456789abcdef_.c",
+                     "nk_lib_0123456789abcdef_x.c", "nk_lib_0123456789abcdef_1.o"):
+            self.assertFalse(title_codegen_plan._is_aot_output(name, "game"), name)
+
+
+class ImportsNoSourceExportsTests(unittest.TestCase):
+    def test_a_library_the_game_exports_is_not_an_unsupported_import(self) -> None:
+        # A game's modules import its executable's library: thousands of rows across many
+        # modules, none a function the runtime serves. A NID nothing exports stays reported,
+        # even in a library that exports others, and so does an exported NID imported from
+        # another library.
+        def row(library: str, nid: int) -> dict:
+            return {"module": "menu.bin", "library": library, "nid": f"0x{nid:08x}"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "selected.elf"
+            executable.write_bytes(build_module_elf([("main", 0x4001, [0x51000001], [])]))
+            module = Path(directory) / "menu.bin"
+            module.write_bytes(build_module_elf(
+                [("menu", 0x4001, [0x52000001], [])],
+                imports=[("main", [0x51000001, 0x51000002])],
+            ))
+            rows = [row("main", 0x51000001), row("main", 0x51000002), row("sceAudio", 0x51000001)]
+            self.assertEqual(
+                title_codegen_plan._imports_no_source_exports(
+                    rows, [{"path": executable}, {"path": module}]),
+                rows[1:],
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

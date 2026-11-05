@@ -1,0 +1,2225 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2025-2026 the psp-recomp authors
+// Copyright (C) 2026 the Nakagawa Recomp authors
+
+/* clock_gettime(CLOCK_MONOTONIC) is POSIX: strict -std=c99/c11 builds hide it unless
+ * the feature macro is set, and the timer would silently fall back to clock(). */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+#include "perf.h"
+
+#include <inttypes.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#endif
+
+/* The scheduler thread's CPU clock (thread_cpu_now). Windows counts a thread's run time in TSC
+ * cycles (QueryThreadCycleTime), converted with the TSC rate measured against the performance
+ * counter; only an invariant TSC ticks at that one rate. POSIX has a thread CPU clock. */
+#if (defined(_WIN32) || defined(_WIN64)) && (defined(__x86_64__) || defined(__i386__)) && \
+    defined(__GNUC__)
+#include <cpuid.h>
+#include <x86intrin.h>
+#define SR_PERF_TSC_THREAD_CLOCK 1
+#endif
+
+#ifndef PERF_AOT_INSTRUCTIONS
+#define PERF_AOT_INSTRUCTIONS 0
+#endif
+
+#define SR_PERF_TOP_N 16u
+#define SR_PERF_PATH_MAX 4096u
+#define SR_PERF_TIER_NONE 0u
+#define SR_PERF_TIER_AOT 1u
+#define SR_PERF_TIER_INTERP 2u
+#define SR_PERF_RESULT_AOT_HANDOFF 1
+#define SR_PERF_RESULT_CALL_RETURN 2
+
+#define ADD(field, value) do { \
+    s_perf.interval.field += (value); \
+    s_perf.total.field += (value); \
+} while (0)
+
+#define ADD_ARRAY(field, index, value) do { \
+    s_perf.interval.field[(index)] += (value); \
+    s_perf.total.field[(index)] += (value); \
+} while (0)
+
+#define KEEP_MAX(field, value) do { \
+    if ((value) > s_perf.interval.field) s_perf.interval.field = (value); \
+    if ((value) > s_perf.total.field) s_perf.total.field = (value); \
+} while (0)
+
+/* New-frame intervals by VBLANK count: 0 (two flips in one period, which a catch-up latch can
+ * produce), 1, 2, 3, and 4 or more. */
+#define SR_PERF_FRAME_IV_COUNT 5u
+/* Frame-work buckets, by upper bound: one display period (1001/60 ms), 22 ms (the #1296 margin
+ * target: two-thirds of a 30 fps frame), two periods, three periods, and over three. */
+#define SR_PERF_FRAME_WORK_BUCKETS 5u
+static const uint64_t s_frame_work_bound_ns[SR_PERF_FRAME_WORK_BUCKETS - 1u] = {
+    16683333u, 22000000u, 33366667u, 50050000u,
+};
+/* How far one frame's thread CPU time may exceed its wall time before the thread clock is
+ * rejected: the two clocks are read a few instructions apart. */
+#define SR_PERF_THREAD_CLOCK_SLACK_NS 1000000u
+static const char *const s_frame_work_names[SR_PERF_FRAME_WORK_BUCKETS] = {
+    "le16_7", "le22", "le33_4", "le50_1", "gt50_1",
+};
+
+/* SR_PERF_FRAMES columns (frames_row()). */
+static const char s_frames_header[] =
+    "vcount,vblanks,work_ms,wall_ms,guest_ms,aot_ms,interp_ms,ge_cpu_ms,ge_cpu_calls,ge_wait_ms,ge_waits,"
+    "readback_waits,vk_submit_ms,vk_wait_ms,vk_readback_ms,vk_pipeline_ms,vk_pipeline_creations,"
+    "texture_decode_ms,texture_decodes,storage_ms,atrac_ms,h264_ms,audio_mix_ms,present_ms,"
+    "sched_switches\n";
+
+
+typedef struct SrPerfMetrics {
+    uint64_t guest_ns;
+    uint64_t guest_idle_ns;
+    uint64_t ge_wait_ns;
+    uint64_t present_ns;
+    uint64_t present_wait_ns;
+    uint64_t vblanks;
+    uint64_t presents;
+    uint64_t new_frames;            /* presents of a buffer other than the previous present's */
+    uint64_t new_frame_intervals;   /* new frames with a previous new frame to measure from */
+    uint64_t new_frame_vblanks;     /* VBLANKs summed over those intervals */
+    uint64_t new_frame_iv[SR_PERF_FRAME_IV_COUNT];   /* those intervals by VBLANK count */
+    uint64_t new_frame_iv1_late;    /* one-VBLANK intervals holding a late VBLANK latch */
+    uint64_t frame_work_frames;     /* intervals whose scheduler-thread CPU time was read */
+    uint64_t frame_work_ns;         /* that CPU time, summed */
+    uint64_t frame_work_max_ns;     /* the longest single interval's */
+    uint64_t frame_work_bucket[SR_PERF_FRAME_WORK_BUCKETS];
+    uint64_t ge_submits;
+    uint64_t present_submits;
+    uint64_t ge_waits;
+    uint64_t present_waits;
+    uint64_t present_skips;
+    uint64_t readback_waits;
+    uint64_t ge_reason_submits[SR_PERF_GE_REASON_COUNT];
+    uint64_t ge_reason_waits[SR_PERF_GE_REASON_COUNT];
+    uint64_t ge_reason_wait_ns[SR_PERF_GE_REASON_COUNT];
+    uint64_t ge_events[SR_PERF_GE_EVENT_COUNT];
+    uint64_t aot_ns;
+    uint64_t aot_calls;
+    uint64_t aot_instructions;
+    uint64_t interp_ns;
+    uint64_t interp_calls;
+    uint64_t interp_instructions;
+    uint64_t aot_to_interp;
+    uint64_t interp_to_aot;
+    uint64_t vfpu_ns;
+    uint64_t vfpu_count;
+    uint64_t vfpu_interp_count;
+    uint64_t vfpu_aot_count;
+    uint64_t vfpu_interp_ns;
+    uint64_t vfpu_aot_ns;
+    uint64_t vfpu_errors;
+    uint64_t vfpu_family[SR_PERF_VFPU_FAMILY_COUNT];
+    uint64_t sched_ns[SR_PERF_SCHED_STATE_COUNT];
+    uint64_t sched_switches;
+    uint64_t sched_blocked;
+    uint64_t sched_wakes;
+    uint64_t ge_cpu_ns;
+    uint64_t ge_cpu_calls;
+    uint64_t ge_transform_sample_ns;
+    uint64_t ge_primitive_ns;
+    uint64_t ge_frontend_profile_enabled;
+    uint64_t ge_frontend_profile_stride;
+    uint64_t ge_frontend_calibration_enabled;
+    uint64_t ge_frontend_sample_ns[SR_PERF_GE_FRONTEND_STAGE_COUNT];
+    uint64_t ge_frontend_samples[SR_PERF_GE_FRONTEND_STAGE_COUNT];
+    uint64_t ge_frontend_eligible[SR_PERF_GE_FRONTEND_STAGE_COUNT];
+    uint64_t vk_submit_ns;
+    uint64_t vk_submits;
+    uint64_t vk_wait_ns;
+    uint64_t vk_waits;
+    uint64_t vk_readback_ns;
+    uint64_t vk_readbacks;
+    uint64_t vk_readback_bytes;
+    uint64_t vk_pipeline_ns;
+    uint64_t vk_pipeline_creations;
+    uint64_t texture_decode_ns;
+    uint64_t texture_decodes;
+    uint64_t texture_decode_bytes;
+    uint64_t texture_cache_hits;
+    uint64_t texture_cache_misses;
+    uint64_t storage_ns[SR_PERF_STORAGE_SOURCE_COUNT];
+    uint64_t storage_reads[SR_PERF_STORAGE_SOURCE_COUNT];
+    uint64_t storage_bytes[SR_PERF_STORAGE_SOURCE_COUNT];
+    uint64_t storage_failures[SR_PERF_STORAGE_SOURCE_COUNT];
+    uint64_t h264_ns;
+    uint64_t h264_calls;
+    uint64_t h264_failures;
+    uint64_t atrac_ns;
+    uint64_t atrac_calls;
+    uint64_t atrac_failures;
+    uint64_t audio_mix_ns;
+    uint64_t audio_mix_calls;
+    uint64_t audio_output_ns;
+    uint64_t audio_output_calls;
+    uint64_t audio_output_frames;
+    uint64_t audio_queue_pushes[SR_PERF_AUDIO_CHANNELS];
+    uint64_t audio_queue_underruns[SR_PERF_AUDIO_CHANNELS];
+    uint64_t audio_queue_starved_ns[SR_PERF_AUDIO_CHANNELS];
+    /* Shallowest and deepest pre-push queue this interval; min is valid only with pushes. */
+    uint64_t audio_queue_min_frames[SR_PERF_AUDIO_CHANNELS];
+    uint64_t audio_queue_max_frames[SR_PERF_AUDIO_CHANNELS];
+    uint64_t gpu_replay[SR_PERF_GPU_REPLAY_COUNT];
+} SrPerfMetrics;
+
+typedef struct SrPerfTransitionEntry {
+    uint32_t pc;
+    uint32_t reason;
+    uint64_t count;
+} SrPerfTransitionEntry;
+
+typedef struct SrPerfState {
+    int enabled;
+    int initialized;
+    int shutdown;
+    int guest_active;
+    unsigned current_tier;
+    uint64_t run_start_ns;
+    uint64_t interval_start_ns;
+    uint64_t attrib_report_ns;   /* last cumulative phase-attribution line, host ns */
+    uint64_t guest_start_ns;
+    uint64_t total_vblanks;
+    uint64_t interval_count;
+    SrPerfMetrics interval;
+    SrPerfMetrics total;
+    FILE *csv;
+    FILE *frames;                   /* SR_PERF_FRAMES: one row per new frame */
+    SrPerfMetrics frame_base;       /* the totals at the previous new frame */
+    char csv_path[SR_PERF_PATH_MAX];
+    char json_path[SR_PERF_PATH_MAX];
+    int aot_depth;
+    int interp_depth;
+    int aot_seen;
+    uint32_t last_aot_pc;
+    uint64_t aot_start_ns;
+    uint64_t interp_start_ns;
+    SrPerfInterpReason pending_interp_reason;
+    int sched_state_valid;
+    SrPerfSchedState sched_state;
+    uint32_t sched_uid;
+    uint64_t sched_start_ns;
+    uint64_t gpu_replay_last[SR_PERF_GPU_REPLAY_COUNT];   /* last cumulative snapshot */
+    SrPerfTransitionEntry transitions[2][SR_PERF_TOP_N];
+    int frame_seen;                 /* a present happened, so last_frame_buffer is valid */
+    uint32_t last_frame_buffer;     /* guest framebuffer of the previous present */
+    uint32_t last_new_frame_vcount; /* VBLANK of the previous new frame */
+    int late_since_frame;           /* a late VBLANK latch since the previous new frame */
+    int frame_cpu_valid;            /* last_frame_cpu_ns holds a reading */
+    uint64_t last_frame_cpu_ns;     /* scheduler-thread CPU clock at the previous new frame */
+    uint64_t last_frame_wall_ns;    /* host clock at the previous new frame */
+} SrPerfState;
+
+static SrPerfState s_perf;
+/* The closed intervals the live view reads (#314). Outside s_perf so a fresh init starts it
+ * empty on its own terms (sr_perf_history_reset), and filled only where the PERF line is. */
+static SrPerfHistory s_history;
+/* Contract: written only by sr_perf_set_gpu_replay_source() (called from gegpu_init); NULL
+ * means no GPU backend, so the gpu_replay_* columns stay 0. Kept outside s_perf so init's
+ * memset does not clear it. */
+static SrPerfGpuReplaySource s_gpu_replay_source;
+int sr_perf_aot_active;
+int sr_perf_enabled;
+static const char *const s_ge_frontend_stage_names[SR_PERF_GE_FRONTEND_STAGE_COUNT] = {
+    "command_dispatch", "draw_setup", "vertex_fetch_decode", "transform", "lighting",
+    "clipping_acceptance", "assembly", "triangle_total", "empty_control",
+};
+static const char *const s_gpu_replay_names[SR_PERF_GPU_REPLAY_COUNT] = {
+    "queue_submits", "batches", "draws", "snapshot_requests", "snapshot_copies",
+    "upload_ring_reservations", "upload_ring_bytes", "upload_ring_wraps", "upload_ring_fallbacks",
+    "snapshot_copy_px", "fallback_prims", "fallback_stencil", "fallback_color_test",
+    "fallback_logic_op", "fallback_write_mask", "fallback_ram_fb", "fallback_wide_stride",
+    "fallback_mips", "fallback_line", "fallback_point", "stencil_splits",
+};
+/* SR_PERF prints 1 Hz telemetry; SR_HUD or the F1 overlay only collect counters for
+ * the in-game HUD, so the stderr lines are gated separately. SR_PERF_CSV or SR_PERF_JSON alone
+ * turns the counters on for their files and writes no telemetry line to stderr at all, the
+ * start-up line and the cumulative PERF_ATTRIB lines included: a measured run's stderr carries
+ * only failures (an output that cannot be opened, a thread clock rejected). */
+static int s_perf_stderr_enabled = 0;
+static int s_perf_files_only = 0;
+#ifdef SR_PROFILER_SELFTEST
+static SrPerfTestClock s_test_wall_clock;
+static SrPerfTestClock s_test_thread_clock;
+#endif
+/* Set when one frame's thread CPU time came out longer than its wall time, which no thread can
+ * run: the clock is not what it claims to be, so host work per frame is off until the counters
+ * next come on. */
+static int s_thread_clock_rejected = 0;
+#ifdef SR_PERF_TSC_THREAD_CLOCK
+static int s_tsc_invariant = -1;      /* -1: not asked yet */
+static uint64_t s_tsc_base;           /* TSC and host clock at the start of the rate measurement */
+static uint64_t s_tsc_base_ns;
+#endif
+static double s_hud_fps = 0.0;
+static double s_hud_frame_ms = 0.0;
+static double s_hud_vblank_hz = 0.0;
+static double s_hud_game_fps = 0.0;
+static double s_hud_vblanks_per_frame = 0.0;
+
+static int env_on(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static uint64_t raw_now_ns(void) {
+#ifdef SR_PROFILER_SELFTEST
+    if (s_test_wall_clock) return s_test_wall_clock();
+#endif
+#if defined(_WIN32) || defined(_WIN64)
+    static LARGE_INTEGER frequency;
+    LARGE_INTEGER counter;
+    if (frequency.QuadPart == 0 && !QueryPerformanceFrequency(&frequency))
+        return (uint64_t)clock() * 1000000000ull / (uint64_t)CLOCKS_PER_SEC;
+    if (!QueryPerformanceCounter(&counter))
+        return (uint64_t)clock() * 1000000000ull / (uint64_t)CLOCKS_PER_SEC;
+    return (uint64_t)(counter.QuadPart / frequency.QuadPart) * 1000000000ull +
+           (uint64_t)((counter.QuadPart % frequency.QuadPart) * 1000000000ll /
+                      frequency.QuadPart);
+#elif defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return 0;
+#else
+    return (uint64_t)clock() * 1000000000ull / (uint64_t)CLOCKS_PER_SEC;
+#endif
+}
+
+static double ms(uint64_t ns) {
+    return (double)ns / 1000000.0;
+}
+
+/* Starts the TSC rate measurement thread_cpu_now converts with; called when the counters come
+ * on. The rate is the TSC's advance over the host clock's since then, so it sharpens as the run
+ * goes on and is read only once at least half a second has passed. */
+static void thread_clock_start(void) {
+    s_thread_clock_rejected = 0;
+#ifdef SR_PERF_TSC_THREAD_CLOCK
+    if (s_tsc_invariant < 0) {
+        unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+        s_tsc_invariant = __get_cpuid(0x80000007u, &eax, &ebx, &ecx, &edx) && (edx & (1u << 8)) ? 1 : 0;
+    }
+    s_tsc_base = __rdtsc();
+    s_tsc_base_ns = raw_now_ns();
+#endif
+}
+
+/* The calling thread's CPU time in ns. Returns 0 when this host has no precise thread clock or
+ * its rate is not measured yet. Only differences between two readings on the same thread mean
+ * anything; time the thread spent waiting or descheduled is not in them. */
+static int thread_cpu_now(uint64_t *out_ns) {
+    if (s_thread_clock_rejected) return 0;
+#ifdef SR_PROFILER_SELFTEST
+    if (s_test_thread_clock) {
+        *out_ns = s_test_thread_clock();
+        return 1;
+    }
+#endif
+#ifdef SR_PERF_TSC_THREAD_CLOCK
+    ULONG64 cycles = 0;
+    uint64_t now = raw_now_ns();
+    if (s_tsc_invariant != 1 || now < s_tsc_base_ns + 500000000ull ||
+        !QueryThreadCycleTime(GetCurrentThread(), &cycles))
+        return 0;
+    double tsc_per_ns = (double)(__rdtsc() - s_tsc_base) / (double)(now - s_tsc_base_ns);
+    if (!(tsc_per_ns > 0.0)) return 0;
+    *out_ns = (uint64_t)((double)cycles / tsc_per_ns);
+    return 1;
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    *out_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return 1;
+#else
+    (void)out_ns;
+    return 0;
+#endif
+}
+
+/* Whether thread_cpu_now converts a count at a measured rate (the Windows TSC clock, and the
+ * selftest's stand-in for it), which can read at the wrong rate. CLOCK_THREAD_CPUTIME_ID is a
+ * thread CPU clock by definition: Linux reads it from per-CPU scheduler clocks the kernel keeps
+ * within a tick or two of the wall clock (kernel/sched/clock.c), so one frame can read a few ms
+ * long without the clock being wrong, and a run's sum is off by one reading at most. */
+static int thread_clock_converted(void) {
+#ifdef SR_PROFILER_SELFTEST
+    if (s_test_thread_clock) return 1;
+#endif
+#ifdef SR_PERF_TSC_THREAD_CLOCK
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static uint64_t ge_frontend_estimate_ns(const SrPerfMetrics *m, unsigned stage) {
+    if (!m || stage >= SR_PERF_GE_FRONTEND_STAGE_COUNT ||
+        !m->ge_frontend_samples[stage] || !m->ge_frontend_eligible[stage])
+        return 0;
+    long double estimate = (long double)m->ge_frontend_sample_ns[stage] *
+                           (long double)m->ge_frontend_eligible[stage] /
+                           (long double)m->ge_frontend_samples[stage];
+    return estimate >= (long double)UINT64_MAX ? UINT64_MAX : (uint64_t)estimate;
+}
+
+static uint64_t elapsed_ns(uint64_t started_ns) {
+    if (!started_ns) return 0;
+    uint64_t now = raw_now_ns();
+    return now > started_ns ? now - started_ns : 0;
+}
+
+static void checkpoint_timers(uint64_t now) {
+    if (s_perf.guest_active && now > s_perf.guest_start_ns) {
+        ADD(guest_ns, now - s_perf.guest_start_ns);
+        s_perf.guest_start_ns = now;
+    }
+    if (s_perf.current_tier == SR_PERF_TIER_AOT && s_perf.aot_start_ns &&
+        now > s_perf.aot_start_ns) {
+        ADD(aot_ns, now - s_perf.aot_start_ns);
+        s_perf.aot_start_ns = now;
+    }
+    if (s_perf.current_tier == SR_PERF_TIER_INTERP && s_perf.interp_start_ns &&
+        now > s_perf.interp_start_ns) {
+        ADD(interp_ns, now - s_perf.interp_start_ns);
+        s_perf.interp_start_ns = now;
+    }
+    if (s_perf.sched_state_valid && s_perf.sched_start_ns && now > s_perf.sched_start_ns &&
+        (unsigned)s_perf.sched_state < SR_PERF_SCHED_STATE_COUNT) {
+        ADD_ARRAY(sched_ns, (unsigned)s_perf.sched_state, now - s_perf.sched_start_ns);
+        s_perf.sched_start_ns = now;
+    }
+}
+
+static void stop_timers(uint64_t now) {
+    if (s_perf.guest_active && now > s_perf.guest_start_ns)
+        ADD(guest_ns, now - s_perf.guest_start_ns);
+    if (s_perf.current_tier == SR_PERF_TIER_AOT && s_perf.aot_start_ns &&
+        now > s_perf.aot_start_ns)
+        ADD(aot_ns, now - s_perf.aot_start_ns);
+    if (s_perf.current_tier == SR_PERF_TIER_INTERP && s_perf.interp_start_ns &&
+        now > s_perf.interp_start_ns)
+        ADD(interp_ns, now - s_perf.interp_start_ns);
+    if (s_perf.sched_state_valid && s_perf.sched_start_ns && now > s_perf.sched_start_ns &&
+        (unsigned)s_perf.sched_state < SR_PERF_SCHED_STATE_COUNT)
+        ADD_ARRAY(sched_ns, (unsigned)s_perf.sched_state, now - s_perf.sched_start_ns);
+    s_perf.guest_active = 0;
+    s_perf.guest_start_ns = 0;
+    s_perf.aot_start_ns = 0;
+    s_perf.interp_start_ns = 0;
+    s_perf.sched_state_valid = 0;
+    s_perf.sched_start_ns = 0;
+    s_perf.current_tier = SR_PERF_TIER_NONE;
+    sr_perf_aot_active = 0;
+}
+
+static const char *interp_reason_name(uint32_t reason) {
+    switch (reason) {
+    case SR_PERF_INTERP_DISPATCH_MISS: return "dispatch-miss";
+    case SR_PERF_INTERP_STALE_BLOCK: return "stale-block";
+    case SR_PERF_INTERP_AOT_HANDOFF: return "aot-handoff";
+    case SR_PERF_INTERP_CALL_RETURN: return "call-return";
+    default: return "unknown";
+    }
+}
+
+static void record_transition(unsigned direction, uint32_t pc, uint32_t reason) {
+    if (direction > 1u || (unsigned)reason >= SR_PERF_INTERP_REASON_COUNT) return;
+    SrPerfTransitionEntry *table = s_perf.transitions[direction];
+    for (unsigned i = 0; i < SR_PERF_TOP_N; i++) {
+        if (table[i].count && table[i].pc == pc && table[i].reason == reason) {
+            table[i].count++;
+            return;
+        }
+    }
+    for (unsigned i = 0; i < SR_PERF_TOP_N; i++) {
+        if (!table[i].count) {
+            table[i].pc = pc;
+            table[i].reason = reason;
+            table[i].count = 1;
+            return;
+        }
+    }
+    unsigned lowest = 0;
+    for (unsigned i = 1; i < SR_PERF_TOP_N; i++)
+        if (table[i].count < table[lowest].count) lowest = i;
+    table[lowest].pc = pc;
+    table[lowest].reason = reason;
+    table[lowest].count = 1;
+}
+
+static SrPerfVfpuFamily vfpu_family(uint32_t opcode) {
+    switch ((opcode >> 26) & 0x3fu) {
+    case 0x32u:
+    case 0x35u:
+    case 0x36u:
+        return SR_PERF_VFPU_LOAD;
+    case 0x3au:
+    case 0x3du:
+    case 0x3eu:
+        return SR_PERF_VFPU_STORE;
+    case 0x34u:
+        return SR_PERF_VFPU_ARITHMETIC;
+    case 0x12u:
+    case 0x37u:
+        return SR_PERF_VFPU_PREFIX;
+    default:
+        return SR_PERF_VFPU_OTHER;
+    }
+}
+
+static void add_vfpu_family(SrPerfVfpuFamily family) {
+    if ((unsigned)family < SR_PERF_VFPU_FAMILY_COUNT)
+        ADD_ARRAY(vfpu_family, (unsigned)family, 1);
+}
+
+static void switch_to_aot(uint64_t now) {
+    if (s_perf.current_tier == SR_PERF_TIER_AOT) return;
+    if (s_perf.current_tier == SR_PERF_TIER_INTERP) {
+        if (s_perf.interp_start_ns && now > s_perf.interp_start_ns)
+            ADD(interp_ns, now - s_perf.interp_start_ns);
+        s_perf.interp_start_ns = 0;
+    }
+    s_perf.current_tier = SR_PERF_TIER_AOT;
+    s_perf.aot_start_ns = now;
+    sr_perf_aot_active = 1;
+}
+
+static void switch_to_interp(uint32_t pc, SrPerfInterpReason reason, uint64_t now,
+                              int record) {
+    if (s_perf.current_tier == SR_PERF_TIER_INTERP) return;
+    if (s_perf.current_tier == SR_PERF_TIER_AOT) {
+        if (s_perf.aot_start_ns && now > s_perf.aot_start_ns)
+            ADD(aot_ns, now - s_perf.aot_start_ns);
+        s_perf.aot_start_ns = 0;
+        if (record) {
+            record_transition(0u, pc, (uint32_t)reason);
+            ADD(aot_to_interp, 1);
+        }
+    }
+    s_perf.current_tier = SR_PERF_TIER_INTERP;
+    s_perf.interp_start_ns = now;
+    sr_perf_aot_active = 0;
+}
+
+static void csv_header(FILE *csv) {
+    fputs("vblank_total,wall_ms,fps,frame_ms,vblank_hz,cpu_ms,ge_wait_ms,present_ms,idle_ms,"
+          "submits,ge_submits,present_submits,waits,readback_waits,present_skips,present_wait_ms,target30,"
+          "ge_submit_render,ge_submit_snapshot,ge_submit_texup,ge_submit_targetup,ge_submit_depthup,ge_submit_depthread,ge_submit_targetread,ge_submit_xfer,ge_submit_init,ge_submit_mixed,"
+          "ge_wait_render,ge_wait_snapshot,ge_wait_texup,ge_wait_targetup,ge_wait_depthup,ge_wait_depthread,ge_wait_targetread,ge_wait_xfer,ge_wait_init,ge_wait_mixed,"
+          "ge_wait_render_ms,ge_wait_snapshot_ms,ge_wait_texup_ms,ge_wait_targetup_ms,ge_wait_depthup_ms,ge_wait_depthread_ms,ge_wait_targetread_ms,ge_wait_xfer_ms,ge_wait_init_ms,ge_wait_mixed_ms,"
+          "shblend_states,shblend_draws,shblend_batches,shblend_fb16,shblend_dither,shblend_absdiff,shblend_double_dst_alpha,shblend_double_src_alpha_dst,shblend_dual_fix,"
+          "snapshot_requests,snapshot_cache_hits,snapshot_copies,"
+          "aot_ms,aot_calls,aot_instructions,interp_ms,interp_calls,interp_instructions,aot_to_interp,interp_to_aot,"
+          "vfpu_ms,vfpu_count,vfpu_interp_count,vfpu_aot_count,vfpu_errors,vfpu_interp_ms,vfpu_aot_ms,"
+          "vfpu_load_count,vfpu_store_count,vfpu_arithmetic_count,vfpu_prefix_count,vfpu_other_count,"
+          "sched_running_ms,sched_runnable_ms,sched_blocked_ms,sched_idle_ms,context_switches,"
+          "ge_cpu_ms,ge_cpu_calls,ge_transform_sample_ms,ge_primitive_ms,"
+          "vulkan_submit_ms,vulkan_submits,vulkan_wait_ms,vulkan_waits,vulkan_readback_ms,vulkan_readbacks,vulkan_readback_bytes,vulkan_pipeline_ms,vulkan_pipeline_creations,"
+          "texture_decode_ms,texture_decodes,texture_decode_bytes,texture_cache_hits,texture_cache_misses,"
+          "iso_read_ms,iso_reads,iso_read_bytes,iso_failures,vfs_read_ms,vfs_reads,vfs_read_bytes,vfs_failures,"
+          "h264_decode_ms,h264_decodes,h264_failures,atrac_decode_ms,atrac_decodes,atrac_failures,"
+          "audio_mix_ms,audio_mix_calls,audio_output_ms,audio_output_calls,audio_output_frames"
+          ",ge_frontend_profile_enabled,ge_frontend_profile_stride,ge_frontend_calibration_enabled", csv);
+    for (unsigned i = 0; i < SR_PERF_GE_FRONTEND_STAGE_COUNT; i++)
+        fprintf(csv, ",ge_frontend_%s_estimated_ms,ge_frontend_%s_sample_ns,"
+                     "ge_frontend_%s_samples,ge_frontend_%s_eligible",
+                s_ge_frontend_stage_names[i], s_ge_frontend_stage_names[i],
+                s_ge_frontend_stage_names[i], s_ge_frontend_stage_names[i]);
+    for (unsigned i = 0; i < SR_PERF_GPU_REPLAY_COUNT; i++)
+        fprintf(csv, ",gpu_replay_%s", s_gpu_replay_names[i]);
+    fputs(",new_frames,new_frame_intervals,new_frame_vblanks", csv);
+    fputs(",new_frame_iv0,new_frame_iv1,new_frame_iv2,new_frame_iv3,new_frame_iv4p,new_frame_iv1_late"
+          ",frame_work_frames,frame_work_ms,frame_work_max_ms", csv);
+    for (unsigned i = 0; i < SR_PERF_FRAME_WORK_BUCKETS; i++)
+        fprintf(csv, ",frame_work_%s", s_frame_work_names[i]);
+    fputc('\n', csv);
+}
+
+static void csv_row(FILE *csv, const SrPerfMetrics *m, uint64_t total_vblanks,
+                    uint64_t wall_ns) {
+    double seconds = (double)wall_ns / 1000000000.0;
+    double fps = seconds > 0.0 ? (double)m->presents / seconds : 0.0;
+    double vblank_hz = seconds > 0.0 ? (double)m->vblanks / seconds : 0.0;
+    double frame_ms = m->presents ? ms(wall_ns) / (double)m->presents : 0.0;
+    uint64_t scheduler_ns = wall_ns > m->guest_ns ? wall_ns - m->guest_ns : 0;
+    uint64_t idle_ns = scheduler_ns + m->guest_idle_ns;
+    uint64_t excluded_ns = m->ge_wait_ns + m->present_ns + m->guest_idle_ns;
+    uint64_t cpu_ns = m->guest_ns > excluded_ns ? m->guest_ns - excluded_ns : 0;
+    fprintf(csv, "%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%llu,%llu,%llu,%llu,%llu,%llu,%.3f,%s",
+            (unsigned long long)total_vblanks, ms(wall_ns), fps, frame_ms, vblank_hz,
+            ms(cpu_ns), ms(m->ge_wait_ns), ms(m->present_ns), ms(idle_ns),
+            (unsigned long long)(m->ge_submits + m->present_submits),
+            (unsigned long long)m->ge_submits, (unsigned long long)m->present_submits,
+            (unsigned long long)(m->ge_waits + m->present_waits),
+            (unsigned long long)m->readback_waits, (unsigned long long)m->present_skips,
+            ms(m->present_wait_ns), fps >= 29.5 ? "yes" : "no");
+    for (unsigned i = 0; i < SR_PERF_GE_REASON_COUNT; i++)
+        fprintf(csv, ",%llu", (unsigned long long)m->ge_reason_submits[i]);
+    for (unsigned i = 0; i < SR_PERF_GE_REASON_COUNT; i++)
+        fprintf(csv, ",%llu", (unsigned long long)m->ge_reason_waits[i]);
+    for (unsigned i = 0; i < SR_PERF_GE_REASON_COUNT; i++)
+        fprintf(csv, ",%.3f", ms(m->ge_reason_wait_ns[i]));
+    for (unsigned i = 0; i < SR_PERF_GE_EVENT_COUNT; i++)
+        fprintf(csv, ",%llu", (unsigned long long)m->ge_events[i]);
+    fprintf(csv, ",%.3f,%llu,%llu,%.3f,%llu,%llu,%llu,%llu",
+            ms(m->aot_ns), (unsigned long long)m->aot_calls,
+            (unsigned long long)m->aot_instructions, ms(m->interp_ns),
+            (unsigned long long)m->interp_calls,
+            (unsigned long long)m->interp_instructions,
+            (unsigned long long)m->aot_to_interp,
+            (unsigned long long)m->interp_to_aot);
+    fprintf(csv, ",%.3f,%llu,%llu,%llu,%llu,%.3f,%.3f",
+            ms(m->vfpu_ns), (unsigned long long)m->vfpu_count,
+            (unsigned long long)m->vfpu_interp_count,
+            (unsigned long long)m->vfpu_aot_count, (unsigned long long)m->vfpu_errors,
+            ms(m->vfpu_interp_ns), ms(m->vfpu_aot_ns));
+    for (unsigned i = 0; i < SR_PERF_VFPU_FAMILY_COUNT; i++)
+        fprintf(csv, ",%llu", (unsigned long long)m->vfpu_family[i]);
+    fprintf(csv, ",%.3f,%.3f,%.3f,%.3f,%llu",
+            ms(m->sched_ns[SR_PERF_SCHED_RUNNING]),
+            ms(m->sched_ns[SR_PERF_SCHED_RUNNABLE]),
+            ms(m->sched_ns[SR_PERF_SCHED_BLOCKED]),
+            ms(m->sched_ns[SR_PERF_SCHED_IDLE]),
+            (unsigned long long)m->sched_switches);
+    fprintf(csv, ",%.3f,%llu,%.3f,%.3f",
+            ms(m->ge_cpu_ns), (unsigned long long)m->ge_cpu_calls,
+            ms(m->ge_transform_sample_ns), ms(m->ge_primitive_ns));
+    fprintf(csv, ",%.3f,%llu,%.3f,%llu,%.3f,%llu,%llu,%.3f,%llu",
+            ms(m->vk_submit_ns), (unsigned long long)m->vk_submits,
+            ms(m->vk_wait_ns), (unsigned long long)m->vk_waits,
+            ms(m->vk_readback_ns), (unsigned long long)m->vk_readbacks,
+            (unsigned long long)m->vk_readback_bytes, ms(m->vk_pipeline_ns),
+            (unsigned long long)m->vk_pipeline_creations);
+    fprintf(csv, ",%.3f,%llu,%llu,%llu,%llu",
+            ms(m->texture_decode_ns), (unsigned long long)m->texture_decodes,
+            (unsigned long long)m->texture_decode_bytes,
+            (unsigned long long)m->texture_cache_hits,
+            (unsigned long long)m->texture_cache_misses);
+    for (unsigned i = 0; i < SR_PERF_STORAGE_SOURCE_COUNT; i++)
+        fprintf(csv, ",%.3f,%llu,%llu,%llu", ms(m->storage_ns[i]),
+                (unsigned long long)m->storage_reads[i],
+                (unsigned long long)m->storage_bytes[i],
+                (unsigned long long)m->storage_failures[i]);
+    fprintf(csv, ",%.3f,%llu,%llu,%.3f,%llu,%llu",
+            ms(m->h264_ns), (unsigned long long)m->h264_calls,
+            (unsigned long long)m->h264_failures, ms(m->atrac_ns),
+            (unsigned long long)m->atrac_calls, (unsigned long long)m->atrac_failures);
+    fprintf(csv, ",%.3f,%llu,%.3f,%llu,%llu", ms(m->audio_mix_ns),
+            (unsigned long long)m->audio_mix_calls, ms(m->audio_output_ns),
+            (unsigned long long)m->audio_output_calls,
+            (unsigned long long)m->audio_output_frames);
+    fprintf(csv, ",%llu,%llu,%llu",
+            (unsigned long long)m->ge_frontend_profile_enabled,
+            (unsigned long long)m->ge_frontend_profile_stride,
+            (unsigned long long)m->ge_frontend_calibration_enabled);
+    for (unsigned i = 0; i < SR_PERF_GE_FRONTEND_STAGE_COUNT; i++)
+        fprintf(csv, ",%.3f,%llu,%llu,%llu", ms(ge_frontend_estimate_ns(m, i)),
+                (unsigned long long)m->ge_frontend_sample_ns[i],
+                (unsigned long long)m->ge_frontend_samples[i],
+                (unsigned long long)m->ge_frontend_eligible[i]);
+    for (unsigned i = 0; i < SR_PERF_GPU_REPLAY_COUNT; i++)
+        fprintf(csv, ",%llu", (unsigned long long)m->gpu_replay[i]);
+    fprintf(csv, ",%llu,%llu,%llu", (unsigned long long)m->new_frames,
+            (unsigned long long)m->new_frame_intervals, (unsigned long long)m->new_frame_vblanks);
+    for (unsigned i = 0; i < SR_PERF_FRAME_IV_COUNT; i++)
+        fprintf(csv, ",%llu", (unsigned long long)m->new_frame_iv[i]);
+    fprintf(csv, ",%llu,%llu,%.3f,%.3f", (unsigned long long)m->new_frame_iv1_late,
+            (unsigned long long)m->frame_work_frames, ms(m->frame_work_ns), ms(m->frame_work_max_ns));
+    for (unsigned i = 0; i < SR_PERF_FRAME_WORK_BUCKETS; i++)
+        fprintf(csv, ",%llu", (unsigned long long)m->frame_work_bucket[i]);
+    fputc('\n', csv);
+}
+
+static int transition_compare(const void *left, const void *right) {
+    const SrPerfTransitionEntry *a = (const SrPerfTransitionEntry *)left;
+    const SrPerfTransitionEntry *b = (const SrPerfTransitionEntry *)right;
+    if (a->count < b->count) return 1;
+    if (a->count > b->count) return -1;
+    if (a->pc < b->pc) return -1;
+    if (a->pc > b->pc) return 1;
+    if (a->reason < b->reason) return -1;
+    if (a->reason > b->reason) return 1;
+    return 0;
+}
+
+static void json_top_pcs(FILE *json, unsigned direction) {
+    SrPerfTransitionEntry entries[SR_PERF_TOP_N];
+    unsigned count = 0;
+    for (unsigned i = 0; i < SR_PERF_TOP_N; i++)
+        if (s_perf.transitions[direction][i].count)
+            entries[count++] = s_perf.transitions[direction][i];
+    qsort(entries, count, sizeof(entries[0]), transition_compare);
+    fputc('[', json);
+    for (unsigned i = 0; i < count; i++) {
+        if (i) fputc(',', json);
+        fprintf(json, "{\"pc\":\"0x%08" PRIx32 "\",\"reason\":\"%s\",\"count\":%llu}",
+                entries[i].pc, interp_reason_name(entries[i].reason),
+                (unsigned long long)entries[i].count);
+    }
+    fputc(']', json);
+}
+
+/* ---- native AOT VFPU time (census builds: PERF_AOT_INSTRUCTIONS=1) -----------------------
+ * Generated code runs VFPU instructions inline, so there is no call to time. In a census build
+ * every AOT instruction passes sr_perf_aot_instruction(pc, opcode) as it starts. That gives an
+ * exact count per family and, by sampling, a time per family: one VFPU instruction in
+ * AOT_VFPU_STRIDE is timed from its start to the start of the next instruction, and one scalar
+ * instruction in AOT_VFPU_BASELINE_STRIDE is timed the same way as the baseline (the hook plus an
+ * ordinary instruction). A sample counts only when the next instruction is at pc + 4, so a branch,
+ * call, return or dispatch never lands in it. The estimate for a family is
+ * count * max(0, mean sample - mean baseline): the VFPU instruction's cost above an ordinary
+ * one. It is an estimate from samples, labelled so in the summary. */
+#define AOT_VFPU_STRIDE 64u
+#define AOT_VFPU_BASELINE_STRIDE 1024u
+
+typedef enum AotVfpuFamily {
+    AOT_VFPU_LOAD = 0,      /* lv.s, lv.q, lvl.q/lvr.q */
+    AOT_VFPU_STORE,         /* sv.s, sv.q, svl.q/svr.q */
+    AOT_VFPU_VFPU0,         /* opcode 0x18: vadd, vsub, vsbn, vdiv */
+    AOT_VFPU_VFPU1,         /* opcode 0x19: vmul, vdot, vscl, vhdp, vcrs, vdet */
+    AOT_VFPU_VFPU3,         /* opcode 0x1b: vcmp, vmin, vmax, vscmp, vsge, vslt */
+    AOT_VFPU_VFPU4,         /* opcode 0x34: unary, conversion and transcendental forms */
+    AOT_VFPU_MATRIX,        /* opcode 0x3c: vmmul, vtfm, vhtfm, vmscl, vqmul, matrix moves */
+    AOT_VFPU_PREFIX_IMM,    /* opcode 0x37: prefixes, viim, vfim */
+    AOT_VFPU_MOVE_CONTROL,  /* opcode 0x12 (mfv, mtv, bvf) and 0x3f (vflush) */
+    AOT_VFPU_FAMILY_COUNT,
+    AOT_VFPU_NOT_VFPU = -1,
+} AotVfpuFamily;
+
+static const char *const s_aot_vfpu_family_names[AOT_VFPU_FAMILY_COUNT] = {
+    "load", "store", "vfpu0", "vfpu1", "vfpu3", "vfpu4", "matrix", "prefix_imm", "move_control",
+};
+
+static struct {
+    uint64_t count[AOT_VFPU_FAMILY_COUNT];
+    uint64_t sample_ns[AOT_VFPU_FAMILY_COUNT];
+    uint64_t samples[AOT_VFPU_FAMILY_COUNT];
+    uint64_t baseline_ns, baseline_samples;
+    uint64_t vfpu_seen, scalar_seen;
+    int pending;            /* a sample is open: -1 baseline, else 1 + family */
+    uint32_t pending_pc;
+    uint64_t pending_start_ns;
+} s_aot_vfpu;
+
+static int aot_vfpu_family(uint32_t opcode) {
+    switch ((opcode >> 26) & 0x3fu) {
+    case 0x32u: case 0x35u: case 0x36u: return AOT_VFPU_LOAD;
+    case 0x3au: case 0x3du: case 0x3eu: return AOT_VFPU_STORE;
+    case 0x18u: return AOT_VFPU_VFPU0;
+    case 0x19u: return AOT_VFPU_VFPU1;
+    case 0x1bu: return AOT_VFPU_VFPU3;
+    case 0x34u: return AOT_VFPU_VFPU4;
+    case 0x3cu: return AOT_VFPU_MATRIX;
+    case 0x37u: return AOT_VFPU_PREFIX_IMM;
+    case 0x12u: case 0x3fu: return AOT_VFPU_MOVE_CONTROL;
+    default: return AOT_VFPU_NOT_VFPU;
+    }
+}
+
+/* Called for each AOT instruction start in a census build, with the AOT tier current. */
+static void aot_vfpu_observe(uint32_t pc, uint32_t opcode) {
+    if (s_aot_vfpu.pending) {
+        uint64_t now = raw_now_ns();
+        /* A zero-length sample is a measurement too: the clock's tick can exceed one instruction. */
+        if (pc == s_aot_vfpu.pending_pc + 4u && now >= s_aot_vfpu.pending_start_ns) {
+            uint64_t elapsed = now - s_aot_vfpu.pending_start_ns;
+            if (s_aot_vfpu.pending < 0) {
+                s_aot_vfpu.baseline_ns += elapsed;
+                s_aot_vfpu.baseline_samples++;
+            } else {
+                unsigned family = (unsigned)(s_aot_vfpu.pending - 1);
+                s_aot_vfpu.sample_ns[family] += elapsed;
+                s_aot_vfpu.samples[family]++;
+            }
+        }
+        s_aot_vfpu.pending = 0;
+    }
+    int family = aot_vfpu_family(opcode);
+    if (family >= 0) {
+        s_aot_vfpu.count[family]++;
+        if (++s_aot_vfpu.vfpu_seen % AOT_VFPU_STRIDE != 0u) return;
+        s_aot_vfpu.pending = 1 + family;
+    } else {
+        if (++s_aot_vfpu.scalar_seen % AOT_VFPU_BASELINE_STRIDE != 0u) return;
+        s_aot_vfpu.pending = -1;
+    }
+    s_aot_vfpu.pending_pc = pc;
+    s_aot_vfpu.pending_start_ns = raw_now_ns();
+}
+
+/* The "aot_families" member of the summary's "vfpu" object. */
+static void json_aot_vfpu(FILE *json) {
+    double baseline = s_aot_vfpu.baseline_samples
+        ? (double)s_aot_vfpu.baseline_ns / (double)s_aot_vfpu.baseline_samples : 0.0;
+    fprintf(json, "\"aot_families\":{\"status\":\"%s\",\"stride\":%u,\"baseline_stride\":%u,"
+            "\"baseline_samples\":%llu,\"baseline_mean_ns\":%.3f,\"families\":{",
+            PERF_AOT_INSTRUCTIONS ? "sampled" : "not_compiled", AOT_VFPU_STRIDE,
+            AOT_VFPU_BASELINE_STRIDE, (unsigned long long)s_aot_vfpu.baseline_samples, baseline);
+    for (unsigned i = 0; i < AOT_VFPU_FAMILY_COUNT; i++) {
+        double mean = s_aot_vfpu.samples[i]
+            ? (double)s_aot_vfpu.sample_ns[i] / (double)s_aot_vfpu.samples[i] : 0.0;
+        double above = s_aot_vfpu.samples[i] && mean > baseline ? mean - baseline : 0.0;
+        fprintf(json, "%s\"%s\":{\"count\":%llu,\"samples\":%llu,\"mean_ns\":%.3f,"
+                "\"estimated_ns\":%.0f}",
+                i ? "," : "", s_aot_vfpu_family_names[i],
+                (unsigned long long)s_aot_vfpu.count[i], (unsigned long long)s_aot_vfpu.samples[i],
+                mean, above * (double)s_aot_vfpu.count[i]);
+    }
+    fputs("}}", json);
+}
+
+static void write_summary(const char *path, uint64_t wall_ns) {
+    FILE *json = fopen(path, "w");
+    if (!json) {
+        fprintf(stderr, "PERF: cannot open JSON summary output\n");
+        return;
+    }
+    const SrPerfMetrics *m = &s_perf.total;
+    fprintf(json, "{\n");
+    fprintf(json, "  \"schema\":\"nakagawa-perf-v1\",\n");
+    fprintf(json, "  \"build\":{\"aot_instruction_hook\":%s},\n",
+            PERF_AOT_INSTRUCTIONS ? "true" : "false");
+    fprintf(json, "  \"wall_ns\":%llu,\n", (unsigned long long)wall_ns);
+    fprintf(json, "  \"interval_count\":%llu,\n", (unsigned long long)s_perf.interval_count);
+    fprintf(json, "  \"vblanks\":{\"count\":%llu,\"presents\":%llu,\"present_skips\":%llu},\n",
+            (unsigned long long)m->vblanks, (unsigned long long)m->presents,
+            (unsigned long long)m->present_skips);
+    fprintf(json, "  \"frames\":{\"new\":%llu,\"intervals\":%llu,\"interval_vblanks\":%llu,"
+                  "\"intervals_by_vblanks\":[%llu,%llu,%llu,%llu,%llu],\"one_vblank_after_late_latch\":%llu,"
+                  "\"work\":{\"frames\":%llu,\"ns\":%llu,\"max_ns\":%llu,\"buckets\":{",
+            (unsigned long long)m->new_frames, (unsigned long long)m->new_frame_intervals,
+            (unsigned long long)m->new_frame_vblanks, (unsigned long long)m->new_frame_iv[0],
+            (unsigned long long)m->new_frame_iv[1], (unsigned long long)m->new_frame_iv[2],
+            (unsigned long long)m->new_frame_iv[3], (unsigned long long)m->new_frame_iv[4],
+            (unsigned long long)m->new_frame_iv1_late, (unsigned long long)m->frame_work_frames,
+            (unsigned long long)m->frame_work_ns, (unsigned long long)m->frame_work_max_ns);
+    for (unsigned i = 0; i < SR_PERF_FRAME_WORK_BUCKETS; i++)
+        fprintf(json, "%s\"%s\":%llu", i ? "," : "", s_frame_work_names[i],
+                (unsigned long long)m->frame_work_bucket[i]);
+    fputs("}}},\n", json);
+    fprintf(json, "  \"guest\":{\"ns\":%llu,\"idle_ns\":%llu,\"aot_ns\":%llu,\"aot_calls\":%llu,\"aot_instruction_count\":",
+            (unsigned long long)m->guest_ns, (unsigned long long)m->guest_idle_ns,
+            (unsigned long long)m->aot_ns, (unsigned long long)m->aot_calls);
+    if (PERF_AOT_INSTRUCTIONS)
+        fprintf(json, "%llu", (unsigned long long)m->aot_instructions);
+    else
+        fputs("null", json);
+    fprintf(json, ",\"interpreter_ns\":%llu,\"interpreter_calls\":%llu,\"interpreter_instructions\":%llu},\n",
+            (unsigned long long)m->interp_ns, (unsigned long long)m->interp_calls,
+            (unsigned long long)m->interp_instructions);
+    fprintf(json, "  \"transitions\":{\"aot_to_interpreter_count\":%llu,\"interpreter_to_aot_count\":%llu,\"top_pcs\":{\"aot_to_interpreter\":",
+            (unsigned long long)m->aot_to_interp, (unsigned long long)m->interp_to_aot);
+    json_top_pcs(json, 0);
+    fputs(",\"interpreter_to_aot\":", json);
+    json_top_pcs(json, 1);
+    fputs("}},\n", json);
+    fprintf(json, "  \"scheduler\":{\"running_ns\":%llu,\"runnable_ns\":%llu,\"blocked_ns\":%llu,\"idle_ns\":%llu,\"context_switches\":%llu,\"blocked_transitions\":%llu,\"wake_transitions\":%llu},\n",
+            (unsigned long long)m->sched_ns[SR_PERF_SCHED_RUNNING],
+            (unsigned long long)m->sched_ns[SR_PERF_SCHED_RUNNABLE],
+            (unsigned long long)m->sched_ns[SR_PERF_SCHED_BLOCKED],
+            (unsigned long long)m->sched_ns[SR_PERF_SCHED_IDLE],
+            (unsigned long long)m->sched_switches, (unsigned long long)m->sched_blocked,
+            (unsigned long long)m->sched_wakes);
+    fprintf(json, "  \"vfpu\":{\"ns\":%llu,\"count\":%llu,\"interpreter_count\":%llu,\"aot_instruction_count\":%llu,\"interpreter_ns\":%llu,\"aot_ns\":%llu,\"errors\":%llu,\"families\":{\"load\":%llu,\"store\":%llu,\"arithmetic\":%llu,\"prefix\":%llu,\"other\":%llu},",
+            (unsigned long long)m->vfpu_ns, (unsigned long long)m->vfpu_count,
+            (unsigned long long)m->vfpu_interp_count,
+            (unsigned long long)m->vfpu_aot_count,
+            (unsigned long long)m->vfpu_interp_ns, (unsigned long long)m->vfpu_aot_ns,
+            (unsigned long long)m->vfpu_errors,
+            (unsigned long long)m->vfpu_family[SR_PERF_VFPU_LOAD],
+            (unsigned long long)m->vfpu_family[SR_PERF_VFPU_STORE],
+            (unsigned long long)m->vfpu_family[SR_PERF_VFPU_ARITHMETIC],
+            (unsigned long long)m->vfpu_family[SR_PERF_VFPU_PREFIX],
+            (unsigned long long)m->vfpu_family[SR_PERF_VFPU_OTHER]);
+    json_aot_vfpu(json);
+    fputs("},\n", json);
+    fprintf(json, "  \"ge\":{\"cpu_ns\":%llu,\"cpu_calls\":%llu,\"transform_sample_ns\":%llu,\"primitive_ns\":%llu,\"submits\":%llu,\"waits\":%llu,\"wait_ns\":%llu,\"present_submits\":%llu,\"present_waits\":%llu,\"present_wait_ns\":%llu,\"frontend_profile\":{\"enabled\":%s,\"stride\":%llu,\"calibration_enabled\":%s,\"stages\":{",
+            (unsigned long long)m->ge_cpu_ns, (unsigned long long)m->ge_cpu_calls,
+            (unsigned long long)m->ge_transform_sample_ns,
+            (unsigned long long)m->ge_primitive_ns, (unsigned long long)m->ge_submits,
+            (unsigned long long)m->ge_waits, (unsigned long long)m->ge_wait_ns,
+            (unsigned long long)m->present_submits,
+            (unsigned long long)m->present_waits,
+            (unsigned long long)m->present_wait_ns,
+            m->ge_frontend_profile_enabled ? "true" : "false",
+            (unsigned long long)m->ge_frontend_profile_stride,
+            m->ge_frontend_calibration_enabled ? "true" : "false");
+    for (unsigned i = 0; i < SR_PERF_GE_FRONTEND_STAGE_COUNT; i++) {
+        if (i) fputc(',', json);
+        fprintf(json, "\"%s\":{\"estimated_ns\":%llu,\"sample_ns\":%llu,\"samples\":%llu,\"eligible\":%llu}",
+                s_ge_frontend_stage_names[i],
+                (unsigned long long)ge_frontend_estimate_ns(m, i),
+                (unsigned long long)m->ge_frontend_sample_ns[i],
+                (unsigned long long)m->ge_frontend_samples[i],
+                (unsigned long long)m->ge_frontend_eligible[i]);
+    }
+    fputs("}}},\n", json);
+    fprintf(json, "  \"vulkan\":{\"submit_ns\":%llu,\"submits\":%llu,\"wait_ns\":%llu,\"waits\":%llu,\"readback_ns\":%llu,\"readbacks\":%llu,\"readback_bytes\":%llu,\"pipeline_creation_ns\":%llu,\"pipeline_creations\":%llu},\n",
+            (unsigned long long)m->vk_submit_ns, (unsigned long long)m->vk_submits,
+            (unsigned long long)m->vk_wait_ns, (unsigned long long)m->vk_waits,
+            (unsigned long long)m->vk_readback_ns,
+            (unsigned long long)m->vk_readbacks,
+            (unsigned long long)m->vk_readback_bytes,
+            (unsigned long long)m->vk_pipeline_ns,
+            (unsigned long long)m->vk_pipeline_creations);
+    fprintf(json, "  \"textures\":{\"decode_ns\":%llu,\"decodes\":%llu,\"decoded_bytes\":%llu,\"cache_hits\":%llu,\"cache_misses\":%llu},\n",
+            (unsigned long long)m->texture_decode_ns,
+            (unsigned long long)m->texture_decodes,
+            (unsigned long long)m->texture_decode_bytes,
+            (unsigned long long)m->texture_cache_hits,
+            (unsigned long long)m->texture_cache_misses);
+    fprintf(json, "  \"storage\":{\"iso_read_ns\":%llu,\"iso_reads\":%llu,\"iso_read_bytes\":%llu,\"iso_failures\":%llu,\"vfs_read_ns\":%llu,\"vfs_reads\":%llu,\"vfs_read_bytes\":%llu,\"vfs_failures\":%llu},\n",
+            (unsigned long long)m->storage_ns[SR_PERF_STORAGE_ISO],
+            (unsigned long long)m->storage_reads[SR_PERF_STORAGE_ISO],
+            (unsigned long long)m->storage_bytes[SR_PERF_STORAGE_ISO],
+            (unsigned long long)m->storage_failures[SR_PERF_STORAGE_ISO],
+            (unsigned long long)m->storage_ns[SR_PERF_STORAGE_VFS],
+            (unsigned long long)m->storage_reads[SR_PERF_STORAGE_VFS],
+            (unsigned long long)m->storage_bytes[SR_PERF_STORAGE_VFS],
+            (unsigned long long)m->storage_failures[SR_PERF_STORAGE_VFS]);
+    fprintf(json, "  \"media\":{\"h264_decode_ns\":%llu,\"h264_decodes\":%llu,\"h264_failures\":%llu,\"atrac_decode_ns\":%llu,\"atrac_decodes\":%llu,\"atrac_failures\":%llu},\n",
+            (unsigned long long)m->h264_ns, (unsigned long long)m->h264_calls,
+            (unsigned long long)m->h264_failures, (unsigned long long)m->atrac_ns,
+            (unsigned long long)m->atrac_calls, (unsigned long long)m->atrac_failures);
+    fprintf(json, "  \"audio\":{\"mix_ns\":%llu,\"mix_calls\":%llu,\"output_ns\":%llu,\"output_calls\":%llu,\"output_frames\":%llu},\n",
+            (unsigned long long)m->audio_mix_ns, (unsigned long long)m->audio_mix_calls,
+            (unsigned long long)m->audio_output_ns,
+            (unsigned long long)m->audio_output_calls,
+            (unsigned long long)m->audio_output_frames);
+    fputs("  \"boundaries\":[", json);
+    fputs("{\"metric\":\"aot_instruction_count\",\"status\":", json);
+    fputs(PERF_AOT_INSTRUCTIONS ? "\"compiled\"" : "\"not_compiled\"", json);
+    fputs("},{\"metric\":\"aot_vfpu_time\",\"status\":\"",
+          json);
+    fputs(PERF_AOT_INSTRUCTIONS ? "sampled" : "partial", json);
+    fputs("\"},{\"metric\":\"ge_primitive_phase\",\"status\":\"sampled\"}]\n", json);
+    fputs("}\n", json);
+    fclose(json);
+}
+
+/* A telemetry line leaves the process as ONE stdio write.
+ *
+ * stderr is unbuffered, and on the MinGW C runtime a formatted fprintf() to an unbuffered
+ * stream issues a separate WriteFile per output piece.  With stderr redirected to a log file
+ * a ~330-character PERF line cost ~25 ms and the ~450-character PERF_ATTRIB line ~30 ms,
+ * measured around the two calls inside the running flagship.  Both lines are written from
+ * the guest thread at the end of every telemetry interval, and guest time is host time, so
+ * the guest was stopped for ~55 ms once a second whenever SR_PERF was on (every Benchmark
+ * profile run): one VBLANK in 18, which is how a title that gates its frame on two VBLANKs
+ * measured 2.26 per frame instead of 2.02.  Formatting into a buffer first and handing the
+ * finished line to a single fwrite() removes the per-piece writes.  The sink exists so the
+ * selftest can observe the unit in which a line is emitted. */
+static SrPerfReportSink s_report_sink;
+
+static void perf_emit_line(const char *line, size_t len) {
+    if (s_report_sink) {
+        s_report_sink(line, len);
+        return;
+    }
+    fwrite(line, 1, len, stderr);
+}
+
+static void perf_emit_format(const char *fmt, ...) {
+    char line[1536];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    size_t len = (size_t)n < sizeof line ? (size_t)n : sizeof line - 1u;
+    if (len == sizeof line - 1u) line[len - 1u] = '\n';   /* a truncated line still ends the line */
+    perf_emit_line(line, len);
+}
+
+static void perf_emit_ge_frontend(const SrPerfMetrics *m) {
+    if (!m || !m->ge_frontend_profile_enabled) return;
+    char line[2048];
+    int written = snprintf(line, sizeof line,
+                           "PERF_GE_FRONTEND stride=%llu calibration=%llu",
+                           (unsigned long long)m->ge_frontend_profile_stride,
+                           (unsigned long long)m->ge_frontend_calibration_enabled);
+    if (written < 0 || (size_t)written >= sizeof line) return;
+    size_t used = (size_t)written;
+    for (unsigned i = 0; i < SR_PERF_GE_FRONTEND_STAGE_COUNT; i++) {
+        int n = snprintf(line + used, sizeof line - used,
+                         " %s_sample_ns=%llu %s_samples=%llu %s_eligible=%llu",
+                         s_ge_frontend_stage_names[i],
+                         (unsigned long long)m->ge_frontend_sample_ns[i],
+                         s_ge_frontend_stage_names[i],
+                         (unsigned long long)m->ge_frontend_samples[i],
+                         s_ge_frontend_stage_names[i],
+                         (unsigned long long)m->ge_frontend_eligible[i]);
+        if (n < 0 || (size_t)n >= sizeof line - used) return;
+        used += (size_t)n;
+    }
+    if (used + 1u >= sizeof line) return;
+    line[used++] = '\n';
+    perf_emit_line(line, used);
+}
+
+/* Sets the baseline to the backend's current counts, so deltas start when the sampler starts.
+ * Called wherever the source or the enabled state changes; a no-op until both are set. */
+static void seed_gpu_replay_base(void) {
+    if (s_gpu_replay_source && s_perf.enabled) s_gpu_replay_source(s_perf.gpu_replay_last);
+}
+
+/* Adds the GPU replay counters that moved since the last snapshot to this interval.
+ * No lock: the GE submit path that writes the counters and this sampler both run on the
+ * scheduler's OS thread (guest threads are coroutines on one OS thread, sr_coro.h; sched.c
+ * calls sr_perf_vblank). A GE worker thread would need a snapshot lock here first. */
+static void sample_gpu_replay(void) {
+    if (!s_gpu_replay_source) return;
+    uint64_t counts[SR_PERF_GPU_REPLAY_COUNT];
+    s_gpu_replay_source(counts);
+    for (unsigned i = 0; i < SR_PERF_GPU_REPLAY_COUNT; i++) {
+        uint64_t last = s_perf.gpu_replay_last[i];
+        ADD_ARRAY(gpu_replay, i, counts[i] >= last ? counts[i] - last : counts[i]);
+        s_perf.gpu_replay_last[i] = counts[i];
+    }
+}
+
+/* PERF_AUDIO: one line per host audio channel that was pushed this interval. The queue
+ * depths are taken just before each push, in milliseconds of 44.1 kHz audio, so a q_min_ms
+ * near zero is a channel about to run dry. starved_ms is the silence the device played on
+ * the channel's underruns; a gap with no push at all is reported at the push that ends it. */
+static void perf_emit_audio_queue(const SrPerfMetrics *m) {
+    for (int ch = 0; ch < SR_PERF_AUDIO_CHANNELS; ch++) {
+        if (!m->audio_queue_pushes[ch]) continue;
+        perf_emit_format(
+            "PERF_AUDIO ch=%d pushes=%llu q_min_ms=%.1f q_max_ms=%.1f underruns=%llu "
+            "starved_ms=%.3f\n",
+            ch, (unsigned long long)m->audio_queue_pushes[ch],
+            (double)m->audio_queue_min_frames[ch] * 1000.0 / 44100.0,
+            (double)m->audio_queue_max_frames[ch] * 1000.0 / 44100.0,
+            (unsigned long long)m->audio_queue_underruns[ch],
+            ms(m->audio_queue_starved_ns[ch]));
+    }
+}
+
+static void report_if_due(uint64_t now) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    if (!s_perf.interval_start_ns) {
+        s_perf.interval_start_ns = now;
+        return;
+    }
+    if (now <= s_perf.interval_start_ns || now - s_perf.interval_start_ns < 1000000000ull)
+        return;
+    checkpoint_timers(now);
+    sample_gpu_replay();
+    uint64_t wall_ns = now - s_perf.interval_start_ns;
+    SrPerfMetrics m = s_perf.interval;
+    uint64_t scheduler_ns = wall_ns > m.guest_ns ? wall_ns - m.guest_ns : 0;
+    uint64_t idle_ns = scheduler_ns + m.guest_idle_ns;
+    uint64_t excluded_ns = m.ge_wait_ns + m.present_ns + m.guest_idle_ns;
+    uint64_t cpu_ns = m.guest_ns > excluded_ns ? m.guest_ns - excluded_ns : 0;
+    uint64_t submits = m.ge_submits + m.present_submits;
+    uint64_t waits = m.ge_waits + m.present_waits;
+    double seconds = (double)wall_ns / 1000000000.0;
+    double fps = seconds > 0.0 ? (double)m.presents / seconds : 0.0;
+    double vblank_hz = seconds > 0.0 ? (double)m.vblanks / seconds : 0.0;
+    double frame_ms = m.presents ? ms(wall_ns) / (double)m.presents : 0.0;
+    s_hud_fps = fps;
+    s_hud_frame_ms = frame_ms;
+    s_hud_vblank_hz = vblank_hz;
+    s_hud_game_fps = seconds > 0.0 ? (double)m.new_frames / seconds : 0.0;
+    s_hud_vblanks_per_frame = m.new_frame_intervals
+        ? (double)m.new_frame_vblanks / (double)m.new_frame_intervals : 0.0;
+    {
+        SrPerfLiveInterval live;
+        memset(&live, 0, sizeof(live));
+        live.wall_ns = wall_ns;
+        live.cpu_ns = cpu_ns;
+        live.ge_wait_ns = m.ge_wait_ns;
+        live.present_ns = m.present_ns;
+        live.idle_ns = idle_ns;
+        live.presents = m.presents;
+        live.new_frames = m.new_frames;
+        live.vblanks = m.vblanks;
+        live.aot_ns = m.aot_ns;
+        live.interp_ns = m.interp_ns;
+        live.aot_to_interp = m.aot_to_interp;
+        live.interp_to_aot = m.interp_to_aot;
+        memcpy(live.sched_ns, m.sched_ns, sizeof(live.sched_ns));
+        live.ge_cpu_ns = m.ge_cpu_ns;
+        live.gpu_draws = m.gpu_replay[SR_PERF_GPU_DRAWS];
+        live.vk_submit_ns = m.vk_submit_ns;
+        live.vk_wait_ns = m.vk_wait_ns;
+        live.vk_pipeline_ns = m.vk_pipeline_ns;
+        live.vk_readback_ns = m.vk_readback_ns;
+        for (int ch = 0; ch < SR_PERF_AUDIO_CHANNELS; ch++)
+            live.audio_underruns += m.audio_queue_underruns[ch];
+        sr_perf_history_push(&s_history, &live);
+    }
+    if (s_perf_stderr_enabled) {
+    perf_emit_format(
+            "PERF vblank_total=%llu wall_ms=%.3f fps=%.3f frame_ms=%.3f vblank_hz=%.3f "
+            "cpu_ms=%.3f ge_wait_ms=%.3f present_ms=%.3f idle_ms=%.3f "
+            "submits=%llu ge_submits=%llu present_submits=%llu waits=%llu "
+            "readback_waits=%llu present_skips=%llu present_wait_ms=%.3f target30=%s\n",
+            (unsigned long long)s_perf.total_vblanks, ms(wall_ns), fps, frame_ms,
+            vblank_hz, ms(cpu_ns), ms(m.ge_wait_ns), ms(m.present_ns), ms(idle_ns),
+            (unsigned long long)submits, (unsigned long long)m.ge_submits,
+            (unsigned long long)m.present_submits, (unsigned long long)waits,
+            (unsigned long long)m.readback_waits,
+            (unsigned long long)m.present_skips, ms(m.present_wait_ns),
+            fps >= 29.5 ? "yes" : "no");
+    perf_emit_format(
+            "PERF_ATTRIB aot_ms=%.3f aot_calls=%llu aot_instructions=%llu interp_ms=%.3f interp_calls=%llu interp_instructions=%llu aot_to_interp=%llu interp_to_aot=%llu vfpu_ms=%.3f ge_cpu_ms=%.3f vk_submit_ms=%.3f vk_wait_ms=%.3f texture_decode_ms=%.3f iso_read_ms=%.3f vfs_read_ms=%.3f h264_ms=%.3f atrac_ms=%.3f mix_ms=%.3f output_ms=%.3f\n",
+            ms(m.aot_ns), (unsigned long long)m.aot_calls,
+            (unsigned long long)m.aot_instructions, ms(m.interp_ns),
+            (unsigned long long)m.interp_calls,
+            (unsigned long long)m.interp_instructions,
+            (unsigned long long)m.aot_to_interp,
+            (unsigned long long)m.interp_to_aot, ms(m.vfpu_ns), ms(m.ge_cpu_ns),
+            ms(m.vk_submit_ns), ms(m.vk_wait_ns), ms(m.texture_decode_ns),
+            ms(m.storage_ns[SR_PERF_STORAGE_ISO]),
+            ms(m.storage_ns[SR_PERF_STORAGE_VFS]), ms(m.h264_ns), ms(m.atrac_ns),
+            ms(m.audio_mix_ns), ms(m.audio_output_ns));
+    perf_emit_ge_frontend(&m);
+    perf_emit_audio_queue(&m);
+    }
+    if (s_perf.csv) {
+        csv_row(s_perf.csv, &m, s_perf.total_vblanks, wall_ns);
+        fflush(s_perf.csv);
+    }
+    fflush(stderr);
+    memset(&s_perf.interval, 0, sizeof(s_perf.interval));
+    s_perf.interval_start_ns = now;
+    s_perf.interval_count++;
+}
+
+#ifdef SR_PROFILER_SELFTEST
+void sr_perf_test_set_report_sink(SrPerfReportSink sink) { s_report_sink = sink; }
+
+/* Make the current interval due and report it, so a selftest need not wait a second. */
+void sr_perf_test_force_report(void) {
+    uint64_t now = raw_now_ns();
+    s_perf.interval_start_ns = now > 2000000000ull ? now - 2000000000ull : 1u;
+    report_if_due(now);
+}
+#endif
+
+/* ---- execution share (perf.h) -------------------------------------------------------
+ * Always on and independent of s_perf, so the share is known without SR_PERF. The hot
+ * paths are sr_exec_enter/leave (inline, a compare when the tier is unchanged) and the
+ * interpreter's instruction counter; the clock is read only when the running tier changes
+ * and at slice edges. */
+#define SR_EXEC_ENTRY_POINT_SLOTS 4096u
+
+int sr_exec_tier;
+uint64_t sr_exec_interp_instructions;
+
+static struct {
+    uint64_t tier_start_ns;
+    uint64_t tier_ns[SR_EXEC_TIER_COUNT];
+    uint64_t entries[SR_PERF_INTERP_REASON_COUNT];   /* why the interpreter was entered */
+    uint64_t exits_aot_handoff, exits_call_return, exits_other;
+    uint64_t idle_ns;
+    uint32_t point_pc[SR_EXEC_ENTRY_POINT_SLOTS];     /* distinct entry PCs, open addressing */
+    uint8_t point_used[SR_EXEC_ENTRY_POINT_SLOTS];
+    uint8_t point_miss[SR_EXEC_ENTRY_POINT_SLOTS];
+    unsigned points, miss_points;
+    uint64_t points_overflow;                        /* entries whose PC did not fit the set */
+    int pending_reason;
+    int armed, reported;
+} s_exec;
+
+uint64_t sr_exec_now_ns(void) { return raw_now_ns(); }
+
+static void exec_accrue(uint64_t now) {
+    if (sr_exec_tier != SR_EXEC_TIER_NONE && now > s_exec.tier_start_ns)
+        s_exec.tier_ns[sr_exec_tier] += now - s_exec.tier_start_ns;
+    s_exec.tier_start_ns = now;
+}
+
+void sr_exec_tier_switch(int tier) {
+    if (tier < SR_EXEC_TIER_NONE || tier >= SR_EXEC_TIER_COUNT) return;
+    exec_accrue(raw_now_ns());
+    sr_exec_tier = tier;
+}
+
+void sr_exec_slice_begin(int tier) {
+    sr_exec_tier = tier >= SR_EXEC_TIER_NONE && tier < SR_EXEC_TIER_COUNT ? tier : SR_EXEC_TIER_NONE;
+    s_exec.tier_start_ns = sr_exec_tier != SR_EXEC_TIER_NONE ? raw_now_ns() : 0u;
+}
+
+int sr_exec_slice_end(void) {
+    int tier = sr_exec_tier;
+    if (tier != SR_EXEC_TIER_NONE) exec_accrue(raw_now_ns());
+    sr_exec_tier = SR_EXEC_TIER_NONE;
+    return tier;
+}
+
+void sr_exec_idle(uint64_t started_ns) {
+    if (!started_ns) return;
+    uint64_t now = raw_now_ns();
+    if (now <= started_ns) return;
+    s_exec.idle_ns += now - started_ns;
+    /* The wait is not the running tier's work: move its start past the wait. */
+    if (sr_exec_tier != SR_EXEC_TIER_NONE) {
+        if (s_exec.tier_start_ns < started_ns) exec_accrue(started_ns);
+        s_exec.tier_start_ns = now;
+    }
+}
+
+void sr_exec_interp_entry(uint32_t entry_pc) {
+    int reason = s_exec.pending_reason;
+    s_exec.pending_reason = SR_PERF_INTERP_DISPATCH_MISS;
+    s_exec.entries[reason]++;
+    uint32_t slot = (entry_pc * 2654435761u) & (SR_EXEC_ENTRY_POINT_SLOTS - 1u);
+    for (unsigned probe = 0; probe < 32u; probe++) {
+        uint32_t i = (slot + probe) & (SR_EXEC_ENTRY_POINT_SLOTS - 1u);
+        if (!s_exec.point_used[i]) {
+            if (s_exec.points >= SR_EXEC_ENTRY_POINT_SLOTS / 2u) break;   /* keep probes short */
+            s_exec.point_used[i] = 1u;
+            s_exec.point_pc[i] = entry_pc;
+            s_exec.points++;
+        } else if (s_exec.point_pc[i] != entry_pc) {
+            continue;
+        }
+        if (reason == SR_PERF_INTERP_DISPATCH_MISS && !s_exec.point_miss[i]) {
+            s_exec.point_miss[i] = 1u;
+            s_exec.miss_points++;
+        }
+        return;
+    }
+    s_exec.points_overflow++;
+}
+
+void sr_exec_interp_exit(int returned_to_aot, int call_return) {
+    if (!returned_to_aot) s_exec.exits_other++;
+    else if (call_return) s_exec.exits_call_return++;
+    else s_exec.exits_aot_handoff++;
+}
+
+static int miss_target_compare(const void *left, const void *right) {
+    uint32_t a = *(const uint32_t *)left, b = *(const uint32_t *)right;
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/* SR_MISS_SEEDS: the distinct dispatch-miss targets of this run, one guest address per line in
+ * ascending order, for tools/miss_seeds.py to merge into the title's seed list (#1848). It only
+ * reports what the run already counted; nothing here changes how a miss is handled. A target
+ * that did not fit the entry-point set is counted in points_overflow, and the file says so
+ * rather than passing a short list off as complete. */
+static void exec_write_miss_seeds(const char *path) {
+    uint32_t targets[SR_EXEC_ENTRY_POINT_SLOTS];
+    size_t count = 0;
+    for (unsigned i = 0; i < SR_EXEC_ENTRY_POINT_SLOTS; i++)
+        if (s_exec.point_used[i] && s_exec.point_miss[i]) targets[count++] = s_exec.point_pc[i];
+    qsort(targets, count, sizeof targets[0], miss_target_compare);
+    FILE *out = fopen(path, "w");
+    if (!out) {
+        fprintf(stderr, "EXEC_SHARE: cannot open SR_MISS_SEEDS output\n");
+        return;
+    }
+    fprintf(out, "# nakagawa-miss-seeds-v1\n# miss_targets=%zu entry_points_overflow=%llu\n", count,
+            (unsigned long long)s_exec.points_overflow);
+    for (size_t i = 0; i < count; i++) fprintf(out, "0x%08" PRIx32 "\n", targets[i]);
+    if (fclose(out) != 0)
+        fprintf(stderr, "EXEC_SHARE: cannot write SR_MISS_SEEDS output\n");
+    if (s_exec.points_overflow)
+        fprintf(stderr,
+                "EXEC_SHARE: %llu interpreter entries did not fit the entry-point set; the "
+                "SR_MISS_SEEDS list may be incomplete\n",
+                (unsigned long long)s_exec.points_overflow);
+}
+
+void sr_exec_share_arm(void) { s_exec.armed = 1; }
+
+#define SR_PROCESS_END_MAX 8
+static void (*s_process_end[SR_PROCESS_END_MAX])(void);
+static unsigned s_process_end_count;
+
+void sr_at_process_end(void (*report)(void)) {
+    if (s_process_end_count == SR_PROCESS_END_MAX) {
+        fprintf(stderr, "SR_PROCESS_END: more than %u end-of-process reports; the run stops here\n",
+                (unsigned)SR_PROCESS_END_MAX);
+        fflush(stderr);
+        exit(1);
+    }
+    s_process_end[s_process_end_count++] = report;
+}
+
+static void sr_process_end_reports(void) {
+    for (unsigned i = 0; i < s_process_end_count; i++) {
+        void (*report)(void) = s_process_end[i];
+        s_process_end[i] = NULL;
+        if (report) report();
+    }
+    fflush(stderr);
+}
+
+void sr_exec_share_report(void) {
+    if (!s_exec.armed || s_exec.reported) return;
+    s_exec.reported = 1;
+    exec_accrue(raw_now_ns());
+    uint64_t aot_ns = s_exec.tier_ns[SR_EXEC_TIER_AOT];
+    uint64_t interp_ns = s_exec.tier_ns[SR_EXEC_TIER_INTERP];
+    uint64_t guest_ns = aot_ns + interp_ns;
+    uint64_t entries = 0;
+    for (unsigned i = 0; i < SR_PERF_INTERP_REASON_COUNT; i++) entries += s_exec.entries[i];
+    char share[32];
+    if (guest_ns) snprintf(share, sizeof share, "%.6f", (double)interp_ns / (double)guest_ns);
+    else snprintf(share, sizeof share, "none");
+    fprintf(stderr,
+            "EXEC_SHARE interp_time_share=%s aot_ms=%.3f interp_ms=%.3f idle_ms=%.3f "
+            "interp_entries=%llu entries_dispatch_miss=%llu "
+            "entries_stale_block=%llu exits_aot_handoff=%llu exits_call_return=%llu "
+            "exits_other=%llu interp_instructions=%llu interp_entry_points=%u "
+            "miss_targets=%u entry_points_overflow=%llu\n",
+            share, ms(aot_ns), ms(interp_ns), ms(s_exec.idle_ns),
+            (unsigned long long)entries,
+            (unsigned long long)s_exec.entries[SR_PERF_INTERP_DISPATCH_MISS],
+            (unsigned long long)s_exec.entries[SR_PERF_INTERP_STALE_BLOCK],
+            (unsigned long long)s_exec.exits_aot_handoff,
+            (unsigned long long)s_exec.exits_call_return,
+            (unsigned long long)s_exec.exits_other,
+            (unsigned long long)sr_exec_interp_instructions, s_exec.points,
+            s_exec.miss_points, (unsigned long long)s_exec.points_overflow);
+    fflush(stderr);
+    const char *seeds_path = getenv("SR_MISS_SEEDS");
+    if (seeds_path && seeds_path[0]) exec_write_miss_seeds(seeds_path);
+    const char *path = getenv("SR_EXEC_SHARE_JSON");
+    if (!path || !path[0]) return;
+    FILE *out = fopen(path, "w");
+    if (!out) {
+        fprintf(stderr, "EXEC_SHARE: cannot open SR_EXEC_SHARE_JSON output\n");
+        return;
+    }
+    fprintf(out,
+            "{\n  \"schema\": \"nakagawa-exec-share-v1\",\n"
+            "  \"interp_time_share\": %s,\n  \"aot_ns\": %llu,\n  \"interp_ns\": %llu,\n"
+            "  \"idle_ns\": %llu,\n  \"interp_entries\": %llu,\n"
+            "  \"entries_by_reason\": {\"dispatch_miss\": %llu, \"stale_block\": %llu},\n"
+            "  \"exits\": {\"aot_handoff\": %llu, \"call_return\": %llu, \"other\": %llu},\n"
+            "  \"interp_instructions\": %llu,\n  \"interp_entry_points\": %u,\n"
+            "  \"miss_targets\": %u,\n  \"entry_points_overflow\": %llu\n}\n",
+            guest_ns ? share : "null", (unsigned long long)aot_ns,
+            (unsigned long long)interp_ns, (unsigned long long)s_exec.idle_ns,
+            (unsigned long long)entries,
+            (unsigned long long)s_exec.entries[SR_PERF_INTERP_DISPATCH_MISS],
+            (unsigned long long)s_exec.entries[SR_PERF_INTERP_STALE_BLOCK],
+            (unsigned long long)s_exec.exits_aot_handoff,
+            (unsigned long long)s_exec.exits_call_return,
+            (unsigned long long)s_exec.exits_other,
+            (unsigned long long)sr_exec_interp_instructions, s_exec.points,
+            s_exec.miss_points, (unsigned long long)s_exec.points_overflow);
+    fclose(out);
+}
+
+static void make_summary_path(const char *csv_path, char *out, size_t out_size) {
+    const char *slash = strrchr(csv_path, '/');
+    const char *dot = strrchr(csv_path, '.');
+    size_t length = strlen(csv_path);
+    if (length + sizeof(".json") > out_size) {
+        if (out_size) out[0] = '\0';
+        return;
+    }
+    if (dot && (!slash || dot > slash)) {
+        size_t stem = (size_t)(dot - csv_path);
+        memcpy(out, csv_path, stem);
+        memcpy(out + stem, ".json", sizeof(".json"));
+        return;
+    }
+    memcpy(out, csv_path, length);
+    memcpy(out + length, ".json", sizeof(".json"));
+}
+
+void sr_perf_shutdown(void) {
+    sr_process_end_reports();
+    sr_exec_share_report();
+    if (!s_perf.enabled || !s_perf.initialized || s_perf.shutdown) return;
+    s_perf.shutdown = 1;
+    sr_perf_enabled = 0;
+    sr_perf_phase_report(1);
+    uint64_t now = raw_now_ns();
+    stop_timers(now);
+    uint64_t wall_ns = s_perf.run_start_ns && now > s_perf.run_start_ns
+                          ? now - s_perf.run_start_ns : 0;
+    if (s_perf.json_path[0]) write_summary(s_perf.json_path, wall_ns);
+    if (s_perf.csv) {
+        uint64_t final_wall_ns = s_perf.interval_start_ns && now > s_perf.interval_start_ns
+                                     ? now - s_perf.interval_start_ns : 0;
+        sample_gpu_replay();
+        if (final_wall_ns)
+            csv_row(s_perf.csv, &s_perf.interval, s_perf.total_vblanks, final_wall_ns);
+        fflush(s_perf.csv);
+        fclose(s_perf.csv);
+        s_perf.csv = NULL;
+    }
+    if (s_perf.frames) {
+        fclose(s_perf.frames);
+        s_perf.frames = NULL;
+    }
+}
+
+static void perf_exit(void) {
+    sr_perf_shutdown();
+}
+
+void sr_perf_init(void) {
+    if (s_perf.initialized) return;
+    memset(&s_perf, 0, sizeof(s_perf));
+    memset(&s_aot_vfpu, 0, sizeof(s_aot_vfpu));
+    sr_perf_history_reset(&s_history);
+    s_perf.initialized = 1;
+    s_perf_stderr_enabled = env_on("SR_PERF");
+    /* An output path alone turns the counters on, unless SR_PERF says 0: that is how a benchmark
+     * measures the runtime with the profiler off (tools/run_perf_benchmarks.py). */
+    const char *perf = getenv("SR_PERF");
+    const char *csv_path = getenv("SR_PERF_CSV");
+    const char *json_path = getenv("SR_PERF_JSON");
+    const char *frames_path = getenv("SR_PERF_FRAMES");
+    int perf_off = perf && strcmp(perf, "0") == 0;
+    int files = !perf_off && ((csv_path && csv_path[0]) || (json_path && json_path[0]) ||
+                              (frames_path && frames_path[0]));
+    int hud = env_on("SR_HUD");
+    s_perf.enabled = s_perf_stderr_enabled || hud || files;
+    s_perf_files_only = s_perf.enabled && !s_perf_stderr_enabled && !hud;
+    sr_perf_enabled = s_perf.enabled;
+    sr_perf_aot_active = 0;
+    if (!s_perf.enabled) return;
+    s_perf.run_start_ns = raw_now_ns();
+    s_perf.interval_start_ns = s_perf.run_start_ns;
+    thread_clock_start();
+    seed_gpu_replay_base();
+    if (csv_path && csv_path[0]) {
+        snprintf(s_perf.csv_path, sizeof(s_perf.csv_path), "%s", csv_path);
+        make_summary_path(s_perf.csv_path, s_perf.json_path, sizeof(s_perf.json_path));
+        s_perf.csv = fopen(s_perf.csv_path, "w");
+        if (s_perf.csv) {
+            csv_header(s_perf.csv);
+            fflush(s_perf.csv);
+        } else {
+            fprintf(stderr, "PERF: cannot open CSV output\n");
+        }
+    }
+    if (json_path && json_path[0])
+        snprintf(s_perf.json_path, sizeof(s_perf.json_path), "%s", json_path);
+    if (frames_path && frames_path[0]) {
+        s_perf.frames = fopen(frames_path, "w");
+        if (s_perf.frames) fputs(s_frames_header, s_perf.frames);
+        else fprintf(stderr, "PERF: cannot open SR_PERF_FRAMES output\n");
+    }
+    static int exit_hooked;
+    if (!exit_hooked) atexit(perf_exit);
+    exit_hooked = 1;
+    if (!s_perf_files_only)            /* counters for the files only: stderr carries failures only */
+        perf_emit_format("PERF enabled: 1 Hz aggregate telemetry%s%s\n", s_perf.csv ? " + CSV" : "",
+                         s_perf.json_path[0] ? " + JSON summary" : "");
+}
+
+#ifdef SR_PROFILER_SELFTEST
+void sr_perf_test_set_clocks(SrPerfTestClock wall_ns, SrPerfTestClock thread_cpu_ns) {
+    s_test_wall_clock = wall_ns;
+    s_test_thread_clock = thread_cpu_ns;
+}
+
+void sr_perf_test_reinit(void) {
+    if (s_perf.csv) fclose(s_perf.csv);
+    s_perf.csv = NULL;
+    if (s_perf.frames) fclose(s_perf.frames);
+    s_perf.frames = NULL;
+    s_perf.initialized = 0;
+    s_perf_files_only = 0;
+    sr_perf_init();
+}
+#endif
+
+void sr_perf_set_gpu_replay_source(SrPerfGpuReplaySource source) {
+    s_gpu_replay_source = source;
+    seed_gpu_replay_base();
+}
+
+uint64_t sr_perf_now_ns_impl(void) {
+    return s_perf.enabled && !s_perf.shutdown ? raw_now_ns() : 0;
+}
+
+void sr_perf_guest_begin(void) {
+    if (!s_perf.enabled || s_perf.shutdown || s_perf.guest_active) return;
+    s_perf.guest_active = 1;
+    s_perf.guest_start_ns = raw_now_ns();
+}
+
+void sr_perf_guest_end(void) {
+    if (!s_perf.enabled || s_perf.shutdown || !s_perf.guest_active) return;
+    uint64_t now = raw_now_ns();
+    if (now > s_perf.guest_start_ns) ADD(guest_ns, now - s_perf.guest_start_ns);
+    s_perf.guest_active = 0;
+    s_perf.guest_start_ns = 0;
+    report_if_due(now);
+}
+
+void sr_perf_guest_idle_wait(uint64_t started_ns) {
+    if (s_perf.enabled && !s_perf.shutdown && s_perf.guest_active && started_ns)
+        ADD(guest_idle_ns, elapsed_ns(started_ns));
+}
+
+void sr_perf_vblank(void) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    ADD(vblanks, 1);
+    s_perf.total_vblanks++;
+    report_if_due(raw_now_ns());
+}
+
+/* ---- display-source service cadence ------------------------------------------------
+ * The display source counts a period per elapsed rational deadline, but delivery
+ * happens only at an eligible service point and the pending bit coalesces. A latch
+ * whose host-time gap since the previous latch exceeds one display period is
+ * therefore a period the guest could not be told about, and attributing it to the
+ * phase that was executing when the period came due is what turns "the rate is
+ * low" into "this construct holds the CPU".  Counted here, not derived afterwards:
+ * after the fact the phase is unknowable. */
+#define SR_PERF_DISPLAY_PERIOD_US 16683u   /* 60000/1001 Hz */
+#define SR_PERF_PHASE_SAMPLE_N 4u          /* guest-PC/NID samples kept per phase */
+
+typedef struct SrPerfPhaseAttrib {
+    uint64_t latches;            /* latches whose gap fit inside one period */
+    uint64_t late;               /* latches whose gap exceeded one period */
+    uint64_t lost_us;            /* sum of (gap - one period) over those latches */
+    uint64_t max_gap_us;         /* worst single gap seen in this phase */
+    uint64_t periods_lost;       /* whole source periods the coalesced bit swallowed */
+    uint32_t pc[SR_PERF_PHASE_SAMPLE_N];    /* interrupted guest PCs, power-of-two sampled */
+    uint32_t nid[SR_PERF_PHASE_SAMPLE_N];   /* NIDs in progress, power-of-two sampled */
+    uint32_t uid[SR_PERF_PHASE_SAMPLE_N];   /* running thread uid at the latch */
+    uint64_t sample_mask;        /* 2^n - 1: keep every 2^n-th late latch */
+} SrPerfPhaseAttrib;
+
+static SrPerfPhaseAttrib s_phase_attrib[SR_RT_PHASE_COUNT];
+static uint64_t s_late_total;
+static uint64_t s_periods_masked;   /* display periods that elapsed with IE clear */
+
+/* Delivery accounting.  A late latch only says the guest was told late; an episode that
+ * was latched and then destroyed before delivery is a different failure with the same
+ * visible symptom (a low delivered rate), so owed, delivered, coalesced and dropped
+ * episodes are counted on their own terms and drops are attributed to the phase that
+ * destroyed them rather than to whichever phase noticed later.  The identity
+ *     owed + coalesced = delivered + dropped + in_flight
+ * closes at every report, which is what tells a period that was latched and never
+ * delivered (it is in the in_flight residual, or it was dropped) from one that was
+ * merely delivered late (late_owed - late_delivered, and no other late class). */
+static uint64_t s_owed_total;        /* episodes the source owed a service point */
+static uint64_t s_coalesced_total;   /* masked windows, one coalesced episode each */
+static uint64_t s_delivered_total;   /* episodes a service point actually delivered */
+static uint64_t s_dropped_total;     /* owed episodes destroyed before any service point */
+static uint64_t s_dropped_by_phase[SR_RT_PHASE_COUNT];
+static uint64_t s_collapsed_periods; /* source periods a saturated timeline cannot name */
+static uint64_t s_late_owed_total;   /* episodes that came due at a late latch */
+static uint64_t s_late_in_flight;    /* ... of those, still owed */
+static uint64_t s_late_delivered;    /* ... of those, a service point delivered */
+
+const char *const sr_rt_phase_name[SR_RT_PHASE_COUNT] = {
+    "other", "aot", "interp", "syscall", "ge", "host_wait", "sched", "present",
+};
+
+/* Read by the attribution above and written at the cheap phase seams; a plain
+ * global so a phase change costs one store and no call. */
+int sr_rt_phase = SR_RT_PHASE_OTHER;
+uint32_t sr_rt_nid = 0u;
+/* Installed by the scheduler, which owns the live CpuState; NULL in a build with
+ * no scheduler, where there is no guest PC to report. */
+uint32_t (*sr_rt_pc_fn)(void) = NULL;
+uint32_t (*sr_rt_uid_fn)(void) = NULL;
+
+/* The cumulative attribution lines, each formatted whole and written once (perf_emit_line: a
+ * formatted fprintf to the unbuffered stderr is one write per piece, which costs the guest tens of
+ * milliseconds a line). Not written at all when only the output files asked for the counters. */
+void sr_perf_phase_report(int force) {
+    if (!s_perf.enabled || s_perf.shutdown || s_perf_files_only) return;
+    uint64_t now = raw_now_ns();
+    if (!force && now - s_perf.attrib_report_ns < 60000000000ull) return;
+    s_perf.attrib_report_ns = now;
+    uint64_t total_late = 0, total_lost = 0;
+    for (int i = 0; i < SR_RT_PHASE_COUNT; i++) {
+        total_late += s_phase_attrib[i].late;
+        total_lost += s_phase_attrib[i].lost_us;
+    }
+    perf_emit_format("PERF_ATTRIB vblank_late total=%llu lost_ms=%llu masked_periods=%llu "
+                     "collapsed_periods=%llu\n",
+                     (unsigned long long)total_late, (unsigned long long)(total_lost / 1000u),
+                     (unsigned long long)s_periods_masked,
+                     (unsigned long long)s_collapsed_periods);
+    /* in_flight is the identity residual, computed rather than counted: episodes owed
+     * and not yet delivered.  A bookkeeping bug shows up here as an absurd number
+     * instead of a plausible one. */
+    perf_emit_format("PERF_ATTRIB vblank_owed owed=%llu coalesced=%llu delivered=%llu "
+                     "dropped=%llu in_flight=%llu late_owed=%llu late_delivered=%llu\n",
+                     (unsigned long long)s_owed_total, (unsigned long long)s_coalesced_total,
+                     (unsigned long long)s_delivered_total, (unsigned long long)s_dropped_total,
+                     (unsigned long long)(s_owed_total + s_coalesced_total
+                                          - s_delivered_total - s_dropped_total),
+                     (unsigned long long)s_late_owed_total, (unsigned long long)s_late_delivered);
+    for (int i = 0; i < SR_RT_PHASE_COUNT; i++) {
+        if (!s_dropped_by_phase[i]) continue;
+        perf_emit_format("  PERF_ATTRIB_DROP phase=%s episodes=%llu\n",
+                         sr_rt_phase_name[i], (unsigned long long)s_dropped_by_phase[i]);
+    }
+    for (int i = 0; i < SR_RT_PHASE_COUNT; i++) {
+        const SrPerfPhaseAttrib *a = &s_phase_attrib[i];
+        if (!a->late) continue;
+        char line[512];
+        int n = snprintf(line, sizeof line,
+                         "  PERF_ATTRIB_LATE phase=%s n=%llu lost_ms=%llu max_gap_ms=%llu periods=%llu",
+                         sr_rt_phase_name[i], (unsigned long long)a->late,
+                         (unsigned long long)(a->lost_us / 1000u),
+                         (unsigned long long)(a->max_gap_us / 1000u),
+                         (unsigned long long)a->periods_lost);
+        size_t used = n > 0 && (size_t)n < sizeof line ? (size_t)n : 0u;
+        for (unsigned k = 0; used && k < SR_PERF_PHASE_SAMPLE_N; k++) {
+            if (!a->pc[k] && !a->nid[k] && !a->uid[k]) continue;
+            n = snprintf(line + used, sizeof line - used, " [uid=0x%" PRIx32 " pc=0x%08" PRIx32 "%s]",
+                         a->uid[k], a->pc[k], a->nid[k] ? " nid" : "");
+            used = n > 0 && (size_t)n < sizeof line - used ? used + (size_t)n : 0u;
+            if (used && a->nid[k]) {
+                n = snprintf(line + used, sizeof line - used, "=0x%08" PRIx32, a->nid[k]);
+                used = n > 0 && (size_t)n < sizeof line - used ? used + (size_t)n : 0u;
+            }
+        }
+        if (!used || used + 1u >= sizeof line) continue;   /* 4 samples always fit: never hit */
+        line[used++] = '\n';
+        perf_emit_line(line, used);
+    }
+    fflush(stderr);
+}
+
+/* A source that cannot name the periods it crossed (a saturated deadline) collapses
+ * them into the one episode the overflow can deliver.  The queued episodes were already
+ * counted as owed when their latches happened, so they are dropped here, attributed to
+ * the phase that destroyed them; the collapsed remainder was never owed to anyone and is
+ * counted as periods. */
+void sr_perf_vblank_collapse(uint32_t owed, uint32_t periods) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    s_collapsed_periods += periods;
+    if (!owed) return;
+    unsigned phase = (unsigned)sr_rt_phase;
+    if (phase >= SR_RT_PHASE_COUNT) phase = SR_RT_PHASE_OTHER;
+    s_dropped_total += owed;
+    s_dropped_by_phase[phase] += owed;
+    s_late_in_flight = owed < s_late_in_flight ? 0u : s_late_in_flight - owed;
+}
+
+/* One masked window owes the guest its single coalesced episode, which the resume adds
+ * to the same owed queue as an ordinary source latch. */
+void sr_perf_vblank_coalesced(void) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    s_coalesced_total++;
+}
+
+void sr_perf_vblank_service(uint32_t delivered) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    s_delivered_total += delivered;
+    /* Late episodes are served from the same queue as the on-time ones, so a service
+     * point resolves as many of them as its batch can cover. */
+    uint64_t from_late = s_late_in_flight < delivered ? s_late_in_flight : delivered;
+    s_late_in_flight -= from_late;
+    s_late_delivered += from_late;
+}
+
+void sr_perf_vblank_latch(uint64_t gap_us, uint32_t periods, int masked) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    if (masked) {                 /* the guest's own interrupt mask, not a lost edge */
+        s_periods_masked += periods;
+        return;
+    }
+    s_owed_total += periods;
+    unsigned phase = (unsigned)sr_rt_phase;
+    if (phase >= SR_RT_PHASE_COUNT) phase = SR_RT_PHASE_OTHER;
+    SrPerfPhaseAttrib *a = &s_phase_attrib[phase];
+    a->latches++;
+    if (gap_us <= SR_PERF_DISPLAY_PERIOD_US) return;
+    uint64_t lost = gap_us - SR_PERF_DISPLAY_PERIOD_US;
+    s_perf.late_since_frame = 1;
+    a->late++;
+    a->lost_us += lost;
+    if (periods > 1u) a->periods_lost += periods - 1u;
+    if (gap_us > a->max_gap_us) a->max_gap_us = gap_us;
+    s_late_owed_total += periods;
+    s_late_in_flight += periods;
+    /* Guest PCs and NIDs are functional facts, not private bytes: keep a
+     * power-of-two sample so a long run stays readable and bounded. */
+    a->sample_mask++;
+    if ((a->sample_mask & (a->sample_mask - 1u)) == 0u) {
+        unsigned slot = (unsigned)(a->sample_mask >> 1) % SR_PERF_PHASE_SAMPLE_N;
+        a->pc[slot] = sr_rt_pc_fn ? sr_rt_pc_fn() : 0u;
+        a->uid[slot] = sr_rt_uid_fn ? sr_rt_uid_fn() : 0u;
+        a->nid[slot] = (phase == (unsigned)SR_RT_PHASE_SYSCALL) ? sr_rt_nid : 0u;
+    }
+    s_late_total++;
+    sr_perf_phase_report(0);
+}
+
+void sr_perf_ge_submit(SrPerfGeReason reason) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    ADD(ge_submits, 1);
+    if ((unsigned)reason < SR_PERF_GE_REASON_COUNT)
+        ADD_ARRAY(ge_reason_submits, (unsigned)reason, 1);
+}
+
+void sr_perf_ge_wait(uint64_t started_ns, SrPerfGeReason reason) {
+    if (!s_perf.enabled || s_perf.shutdown || !started_ns) return;
+    sr_rt_phase = SR_RT_PHASE_GE;   /* a GE completion wait, not host sleep */
+    uint64_t elapsed = elapsed_ns(started_ns);
+    ADD(ge_wait_ns, elapsed);
+    ADD(ge_waits, 1);
+    if ((unsigned)reason < SR_PERF_GE_REASON_COUNT) {
+        ADD_ARRAY(ge_reason_waits, (unsigned)reason, 1);
+        ADD_ARRAY(ge_reason_wait_ns, (unsigned)reason, elapsed);
+    }
+    if (reason == SR_PERF_GE_DEPTH_READBACK ||
+        reason == SR_PERF_GE_TARGET_READBACK_TRANSITION)
+        ADD(readback_waits, 1);
+    sr_rt_phase = SR_RT_PHASE_OTHER;
+}
+
+void sr_perf_ge_event(SrPerfGeEvent event, uint64_t count) {
+    if (s_perf.enabled && !s_perf.shutdown && (unsigned)event < SR_PERF_GE_EVENT_COUNT)
+        ADD_ARRAY(ge_events, (unsigned)event, count);
+}
+
+void sr_perf_present_submit(void) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    sr_rt_phase = SR_RT_PHASE_PRESENT;
+    ADD(present_submits, 1);
+}
+
+void sr_perf_present_wait(uint64_t started_ns) {
+    if (!s_perf.enabled || s_perf.shutdown || !started_ns) return;
+    ADD(present_wait_ns, elapsed_ns(started_ns));
+    ADD(present_waits, 1);
+}
+
+void sr_perf_present_done(uint64_t started_ns, int result) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    if (started_ns) ADD(present_ns, elapsed_ns(started_ns));
+    if (result == 1) ADD(presents, 1);
+    sr_rt_phase = SR_RT_PHASE_OTHER;
+}
+
+void sr_perf_present_skip(void) {
+    if (s_perf.enabled && !s_perf.shutdown) ADD(present_skips, 1);
+}
+
+/* SR_PERF_FRAMES: what one game frame cost, from the previous new frame to this one, so a frame
+ * that misses its period can be told apart by cause. Every column but the first three is a
+ * difference of the run totals; `work_ms` is empty when the thread clock gave no reading. */
+static void frames_row(uint32_t vcount, uint32_t vblanks, int work_valid, uint64_t work_ns,
+                       uint64_t wall_ns) {
+    const SrPerfMetrics *t = &s_perf.total, *b = &s_perf.frame_base;
+#define D(field) (t->field - b->field)
+#define DMS(field) ms(D(field))
+    uint64_t storage = 0;
+    for (unsigned i = 0; i < SR_PERF_STORAGE_SOURCE_COUNT; i++)
+        storage += t->storage_ns[i] - b->storage_ns[i];
+    fprintf(s_perf.frames, "%u,%u,", (unsigned)vcount, (unsigned)vblanks);
+    if (work_valid) fprintf(s_perf.frames, "%.3f", ms(work_ns));
+    fprintf(s_perf.frames,
+            ",%.3f,%.3f,%.3f,%.3f,%.3f,%llu,%.3f,%llu,%llu,%.3f,%.3f,%.3f,%.3f,%llu,%.3f,%llu,%.3f,%.3f,"
+            "%.3f,%.3f,%.3f,%llu\n",
+            ms(wall_ns), DMS(guest_ns), DMS(aot_ns), DMS(interp_ns), DMS(ge_cpu_ns),
+            (unsigned long long)D(ge_cpu_calls), DMS(ge_wait_ns), (unsigned long long)D(ge_waits),
+            (unsigned long long)D(readback_waits), DMS(vk_submit_ns), DMS(vk_wait_ns),
+            DMS(vk_readback_ns), DMS(vk_pipeline_ns), (unsigned long long)D(vk_pipeline_creations),
+            DMS(texture_decode_ns), (unsigned long long)D(texture_decodes), ms(storage), DMS(atrac_ns),
+            DMS(h264_ns), DMS(audio_mix_ns), DMS(present_ns), (unsigned long long)D(sched_switches));
+#undef DMS
+#undef D
+}
+
+/* A new game frame is a present whose guest framebuffer differs from the previous present's,
+ * the flip of tools/perf_attribution.py; the first present is one and starts the interval
+ * clock. A title that hands one finished frame to the window more than once (Hot Shots Tennis
+ * sets the same buffer immediately and for the next frame) makes one new frame and re-presents,
+ * so `presents` counts what the window received and `new_frames` what the game drew. The
+ * VBLANKs from one new frame to the next are the game's pacing: 2 is a 30-frame title on time.
+ * A title that redraws one buffer in place shows as re-presents, as in that tool. */
+void sr_perf_present_frame(uint32_t buffer, uint32_t vcount) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    if (s_perf.frame_seen && buffer == s_perf.last_frame_buffer) return;
+    uint64_t cpu_ns = 0;
+    int cpu_valid = thread_cpu_now(&cpu_ns);
+    const uint64_t wall_ns = raw_now_ns();
+    ADD(new_frames, 1);
+    if (s_perf.frame_seen) {
+        uint32_t vblanks = (uint32_t)(vcount - s_perf.last_new_frame_vcount);
+        ADD(new_frame_intervals, 1);
+        ADD(new_frame_vblanks, (uint64_t)vblanks);
+        ADD_ARRAY(new_frame_iv, vblanks < SR_PERF_FRAME_IV_COUNT - 1u ? vblanks
+                                                                     : SR_PERF_FRAME_IV_COUNT - 1u, 1);
+        /* Owed periods are credited at the latch, so a frame that follows a catch-up can be one
+         * VBLANK after the previous one and still on time: count those apart. */
+        if (vblanks == 1u && s_perf.late_since_frame) ADD(new_frame_iv1_late, 1);
+        /* Host work for the frame: everything the scheduler thread ran since the previous new
+         * frame (guest code, HLE, GE lists, VBLANK service and the presents), none of its waits. */
+        /* A thread cannot run longer than the wall time between two of its own readings. Windows
+         * does not promise that thread cycles tick at the TSC rate, so a converted clock that reads
+         * more is turned off for the run, not reported. */
+        if (thread_clock_converted() && cpu_valid && s_perf.frame_cpu_valid &&
+            cpu_ns >= s_perf.last_frame_cpu_ns &&
+            cpu_ns - s_perf.last_frame_cpu_ns >
+                wall_ns - s_perf.last_frame_wall_ns + SR_PERF_THREAD_CLOCK_SLACK_NS) {
+            s_thread_clock_rejected = 1;
+            cpu_valid = 0;
+            perf_emit_format("PERF: thread CPU clock read %.3f ms over %.3f ms of wall time; host work "
+                             "per frame is off for the rest of the run\n",
+                             ms(cpu_ns - s_perf.last_frame_cpu_ns), ms(wall_ns - s_perf.last_frame_wall_ns));
+        }
+        int work_valid = cpu_valid && s_perf.frame_cpu_valid && cpu_ns >= s_perf.last_frame_cpu_ns;
+        uint64_t work = work_valid ? cpu_ns - s_perf.last_frame_cpu_ns : 0;
+        if (work_valid) {
+            unsigned bucket = 0;
+            while (bucket < SR_PERF_FRAME_WORK_BUCKETS - 1u && work > s_frame_work_bound_ns[bucket])
+                bucket++;
+            ADD(frame_work_frames, 1);
+            ADD(frame_work_ns, work);
+            KEEP_MAX(frame_work_max_ns, work);
+            ADD_ARRAY(frame_work_bucket, bucket, 1);
+        }
+        if (s_perf.frames)
+            frames_row(vcount, vblanks, work_valid, work,
+                       wall_ns > s_perf.last_frame_wall_ns ? wall_ns - s_perf.last_frame_wall_ns : 0);
+    }
+    if (s_perf.frames) s_perf.frame_base = s_perf.total;
+    s_perf.frame_seen = 1;
+    s_perf.last_frame_buffer = buffer;
+    s_perf.last_new_frame_vcount = vcount;
+    s_perf.late_since_frame = 0;
+    s_perf.frame_cpu_valid = cpu_valid;
+    s_perf.last_frame_cpu_ns = cpu_ns;
+    s_perf.last_frame_wall_ns = wall_ns;
+}
+
+void sr_perf_aot_begin(uint32_t pc) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    uint64_t now = raw_now_ns();
+    s_perf.last_aot_pc = pc;
+    if (s_perf.interp_depth)
+        s_perf.aot_seen = 1;
+    if (s_perf.current_tier != SR_PERF_TIER_AOT)
+        switch_to_aot(now);
+    /* The tag names the INNERMOST active tier, so it is re-asserted on every
+     * entry rather than only on the outermost one: a late latch is attributed to
+     * the code actually running, not to whatever context last ran a scheduler. */
+    sr_rt_phase = SR_RT_PHASE_AOT;
+    s_perf.aot_depth++;
+    ADD(aot_calls, 1);
+}
+
+void sr_perf_aot_end(void) {
+    if (!s_perf.enabled || s_perf.shutdown || !s_perf.aot_depth) return;
+    uint64_t now = raw_now_ns();
+    s_perf.aot_depth--;
+    if (s_perf.aot_depth) {
+        sr_rt_phase = SR_RT_PHASE_AOT;
+        return;
+    }
+    if (s_perf.current_tier == SR_PERF_TIER_AOT && s_perf.aot_start_ns &&
+        now > s_perf.aot_start_ns)
+        ADD(aot_ns, now - s_perf.aot_start_ns);
+    s_perf.aot_start_ns = 0;
+    if (s_perf.interp_depth) {
+        s_perf.current_tier = SR_PERF_TIER_INTERP;
+        s_perf.interp_start_ns = now;
+        sr_perf_aot_active = 0;
+        sr_rt_phase = SR_RT_PHASE_INTERP;
+    } else {
+        s_perf.current_tier = SR_PERF_TIER_NONE;
+        sr_perf_aot_active = 0;
+        sr_rt_phase = SR_RT_PHASE_OTHER;
+    }
+}
+
+void sr_perf_aot_instruction(uint32_t pc, uint32_t opcode) {
+    if (!s_perf.enabled || s_perf.shutdown ||
+        s_perf.current_tier != SR_PERF_TIER_AOT)
+        return;
+    ADD(aot_instructions, 1);
+    aot_vfpu_observe(pc, opcode);
+}
+
+void sr_perf_interp_set_reason(SrPerfInterpReason reason) {
+    if ((unsigned)reason < SR_PERF_INTERP_REASON_COUNT) s_exec.pending_reason = (int)reason;
+    if (s_perf.enabled && !s_perf.shutdown &&
+        (unsigned)reason < SR_PERF_INTERP_REASON_COUNT)
+        s_perf.pending_interp_reason = reason;
+}
+
+void sr_perf_interp_begin(uint32_t entry_pc) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    uint64_t now = raw_now_ns();
+    if (!s_perf.interp_depth) {
+        s_perf.aot_seen = 0;
+        switch_to_interp(entry_pc, s_perf.pending_interp_reason, now, 1);
+    }
+    sr_rt_phase = SR_RT_PHASE_INTERP;
+    s_perf.interp_depth++;
+    ADD(interp_calls, 1);
+    s_perf.pending_interp_reason = SR_PERF_INTERP_DISPATCH_MISS;
+}
+
+void sr_perf_interp_instruction(void) {
+    if (s_perf.enabled && !s_perf.shutdown &&
+        s_perf.current_tier == SR_PERF_TIER_INTERP)
+        ADD(interp_instructions, 1);
+}
+
+void sr_perf_interp_end(uint32_t exit_pc, int result) {
+    if (!s_perf.enabled || s_perf.shutdown || !s_perf.interp_depth) return;
+    uint64_t now = raw_now_ns();
+    s_perf.interp_depth--;
+    if (s_perf.interp_depth) return;
+    if (s_perf.current_tier == SR_PERF_TIER_INTERP && s_perf.interp_start_ns &&
+        now > s_perf.interp_start_ns)
+        ADD(interp_ns, now - s_perf.interp_start_ns);
+    s_perf.interp_start_ns = 0;
+    int returned_to_aot = s_perf.aot_depth || s_perf.aot_seen;
+    if (returned_to_aot) {
+        uint32_t pc = s_perf.aot_seen ? s_perf.last_aot_pc : exit_pc;
+        SrPerfInterpReason reason = result == SR_PERF_RESULT_CALL_RETURN
+                                        ? SR_PERF_INTERP_CALL_RETURN
+                                        : SR_PERF_INTERP_AOT_HANDOFF;
+        record_transition(1u, pc, (uint32_t)reason);
+        ADD(interp_to_aot, 1);
+        s_perf.aot_seen = 0;
+    }
+    if (s_perf.aot_depth) {
+        s_perf.current_tier = SR_PERF_TIER_AOT;
+        s_perf.aot_start_ns = now;
+        sr_perf_aot_active = 1;
+        sr_rt_phase = SR_RT_PHASE_AOT;
+    } else {
+        s_perf.current_tier = SR_PERF_TIER_NONE;
+        sr_perf_aot_active = 0;
+        sr_rt_phase = SR_RT_PHASE_OTHER;
+    }
+}
+
+void sr_perf_vfpu(uint32_t opcode, uint64_t started_ns, int result) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    int aot = s_perf.current_tier == SR_PERF_TIER_AOT;
+    ADD(vfpu_count, 1);
+    if (aot) ADD(vfpu_aot_count, 1);
+    else ADD(vfpu_interp_count, 1);
+    if (result == 0) ADD(vfpu_errors, 1);
+    add_vfpu_family(vfpu_family(opcode));
+    if (started_ns) {
+        uint64_t elapsed = elapsed_ns(started_ns);
+        ADD(vfpu_ns, elapsed);
+        if (aot) ADD(vfpu_aot_ns, elapsed);
+        else ADD(vfpu_interp_ns, elapsed);
+    }
+}
+
+void sr_perf_sched_state(SrPerfSchedState state, uint32_t uid) {
+    if (!s_perf.enabled || s_perf.shutdown ||
+        (unsigned)state >= SR_PERF_SCHED_STATE_COUNT)
+        return;
+    uint64_t now = raw_now_ns();
+    if (s_perf.sched_state_valid && s_perf.sched_state == state &&
+        s_perf.sched_uid == uid)
+        return;
+    if (s_perf.sched_state_valid && s_perf.sched_start_ns && now > s_perf.sched_start_ns)
+        ADD_ARRAY(sched_ns, (unsigned)s_perf.sched_state, now - s_perf.sched_start_ns);
+    if (state == SR_PERF_SCHED_BLOCKED) ADD(sched_blocked, 1);
+    if (s_perf.sched_state_valid && s_perf.sched_state == SR_PERF_SCHED_BLOCKED &&
+        state != SR_PERF_SCHED_BLOCKED)
+        ADD(sched_wakes, 1);
+    s_perf.sched_state = state;
+    s_perf.sched_uid = uid;
+    s_perf.sched_start_ns = now;
+    s_perf.sched_state_valid = 1;
+}
+
+void sr_perf_sched_switch(uint32_t from_uid, uint32_t to_uid) {
+    (void)from_uid;
+    (void)to_uid;
+    if (s_perf.enabled && !s_perf.shutdown) ADD(sched_switches, 1);
+}
+
+void sr_perf_ge_cpu(uint64_t started_ns) {
+    if (!s_perf.enabled || s_perf.shutdown || !started_ns) return;
+    ADD(ge_cpu_ns, elapsed_ns(started_ns));
+    ADD(ge_cpu_calls, 1);
+}
+
+void sr_perf_ge_cpu_phase(uint64_t transform_ns, uint64_t raster_ns) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    ADD(ge_transform_sample_ns, transform_ns);
+    ADD(ge_primitive_ns, raster_ns);
+}
+
+void sr_perf_ge_frontend_profile_config(uint32_t stride, int calibration_enabled) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    s_perf.interval.ge_frontend_profile_enabled = 1;
+    s_perf.total.ge_frontend_profile_enabled = 1;
+    s_perf.interval.ge_frontend_profile_stride = stride;
+    s_perf.total.ge_frontend_profile_stride = stride;
+    s_perf.interval.ge_frontend_calibration_enabled = calibration_enabled != 0;
+    s_perf.total.ge_frontend_calibration_enabled = calibration_enabled != 0;
+}
+
+void sr_perf_ge_frontend_profile(SrPerfGeFrontendStage stage, uint64_t sample_ns,
+                                 uint64_t samples, uint64_t eligible) {
+    if (!s_perf.enabled || s_perf.shutdown || (unsigned)stage >= SR_PERF_GE_FRONTEND_STAGE_COUNT)
+        return;
+    ADD_ARRAY(ge_frontend_sample_ns, (unsigned)stage, sample_ns);
+    ADD_ARRAY(ge_frontend_samples, (unsigned)stage, samples);
+    ADD_ARRAY(ge_frontend_eligible, (unsigned)stage, eligible);
+}
+
+void sr_perf_vulkan_submit(uint64_t started_ns) {
+    if (!s_perf.enabled || s_perf.shutdown || !started_ns) return;
+    ADD(vk_submit_ns, elapsed_ns(started_ns));
+    ADD(vk_submits, 1);
+}
+
+void sr_perf_vulkan_wait(uint64_t started_ns, int readback) {
+    if (!s_perf.enabled || s_perf.shutdown || !started_ns) return;
+    uint64_t elapsed = elapsed_ns(started_ns);
+    ADD(vk_wait_ns, elapsed);
+    ADD(vk_waits, 1);
+    if (readback) ADD(vk_readback_ns, elapsed);
+}
+
+void sr_perf_vulkan_pipeline(uint64_t started_ns) {
+    if (!s_perf.enabled || s_perf.shutdown || !started_ns) return;
+    ADD(vk_pipeline_ns, elapsed_ns(started_ns));
+    ADD(vk_pipeline_creations, 1);
+}
+
+void sr_perf_vulkan_readback(uint32_t bytes) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    ADD(vk_readbacks, 1);
+    ADD(vk_readback_bytes, bytes);
+}
+
+void sr_perf_texture_cache(int hit) {
+    if (!s_perf.enabled || s_perf.shutdown) return;
+    if (hit) ADD(texture_cache_hits, 1);
+    else ADD(texture_cache_misses, 1);
+}
+
+void sr_perf_texture_decode(uint64_t started_ns, uint32_t bytes) {
+    if (!s_perf.enabled || s_perf.shutdown || !started_ns) return;
+    ADD(texture_decode_ns, elapsed_ns(started_ns));
+    ADD(texture_decodes, 1);
+    ADD(texture_decode_bytes, bytes);
+}
+
+void sr_perf_storage_read(SrPerfStorageSource source, uint32_t bytes,
+                          uint64_t started_ns, int success) {
+    if (!s_perf.enabled || s_perf.shutdown ||
+        (unsigned)source >= SR_PERF_STORAGE_SOURCE_COUNT || !started_ns)
+        return;
+    ADD_ARRAY(storage_ns, (unsigned)source, elapsed_ns(started_ns));
+    ADD_ARRAY(storage_reads, (unsigned)source, 1);
+    ADD_ARRAY(storage_bytes, (unsigned)source, bytes);
+    if (!success) ADD_ARRAY(storage_failures, (unsigned)source, 1);
+}
+
+void sr_perf_h264(uint64_t started_ns, int result) {
+    if (!s_perf.enabled || s_perf.shutdown || !started_ns) return;
+    ADD(h264_ns, elapsed_ns(started_ns));
+    ADD(h264_calls, 1);
+    if (result < 0) ADD(h264_failures, 1);
+}
+
+void sr_perf_atrac(uint64_t started_ns, int result) {
+    if (!s_perf.enabled || s_perf.shutdown || !started_ns) return;
+    ADD(atrac_ns, elapsed_ns(started_ns));
+    ADD(atrac_calls, 1);
+    if (result < 0) ADD(atrac_failures, 1);
+}
+
+void sr_perf_audio_mix(uint64_t started_ns) {
+    if (!s_perf.enabled || s_perf.shutdown || !started_ns) return;
+    ADD(audio_mix_ns, elapsed_ns(started_ns));
+    ADD(audio_mix_calls, 1);
+}
+
+void sr_perf_audio_output(uint64_t started_ns, uint32_t frames) {
+    if (!s_perf.enabled || s_perf.shutdown || !started_ns) return;
+    ADD(audio_output_ns, elapsed_ns(started_ns));
+    ADD(audio_output_calls, 1);
+    ADD(audio_output_frames, frames);
+}
+
+static void audio_queue_extent(SrPerfMetrics *m, int channel, uint32_t queued_frames) {
+    if (m->audio_queue_pushes[channel] == 0 || queued_frames < m->audio_queue_min_frames[channel])
+        m->audio_queue_min_frames[channel] = queued_frames;
+    if (queued_frames > m->audio_queue_max_frames[channel])
+        m->audio_queue_max_frames[channel] = queued_frames;
+    m->audio_queue_pushes[channel]++;
+}
+
+void sr_perf_audio_queue(int channel, uint32_t queued_frames, uint64_t starved_ns,
+                         int underrun) {
+    if (!s_perf.enabled || s_perf.shutdown || channel < 0 ||
+        channel >= SR_PERF_AUDIO_CHANNELS) return;
+    audio_queue_extent(&s_perf.interval, channel, queued_frames);
+    audio_queue_extent(&s_perf.total, channel, queued_frames);
+    if (underrun) {
+        ADD_ARRAY(audio_queue_underruns, channel, 1);
+        ADD_ARRAY(audio_queue_starved_ns, channel, starved_ns);
+    }
+}
+
+void sr_perf_enable_counters(void) {
+    if (!s_perf.initialized) {
+        s_perf.initialized = 1;
+        s_perf.run_start_ns = raw_now_ns();
+    }
+    int was_enabled = s_perf.enabled;
+    s_perf.enabled = 1;
+    sr_perf_enabled = 1;
+    if (!was_enabled) {
+        seed_gpu_replay_base();
+        thread_clock_start();
+    }
+    if (s_perf.interval_start_ns == 0) s_perf.interval_start_ns = raw_now_ns();
+}
+
+void sr_perf_get_hud_metrics(double *out_fps, double *out_frame_ms, double *out_vblank_hz) {
+    double fps = 0.0, frame_ms = 0.0, vblank_hz = 0.0;
+    if (s_hud_fps > 0.0) {
+        fps = s_hud_fps;
+        frame_ms = s_hud_frame_ms;
+        vblank_hz = s_hud_vblank_hz;
+    } else {
+        /* Before the first 1 Hz interval closes, estimate from the open interval. */
+        uint64_t now = raw_now_ns();
+        uint64_t elapsed = now > s_perf.interval_start_ns ? now - s_perf.interval_start_ns : 0;
+        double seconds = (double)elapsed / 1000000000.0;
+        if (s_perf.interval_start_ns && seconds > 0.1) {
+            fps = (double)s_perf.interval.presents / seconds;
+            vblank_hz = (double)s_perf.interval.vblanks / seconds;
+            frame_ms = s_perf.interval.presents
+                           ? ms(elapsed) / (double)s_perf.interval.presents : 0.0;
+        }
+    }
+    if (out_fps) *out_fps = fps;
+    if (out_frame_ms) *out_frame_ms = frame_ms;
+    if (out_vblank_hz) *out_vblank_hz = vblank_hz;
+}
+
+void sr_perf_get_hud_frames(double *out_game_fps, double *out_vblanks_per_frame) {
+    double game_fps = s_hud_game_fps, vblanks_per_frame = s_hud_vblanks_per_frame;
+    if (s_hud_fps <= 0.0) {
+        /* Before the first 1 Hz interval closes, estimate from the open interval, as
+         * sr_perf_get_hud_metrics() does. */
+        uint64_t now = raw_now_ns();
+        uint64_t elapsed = now > s_perf.interval_start_ns ? now - s_perf.interval_start_ns : 0;
+        double seconds = (double)elapsed / 1000000000.0;
+        if (s_perf.interval_start_ns && seconds > 0.1) {
+            game_fps = (double)s_perf.interval.new_frames / seconds;
+            vblanks_per_frame = s_perf.interval.new_frame_intervals
+                ? (double)s_perf.interval.new_frame_vblanks /
+                      (double)s_perf.interval.new_frame_intervals
+                : 0.0;
+        }
+    }
+    if (out_game_fps) *out_game_fps = game_fps;
+    if (out_vblanks_per_frame) *out_vblanks_per_frame = vblanks_per_frame;
+}
+
+/* ---- live profile view (#314) -------------------------------------------------------- */
+
+void sr_perf_history_reset(SrPerfHistory *history) {
+    if (history) memset(history, 0, sizeof(*history));
+}
+
+void sr_perf_history_push(SrPerfHistory *history, const SrPerfLiveInterval *interval) {
+    if (!history || !interval || history->head >= SR_PERF_HISTORY_LEN) return;
+    history->slot[history->head] = *interval;
+    history->head = (history->head + 1u) % SR_PERF_HISTORY_LEN;
+    if (history->count < SR_PERF_HISTORY_LEN) history->count++;
+}
+
+const SrPerfLiveInterval *sr_perf_history_at(const SrPerfHistory *history, unsigned age) {
+    if (!history || age >= history->count || history->count > SR_PERF_HISTORY_LEN ||
+        history->head >= SR_PERF_HISTORY_LEN)
+        return NULL;
+    return &history->slot[(history->head + SR_PERF_HISTORY_LEN - 1u - age) % SR_PERF_HISTORY_LEN];
+}
+
+const SrPerfHistory *sr_perf_history(void) {
+    return &s_history;
+}
+
+unsigned sr_perf_top_transitions(unsigned direction, SrPerfTopPc *out, unsigned max) {
+    SrPerfTransitionEntry entries[SR_PERF_TOP_N];
+    unsigned count = 0;
+    if (direction > 1u || !out) return 0;
+    for (unsigned i = 0; i < SR_PERF_TOP_N; i++)
+        if (s_perf.transitions[direction][i].count)
+            entries[count++] = s_perf.transitions[direction][i];
+    qsort(entries, count, sizeof(entries[0]), transition_compare);
+    if (count > max) count = max;
+    for (unsigned i = 0; i < count; i++) {
+        out[i].pc = entries[i].pc;
+        out[i].count = entries[i].count;
+        out[i].reason = interp_reason_name(entries[i].reason);
+    }
+    return count;
+}
+
+static unsigned live_pct(uint64_t part, uint64_t whole) {
+    if (!whole) return 0;
+    double p = (double)part * 100.0 / (double)whole + 0.5;
+    return p >= 999.0 ? 999u : (unsigned)p;
+}
+
+static void live_row(SrPerfLiveRow *row, const char *label, const char *fmt, ...) {
+    va_list ap;
+    snprintf(row->label, sizeof row->label, "%s", label);
+    va_start(ap, fmt);
+    vsnprintf(row->value, sizeof row->value, fmt, ap);
+    va_end(ap);
+}
+
+unsigned sr_perf_live_rows(const SrPerfLiveInterval *iv, SrPerfLiveRow *rows, unsigned max) {
+    if (!iv || !rows || max < SR_PERF_LIVE_ROWS || !iv->wall_ns) return 0;
+    double seconds = (double)iv->wall_ns / 1000000000.0;
+    uint64_t sched_total = 0;
+    for (unsigned i = 0; i < SR_PERF_SCHED_STATE_COUNT; i++) sched_total += iv->sched_ns[i];
+    live_row(&rows[0], "Frame", "%.1f game fps  %.1f ms per present",
+             (double)iv->new_frames / seconds,
+             iv->presents ? ms(iv->wall_ns) / (double)iv->presents : 0.0);
+    live_row(&rows[1], "Guest/host", "cpu %u%%  ge wait %u%%  present %u%%  idle %u%%",
+             live_pct(iv->cpu_ns, iv->wall_ns), live_pct(iv->ge_wait_ns, iv->wall_ns),
+             live_pct(iv->present_ns, iv->wall_ns), live_pct(iv->idle_ns, iv->wall_ns));
+    live_row(&rows[2], "Residency", "aot %u%%  interpreter %u%%",
+             live_pct(iv->aot_ns, iv->wall_ns), live_pct(iv->interp_ns, iv->wall_ns));
+    live_row(&rows[3], "Transitions", "%llu to interpreter  %llu to aot",
+             (unsigned long long)iv->aot_to_interp, (unsigned long long)iv->interp_to_aot);
+    if (sched_total)
+        live_row(&rows[4], "Scheduler", "run %u%%  ready %u%%  blocked %u%%  idle %u%%",
+                 live_pct(iv->sched_ns[SR_PERF_SCHED_RUNNING], sched_total),
+                 live_pct(iv->sched_ns[SR_PERF_SCHED_RUNNABLE], sched_total),
+                 live_pct(iv->sched_ns[SR_PERF_SCHED_BLOCKED], sched_total),
+                 live_pct(iv->sched_ns[SR_PERF_SCHED_IDLE], sched_total));
+    else
+        live_row(&rows[4], "Scheduler", "no thread states recorded");
+    live_row(&rows[5], "GE CPU", "%.1f ms  %llu gpu draws", ms(iv->ge_cpu_ns),
+             (unsigned long long)iv->gpu_draws);
+    live_row(&rows[6], "Vulkan", "submit %.1f wait %.1f pipeline %.1f readback %.1f ms",
+             ms(iv->vk_submit_ns), ms(iv->vk_wait_ns), ms(iv->vk_pipeline_ns),
+             ms(iv->vk_readback_ns));
+    live_row(&rows[7], "Audio", "%llu underruns", (unsigned long long)iv->audio_underruns);
+    return SR_PERF_LIVE_ROWS;
+}

@@ -1,0 +1,2233 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+"""Content-addressed private AOT package cache contract."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import json
+import math
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import subprocess
+import tempfile
+from typing import Any, Iterator, Mapping
+
+CACHE_FORMAT = "nakagawa-aot-cache"
+COMPLETION_FORMAT = "nakagawa-aot-cache-completion"
+CACHE_SCHEMA_VERSION = 2
+COMPLETION_SCHEMA_VERSION = 2
+TITLE_INPUT_IDENTITY_FORMAT = "nakagawa-title-input-identity"
+TITLE_INPUT_IDENTITY_SCHEMA_VERSION = 2
+# The container facts that are part of the identity. inspect_iso also reports diagnostics and
+# provenance there (format_warnings, source_format); the builder projects onto these keys.
+TITLE_INPUT_CONTAINER_KEYS = ("format", "volume_id", "size_bytes", "pvd_sector", "sector_size")
+ANALYZER_CODEGEN_SEMANTICS_EPOCH = "analyzer-codegen-v1"
+GENERATED_CODE_ABI_EPOCH = 3
+RUNTIME_ABI_EPOCH = 2
+# The CpuState layout (src/rt/recomp.h SR_CPUSTATE_ABI_VERSION) is part of both contracts:
+# generated C addresses CpuState fields by offset, and the runtime package shares the struct
+# with the generated objects. Every layout version therefore names the epoch pair
+# (generated-code, runtime) that was current for it, and tools/test_package_cache.py pins the
+# header version, this table, the constants above and their native twins in
+# src/core/nk_title_manifest.h to each other, so a layout change cannot land without the bump.
+CPUSTATE_ABI_EPOCHS: dict[int, tuple[int, int]] = {
+    2: (1, 1),  # the 996-byte CpuState
+    # #812 appended llbit (offset 996, size 1000); generated code 3 records each module's
+    # identity as SHA-256 (#969).
+    3: (3, 2),
+}
+# previous runtime epoch -> the runtime epochs whose packages may reuse its generated C with a
+# native recompile. A CpuState layout change is never compatible: the generated C carries the
+# old offsets and its own SR_CPUSTATE_ABI_VERSION guard.
+RUNTIME_ABI_COMPATIBILITY: dict[int, frozenset[int]] = {
+    1: frozenset({1}),
+    2: frozenset({2}),
+}
+CACHE_ROOT_PARTS = ("cache", "packages")
+COMPLETION_MANIFEST = "completion-manifest.json"
+DEFAULT_MAX_CACHE_ENTRIES = 8
+CACHE_LIMIT_ENV = "NK_AOT_CACHE_MAX_ENTRIES"
+LOCAL_IDENTITIES_DIR = "title-input-identities"
+
+
+class PackageCacheError(ValueError):
+    """Named failure in the private package cache contract."""
+
+
+@dataclass(frozen=True)
+class CacheDecision:
+    action: str
+    generated_c_reusable: bool
+    native_objects_reusable: bool
+    reasons: tuple[str, ...]
+
+    @property
+    def rebuild_components(self) -> tuple[str, ...]:
+        return self.reasons
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+# The analyzer is analyze.py plus the modules split out of it; the cache key covers all of them.
+ANALYZER_SOURCES = ("analyze.py", "analyze_cfg.py")
+
+
+def analyzer_sources_sha256(tools_dir: Path) -> str:
+    """One digest over every analyzer source file, so a change to any of them changes the cache key.
+
+    SHA-256 over each source's name, NUL, the hex SHA-256 of its bytes, NUL, in ANALYZER_SOURCES order.
+    ``package_analyzer_sources_digest`` in ``src/core/nk_title_manifest.c`` computes the same value for
+    the player, which must agree or it calls every package outdated.
+    """
+    digest = hashlib.sha256()
+    for name in ANALYZER_SOURCES:
+        digest.update(name.encode("ascii") + b"\0" + sha256_file(tools_dir / name).encode("ascii") + b"\0")
+    return digest.hexdigest()
+
+
+def _digest(value: Any) -> str:
+    return sha256_bytes(canonical_json(value).encode("utf-8"))
+
+
+def build_title_input_identity(
+    *,
+    manifest: Mapping[str, Any],
+    executable_name: str,
+    executable_sha256: str,
+    modules: list[Mapping[str, Any]],
+    psp_header_sha256: str | None = None,
+    psp_header_magic: str | None = None,
+    disc_id: str | None = None,
+    region: str | None = None,
+    disc_version: str | None = None,
+    param_sfo: Mapping[str, Any] | None = None,
+    container: Mapping[str, Any] | None = None,
+    source_media: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the private, versioned identity record for one package input set.
+
+    ``container`` is projected onto ``TITLE_INPUT_CONTAINER_KEYS``. The other keys that
+    ``inspect_iso`` reports there (``format_warnings`` parser notes, ``source_format`` of a
+    compressed image) describe how the disc was read, not its content: left in, they would fail
+    the exact container schema, and a reworded note would change the identity digest. A missing
+    identity key still fails validation, and a stored record with any extra key is refused.
+    """
+    module_records = [
+        {"name": item.get("name"), "sha256": item.get("sha256")}
+        for item in sorted(modules, key=lambda item: str(item.get("name", "")))
+    ]
+    identity = {
+        "format": TITLE_INPUT_IDENTITY_FORMAT,
+        "schema_version": TITLE_INPUT_IDENTITY_SCHEMA_VERSION,
+        "manifest": {
+            "id": manifest.get("id"),
+            "schema_version": manifest.get("schema_version"),
+        },
+        "disc": {
+            "id": disc_id.upper() if isinstance(disc_id, str) else None,
+            "region": region,
+            "disc_version": disc_version,
+        },
+        "param_sfo": dict(param_sfo) if param_sfo is not None else None,
+        "container": (
+            {key: container[key] for key in TITLE_INPUT_CONTAINER_KEYS if key in container}
+            if container is not None else None
+        ),
+        "main_executable": {"name": executable_name, "sha256": executable_sha256},
+        "modules": module_records,
+        "psp_header": (
+            {"sha256": psp_header_sha256, "magic": psp_header_magic}
+            if psp_header_sha256 is not None else None
+        ),
+        "source_media": dict(source_media) if source_media is not None else None,
+    }
+    validate_title_input_identity(identity)
+    return identity
+
+
+def validate_title_input_identity(value: Any) -> dict[str, Any]:
+    """Validate the local identity schema without exposing or logging hashes."""
+    root_keys = {
+        "format", "schema_version", "manifest", "disc", "param_sfo",
+        "container", "main_executable", "modules", "psp_header", "source_media",
+    }
+    if not isinstance(value, dict) or set(value) != root_keys:
+        raise PackageCacheError("title input identity fields do not match schema v2")
+    if value.get("format") != TITLE_INPUT_IDENTITY_FORMAT or value.get("schema_version") != TITLE_INPUT_IDENTITY_SCHEMA_VERSION:
+        raise PackageCacheError("title input identity format or schema is unsupported")
+    manifest = value.get("manifest")
+    if not isinstance(manifest, dict) or set(manifest) != {"id", "schema_version"}:
+        raise PackageCacheError("title input identity manifest record is invalid")
+    if not isinstance(manifest.get("id"), str) or not manifest["id"]:
+        raise PackageCacheError("title input identity manifest ID is invalid")
+    if type(manifest.get("schema_version")) is not int or manifest["schema_version"] < 1:
+        raise PackageCacheError("title input identity manifest schema is invalid")
+    disc = value.get("disc")
+    if not isinstance(disc, dict) or set(disc) != {"id", "region", "disc_version"}:
+        raise PackageCacheError("title input identity disc record is invalid")
+    disc_id = disc.get("id")
+    if disc_id is not None and (
+        not isinstance(disc_id, str) or re.fullmatch(r"[A-Z]{4}[0-9]{5}", disc_id) is None
+    ):
+        raise PackageCacheError("title input identity DISC_ID is invalid")
+    region = disc.get("region")
+    if region is not None and region not in {"JP", "NA", "EU", "KR", "ASIA", "OTHER", "TEST", "HOMEBREW"}:
+        raise PackageCacheError("title input identity region is invalid")
+    version = disc.get("disc_version")
+    if version is not None and (not isinstance(version, str) or not version or len(version) > 32):
+        raise PackageCacheError("title input identity DISC_VERSION is invalid")
+    sfo = value.get("param_sfo")
+    if sfo is not None:
+        if not isinstance(sfo, dict) or set(sfo) - {
+            "DISC_ID", "TITLE", "DISC_VERSION", "APP_VER", "PSP_SYSTEM_VER", "CATEGORY",
+        }:
+            raise PackageCacheError("title input identity PARAM.SFO facts are invalid")
+        if any(not isinstance(item, str) or len(item) > 256 for item in sfo.values()):
+            raise PackageCacheError("title input identity PARAM.SFO fact is invalid")
+    container = value.get("container")
+    if container is not None:
+        if not isinstance(container, dict) or set(container) != set(TITLE_INPUT_CONTAINER_KEYS):
+            raise PackageCacheError("title input identity container metadata is invalid")
+        if not isinstance(container.get("format"), str) or not isinstance(container.get("volume_id"), str):
+            raise PackageCacheError("title input identity container label is invalid")
+        for field in ("size_bytes", "pvd_sector", "sector_size"):
+            if type(container.get(field)) is not int or container[field] < 0:
+                raise PackageCacheError(f"title input identity container {field} is invalid")
+    executable = value.get("main_executable")
+    if not isinstance(executable, dict) or set(executable) != {"name", "sha256"}:
+        raise PackageCacheError("title input identity main executable record is invalid")
+    if not isinstance(executable.get("name"), str) or not executable["name"]:
+        raise PackageCacheError("title input identity main executable name is invalid")
+    _input_sha(executable, "title input identity main executable")
+    modules = value.get("modules")
+    if not isinstance(modules, list):
+        raise PackageCacheError("title input identity modules must be an array")
+    names: set[str] = set()
+    for item in modules:
+        if not isinstance(item, dict) or set(item) != {"name", "sha256"}:
+            raise PackageCacheError("title input identity module record is invalid")
+        name = item.get("name")
+        if not isinstance(name, str) or not name or name in names:
+            raise PackageCacheError("title input identity module name is invalid or repeated")
+        names.add(name)
+        _input_sha(item, f"title input identity module {name}")
+    header = value.get("psp_header")
+    if header is not None:
+        if not isinstance(header, dict) or set(header) != {"sha256", "magic"}:
+            raise PackageCacheError("title input identity PSP header record is invalid")
+        _input_sha(header, "title input identity PSP header")
+        if header.get("magic") is not None and not isinstance(header["magic"], str):
+            raise PackageCacheError("title input identity PSP header magic is invalid")
+    source_media = value.get("source_media")
+    if source_media is not None:
+        if not isinstance(source_media, dict) or set(source_media) != {"executable", "modules"}:
+            raise PackageCacheError("title input identity source media record is invalid")
+        if executable["name"] not in {"EBOOT.BIN", "BOOT.BIN"}:
+            raise PackageCacheError("title input identity source executable name is unsupported")
+        executable_source = source_media.get("executable")
+        if not isinstance(executable_source, dict) or set(executable_source) != {"path", "sha256"}:
+            raise PackageCacheError("title input identity source executable record is invalid")
+        executable_path = _validate_source_iso_path(
+            executable_source.get("path"), "title input identity source executable path"
+        )
+        expected_executable_path = f"PSP_GAME/SYSDIR/{executable['name']}"
+        if executable_path.casefold() != expected_executable_path.casefold():
+            raise PackageCacheError("title input identity source executable path does not match its name")
+        _input_sha(executable_source, "title input identity source executable")
+        source_modules = source_media.get("modules")
+        if not isinstance(source_modules, list):
+            raise PackageCacheError("title input identity source modules must be an array")
+        source_module_names: set[str] = set()
+        for item in source_modules:
+            if not isinstance(item, dict) or set(item) != {"name", "path", "sha256"}:
+                raise PackageCacheError("title input identity source module record is invalid")
+            name = item.get("name")
+            if not isinstance(name, str) or name not in names or name in source_module_names:
+                raise PackageCacheError("title input identity source module name is invalid or repeated")
+            source_module_names.add(name)
+            _validate_source_iso_path(item.get("path"), f"title input identity source module {name} path")
+            _input_sha(item, f"title input identity source module {name}")
+    return value
+
+
+def _validate_source_iso_path(value: Any, field: str) -> str:
+    """Accept only an ISO-relative PSP_GAME path, never a host path."""
+    if (not isinstance(value, str) or not value or len(value) > 512 or
+        "\\" in value or ":" in value or value.startswith("/") or
+        any(ord(character) < 0x20 or ord(character) > 0x7E or
+            character in '?*"<>|' for character in value)):
+        raise PackageCacheError(f"{field} is invalid")
+    parts = value.split("/")
+    if (len(parts) < 3 or parts[0].casefold() != "psp_game" or
+        any(part in {"", ".", ".."} for part in parts)):
+        raise PackageCacheError(f"{field} is invalid")
+    return value
+
+
+def title_input_identity_digest(value: Any) -> str:
+    return _digest(validate_title_input_identity(value))
+
+
+def title_input_identity_changes(previous: Any, current: Any) -> tuple[str, ...]:
+    """Return human-readable identity classes; never include hashes or source bytes."""
+    try:
+        old = validate_title_input_identity(previous)
+        new = validate_title_input_identity(current)
+    except PackageCacheError:
+        return ("identity record changed",)
+    changes: list[str] = []
+    if old["manifest"] != new["manifest"]:
+        changes.append("manifest/profile changed")
+    if old["disc"]["id"] != new["disc"]["id"]:
+        changes.append("DISC_ID changed")
+    if old["disc"]["region"] != new["disc"]["region"]:
+        changes.append("region changed")
+    if (old["disc"]["disc_version"] != new["disc"]["disc_version"] or
+        (old["param_sfo"] or {}).get("DISC_VERSION") != (new["param_sfo"] or {}).get("DISC_VERSION") or
+        (old["param_sfo"] or {}).get("APP_VER") != (new["param_sfo"] or {}).get("APP_VER")):
+        changes.append("SFO revision changed")
+    if old["param_sfo"] != new["param_sfo"] and "SFO revision changed" not in changes:
+        changes.append("PARAM.SFO facts changed")
+    if old["main_executable"] != new["main_executable"]:
+        changes.append("main executable changed")
+    old_modules = {item["name"]: item["sha256"] for item in old["modules"]}
+    new_modules = {item["name"]: item["sha256"] for item in new["modules"]}
+    for name in sorted(set(old_modules) | set(new_modules)):
+        if old_modules.get(name) != new_modules.get(name):
+            changes.append(f"module {name} changed")
+    if old["container"] != new["container"]:
+        changes.append("container metadata changed")
+    if old["psp_header"] != new["psp_header"]:
+        changes.append("PSP header changed")
+    old_source = old["source_media"]
+    new_source = new["source_media"]
+    if (old_source is None) != (new_source is None):
+        changes.append("source media binding changed")
+    elif old_source is not None and new_source is not None:
+        if old_source["executable"] != new_source["executable"]:
+            changes.append("source executable changed")
+        old_source_modules = {item["name"]: item for item in old_source["modules"]}
+        new_source_modules = {item["name"]: item for item in new_source["modules"]}
+        for name in sorted(set(old_source_modules) | set(new_source_modules)):
+            if old_source_modules.get(name) != new_source_modules.get(name):
+                changes.append(f"source module {name} changed")
+    return tuple(changes)
+
+
+def local_title_input_identity_path(user_data_root: Path | str, disc_id: str) -> Path:
+    if re.fullmatch(r"[A-Z]{4}[0-9]{5}", disc_id or "") is None:
+        raise PackageCacheError("title input identity DISC_ID is invalid")
+    return Path(user_data_root).expanduser().resolve(strict=False) / LOCAL_IDENTITIES_DIR / disc_id / "title-input-identity.json"
+
+
+def write_local_title_input_identity(
+    user_data_root: Path | str, identity: Mapping[str, Any]
+) -> Path:
+    normalized = validate_title_input_identity(dict(identity))
+    disc_id = normalized["disc"]["id"]
+    if not disc_id:
+        raise PackageCacheError("synthetic package identity has no user ISO record")
+    user_root = Path(user_data_root).expanduser().resolve(strict=False)
+    repository_root = Path(__file__).resolve().parents[2]
+    if not cache_root_is_private(user_root, repository_root):
+        raise PackageCacheError("title input identity must be stored outside the public repository")
+    destination = local_title_input_identity_path(user_root, disc_id)
+    for directory in (destination.parent.parent, destination.parent):
+        if directory.is_symlink():
+            raise PackageCacheError("title input identity directory is a symlink")
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if user_root not in destination.parent.resolve(strict=True).parents:
+        raise PackageCacheError("title input identity path escaped the user data directory")
+    _atomic_write(destination, canonical_json(normalized).encode("utf-8"))
+    return destination
+
+
+def read_local_title_input_identity(user_data_root: Path | str, disc_id: str) -> dict[str, Any] | None:
+    path = local_title_input_identity_path(user_data_root, disc_id)
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        return validate_title_input_identity(_read_json(path))
+    except (OSError, ValueError, PackageCacheError):
+        return None  # malformed or hostile identity input is simply absent
+
+
+# Explicit resource ceilings for externally supplied JSON artifacts on the
+# package/cache route (#319). The byte ceiling is enforced with a bounded read
+# through one open handle -- never a whole-file read -- so a hostile or corrupt
+# file cannot be ingested wholesale before it is rejected. The depth/count scan
+# runs on the raw text before json.loads, so pathological nesting cannot first
+# explode inside the standard parser. The limits exceed any legitimate package,
+# cache, completion, or identity document by orders of magnitude; build-report
+# has its own, larger set below.
+MAX_CACHE_JSON_BYTES = 1024 * 1024
+MAX_CACHE_JSON_DEPTH = 32
+MAX_CACHE_JSON_MEMBERS = 16384
+MAX_CACHE_JSON_ITEMS = 16384
+MAX_CACHE_JSON_NODES = 65536
+# build-report.json is the one package artifact whose bulk scales with the
+# analysed title: it carries one record per AOT gap, unsupported instruction and
+# analysis diagnostic, and a measured flagship report is about 1.3 MB. It
+# therefore reads under its own ceilings instead of the shared ones above,
+# while package.json, completion-manifest.json and title-input-identity.json
+# keep the 1 MiB bound. The reader stays bounded -- only the four numbers below
+# differ.
+#
+# Members and separators are counted per object and per document rather than
+# per parse, so the shared 16384 ceilings bind before the shared node ceiling
+# does: a compact report of AOT-gap records reaches the separator ceiling while
+# still under 65536 nodes, and node counts alone therefore cannot size it. Both
+# are set equal to the build-report node ceiling here, which is the coarsest
+# sound choice: every object member and every comma separator in valid JSON
+# corresponds to at least one structural node, so these two remain bounds that
+# cannot reject a document the node ceiling already accepted.
+MAX_BUILD_REPORT_JSON_BYTES = 4 * 1024 * 1024
+MAX_BUILD_REPORT_JSON_MEMBERS = 262144
+MAX_BUILD_REPORT_JSON_ITEMS = 262144
+MAX_BUILD_REPORT_JSON_NODES = 262144
+# Keep decimal conversion bounded even when Python's process-wide guard is
+# disabled. This matches the usual 4,300-digit Python integer ceiling.
+MAX_CACHE_JSON_INTEGER_DIGITS = 4300
+
+
+class BoundedJsonError(ValueError):
+    """Named, controlled failure while reading a bounded external JSON artifact."""
+
+
+# Diagnostics are attacker-reachable: every key and scalar in an externally
+# supplied artifact is attacker-chosen text, and a rejection message is usually
+# the one thing that gets logged or echoed back to a user. Bounding the artifact
+# therefore does not by itself bound the message it produces, so untrusted
+# values are quoted only as a short prefix and untrusted name lists only as a
+# short sample. Rejection itself is unchanged; only the echoed detail is.
+MAX_JSON_ECHO_CHARS = 64
+MAX_JSON_ECHO_FIELDS = 8
+
+
+def bounded_echo(value: Any, *, max_chars: int = MAX_JSON_ECHO_CHARS) -> str:
+    """Render one untrusted value for a message without echoing bulk data.
+
+    Strings are truncated before any quoting, so a multi-hundred-kilobyte key
+    cannot inflate an exception message (or the log record that captures it)
+    past ``max_chars``. Non-strings are rendered with ``repr`` and truncated
+    afterwards; that transient repr is bounded by the artifact ceiling already
+    accepted by the reader, so it is not a new amplification path.
+    """
+    if type(value) is str:
+        if len(value) <= max_chars:
+            return value
+        return value[:max_chars] + "...[truncated]"
+    text = repr(value)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "...[truncated]"
+
+
+def bounded_echo_fields(names: Any, *, max_chars: int = MAX_JSON_ECHO_CHARS) -> str:
+    """Render a set of untrusted field names as a short, fixed-size sample."""
+    ordered = sorted(names)
+    shown = ", ".join(bounded_echo(name, max_chars=max_chars) for name in ordered[:MAX_JSON_ECHO_FIELDS])
+    if len(ordered) > MAX_JSON_ECHO_FIELDS:
+        shown += f", ... (+{len(ordered) - MAX_JSON_ECHO_FIELDS} more)"
+    return shown
+
+
+def _bounded_json_bytes(path: Path, max_bytes: int) -> bytes:
+    """Read at most ``max_bytes`` (+1) bytes of ``path`` through one handle.
+
+    ``fstat`` and the reads share the descriptor, so a replacement or growth
+    race cannot substitute a different file behind the size gate. The extra
+    byte detects a file that grew while it was being read; nothing is ever
+    truncated silently.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags)
+    try:
+        size = os.fstat(fd).st_size
+        if size > max_bytes:
+            raise BoundedJsonError(
+                f"{path} is {size} bytes, over the {max_bytes}-byte JSON artifact limit"
+            )
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if len(data) > max_bytes:
+        raise BoundedJsonError(
+            f"{path} grew past the {max_bytes}-byte JSON artifact limit"
+        )
+    return data
+
+
+def _bounded_json_scan(
+    text: str,
+    *,
+    max_depth: int,
+    max_members: int,
+    max_items: int,
+    max_nodes: int,
+) -> None:
+    """Count containers, members, comma separators, and scalars in raw JSON text.
+
+    Runs before json.loads so hostile nesting or bulk fails at the named
+    ceiling instead of first recursing inside the standard parser. Strings and
+    escapes are skipped with a state machine; counts are conservative upper
+    bounds, so a document that passes can never exceed the ceilings after
+    parsing either. The node count is re-checked after the loop because the
+    in-string branch continues before the per-character test, which would
+    otherwise let a document whose final node is a string closer finish one
+    node past the ceiling.
+    """
+    depth = 0
+    members = 0
+    separators = 0
+    nodes = 0
+    in_string = False
+    escaped = False
+    # Tracks whether the previous character can continue a number, so a number
+    # is counted once at its leading character. A boolean rather than a
+    # sentinel character: "" is a substring of every string, so a ""-seeded
+    # "not previously numeric" test would silently never fire for a document
+    # that starts with a digit.
+    prev_numeric = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+                nodes += 1
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            depth += 1
+            nodes += 1
+            if depth > max_depth:
+                raise BoundedJsonError(
+                    f"JSON nesting exceeds {max_depth} levels"
+                )
+        elif char in "}]":
+            depth -= 1
+        elif char == ":":
+            members += 1
+        elif char == ",":
+            separators += 1
+        elif char in "-0123456789":
+            if not prev_numeric:
+                nodes += 1
+        elif char in "tfn":
+            nodes += 1
+        if nodes > max_nodes:
+            raise BoundedJsonError(
+                f"JSON document exceeds {max_nodes} structural nodes"
+            )
+        prev_numeric = char in "-0123456789.eE"
+    if nodes > max_nodes:
+        raise BoundedJsonError(
+            f"JSON document exceeds {max_nodes} structural nodes"
+        )
+    if members > max_members:
+        raise BoundedJsonError(
+            f"JSON document exceeds {max_members} object members"
+        )
+    if separators > max_items:
+        raise BoundedJsonError(
+            f"JSON document exceeds {max_items} comma separators"
+        )
+
+
+def _json_integer(text: str) -> int:
+    if len(text.removeprefix("-")) > MAX_CACHE_JSON_INTEGER_DIGITS:
+        raise BoundedJsonError(
+            f"JSON integer exceeds {MAX_CACHE_JSON_INTEGER_DIGITS} digits"
+        )
+    try:
+        return int(text)
+    except ValueError as exc:
+        # A stricter host-wide digit guard may reject before the local ceiling.
+        raise BoundedJsonError("JSON integer exceeds the host integer digit limit") from exc
+
+
+def _json_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise BoundedJsonError("JSON number must be finite and representable as a float")
+    return value
+
+
+def _json_nonfinite(_text: str) -> None:
+    raise BoundedJsonError("JSON number must be finite; NaN and Infinity are unsupported")
+
+
+def bounded_json_loads(
+    text: str,
+    *,
+    max_depth: int = MAX_CACHE_JSON_DEPTH,
+    max_members: int = MAX_CACHE_JSON_MEMBERS,
+    max_items: int = MAX_CACHE_JSON_ITEMS,
+    max_nodes: int = MAX_CACHE_JSON_NODES,
+) -> Any:
+    """Parse JSON text under the cache-artifact ceilings with named errors."""
+    _bounded_json_scan(
+        text,
+        max_depth=max_depth,
+        max_members=max_members,
+        max_items=max_items,
+        max_nodes=max_nodes,
+    )
+    try:
+        return json.loads(
+            text, object_pairs_hook=_no_duplicate_pairs, parse_int=_json_integer,
+            parse_float=_json_float, parse_constant=_json_nonfinite,
+        )
+    except BoundedJsonError:
+        raise
+    except UnicodeDecodeError as exc:  # defensive: callers decode bytes first
+        raise BoundedJsonError(f"JSON artifact is not valid UTF-8: {exc}") from exc
+    except RecursionError as exc:
+        raise BoundedJsonError(
+            "JSON artifact nesting exceeded the parser recursion budget"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise BoundedJsonError(f"JSON artifact is not valid JSON: {exc}") from exc
+
+
+def read_bounded_json(
+    path: Path,
+    *,
+    max_bytes: int = MAX_CACHE_JSON_BYTES,
+    max_depth: int = MAX_CACHE_JSON_DEPTH,
+    max_members: int = MAX_CACHE_JSON_MEMBERS,
+    max_items: int = MAX_CACHE_JSON_ITEMS,
+    max_nodes: int = MAX_CACHE_JSON_NODES,
+) -> Any:
+    """Read one externally supplied JSON artifact under explicit ceilings.
+
+    Byte ceiling first (bounded read through one handle), deterministic UTF-8
+    decode, pre-parse depth/count scan, duplicate-key and nonfinite-number
+    rejection, bounded decimal integer conversion, and
+    RecursionError containment. Every malformed outcome raises the named
+    ``BoundedJsonError`` rather than a parser-implementation exception.
+    """
+    if type(max_bytes) is not int or max_bytes < 1:
+        raise ValueError("max_bytes must be a positive integer")
+    data = _bounded_json_bytes(path, max_bytes)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BoundedJsonError(f"{path} is not valid UTF-8: {exc}") from exc
+    return bounded_json_loads(
+        text,
+        max_depth=max_depth,
+        max_members=max_members,
+        max_items=max_items,
+        max_nodes=max_nodes,
+    )
+
+
+def _no_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise BoundedJsonError(f"duplicate JSON field: {bounded_echo(key)}")
+        result[key] = value
+    return result
+
+
+def _read_json(path: Path) -> Any:
+    return read_bounded_json(path)
+
+
+def read_build_report_json(path: Path) -> Any:
+    """Read one build-report.json under the build-report-specific ceilings.
+
+    The report is generated by this project's own planner and scales with the
+    analysed title, so it is bounded by MAX_BUILD_REPORT_JSON_* rather than the
+    shared 1 MiB package/cache ceilings. Every rejection stays a named
+    ``BoundedJsonError`` exactly as on the shared route.
+    """
+    return read_bounded_json(
+        path,
+        max_bytes=MAX_BUILD_REPORT_JSON_BYTES,
+        max_members=MAX_BUILD_REPORT_JSON_MEMBERS,
+        max_items=MAX_BUILD_REPORT_JSON_ITEMS,
+        max_nodes=MAX_BUILD_REPORT_JSON_NODES,
+    )
+
+
+_ARTIFACT_COMPONENT_RE = re.compile(r"[A-Za-z0-9._+-]+")
+_WINDOWS_RESERVED = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def _safe_relative(value: Any) -> str:
+    """Validate one cache/package artifact relative path.
+
+    Mirrors is_valid_artifact_path() in src/core/nk_title_manifest.c so the
+    completion manifest never records a path the native package validator
+    rejects: components are [A-Za-z0-9._+-] (the '+' is required by GCC/MSYS2
+    runtime library names such as libstdc++-6.dll), with no traversal,
+    separators, reserved device names, or trailing dot/space.
+    """
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > 240
+        or "\\" in value
+        or ":" in value
+        or value.startswith("/")
+        or value.endswith("/")
+        or "//" in value
+    ):
+        raise PackageCacheError("cache artifact path is not a portable relative path")
+    for part in value.split("/"):
+        if part in {"", ".", ".."}:
+            raise PackageCacheError("cache artifact path escapes the package")
+        if (
+            not _ARTIFACT_COMPONENT_RE.fullmatch(part)
+            or part.endswith((".", " "))
+            or part.split(".", 1)[0].upper() in _WINDOWS_RESERVED
+        ):
+            raise PackageCacheError("cache artifact path is not a portable relative path")
+    return value
+
+
+def _resolve_within(root: Path, relative: str) -> Path:
+    safe = _safe_relative(relative)
+    candidate_path = root
+    for part in PurePosixPath(safe).parts:
+        candidate_path = candidate_path / part
+        if candidate_path.is_symlink():
+            raise PackageCacheError("cache artifact path is a symlink")
+    candidate = candidate_path.resolve(strict=False)
+    resolved_root = root.resolve(strict=False)
+    try:
+        candidate.relative_to(resolved_root)
+    except ValueError as exc:
+        raise PackageCacheError("cache artifact path escapes the package") from exc
+    return candidate
+
+
+def cache_root(user_data_root: Path | str, disc_id: str) -> Path:
+    if not isinstance(disc_id, str) or len(disc_id) != 9:
+        raise PackageCacheError("cache disc ID must be nine characters")
+    normalized = disc_id.upper()
+    if not normalized[:4].isalpha() or not normalized[4:].isdigit():
+        raise PackageCacheError("cache disc ID is not a PSP identity")
+    root = Path(user_data_root).expanduser().resolve(strict=False)
+    return root.joinpath(*CACHE_ROOT_PARTS, normalized)
+
+
+# One short key level under entries/: a default Windows install has no long
+# paths, and <user data>/cache/packages/<DISC>/entries/<64 hex>/<64 hex>/...
+# reached about 290 characters under a long user profile's local app data. The full
+# AOT and native digests stay in the entry's own cache metadata, which
+# validate_package_cache checks, so a shortened key that collides is rebuilt,
+# never reused.
+CACHE_ENTRY_KEY_CHARS = 16
+
+
+def cache_entry_key(cache_key: Mapping[str, Any]) -> str:
+    """The entry directory name for a cache key: 16 hex characters."""
+    aot = cache_key["aot"]["digest"]
+    native = cache_key["native"]["digest"]
+    if not (_is_cache_digest(aot) and _is_cache_digest(native)):
+        raise PackageCacheError("cache key digests are not SHA-256 hex")
+    return sha256_bytes(f"{aot}:{native}".encode("ascii"))[:CACHE_ENTRY_KEY_CHARS]
+
+
+def cache_entry_root(cache_root_path: Path | str, cache_key: Mapping[str, Any]) -> Path:
+    return Path(cache_root_path) / "entries" / cache_entry_key(cache_key)
+
+
+def _is_cache_entry_key(value: str) -> bool:
+    return (len(value) == CACHE_ENTRY_KEY_CHARS and
+            all(char in "0123456789abcdef" for char in value))
+
+
+def cache_root_is_private(user_data_root: Path | str, repository_root: Path | str) -> bool:
+    root = Path(user_data_root).expanduser().resolve(strict=False)
+    repository = Path(repository_root).expanduser().resolve(strict=False)
+    return root != repository and repository not in root.parents
+
+
+def cache_entry_limit(environment: Mapping[str, str] | None = None) -> int:
+    env = os.environ if environment is None else environment
+    raw = env.get(CACHE_LIMIT_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_CACHE_ENTRIES
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise PackageCacheError(f"{CACHE_LIMIT_ENV} must be a positive integer") from exc
+    if value < 1:
+        raise PackageCacheError(f"{CACHE_LIMIT_ENV} must be a positive integer")
+    return value
+
+
+def _is_cache_digest(value: str) -> bool:
+    return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def _path_key(path: Path) -> str:
+    """Comparison key for filesystem paths.
+
+    MSYS2's Windows Python joins iterdir() children with a backslash while
+    resolve() returns forward slashes, and its Path equality does not treat the
+    two spellings as the same path. Normalise separators and case explicitly.
+    """
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def prune_cache(
+    cache_root_path: Path | str,
+    *,
+    max_entries: int = DEFAULT_MAX_CACHE_ENTRIES,
+    protected_entry: Path | str | None = None,
+) -> tuple[int, int]:
+    if type(max_entries) is not int or max_entries < 1:
+        raise PackageCacheError("cache entry limit must be a positive integer")
+    root = Path(cache_root_path).expanduser().resolve(strict=False)
+    entries_root = root.joinpath("entries")
+    if not entries_root.is_dir() or entries_root.is_symlink():
+        return 0, 0
+    candidates: list[tuple[int, Path]] = []
+    try:
+        for entry in list(entries_root.iterdir()):
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            if _is_cache_digest(entry.name):
+                # The old two-level layout (entries/<aot>/<native>): its paths
+                # are too long for a default Windows install. Drop it; the next
+                # build fills the short layout.
+                try:
+                    shutil.rmtree(entry)
+                except OSError:
+                    pass
+                continue
+            if not _is_cache_entry_key(entry.name):
+                continue
+            try:
+                modified = entry.stat().st_mtime_ns
+            except OSError:
+                continue
+            candidates.append((modified, entry))
+    except OSError:
+        return 0, 0
+    protected = (
+        _path_key(Path(protected_entry).expanduser().resolve(strict=False))
+        if protected_entry is not None else None
+    )
+    candidates.sort(key=lambda item: (_path_key(item[1]) == protected, item[0]), reverse=True)
+    removed = 0
+    for _, entry in candidates[max_entries:]:
+        if protected is not None and _path_key(entry) == protected:
+            continue
+        if entry.is_symlink():
+            continue
+        try:
+            shutil.rmtree(entry)
+        except OSError:
+            continue
+        removed += 1
+    return removed, len(candidates) - removed
+
+
+# The source a title's runtime package is compiled from: the runtime, the shared core
+# it links, the pause overlay's UI library (RT_NK_UI_SRCS) and the third-party headers
+# those include (RT_NK_UI_FLAGS names clay; nk_ui_image.c includes stb_image.h and
+# nk_xb.c safe-math.h). The player (src/player) is not part of a package, so a change
+# there leaves every package as it is. tools/test_package_cache.py checks that every
+# third_party directory these sources include, or the runtime flags name, is listed.
+RUNTIME_SOURCE_DIRECTORIES: tuple[str, ...] = (
+    "src/rt",
+    "src/core",
+    "src/ui",
+    "third_party/clay",
+    "third_party/portable-snippets",
+    "third_party/stb",
+)
+# The build rules: the Makefile and the fragments it includes (mk/nk_ui.mk lists the
+# overlay's UI sources).
+RUNTIME_BUILD_RULE_GLOBS: tuple[str, ...] = ("Makefile", "mk/*.mk")
+
+
+def source_tree_digest(
+    repository_root: Path | str,
+    directories: tuple[str, ...] = RUNTIME_SOURCE_DIRECTORIES,
+) -> str:
+    root = Path(repository_root).resolve(strict=False)
+    entries: list[tuple[str, Path]] = []
+    for pattern in RUNTIME_BUILD_RULE_GLOBS:
+        for rule in sorted(root.glob(pattern)):
+            if rule.is_file() and not rule.is_symlink():
+                entries.append((rule.relative_to(root).as_posix(), rule))
+    for directory in directories:
+        base = root / directory
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if path.is_file() and not path.is_symlink() and path.suffix.lower() in {".c", ".h", ".cpp", ".hpp"}:
+                entries.append((path.relative_to(root).as_posix(), path))
+    assets_root = root / "assets" / "vfpu"
+    if assets_root.is_dir() and not assets_root.is_symlink():
+        for path in assets_root.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                entries.append((path.relative_to(root).as_posix(), path))
+    digest = hashlib.sha256()
+    for relative, path in sorted(entries):
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _compiler_executable(
+    selected: str,
+    env: Mapping[str, str],
+    repository_root: Path | str | None,
+) -> str | None:
+    """The file a compiler name resolves to: PATH first, then a repository-relative path.
+
+    The identity and the target of the native objects must name the same compiler, so
+    both resolve ``CC`` through this one helper.
+    """
+    executable = shutil.which(selected, path=env.get("PATH"))
+    if executable is None and repository_root is not None:
+        candidate = Path(repository_root) / selected
+        if candidate.is_file():
+            executable = str(candidate)
+    return executable
+
+
+# The programs the compiler driver runs to turn C into the package's objects and
+# executable: the compiler proper, the assembler and the linker. A toolchain update can
+# replace any one of them without changing the driver (binutils updates replace as and
+# ld alone), so each is named in the identity by its own content hash.
+COMPILER_PROGRAMS: tuple[str, ...] = ("cc1", "as", "ld")
+
+
+def _compiler_query(executable: str, argument: str, env: Mapping[str, str]) -> str | None:
+    try:
+        completed = subprocess.run(
+            [executable, argument],
+            env=dict(env),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    answer = completed.stdout.strip()
+    return answer if completed.returncode == 0 and answer else None
+
+
+def _compiler_program(executable: str, program: str, env: Mapping[str, str]) -> str:
+    """``name:sha256`` of the program the driver runs for ``program``, or ``program:unavailable``.
+
+    The driver names the file it would run (``-print-prog-name``); a bare name back means
+    it searches ``PATH``, as it would when compiling.
+    """
+    named = _compiler_query(executable, f"-print-prog-name={program}", env)
+    if named is None:
+        return f"{program}:unavailable"
+    candidate = Path(named)
+    resolved = str(candidate) if candidate.is_absolute() else shutil.which(named, path=env.get("PATH"))
+    if resolved is None or not Path(resolved).is_file():
+        return f"{program}:unavailable"
+    return f"{Path(resolved).name}:{sha256_file(Path(resolved))}"
+
+
+def compiler_identity(
+    command: str | None = None,
+    *,
+    repository_root: Path | str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    """The C toolchain a package is compiled with, as one cache-key string.
+
+    ``<driver>:<sha256>`` names the driver file, then its version
+    (``-dumpfullversion``) and the content hash of each of COMPILER_PROGRAMS it runs,
+    separated by ``|``. Paths are left out, so moving an unchanged toolchain keeps the
+    key, while replacing any one of its programs changes it and recompiles the native
+    package (generated C is reused).
+    """
+    env = os.environ if environment is None else environment
+    selected = command or env.get("CC") or "gcc"
+    executable = _compiler_executable(selected, env, repository_root)
+    if executable is None:
+        return f"{selected}:unavailable"
+    path = Path(executable)
+    if not path.is_file():
+        return f"{selected}:unavailable"
+    version = _compiler_query(executable, "-dumpfullversion", env) or "unavailable"
+    parts = [f"{path.name}:{sha256_file(path)}", f"version={version}"]
+    parts.extend(_compiler_program(executable, program, env) for program in COMPILER_PROGRAMS)
+    return "|".join(parts)
+
+
+def compiler_target(
+    environment: Mapping[str, str] | None = None,
+    *,
+    repository_root: Path | str | None = None,
+) -> str:
+    """The machine triple the C compiler builds the native objects for.
+
+    The key names the target of the objects ``CC`` produces, so it is read from that
+    compiler (``-dumpmachine``) and never from the Python interpreter that plans the
+    build. Two interpreters on one machine report different platforms for the same
+    gcc (python.org: ``win-amd64``; MSYS2: ``mingw_x86_64_ucrt_gnu``), so an
+    interpreter-derived target changed the key between two builds of the same inputs.
+    ``NK_TARGET_TRIPLE`` or ``CC_TARGET`` still overrides it. ``repository_root`` lets a
+    relative ``CC`` resolve exactly as :func:`compiler_identity` resolves it.
+    """
+    env = os.environ if environment is None else environment
+    explicit = env.get("NK_TARGET_TRIPLE") or env.get("CC_TARGET")
+    if explicit:
+        return explicit
+    selected = env.get("CC") or "gcc"
+    executable = _compiler_executable(selected, env, repository_root)
+    if executable is None:
+        return f"{selected}:unavailable"
+    try:
+        completed = subprocess.run(
+            [executable, "-dumpmachine"],
+            env=dict(env),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return f"{selected}:unavailable"
+    machine = completed.stdout.strip()
+    if completed.returncode != 0 or not machine:
+        return f"{selected}:unavailable"
+    return machine
+
+
+# What a package build compiles with when its caller sets no optimization (#1296, #1730).
+# The Makefile's -O0 default is for ad-hoc and selftest builds; a package is what a player runs.
+# The runtime is project code and builds at -O2. Generated guest code builds at one measured
+# level for every title: codegen bounds every unit, a body over its unit budget compiles alone
+# at -O0 (tools/codegen.py BODY_FALLBACK_BYTES), and the compile phase budgets each job's memory
+# from the largest unit, so the level no longer depends on which title it is.
+# Measured for #1730 on HST and two other titles: -O1 runs generated guest code 11-33% faster
+# than -O0; -O2 is no faster than -O1 beyond run-to-run noise and takes up to 3.3x the build CPU.
+PACKAGE_RUNTIME_OPT = "-O2"
+PACKAGE_RECOMP_OPT = "-O1"
+
+
+def package_optimization(
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """``RUNTIME_OPT`` and ``RECOMP_OPT`` for a package build; a value the caller set wins.
+
+    Both package routes (the planner and the player's CLI) apply this before deriving the
+    cache key, so the key names the flags the objects were really compiled with.
+    """
+    env = os.environ if environment is None else environment
+    return {
+        "RUNTIME_OPT": env.get("RUNTIME_OPT") or PACKAGE_RUNTIME_OPT,
+        "RECOMP_OPT": env.get("RECOMP_OPT") or PACKAGE_RECOMP_OPT,
+    }
+
+
+# A package build splits generated C into chunks of about this many bytes (#1296). The
+# function count alone made Hot Shots Tennis chunks of 0.8 to 52 MB of C; one cc1 compiling
+# the 52 MB chunk at -O1 peaked at 2.7 GB, so a host with little free memory compiled one
+# chunk at a time. The same functions in chunks of at most 4 MB peaked at 440 MB each, for
+# the same total compile time. Chunking keeps every function's C text, its order and the
+# compile flags, and only moves the boundaries between translation units; gcc's inlining of
+# the runtime header's static inline helpers does depend on the unit's size, so smaller
+# units inline them into more functions (about a fifth of Hot Shots Tennis's functions).
+PACKAGE_CHUNK_TARGET_BYTES = 4_000_000
+
+
+def package_chunking(environment: Mapping[str, str] | None = None) -> dict[str, str]:
+    """``CHUNK_TARGET_BYTES`` for a package build; a value the caller set wins.
+
+    Both package routes' codegen-option builders apply it, so the cache key names
+    the chunking codegen really used whoever derives the options.
+    """
+    env = os.environ if environment is None else environment
+    return {
+        "CHUNK_TARGET_BYTES": env.get("CHUNK_TARGET_BYTES") or str(PACKAGE_CHUNK_TARGET_BYTES),
+    }
+
+
+def default_recomp_flags(recomp_opt: str) -> str:
+    """The generated-code flags Make uses when the caller sets no RECOMP_FLAGS
+    (``RECOMP_FLAGS ?= $(RECOMP_OPT) ...`` in the Makefile, with gcc's flag set)."""
+    return f"{recomp_opt} -w -fno-strict-aliasing -fno-var-tracking -ftrack-macro-expansion=0"
+
+
+def effective_recomp_opt(environment: Mapping[str, str] | None = None) -> str:
+    """The -O level Make compiles generated code with (#1730): the last -O in RECOMP_FLAGS
+    when the caller set them, which override RECOMP_OPT, otherwise RECOMP_OPT."""
+    env = os.environ if environment is None else environment
+    if "RECOMP_FLAGS" not in env:
+        return env.get("RECOMP_OPT", "-O0")
+    levels = [word for word in env["RECOMP_FLAGS"].split() if word.startswith("-O")]
+    if not levels:
+        return "-O0"
+    return "-O1" if levels[-1] == "-O" else levels[-1]
+
+
+def native_compile_flags(
+    *,
+    public_safe: bool = False,
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    env = os.environ if environment is None else environment
+    recomp_opt = env.get("RECOMP_OPT", "-O0")
+    values = (
+        env.get("CFLAGS", ""),
+        env.get("RUNTIME_OPT", "-O0"),
+        env.get("GE_CFLAGS", "-O2 -fno-math-errno -Wall -Wextra -Isrc/rt -DSR_SDL3VK"),
+        recomp_opt,
+        # Unset, Make derives the flags from RECOMP_OPT, so the key must too: a hardcoded -O0
+        # here would match an explicit -O0 RECOMP_FLAGS that compiles differently.
+        env.get("RECOMP_FLAGS", default_recomp_flags(recomp_opt)),
+        env.get("TRACE", "0"),
+        env.get("SR_STALE_DETECT", "0"),
+        env.get("LLE_CPU", ""),
+        env.get("STALE_CODE_POLICY", env.get("SR_STALE_POLICY", "")),
+        "PUBLIC_SAFE=1" if public_safe else "PUBLIC_SAFE=0",
+    )
+    flags = "|".join(values)
+    # The NaN trap adds -DSR_NAN_TRAP inside the Makefile, where CFLAGS above cannot see it.
+    # It is appended only when on, so every untrapped key stays exactly what it was.
+    return flags + "|NAN_TRAP=1" if nan_trap_enabled(env) else flags
+
+
+def nan_trap_enabled(environment: Mapping[str, str] | None = None) -> bool:
+    """Whether a Make build in this environment turns on the NaN trap (issue #69).
+
+    `make NAN_TRAP=1` turns on both halves at once, `--nan-trap` codegen and `-DSR_NAN_TRAP`,
+    and it does so inside the Makefile (`ifeq ($(NAN_TRAP),1)`). So neither
+    CODEGEN_USER_ARGS nor CFLAGS in the environment shows it, and the cache key has to ask
+    for it by name: a trapped and an untrapped build must never share a cache entry.
+    """
+    env = os.environ if environment is None else environment
+    return env.get("NAN_TRAP", "").strip() == "1"
+
+
+AOT_ENHANCEMENT_PACKAGE_EPOCH = "aot-enhancement-package-v1"
+AOT_LLVM_BACKEND_EPOCH = "aot-llvm-backend-v1"
+
+#: The sources that decide what the LLVM IR backend (#330) emits and what its IR calls.
+LLVM_BACKEND_SOURCES = ("tools/codegen_llvm.py", "tools/llvm_ir.py",
+                        "src/rt/llvm_abi.c", "src/rt/llvm_abi.h")
+
+
+def llvm_backend_enabled(environment: Mapping[str, str] | None = None) -> bool:
+    """Whether a Make build in this environment uses the opt-in LLVM IR backend (#330).
+
+    The Makefile reads `CODEGEN_BACKEND` from the environment or from a command line that
+    `MAKEFLAGS` carries, and codegen also accepts `--backend=llvm` in `CODEGEN_USER_ARGS`.
+    """
+    env = os.environ if environment is None else environment
+    if env.get("CODEGEN_BACKEND", "").strip() == "llvm":
+        return True
+    if "CODEGEN_BACKEND=llvm" in env.get("MAKEFLAGS", "").split():
+        return True
+    return "--backend=llvm" in env.get("CODEGEN_USER_ARGS", "").split()
+
+
+def _llvm_tool_identity(tool: str, env: Mapping[str, str], version_flag: str) -> str:
+    executable = shutil.which(tool, path=env.get("PATH"))
+    if executable is None:
+        raise PackageCacheError(f"the LLVM backend needs {tool}, which is not on PATH")
+    completed = subprocess.run([executable, version_flag], env=dict(env), capture_output=True,
+                               text=True, timeout=60, check=False)
+    if completed.returncode != 0:
+        raise PackageCacheError(f"{tool} {version_flag} failed: {completed.stderr.strip()[:200]}")
+    report = (completed.stdout + completed.stderr).strip()
+    return f"{Path(executable).name}:{sha256_file(Path(executable))}\n{report}"
+
+
+def llvm_backend_options(environment: Mapping[str, str] | None = None,
+                         repository_root: Path | None = None) -> dict[str, Any]:
+    """AOT cache-key options for the LLVM IR backend, or an empty dict for the C backend.
+
+    The C backend returns `{}`, so its keys are unchanged. An LLVM build's key names the
+    backend's own sources and the exact Clang and llvm-link that compile its IR, so an
+    LLVM package is never reused for a C build, for another lowering, or across
+    toolchains; a missing tool fails closed.
+    """
+    env = os.environ if environment is None else environment
+    if not llvm_backend_enabled(env):
+        return {}
+    root = repository_root or Path(__file__).resolve().parents[2]
+    return {"llvm_backend": {
+        "epoch": AOT_LLVM_BACKEND_EPOCH,
+        "sources": {path: sha256_file(root / path) for path in LLVM_BACKEND_SOURCES},
+        "clang": _llvm_tool_identity(env.get("LLVM_CLANG", "clang"), env, "-v"),
+        "llvm_link": _llvm_tool_identity(env.get("LLVM_LINK", "llvm-link"), env, "--version"),
+    }}
+
+
+def ambient_enhancement_package(environment: Mapping[str, str] | None = None) -> str | None:
+    """Where an environment names an enhancement package on its own, or None.
+
+    `ENHANCEMENT_PACKAGE` (read by the Makefile, also through `MAKEFLAGS`) and an
+    `--enhancement-package` codegen option in `CODEGEN_USER_ARGS` apply a package to every
+    Make build that inherits them. A package build names its package explicitly, so
+    `nk_cli.py build-package` and `title_codegen_plan.py --package` refuse an environment
+    for which this returns a value: an inherited variable never enhances a build.
+    """
+    env = os.environ if environment is None else environment
+    if env.get("ENHANCEMENT_PACKAGE", "").strip():
+        return "ENHANCEMENT_PACKAGE"
+    for token in env.get("MAKEFLAGS", "").split():
+        if token.startswith("ENHANCEMENT_PACKAGE=") and token.split("=", 1)[1].strip():
+            return "MAKEFLAGS ENHANCEMENT_PACKAGE"
+    for token in env.get("CODEGEN_USER_ARGS", "").split():
+        if token.startswith("--enhancement-package"):
+            return "CODEGEN_USER_ARGS --enhancement-package"
+    return None
+
+
+def enhancement_package_options(environment: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Return AOT cache-key options for an active enhancement package, or empty dict when off.
+
+    When no enhancement package is active (`ENHANCEMENT_PACKAGE` is unset/empty and
+    `--enhancement-package=` does not appear in `CODEGEN_USER_ARGS`), returns `{}` so
+    authentic mode's `codegen_options_sha256` and `aot.digest` remain byte-identical.
+    When an enhancement package is active, validates and hashes the package (and any
+    sibling `.symbols.json` map) and returns the explicit AOT instrumentation epoch
+    and digests so enhanced builds get a distinct cache key and fail closed if the
+    package file is unreadable or invalid.
+    """
+    env = os.environ if environment is None else environment
+    pkg_raw = env.get("ENHANCEMENT_PACKAGE", "").strip()
+    if not pkg_raw:
+        user_args = env.get("CODEGEN_USER_ARGS", "")
+        for token in user_args.split():
+            if token.startswith("--enhancement-package="):
+                pkg_raw = token.split("=", 1)[1].strip()
+                break
+    if not pkg_raw:
+        return {}
+    import enhancement_package
+
+    pkg_path = Path(pkg_raw)
+    try:
+        pkg_data = enhancement_package.load_and_validate_package(pkg_path)
+    except (OSError, ValueError) as exc:
+        raise PackageCacheError(f"enhancement package is invalid or unreadable: {exc}") from exc
+    result: dict[str, Any] = {
+        "enhancement_package_epoch": AOT_ENHANCEMENT_PACKAGE_EPOCH,
+        "enhancement_package_id": pkg_data["id"],
+        "enhancement_package_sha256": enhancement_package.compute_package_digest(pkg_data),
+    }
+    sidecar = pkg_path.with_suffix(".symbols.json")
+    if sidecar.is_file():
+        result["enhancement_symbol_map_sha256"] = sha256_file(sidecar)
+    return result
+
+
+def _input_sha(value: Any, label: str) -> str:
+    if not isinstance(value, Mapping) or not isinstance(value.get("sha256"), str):
+        raise PackageCacheError(f"{label} input digest is missing")
+    digest = value["sha256"]
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise PackageCacheError(f"{label} input digest is invalid")
+    returned: str = digest
+    return returned
+
+
+def _canonical_load_address(value: Any) -> Any:
+    if type(value) is int:
+        return f"0x{value:08x}"
+    if isinstance(value, str):
+        try:
+            return f"0x{int(value, 0):08x}"
+        except ValueError:
+            return value
+    return value
+
+
+def _normal_modules(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise PackageCacheError("module inputs must be an array")
+    result = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise PackageCacheError("module input record is invalid")
+        result.append({
+            "name": item.get("name"),
+            "load_address": _canonical_load_address(item.get("load_address")),
+            "sha256": item.get("sha256"),
+        })
+    return result
+
+
+def build_cache_key(
+    *,
+    input_hashes: Mapping[str, Any],
+    title_input_identity: Mapping[str, Any] | None = None,
+    codegen_options: Mapping[str, Any],
+    analyzer_sha256: str,
+    codegen_sha256: str,
+    compiler: str,
+    target: str,
+    runtime_source_digest: str,
+    compile_flags: str = "",
+    link_flags: str = "",
+    analyzer_codegen_epoch: str = ANALYZER_CODEGEN_SEMANTICS_EPOCH,
+    generated_code_abi_epoch: int = GENERATED_CODE_ABI_EPOCH,
+    runtime_abi_epoch: int = RUNTIME_ABI_EPOCH,
+) -> dict[str, Any]:
+    if not isinstance(input_hashes, Mapping):
+        raise PackageCacheError("package input hashes must be an object")
+    executable_sha256 = _input_sha(input_hashes.get("executable"), "executable")
+    manifest_sha256 = _input_sha(input_hashes.get("manifest"), "manifest")
+    modules = _normal_modules(input_hashes.get("modules"))
+    identity_digest = (
+        title_input_identity_digest(dict(title_input_identity))
+        if title_input_identity is not None else None
+    )
+    psp_header = input_hashes.get("psp_header")
+    psp_header_sha256 = None
+    if psp_header is not None:
+        psp_header_sha256 = _input_sha(psp_header, "PSP header")
+    if not all(isinstance(value, str) and value for value in (
+        analyzer_sha256, codegen_sha256, compiler, target, runtime_source_digest,
+    )):
+        raise PackageCacheError("cache identity components must be non-empty strings")
+    options = json.loads(canonical_json(codegen_options))
+    aot_components = {
+        "executable_sha256": executable_sha256,
+        "manifest_sha256": manifest_sha256,
+        "modules_sha256": _digest(modules),
+        "title_input_identity_sha256": identity_digest,
+        "psp_header_sha256": psp_header_sha256,
+        "analyzer_codegen_epoch": analyzer_codegen_epoch,
+        "analyzer_sha256": analyzer_sha256,
+        "codegen_sha256": codegen_sha256,
+        "codegen_options_sha256": _digest(options),
+        "generated_code_abi_epoch": int(generated_code_abi_epoch),
+        "runtime_abi_epoch": int(runtime_abi_epoch),
+    }
+    generated_components = dict(aot_components)
+    generated_components.pop("runtime_abi_epoch")
+    generated_code_digest = _digest(generated_components)
+    native_components = {
+        "generated_code_digest": generated_code_digest,
+        "compiler_identity": compiler,
+        "compiler_target": target,
+        "runtime_source_digest": runtime_source_digest,
+        "compile_flags": compile_flags,
+        "link_flags": link_flags,
+        "runtime_abi_epoch": int(runtime_abi_epoch),
+    }
+    return {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "aot": {
+            "digest": _digest(aot_components),
+            "components": aot_components,
+        },
+        "native": {
+            "digest": _digest(native_components),
+            "components": native_components,
+        },
+    }
+
+
+def cache_metadata(
+    key: Mapping[str, Any],
+    codegen_options: Mapping[str, Any],
+    *,
+    generated_code_reusable: bool = True,
+) -> dict[str, Any]:
+    components = key.get("aot", {}).get("components", {})
+    runtime_epoch = components.get("runtime_abi_epoch")
+    return {
+        "format": CACHE_FORMAT,
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "key": key,
+        "codegen_options": json.loads(canonical_json(codegen_options)),
+        "runtime_abi_compatibility": {
+            "current_epoch": runtime_epoch,
+            "generated_code_reusable": bool(generated_code_reusable),
+        },
+    }
+
+
+def _key_components(key: Mapping[str, Any], branch: str) -> tuple[Mapping[str, Any], str]:
+    if not isinstance(key, Mapping):
+        raise PackageCacheError("cache key is not an object")
+    value = key.get(branch)
+    if not isinstance(value, Mapping) or not isinstance(value.get("components"), Mapping):
+        raise PackageCacheError(f"cache key {branch} components are missing")
+    digest = value.get("digest")
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise PackageCacheError(f"cache key {branch} digest is invalid")
+    if _digest(value["components"]) != digest:
+        raise PackageCacheError(f"cache key {branch} digest does not match its components")
+    return value["components"], digest
+
+
+def runtime_abi_compatible(previous_epoch: Any, current_epoch: Any) -> bool:
+    if type(previous_epoch) is not int or type(current_epoch) is not int:
+        return False
+    if previous_epoch == current_epoch:
+        return True
+    return current_epoch in RUNTIME_ABI_COMPATIBILITY.get(previous_epoch, frozenset())
+
+
+def _key_from_document(value: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    cache = value.get("cache")
+    if isinstance(cache, Mapping) and isinstance(cache.get("key"), Mapping):
+        returned: Mapping[str, Any] | None = cache["key"]
+        return returned
+    if isinstance(value.get("key"), Mapping) and "aot" not in value:
+        returned = value["key"]
+        return returned
+    if "aot" in value and "native" in value:
+        return value
+    return None
+
+
+def compare_cache_keys(
+    previous: Mapping[str, Any] | None,
+    current: Mapping[str, Any] | None,
+) -> CacheDecision:
+    current_key = _key_from_document(current)
+    if current_key is None:
+        return CacheDecision("aot-regenerate", False, False, ("cache metadata missing",))
+    try:
+        current_aot, current_aot_digest = _key_components(current_key, "aot")
+        current_native, current_native_digest = _key_components(current_key, "native")
+    except PackageCacheError as exc:
+        return CacheDecision("aot-regenerate", False, False, (str(exc),))
+    previous_key = _key_from_document(previous)
+    if previous_key is None:
+        return CacheDecision("aot-regenerate", False, False, ("cache metadata missing",))
+    try:
+        previous_aot, previous_aot_digest = _key_components(previous_key, "aot")
+        previous_native, previous_native_digest = _key_components(previous_key, "native")
+    except PackageCacheError as exc:
+        return CacheDecision("aot-regenerate", False, False, (str(exc),))
+
+    reasons: list[str] = []
+    generated_reusable = True
+    for component in (
+        "executable_sha256", "manifest_sha256", "modules_sha256", "title_input_identity_sha256",
+        "psp_header_sha256",
+        "analyzer_codegen_epoch", "analyzer_sha256", "codegen_sha256",
+        "codegen_options_sha256", "generated_code_abi_epoch",
+    ):
+        if previous_aot.get(component) != current_aot.get(component):
+            generated_reusable = False
+            reasons.append(f"aot:{component}")
+    previous_epoch = previous_aot.get("runtime_abi_epoch")
+    current_epoch = current_aot.get("runtime_abi_epoch")
+    if previous_epoch != current_epoch:
+        reasons.append("aot:runtime_abi_epoch")
+        if not runtime_abi_compatible(previous_epoch, current_epoch):
+            generated_reusable = False
+    if not generated_reusable:
+        return CacheDecision("aot-regenerate", False, False, tuple(reasons))
+
+    native_reusable = True
+    if previous_native.get("generated_code_digest") != current_native.get("generated_code_digest"):
+        native_reusable = False
+        reasons.append("native:generated_code_digest")
+    for component in (
+        "compiler_identity", "compiler_target", "runtime_source_digest", "compile_flags",
+        "link_flags", "runtime_abi_epoch",
+    ):
+        if previous_native.get(component) != current_native.get(component):
+            native_reusable = False
+            reasons.append(f"native:{component}")
+    if native_reusable and previous_aot_digest == current_aot_digest and previous_native_digest == current_native_digest:
+        return CacheDecision("reuse", True, True, tuple(reasons))
+    return CacheDecision("native-recompile", True, False, tuple(reasons))
+
+
+# A profile stamp is named by a hash over its entries, and the entries carry CFLAGS, which
+# carry the build directory (-DSR_BUILD_DIR). Two output roots that build the same inputs
+# therefore name the stamp differently, and a raw name sort would move the stamp relative
+# to its siblings with each root. Records are ordered by the name with that hash removed,
+# and by the full name only to break a tie between two stamps of one kind.
+_PROFILE_STAMP_HASH_RE = re.compile(
+    r"(\.(?:runtime-profile|codegen-profile|recomp-profile|title-config))-[0-9a-f]{4,}"
+)
+
+
+def _record_order(relative: str) -> tuple[str, str]:
+    return (_PROFILE_STAMP_HASH_RE.sub(r"\1", relative), relative)
+
+
+def _artifact_candidates(package_dir: Path) -> Iterator[tuple[str, Path]]:
+    """Yield (raw relative path, file) for each artifact in record order, without reading any bytes."""
+    for path in sorted(
+        package_dir.rglob("*"),
+        key=lambda item: _record_order(item.relative_to(package_dir).as_posix()),
+    ):
+        if path.is_symlink():
+            raise PackageCacheError("package contains a symlink artifact")
+        if not path.is_file():
+            continue
+        relative = path.relative_to(package_dir).as_posix()
+        if relative == COMPLETION_MANIFEST:
+            continue
+        yield relative, path
+
+
+def _artifact_records(package_dir: Path) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for relative, path in _artifact_candidates(package_dir):
+        records.append({"path": _safe_relative(relative), "sha256": sha256_file(path)})
+    return records
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if os.name != "nt":
+            temporary_path.chmod(0o600)
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def write_completion_manifest(
+    package_dir: Path,
+    key: Mapping[str, Any],
+    *,
+    title_input_identity: Mapping[str, Any] | None = None,
+    backends: str | None = None,
+    limits: list[str] | None = None,
+) -> Path:
+    package_dir = package_dir.resolve(strict=False)
+    artifacts = _artifact_records(package_dir)
+    if title_input_identity is None:
+        try:
+            package = _read_json(package_dir / "package.json")
+        except (OSError, ValueError) as exc:
+            raise PackageCacheError(f"package input identity is unavailable: {exc}") from exc
+        title_input_identity = package.get("title_input_identity") if isinstance(package, dict) else None
+    identity = validate_title_input_identity(dict(title_input_identity)) if title_input_identity is not None else None
+    document: dict[str, Any] = {
+        "format": COMPLETION_FORMAT,
+        "schema_version": COMPLETION_SCHEMA_VERSION,
+        "status": "complete",
+        "cache_key": key,
+        "title_input_identity": identity,
+        "artifacts": artifacts,
+    }
+    if backends is not None:
+        document["backends"] = backends
+    if limits is not None:
+        document["limits"] = limits
+    destination = package_dir / COMPLETION_MANIFEST
+    _atomic_write(destination, canonical_json(document).encode("utf-8"))
+    return destination
+
+
+# Failure classes of a completion check, so a caller can name why a record was refused
+# without parsing its message.
+_COMPLETION_OK = ""
+_COMPLETION_MISSING = "missing"
+_COMPLETION_INVALID = "invalid"
+_COMPLETION_KEY = "key"
+_COMPLETION_ARTIFACT = "artifact"
+_COMPLETION_UNCOVERED = "uncovered"
+
+
+def _digest_once(path: Path, digests: dict[Path, str] | None) -> str:
+    """Digest of one resolved package file, reusing a digest already taken in this validation."""
+    if digests is None:
+        return sha256_file(path)
+    digest = digests.get(path)
+    if digest is None:
+        digest = digests[path] = sha256_file(path)
+    return digest
+
+
+def validate_completion_manifest(
+    package_dir: Path,
+    *,
+    expected_key: Mapping[str, Any] | None = None,
+    required_paths: set[str] | None = None,
+    file_digests: dict[Path, str] | None = None,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """Validate the completion manifest.
+
+    ``file_digests`` maps resolved artifact paths to digests computed earlier in the same
+    validation. Each listed artifact is still compared against its manifest digest; only
+    the second read of a file that was already digested is skipped.
+    The comparison therefore reflects the bytes as that validation read them: a file
+    rewritten between the package-level check and this one, inside the same call, is
+    not read a second time. A caller that wants a fresh read passes no digests.
+    """
+    failure, reason, document = _check_completion_manifest(
+        package_dir, expected_key=expected_key, required_paths=required_paths,
+        file_digests=file_digests,
+    )
+    return failure == _COMPLETION_OK, reason, document
+
+
+def _check_completion_manifest(
+    package_dir: Path,
+    *,
+    expected_key: Mapping[str, Any] | None = None,
+    required_paths: set[str] | None = None,
+    file_digests: dict[Path, str] | None = None,
+) -> tuple[str, str, dict[str, Any] | None]:
+    package_dir = package_dir.resolve(strict=False)
+    path = package_dir / COMPLETION_MANIFEST
+    if not path.is_file() or path.is_symlink():
+        return _COMPLETION_MISSING, "completion manifest is missing or not a regular file", None
+    try:
+        document = _read_json(path)
+    except (OSError, ValueError) as exc:
+        return _COMPLETION_INVALID, f"completion manifest is unreadable: {exc}", None  # includes BoundedJsonError
+    if not isinstance(document, dict):
+        return _COMPLETION_INVALID, "completion manifest must be a JSON object", None
+    allowed = {"format", "schema_version", "status", "cache_key", "title_input_identity", "artifacts", "backends", "limits"}
+    required = {"format", "schema_version", "status", "cache_key", "title_input_identity", "artifacts"}
+    doc_keys = set(document)
+    if not required.issubset(doc_keys) or not doc_keys.issubset(allowed):
+        return _COMPLETION_INVALID, "completion manifest fields do not match the cache contract", None
+    if document["format"] != COMPLETION_FORMAT or document["schema_version"] != COMPLETION_SCHEMA_VERSION:
+        return _COMPLETION_INVALID, "completion manifest format or schema is unsupported", None
+    if document["status"] != "complete":
+        return _COMPLETION_INVALID, "completion manifest does not mark a complete build", None
+    key = document["cache_key"]
+    if not isinstance(key, dict):
+        return _COMPLETION_INVALID, "completion manifest cache key is missing", None
+    try:
+        _key_components(key, "aot")
+        _key_components(key, "native")
+    except PackageCacheError as exc:
+        return _COMPLETION_INVALID, str(exc), None
+    if expected_key is not None and key != expected_key:
+        return _COMPLETION_KEY, "completion manifest cache key does not match the package", None
+    try:
+        identity = validate_title_input_identity(document["title_input_identity"])
+    except PackageCacheError as exc:
+        return _COMPLETION_INVALID, str(exc), None
+    try:
+        aot_components, _ = _key_components(key, "aot")
+    except PackageCacheError as exc:
+        return _COMPLETION_INVALID, str(exc), None
+    if aot_components.get("title_input_identity_sha256") != title_input_identity_digest(identity):
+        return _COMPLETION_INVALID, "completion manifest title input identity does not match the cache key", None
+    artifacts = document["artifacts"]
+    if not isinstance(artifacts, list) or not artifacts:
+        return _COMPLETION_INVALID, "completion manifest artifact list is empty", None
+    seen: set[str] = set()
+    for record in artifacts:
+        if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
+            return _COMPLETION_INVALID, "completion manifest artifact record is invalid", None
+        try:
+            relative = _safe_relative(record["path"])
+            digest = record["sha256"]
+            if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                raise PackageCacheError("artifact digest is invalid")
+            resolved = _resolve_within(package_dir, relative)
+        except PackageCacheError as exc:
+            return _COMPLETION_INVALID, str(exc), None
+        if relative in seen:
+            return _COMPLETION_INVALID, f"completion manifest repeats artifact {relative}", None
+        seen.add(relative)
+        if not resolved.is_file() or resolved.is_symlink():
+            return _COMPLETION_ARTIFACT, f"completion artifact is missing: {relative}", None
+        if _digest_once(resolved, file_digests) != digest:
+            return _COMPLETION_ARTIFACT, f"completion artifact digest mismatch: {relative}", None
+    for relative in sorted(required_paths or set()):
+        if relative not in seen:
+            return _COMPLETION_UNCOVERED, f"completion manifest does not cover {relative}", None
+    # Only the path set is compared here. The digests of unlisted files were
+    # computed and discarded, so enumerating without reading them keeps the
+    # same set check while removing a full second read of the package.
+    try:
+        actual = {_safe_relative(relative) for relative, _ in _artifact_candidates(package_dir)}
+    except PackageCacheError as exc:
+        return _COMPLETION_ARTIFACT, str(exc), None
+    if actual != seen:
+        return _COMPLETION_ARTIFACT, "completion manifest artifact set does not match the package", None
+    return _COMPLETION_OK, "", document
+
+
+def package_cache_key(package_dir: Path) -> Mapping[str, Any] | None:
+    try:
+        document = _read_json(package_dir / "package.json")
+    except (OSError, ValueError):
+        return None  # unreadable or hostile package metadata carries no cache key
+    return _key_from_document(document)
+
+
+def validate_package_cache(
+    package_dir: Path,
+    *,
+    expected_key: Mapping[str, Any] | None = None,
+) -> tuple[bool, str]:
+    package_dir = package_dir.resolve(strict=False)
+    try:
+        package = _read_json(package_dir / "package.json")
+        report = read_build_report_json(package_dir / "build-report.json")
+    except (OSError, ValueError) as exc:
+        # BoundedJsonError names byte/depth/count/duplicate-key/UTF-8 failures.
+        return False, f"package metadata is unreadable: {exc}"
+    if not isinstance(package, dict) or not isinstance(report, dict):
+        return False, "package metadata must contain JSON objects"
+    if package.get("format") != "nakagawa-aot-package" or package.get("schema_version") != 2:
+        return False, "package format or schema is unsupported"
+    cache = package.get("cache")
+    key = _key_from_document(package)
+    if not isinstance(cache, dict) or key is None:
+        return False, "package cache metadata is missing"
+    if set(cache) != {"format", "schema_version", "key", "codegen_options", "runtime_abi_compatibility"}:
+        return False, "package cache fields do not match the cache contract"
+    if cache.get("format") != CACHE_FORMAT or cache.get("schema_version") != CACHE_SCHEMA_VERSION:
+        return False, "package cache format or schema is unsupported"
+    if not isinstance(cache.get("codegen_options"), dict):
+        return False, "package cache codegen options are invalid"
+    compatibility = cache.get("runtime_abi_compatibility")
+    if not isinstance(compatibility, dict) or set(compatibility) != {"current_epoch", "generated_code_reusable"}:
+        return False, "package cache runtime compatibility fields are invalid"
+    if report.get("cache") != cache:
+        return False, "build report cache metadata does not match package.json"
+    try:
+        aot_components, _ = _key_components(key, "aot")
+        native_components, _ = _key_components(key, "native")
+    except PackageCacheError as exc:
+        return False, str(exc)
+    if key.get("schema_version") != CACHE_SCHEMA_VERSION:
+        return False, "package cache key schema is unsupported"
+    components = aot_components
+    if (
+        components.get("analyzer_codegen_epoch") != ANALYZER_CODEGEN_SEMANTICS_EPOCH
+        or components.get("generated_code_abi_epoch") != GENERATED_CODE_ABI_EPOCH
+        or components.get("runtime_abi_epoch") != RUNTIME_ABI_EPOCH
+        or native_components.get("runtime_abi_epoch") != RUNTIME_ABI_EPOCH
+        or components.get("codegen_options_sha256") != _digest(cache["codegen_options"])
+        or compatibility.get("current_epoch") != components.get("runtime_abi_epoch")
+        or type(compatibility.get("generated_code_reusable")) is not bool
+    ):
+        return False, "package cache compatibility metadata is invalid"
+    generated_components = dict(components)
+    generated_components.pop("runtime_abi_epoch", None)
+    if native_components.get("generated_code_digest") != _digest(generated_components):
+        return False, "package generated-code digest disagrees with cache key"
+    inputs = package.get("inputs", {})
+    if not isinstance(inputs, dict):
+        return False, "package input metadata is invalid"
+    try:
+        identity = validate_title_input_identity(package.get("title_input_identity"))
+    except PackageCacheError as exc:
+        return False, str(exc)
+    if title_input_identity_digest(identity) != components.get("title_input_identity_sha256"):
+        return False, "package title input identity disagrees with cache key"
+    executable_input = inputs.get("executable", {})
+    manifest_input = inputs.get("manifest", {})
+    if not isinstance(executable_input, dict) or not isinstance(manifest_input, dict):
+        return False, "package input metadata is invalid"
+    if executable_input.get("sha256") != components.get("executable_sha256"):
+        return False, "package executable digest disagrees with cache key"
+    if manifest_input.get("sha256") != components.get("manifest_sha256"):
+        return False, "package manifest digest disagrees with cache key"
+    try:
+        modules_digest = _digest(_normal_modules(inputs.get("modules")))
+    except PackageCacheError:
+        return False, "package module input metadata is invalid"
+    if modules_digest != components.get("modules_sha256"):
+        return False, "package module digest disagrees with cache key"
+    title = package.get("title")
+    if not isinstance(title, dict) or identity["manifest"]["id"] != title.get("id"):
+        return False, "package title input identity does not match its manifest/profile"
+    if identity["main_executable"]["sha256"] != executable_input.get("sha256"):
+        return False, "package title input identity does not match the main executable"
+    identity_modules = {item["name"]: item["sha256"] for item in identity["modules"]}
+    package_modules = {
+        item.get("name"): item.get("sha256")
+        for item in inputs.get("modules", [])
+        if isinstance(item, Mapping)
+    }
+    if identity_modules != package_modules:
+        return False, "package title input identity does not match its module inputs"
+    psp_header = inputs.get("psp_header")
+    expected_psp_header = components.get("psp_header_sha256")
+    if psp_header is None:
+        if expected_psp_header is not None:
+            return False, "package PSP header digest disagrees with cache key"
+    elif not isinstance(psp_header, dict) or psp_header.get("sha256") != expected_psp_header:
+        return False, "package PSP header digest disagrees with cache key"
+    executable = package.get("executable", {})
+    executable_path = executable.get("path") if isinstance(executable, dict) else None
+    if not isinstance(executable_path, str):
+        return False, "package executable path is missing"
+    # Each executable and generated object is digested once here; the completion
+    # check below reuses these digests rather than reading the same bytes again.
+    file_digests: dict[Path, str] = {}
+    try:
+        executable_file = _resolve_within(package_dir, executable_path)
+    except PackageCacheError as exc:
+        return False, str(exc)
+    if not executable_file.is_file() or _digest_once(executable_file, file_digests) != executable.get("sha256"):
+        return False, "package executable digest is stale"
+    image_path = str(Path(executable_path).with_name(
+        f"{Path(executable_path).stem}_image.bin"
+    ).as_posix())
+    try:
+        image_file = _resolve_within(package_dir, image_path)
+    except PackageCacheError as exc:
+        return False, str(exc)
+    if not image_file.is_file():
+        return False, "package runtime image is missing"
+    objects = package.get("generated_objects", [])
+    if not isinstance(objects, list):
+        return False, "package generated object list is invalid"
+    required = {"package.json", "build-report.json", executable_path, image_path}
+    for item in objects:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            return False, "package generated object record is invalid"
+        object_path = item["path"]
+        try:
+            object_file = _resolve_within(package_dir, object_path)
+        except PackageCacheError as exc:
+            return False, str(exc)
+        if not object_file.is_file() or _digest_once(object_file, file_digests) != item.get("sha256"):
+            return False, f"package generated object digest is stale: {object_path}"
+        required.add(object_path)
+    valid, reason, completion = validate_completion_manifest(
+        package_dir,
+        expected_key=expected_key,
+        required_paths=required,
+        file_digests=file_digests,
+    )
+    if not valid:
+        return False, reason
+    if completion is None or completion.get("title_input_identity") != identity:
+        return False, "completion manifest title input identity does not match package.json"
+    return True, ""
+
+
+# A generated-code stage is AOT output (generated C, its runtime image and import table)
+# written by one planner run and handed to a later package build of the same inputs, so
+# the package compiles it instead of generating it again. It carries the completion
+# record a package carries, written last, and the later build accepts it only after the
+# checks the native-only reuse of a package's generated C performs: the record is
+# complete and every byte it names is intact, and its cache key's generated-code
+# components equal the build's own. Every refusal is named, and a refused stage is
+# regenerated from source, never compiled.
+AOT_STAGE_ACCEPTED = "AOT_STAGE_ACCEPTED"
+AOT_STAGE_RECORD_MISSING = "AOT_STAGE_RECORD_MISSING"
+AOT_STAGE_RECORD_INVALID = "AOT_STAGE_RECORD_INVALID"
+AOT_STAGE_ARTIFACT_MISMATCH = "AOT_STAGE_ARTIFACT_MISMATCH"
+AOT_STAGE_INCOMPLETE = "AOT_STAGE_INCOMPLETE"
+AOT_STAGE_INPUT_CHANGED = "AOT_STAGE_INPUT_CHANGED"
+AOT_STAGE_GENERATOR_CHANGED = "AOT_STAGE_GENERATOR_CHANGED"
+AOT_STAGE_OPTIONS_CHANGED = "AOT_STAGE_OPTIONS_CHANGED"
+AOT_STAGE_REFUSAL_CODES = (
+    AOT_STAGE_RECORD_MISSING,
+    AOT_STAGE_RECORD_INVALID,
+    AOT_STAGE_ARTIFACT_MISMATCH,
+    AOT_STAGE_INCOMPLETE,
+    AOT_STAGE_INPUT_CHANGED,
+    AOT_STAGE_GENERATOR_CHANGED,
+    AOT_STAGE_OPTIONS_CHANGED,
+)
+_AOT_STAGE_COMPLETION_CODES = {
+    _COMPLETION_MISSING: AOT_STAGE_RECORD_MISSING,
+    _COMPLETION_INVALID: AOT_STAGE_RECORD_INVALID,
+    _COMPLETION_KEY: AOT_STAGE_RECORD_INVALID,
+    _COMPLETION_ARTIFACT: AOT_STAGE_ARTIFACT_MISMATCH,
+    _COMPLETION_UNCOVERED: AOT_STAGE_INCOMPLETE,
+}
+# The generated-code key components, grouped by what changed. A refusal names the
+# first group that changed, in this order, and lists every changed component.
+_AOT_STAGE_KEY_GROUPS = (
+    (AOT_STAGE_INPUT_CHANGED, frozenset({
+        "aot:executable_sha256", "aot:manifest_sha256", "aot:modules_sha256",
+        "aot:title_input_identity_sha256", "aot:psp_header_sha256",
+    })),
+    (AOT_STAGE_GENERATOR_CHANGED, frozenset({
+        "aot:analyzer_codegen_epoch", "aot:analyzer_sha256", "aot:codegen_sha256",
+        "aot:generated_code_abi_epoch", "aot:runtime_abi_epoch",
+    })),
+    (AOT_STAGE_OPTIONS_CHANGED, frozenset({"aot:codegen_options_sha256"})),
+)
+
+
+@dataclass(frozen=True)
+class AotStageDecision:
+    """Whether a generated-code stage may be compiled in place of regenerating it."""
+
+    accepted: bool
+    code: str
+    reasons: tuple[str, ...]
+    artifacts: Mapping[str, str]
+
+    @property
+    def detail(self) -> str:
+        return ", ".join(self.reasons)
+
+
+def _refused_stage(code: str, *reasons: str) -> AotStageDecision:
+    return AotStageDecision(False, code, tuple(reason for reason in reasons if reason), {})
+
+
+def evaluate_aot_stage(
+    stage_dir: Path,
+    current_key: Mapping[str, Any],
+    *,
+    required_paths: set[str],
+) -> AotStageDecision:
+    """Decide whether ``stage_dir`` holds generated code reusable under ``current_key``.
+
+    ``required_paths`` names the outputs a complete stage must record. An accepted
+    decision carries the SHA-256 of every recorded artifact, so the caller verifies the
+    bytes it copies against the record rather than against a second read of the stage.
+    """
+    stage = Path(stage_dir)
+    if stage.is_symlink() or not stage.is_dir():
+        return _refused_stage(AOT_STAGE_RECORD_MISSING, "generated-code stage directory is missing")
+    failure, reason, document = _check_completion_manifest(stage, required_paths=required_paths)
+    if failure != _COMPLETION_OK or document is None:
+        return _refused_stage(
+            _AOT_STAGE_COMPLETION_CODES.get(failure, AOT_STAGE_RECORD_INVALID), reason
+        )
+    decision = compare_cache_keys(document["cache_key"], current_key)
+    if not decision.generated_c_reusable:
+        changed = set(decision.reasons)
+        code = next(
+            (group for group, components in _AOT_STAGE_KEY_GROUPS if changed & components),
+            AOT_STAGE_RECORD_INVALID,
+        )
+        return _refused_stage(code, *(decision.reasons or ("cache key mismatch",)))
+    artifacts = {record["path"]: record["sha256"] for record in document["artifacts"]}
+    return AotStageDecision(True, AOT_STAGE_ACCEPTED, (), artifacts)
+
+
+# ---------------------------------------------------------------------------
+# Compiled-object cache
+#
+# A package build compiles the same runtime sources for every game, and the same
+# generated chunks again when a game is rebuilt. Each object is cached under a key
+# made of the compiler's identity, the exact compile command (with the build
+# directory spelled as a placeholder) and the preprocessed translation unit, so an
+# object is reused only when the compiler would see exactly the same input. The
+# optimization level is part of the command, so an -O0 object never stands in for
+# an -O2 one. The package build passes no -g, so an object carries no
+# build-directory path and a cached copy is the object the compiler would write.
+# The cache lives in the player's data folder only; nothing in it is shipped,
+# uploaded or shared.
+# ---------------------------------------------------------------------------
+
+OBJECT_CACHE_ROOT_PARTS = ("cache", "objects")
+OBJECT_CACHE_DIR_ENV = "NK_OBJECT_CACHE_DIR"
+# The system libraries a disc carries (tools/codegen.py nk_lib_*.c) are kept apart, so
+# the player's Settings can turn their sharing off and clear them on their own.
+SHARED_LIBRARY_CACHE_ROOT_PARTS = ("cache", "shared-libraries")
+SHARED_LIBRARY_CACHE_DIR_ENV = "NK_SHARED_LIBRARY_CACHE_DIR"
+OBJECT_CACHE_LIMIT_ENV = "NK_OBJECT_CACHE_MAX_BYTES"
+DEFAULT_OBJECT_CACHE_MAX_BYTES = 2 * 1024**3
+OBJECT_CACHE_KEY_EPOCH = "nakagawa-object-cache-v1"
+_OBJECT_CACHE_SHARD_RE = re.compile(r"[0-9a-f]{2}")
+_OBJECT_CACHE_ENTRY_RE = re.compile(r"[0-9a-f]{64}\.o")
+_BUILD_DIR_PLACEHOLDER = "<BUILD_DIR>"
+# Options whose value is the next argument.
+_SEPARATE_VALUE_OPTIONS = frozenset(
+    {"-o", "-MF", "-MT", "-MQ", "-include", "-imacros", "-I", "-D", "-U", "-x"}
+)
+_DEPENDENCY_OPTIONS = frozenset({"-M", "-MM", "-MD", "-MMD", "-MP", "-MG"})
+_DEPENDENCY_VALUE_OPTIONS = frozenset({"-MF", "-MT", "-MQ"})
+
+
+def object_cache_root(user_data_root: Path | str) -> Path:
+    root = Path(user_data_root).expanduser().resolve(strict=False)
+    return root.joinpath(*OBJECT_CACHE_ROOT_PARTS)
+
+
+def object_cache_limit(environment: Mapping[str, str] | None = None) -> int:
+    """The object cache's byte budget; ``NK_OBJECT_CACHE_MAX_BYTES`` overrides it."""
+    env = os.environ if environment is None else environment
+    raw = env.get(OBJECT_CACHE_LIMIT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_OBJECT_CACHE_MAX_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise PackageCacheError(f"{OBJECT_CACHE_LIMIT_ENV} must be a whole number of bytes")
+    return value
+
+
+@dataclass(frozen=True)
+class CompileCommand:
+    """One ``-c`` compile of a single C source, read from a ``make -n`` listing."""
+
+    line: str
+    argv: tuple[str, ...]
+    source: str
+    output: str
+
+
+def parse_compile_command(line: str) -> CompileCommand | None:
+    """Read a compile of one C source to one ``.o``; anything else is None.
+
+    A line that does not split cleanly, or is not exactly one source and one
+    object, is left to Make: the cache never guesses at a command. The line is
+    split as the POSIX shell Make runs it with would split it, so an escaped
+    quote such as ``-DSR_BUILD_DIR=\\"...\\"`` reaches the compiler as it would.
+    """
+    import shlex
+
+    try:
+        argv = shlex.split(line)
+    except ValueError:
+        return None
+    if len(argv) < 4 or "-c" not in argv:
+        return None
+    positionals: list[str] = []
+    outputs: list[str] = []
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg in _SEPARATE_VALUE_OPTIONS:
+            if index + 1 >= len(argv):
+                return None
+            if arg == "-o":
+                outputs.append(argv[index + 1])
+            index += 2
+            continue
+        if not arg.startswith("-"):
+            positionals.append(arg)
+        index += 1
+    if len(outputs) != 1 or not outputs[0].endswith(".o"):
+        return None
+    if len(positionals) != 1 or not positionals[0].endswith(".c"):
+        return None
+    return CompileCommand(line=line.strip(), argv=tuple(argv), source=positionals[0], output=outputs[0])
+
+
+def preprocess_command(command: CompileCommand) -> list[str]:
+    """The same compile as a preprocess-only run to standard output, without line markers.
+
+    When the compile names its dependency file (``-MF``), the preprocess run keeps the
+    dependency options and so writes that file too: an object taken from the cache then
+    has the same dependency record a compile would have left, and Make still rebuilds
+    it when one of its headers changes.
+    """
+    keep_dependencies = "-MF" in command.argv
+    argv: list[str] = []
+    index = 0
+    while index < len(command.argv):
+        arg = command.argv[index]
+        if arg == "-o" or (arg in _DEPENDENCY_VALUE_OPTIONS and not keep_dependencies):
+            index += 2
+            continue
+        if arg == "-c" or (arg in _DEPENDENCY_OPTIONS and not keep_dependencies):
+            index += 1
+            continue
+        if arg in _DEPENDENCY_VALUE_OPTIONS:
+            argv.extend(command.argv[index : index + 2])
+            index += 2
+            continue
+        argv.append(arg)
+        index += 1
+    return argv + ["-E", "-P"]
+
+
+def object_compiler_identity(
+    compiler: str, *, environment: Mapping[str, str] | None = None
+) -> str | None:
+    """The driver's hash plus its ``-v`` report (version, target and configuration)."""
+    env = dict(os.environ if environment is None else environment)
+    executable = shutil.which(compiler, path=env.get("PATH"))
+    if executable is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [executable, "-v"], env=env, capture_output=True, text=True, timeout=60, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return f"{Path(executable).name}:{sha256_file(Path(executable))}\n{completed.stderr.strip()}"
+
+
+def object_cache_key(
+    command: CompileCommand,
+    *,
+    compiler_identity_text: str,
+    build_dir: str,
+    preprocessed: bytes,
+) -> str:
+    """Key one object by compiler, exact command and preprocessed input."""
+    normalized = command.line
+    if build_dir:
+        normalized = normalized.replace(build_dir, _BUILD_DIR_PLACEHOLDER)
+    digest = hashlib.sha256()
+    for part in (OBJECT_CACHE_KEY_EPOCH, compiler_identity_text, normalized):
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\0")
+    digest.update(preprocessed)
+    return digest.hexdigest()
+
+
+class ObjectCache:
+    """Objects stored as ``<root>/<key[:2]>/<key>.o``; reads and writes never fail a build."""
+
+    def __init__(self, root: Path | str):
+        self.root = Path(root)
+
+    def path_for(self, key: str) -> Path:
+        if not _is_cache_digest(key):
+            raise PackageCacheError("object cache key must be a SHA-256 digest")
+        return self.root / key[:2] / f"{key}.o"
+
+    def fetch(self, key: str, destination: Path | str) -> bool:
+        """Copy a cached object to ``destination``; False when there is none."""
+        cached = self.path_for(key)
+        if cached.is_symlink() or not cached.is_file():
+            return False
+        destination = Path(destination)
+        temporary = destination.with_name(destination.name + ".nkcache-tmp")
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(cached, temporary)
+            os.replace(temporary, destination)
+            os.utime(cached)  # the most recently used survive pruning
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            return False
+        return True
+
+    def store(self, key: str, source: Path | str) -> bool:
+        """Copy a freshly compiled object into the cache."""
+        cached = self.path_for(key)
+        source = Path(source)
+        if source.is_symlink() or not source.is_file() or source.stat().st_size == 0:
+            return False
+        temporary: str | None = None
+        try:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            handle, temporary = tempfile.mkstemp(prefix=".store-", suffix=".tmp", dir=cached.parent)
+            os.close(handle)
+            shutil.copyfile(source, temporary)
+            os.replace(temporary, cached)
+        except OSError:
+            if temporary is not None:
+                Path(temporary).unlink(missing_ok=True)
+            return False
+        return True
+
+    def entries(self) -> list[Path]:
+        """Every object the cache wrote; nothing else under the root is ever touched."""
+        if self.root.is_symlink() or not self.root.is_dir():
+            return []
+        found: list[Path] = []
+        for shard in self.root.iterdir():
+            if shard.is_symlink() or not shard.is_dir() or not _OBJECT_CACHE_SHARD_RE.fullmatch(shard.name):
+                continue
+            for entry in shard.iterdir():
+                if (
+                    _OBJECT_CACHE_ENTRY_RE.fullmatch(entry.name)
+                    and entry.name.startswith(shard.name)
+                    and entry.is_file()
+                    and not entry.is_symlink()
+                ):
+                    found.append(entry)
+        return found
+
+    def size(self) -> int:
+        total = 0
+        for entry in self.entries():
+            try:
+                total += entry.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def prune(self, max_bytes: int) -> int:
+        """Remove the least recently used objects until the cache fits; return how many."""
+        sized: list[tuple[int, int, Path]] = []
+        for entry in self.entries():
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            sized.append((stat.st_mtime_ns, stat.st_size, entry))
+        sized.sort(key=lambda item: item[0], reverse=True)
+        kept = 0
+        removed = 0
+        for _mtime, size, entry in sized:
+            if kept + size <= max_bytes:
+                kept += size
+                continue
+            try:
+                entry.unlink()
+                removed += 1
+            except OSError:
+                kept += size
+        return removed
+
+    def clear(self) -> int:
+        """Remove every cached object; return how many."""
+        removed = 0
+        for entry in self.entries():
+            try:
+                entry.unlink()
+                removed += 1
+            except OSError:
+                continue
+        return removed

@@ -1,0 +1,829 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025-2026 the psp-recomp authors
+// Copyright (C) 2026 the Nakagawa Recomp authors
+// Derived from sal063/PSP-recompilation-project (GPL-2.0-or-later)
+// Modified by Nakagawa Recomp contributors, 2026-08-10.
+// See NOTICE.md for upstream lineage and modification provenance.
+
+/* *
+ * main() of every built game. It loads the PSP program into guest memory, registers every
+ * generated function (sr_register_all), resolves the entry point, and then runs in one of
+ * two ways:
+ *   - with --gui, as the player launches a game: it opens the window (gui.c) and hands the
+ *     entry point to the scheduler (sched_run in sched.c), which runs the game's threads
+ *     until it exits. --sched alone does the same without a window;
+ *   - without --sched, as a trace-comparison harness: it seeds the CpuState from the entry
+ *     register state the reference trace recorded ("# init" line), runs the entry function
+ *     with tracing on, and stops at the first HLE call (sr_hle_call longjmps), exactly where
+ *     the reference trace is truncated for comparison.
+ *
+ * Usage: driver <elf> <ref-trace> <out-trace> [--sched] [--gui] [--expect-u32=ADDR:VALUE]
+ *        driver --image <image.bin> <base-hex> <entry-hex> <ref-trace> <out-trace> [...]
+ */
+
+#define _CRT_SECURE_NO_WARNINGS
+#include "recomp.h"
+#include "debug.h"
+#include "title_config.h"
+#include "flight_recorder.h"
+#include "prx_loader.h"
+#include "ace.h"
+
+#include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+void sr_register_all(void);
+extern void sr_audio_pause_enter(void);
+extern void sr_audio_pause_leave(void);
+extern int sr_audio_pause_script_ready(void);
+
+/* The window's overlay callbacks join once gui_init has a presenter that can draw it. */
+static SrPauseHost s_driver_pause_host = {
+    .audio_enter = sr_audio_pause_enter,
+    .audio_leave = sr_audio_pause_leave,
+    .script_ready = sr_audio_pause_script_ready,
+    .busy_reason = gui_pause_busy_reason,
+};
+
+/* A scheduler run that ends without the guest ending it stops at the scheduler's next
+ * boundary (#1377): the window reports an acceptance launch's last frame or the person's quit
+ * (gui_stop_requested), and an SR_GE_CAPTURE_EXIT capture asks to end once written. */
+static int driver_stop_requested(void) {
+    return ge_capture_exit_due() || gui_stop_requested();
+}
+
+/* An opt-in file side channel for a parent launcher that cannot reliably own a
+ * spawned child's stderr on every host backend. The normal runtime only writes
+ * stderr; SR_BOOT_EVENT_FILE is used by the native-player launch smoke. */
+static void sr_driver_boot_event(const char *format, ...) {
+    uint64_t timestamp_ns = sr_perf_now_ns();
+    va_list args;
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+    if (timestamp_ns) {
+        fprintf(stderr, " t_ns=%llu\n", (unsigned long long)timestamp_ns);
+    } else {
+        fputc('\n', stderr);
+    }
+    fflush(stderr);
+
+    const char *path = getenv("SR_BOOT_EVENT_FILE");
+    if (!path || !*path) return;
+
+    FILE *file = fopen(path, "ab");
+    if (!file) return;
+    va_start(args, format);
+    vfprintf(file, format, args);
+    va_end(args);
+    if (timestamp_ns) {
+        fprintf(file, " t_ns=%llu\n", (unsigned long long)timestamp_ns);
+    } else {
+        fputc('\n', file);
+    }
+    fclose(file);
+}
+
+#ifndef SR_SELFTEST_ONLY
+#ifdef _WIN32
+/* Last-resort crash reporter: a silent host fault (access violation etc.) otherwise kills
+ * the process with nothing in the log. Maps a faulting address inside the guest arena back
+ * to its guest address. Dumps register state and stack trace for post-mortem analysis. */
+static LONG WINAPI sr_crash_filter(EXCEPTION_POINTERS *ep) {
+    CONTEXT *ctx = ep->ContextRecord;
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    extern CpuState *s_cpu;
+
+    /* Integer arithmetic, not pointer comparison: the faulting address may be
+     * unrelated to the guest arena. The report and the recorder both use it. */
+    int guest_mapped = 0;
+    uint32_t guest_fault = 0u;
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2 && g_mem) {
+        uintptr_t fault = (uintptr_t)er->ExceptionInformation[1];
+        uintptr_t base = (uintptr_t)g_mem;
+        /* Same +/-64 MiB window as before, as one wraparound-safe unsigned check. */
+        if ((uintptr_t)(fault - base + 0x04000000u) < 0x08000000u) {
+            guest_mapped = 1;
+            guest_fault = (uint32_t)(fault - base) + 0x08000000u;
+        }
+    }
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "=== PSP RECOMPILER CRASH REPORT ===\n");
+    fprintf(stderr, "Exception: 0x%08lx at host %p\n", er->ExceptionCode, er->ExceptionAddress);
+
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
+        const uint8_t *fa = (const uint8_t *)er->ExceptionInformation[1];
+        int is_write = er->ExceptionInformation[0];
+        fprintf(stderr, "Fault: %s of host %p", is_write ? "WRITE" : "READ", fa);
+        if (guest_mapped) {
+            uint32_t guest_addr = guest_fault;
+            fprintf(stderr, " -> guest 0x%08x", guest_addr);
+            // Check if address is in a known memory watch
+            for (int i = 0; i < g_sr_mem_watch_count; i++) {
+                if (guest_addr >= g_sr_mem_watches[i].start && guest_addr < g_sr_mem_watches[i].end) {
+                    fprintf(stderr, " [WATCHED: %s]", g_sr_mem_watches[i].label);
+                }
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+
+    // Dump x64 register state (Windows CONTEXT)
+    fprintf(stderr, "\n--- Host Registers ---\n");
+    fprintf(stderr, "RIP=0x%016llx  RSP=0x%016llx\n", (unsigned long long)ctx->Rip, (unsigned long long)ctx->Rsp);
+    fprintf(stderr, "RAX=0x%016llx  RBX=0x%016llx\n", (unsigned long long)ctx->Rax, (unsigned long long)ctx->Rbx);
+    fprintf(stderr, "RCX=0x%016llx  RDX=0x%016llx\n", (unsigned long long)ctx->Rcx, (unsigned long long)ctx->Rdx);
+    fprintf(stderr, "RSI=0x%016llx  RDI=0x%016llx\n", (unsigned long long)ctx->Rsi, (unsigned long long)ctx->Rdi);
+    fprintf(stderr, "RBP=0x%016llx  R8 =0x%016llx\n", (unsigned long long)ctx->Rbp, (unsigned long long)ctx->R8);
+    fprintf(stderr, "R9 =0x%016llx  R10=0x%016llx\n", (unsigned long long)ctx->R9, (unsigned long long)ctx->R10);
+    fprintf(stderr, "R11=0x%016llx  R12=0x%016llx\n", (unsigned long long)ctx->R11, (unsigned long long)ctx->R12);
+    fprintf(stderr, "R13=0x%016llx  R14=0x%016llx\n", (unsigned long long)ctx->R13, (unsigned long long)ctx->R14);
+    fprintf(stderr, "R15=0x%016llx\n", (unsigned long long)ctx->R15);
+
+    // Dump guest CpuState if available
+    if (s_cpu) {
+        fprintf(stderr, "\n--- Guest CpuState ---\n");
+        fprintf(stderr, "PC=0x%08x  SP(r29)=0x%08x  RA(r31)=0x%08x\n", s_cpu->pc, s_cpu->r[29], s_cpu->r[31]);
+        /* Names only when a symbol map was built in (sr_guest_symbols_register). */
+        char pc_name[160], ra_name[160];
+        if (sr_guest_symbol_label(s_cpu->pc, pc_name, sizeof pc_name)[0])
+            fprintf(stderr, "PC symbol: %s\n", pc_name);
+        if (sr_guest_symbol_label(s_cpu->r[31], ra_name, sizeof ra_name)[0])
+            fprintf(stderr, "RA symbol: %s\n", ra_name);
+        fprintf(stderr, "r4=0x%08x  r5=0x%08x  r6=0x%08x  r7=0x%08x\n", s_cpu->r[4], s_cpu->r[5], s_cpu->r[6], s_cpu->r[7]);
+        fprintf(stderr, "r8=0x%08x  r9=0x%08x  r10=0x%08x r11=0x%08x\n", s_cpu->r[8], s_cpu->r[9], s_cpu->r[10], s_cpu->r[11]);
+        fprintf(stderr, "r12=0x%08x r13=0x%08x r14=0x%08x r15=0x%08x\n", s_cpu->r[12], s_cpu->r[13], s_cpu->r[14], s_cpu->r[15]);
+        fprintf(stderr, "r16=0x%08x r17=0x%08x r18=0x%08x r19=0x%08x\n", s_cpu->r[16], s_cpu->r[17], s_cpu->r[18], s_cpu->r[19]);
+        fprintf(stderr, "r20=0x%08x r21=0x%08x r22=0x%08x r23=0x%08x\n", s_cpu->r[20], s_cpu->r[21], s_cpu->r[22], s_cpu->r[23]);
+        fprintf(stderr, "r24=0x%08x r25=0x%08x r26=0x%08x r27=0x%08x\n", s_cpu->r[24], s_cpu->r[25], s_cpu->r[26], s_cpu->r[27]);
+        fprintf(stderr, "r28=0x%08x r30=0x%08x\n", s_cpu->r[28], s_cpu->r[30]);
+        fprintf(stderr, "hi=0x%08x  lo=0x%08x  fcr31=0x%08x\n", s_cpu->hi, s_cpu->lo, s_cpu->fcr31);
+    }
+
+    fprintf(stderr, "\n=== END CRASH REPORT ===\n");
+    fflush(stderr);
+
+    /* First-exception trigger, after the report: a fault that also breaks the
+     * bundle writer (heap corruption, a broken stream) cannot cost the report.
+     * The opt-in flight recorder dumps its retained prefix with this fault as
+     * the terminal; it returns at once when the recorder is disabled. */
+    sr_flight_host_fault(s_cpu != NULL ? s_cpu->pc : 0u, (uint32_t)er->ExceptionCode, guest_fault);
+    return EXCEPTION_CONTINUE_SEARCH;   /* still crash (after reporting) */
+}
+#endif
+#endif
+
+static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static uint16_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
+
+static inline int range_within(size_t total, uint64_t offset, uint64_t length) {
+    return offset <= total && length <= (uint64_t)total - offset;
+}
+
+static int sr_redirect_quiet_stream(FILE *stream, const char *path, const char *name) {
+    if (freopen(path, "w", stream) != NULL) return 1;
+    /* Quiet mode is best effort.  Make a failed redirect explicit while leaving
+     * the caller's stream available for the normal driver diagnostics. */
+    fprintf(stderr, "warning: SR_QUIET could not redirect %s to %s\n", name, path);
+    return 0;
+}
+
+static uint8_t *read_file(const char *path, size_t *out_len) {
+    if (!path || !out_len) { fprintf(stderr, "invalid read_file params\n"); exit(2); }
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(2); }
+    if (fseek(f, 0, SEEK_END) != 0) { fprintf(stderr, "cannot seek %s\n", path); fclose(f); exit(2); }
+    long n = ftell(f);
+    if (n < 0) { fprintf(stderr, "cannot size %s\n", path); fclose(f); exit(2); }
+    if (fseek(f, 0, SEEK_SET) != 0) { fprintf(stderr, "cannot rewind %s\n", path); fclose(f); exit(2); }
+    size_t size = (size_t)n;
+    if ((long)size != n) { fprintf(stderr, "file too large %s\n", path); fclose(f); exit(2); }
+    uint8_t *d = (uint8_t *)malloc(size ? size : 1);
+    if (!d) { fprintf(stderr, "allocation failure for %s\n", path); fclose(f); exit(2); }
+    if (size > 0 && fread(d, 1, size, f) != size) {
+        fprintf(stderr, "short read %s\n", path);
+        free(d);
+        fclose(f);
+        exit(2);
+    }
+    fclose(f);
+    *out_len = size;
+    return d;
+}
+
+typedef struct DriverElfImage {
+    const uint8_t *bytes;
+    size_t len;
+} DriverElfImage;
+
+/* SrPrxImageRead over the ELF file held in memory. */
+static bool driver_elf_read(void *context, uint64_t offset, void *dst, uint32_t bytes) {
+    const DriverElfImage *image = (const DriverElfImage *)context;
+    if (offset > image->len || bytes > image->len - offset) return false;
+    memcpy(dst, image->bytes + offset, bytes);
+    return true;
+}
+
+static uint32_t load_elf(const uint8_t *elf, size_t len) {
+    if (!elf || len < 52 || memcmp(elf, "\x7f""ELF", 4) != 0) {
+        fprintf(stderr, "not an ELF or truncated header\n");
+        exit(2);
+    }
+    uint32_t e_entry = rd32(elf + 24);
+    uint32_t e_phoff = rd32(elf + 28);
+    uint16_t phentsize = rd16(elf + 42);
+    uint16_t phnum = rd16(elf + 44);
+
+    if (phnum != 0 && phentsize < 32) {
+        fprintf(stderr, "ELF program header entry too small\n");
+        exit(2);
+    }
+    uint32_t ph_table_size = 0;
+    if (!sr_size_mul_ok(phentsize, phnum, &ph_table_size)) {
+        fprintf(stderr, "ELF program header table size overflow\n");
+        exit(2);
+    }
+    if (!range_within(len, e_phoff, ph_table_size)) {
+        fprintf(stderr, "ELF program header table out of range\n");
+        exit(2);
+    }
+
+    /* Pass 1: Validate all PT_LOAD segments before mutating guest RAM */
+    for (uint16_t i = 0; i < phnum; i++) {
+        uint64_t ph_offset = (uint64_t)e_phoff + (uint64_t)i * phentsize;
+        const uint8_t *ph = elf + ph_offset;
+        uint32_t p_type = rd32(ph + 0);
+        uint32_t p_off = rd32(ph + 4);
+        uint32_t p_vaddr = rd32(ph + 8);
+        uint32_t p_filesz = rd32(ph + 16);
+        uint32_t p_memsz = rd32(ph + 20);
+
+        if (p_type != 1) /* PT_LOAD */
+            continue;
+
+        if (p_filesz > p_memsz) {
+            fprintf(stderr, "ELF PT_LOAD filesz exceeds memsz\n");
+            exit(2);
+        }
+        if (!range_within(len, p_off, p_filesz)) {
+            fprintf(stderr, "ELF PT_LOAD data out of range\n");
+            exit(2);
+        }
+        if (p_memsz > 0 && !sr_guest_span_writable(p_vaddr, p_memsz)) {
+            fprintf(stderr, "ELF PT_LOAD guest range invalid: vaddr=0x%08x memsz=0x%08x\n", p_vaddr, p_memsz);
+            exit(2);
+        }
+    }
+
+    /* The PSP starts the executable at its module_start export, not at e_entry
+     * (sr_prx_start_entry in prx_loader.h). Resolved before guest RAM changes, so
+     * an image whose start entry cannot be read loads nothing. */
+    DriverElfImage image = { elf, len };
+    uint32_t start = e_entry;
+    const char *violation = sr_prx_start_entry(driver_elf_read, &image, len, &start);
+    if (violation) {
+        fprintf(stderr, "ELF start entry cannot be read: %s\n", violation);
+        exit(2);
+    }
+
+    /* Pass 2: Load validated segments */
+    sr_mem_init();
+    for (uint16_t i = 0; i < phnum; i++) {
+        uint64_t ph_offset = (uint64_t)e_phoff + (uint64_t)i * phentsize;
+        const uint8_t *ph = elf + ph_offset;
+        uint32_t p_type = rd32(ph + 0);
+        uint32_t p_off = rd32(ph + 4);
+        uint32_t p_vaddr = rd32(ph + 8);
+        uint32_t p_filesz = rd32(ph + 16);
+        if (p_type == 1 && p_filesz) /* PT_LOAD */
+            sr_load_segment(p_vaddr, elf + p_off, p_filesz);
+    }
+    return start;
+}
+
+static int parse_indexed_register(const char *name, char prefix, uint32_t *index) {
+    if (!name || !index || name[0] != prefix) return 0;
+    if (name[1] < '0' || name[1] > '9') return 0;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long val = strtoull(name + 1, &end, 10);
+    const unsigned long long maximum = prefix == 'v' ? 127ULL : 31ULL;
+    if (errno != 0 || !end || end == name + 1 || *end != '\0' || val > maximum) return 0;
+    *index = (uint32_t)val;
+    return 1;
+}
+
+static int parse_hex32(const char *text, uint32_t *value) {
+    if (!text || !value || *text == '\0' || *text == '-' || *text == '+' || *text == ' ' || *text == '\t') return 0;
+    const char *start = text;
+    if (start[0] == '0' && (start[1] == 'x' || start[1] == 'X')) {
+        start += 2;
+    }
+    if (!((*start >= '0' && *start <= '9') || (*start >= 'a' && *start <= 'f') || (*start >= 'A' && *start <= 'F'))) {
+        return 0;
+    }
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(start, &end, 16);
+    if (errno != 0 || !end || end == start || *end != '\0' || parsed > 0xFFFFFFFFULL) return 0;
+    *value = (uint32_t)parsed;
+    return 1;
+}
+
+typedef struct DriverExpectedU32 {
+    int enabled;
+    uint32_t address;
+    uint32_t value;
+} DriverExpectedU32;
+
+#define DRIVER_MAX_EXPECT_U32 16
+
+static int parse_expected_u32(const char *argument, DriverExpectedU32 *expectations, int count) {
+    static const char prefix[] = "--expect-u32=";
+    if (!argument || !expectations || count <= 0) return 0;
+    if (strncmp(argument, prefix, sizeof(prefix) - 1) != 0) return 0;
+    const char *spec = argument + sizeof(prefix) - 1;
+    const char *separator = strchr(spec, ':');
+    if (!separator || separator == spec || separator[1] == '\0' || strchr(separator + 1, ':')) {
+        return 0;
+    }
+    size_t address_length = (size_t)(separator - spec);
+    size_t value_length = strlen(separator + 1);
+    char address_text[16];
+    char value_text[16];
+    if (address_length >= sizeof(address_text) || value_length >= sizeof(value_text)) {
+        return 0;
+    }
+    memcpy(address_text, spec, address_length);
+    address_text[address_length] = '\0';
+    memcpy(value_text, separator + 1, value_length + 1);
+    uint32_t address, value;
+    if (!parse_hex32(address_text, &address) || !parse_hex32(value_text, &value)) {
+        return 0;
+    }
+    for (int i = 0; i < count; i++) {
+        if (expectations[i].enabled && expectations[i].address == address) {
+            return 0;
+        }
+    }
+    for (int i = 0; i < count; i++) {
+        if (!expectations[i].enabled) {
+            expectations[i].enabled = 1;
+            expectations[i].address = address;
+            expectations[i].value = value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int validate_expectations(DriverExpectedU32 *expectations, int count) {
+    for (int i = 0; i < count; i++) {
+        if (!expectations[i].enabled) continue;
+        if ((expectations[i].address & 3u) != 0 || !sr_guest_span_readable(expectations[i].address, 4)) {
+            fprintf(stderr, "--expect-u32 guest address is unaligned or invalid: 0x%08x\n", expectations[i].address);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void seed_from_init(const char *trace_path, CpuState *s) {
+    if (strcmp(trace_path, "none") == 0) return;
+    FILE *f = fopen(trace_path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", trace_path); exit(2); }
+    char buf[8192];
+    int found = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        if (strncmp(buf, "# init", 6) != 0)
+            continue;
+        found = 1;
+        char *tok = strtok(buf + 6, " \t\n");
+        while (tok) {
+            char *eq = strchr(tok, '=');
+            if (eq) {
+                *eq = 0;
+                const char *name = tok;
+                const char *val_str = eq + 1;
+                uint32_t val = 0, idx = 0;
+                if (parse_hex32(val_str, &val)) {
+                    if (parse_indexed_register(name, 'r', &idx)) s->r[idx] = val;
+                    else if (parse_indexed_register(name, 'f', &idx)) s->fi[idx] = val;
+                    else if (parse_indexed_register(name, 'v', &idx)) s->vi[idx] = val;
+                    else if (strcmp(name, "hi") == 0) s->hi = val;
+                    else if (strcmp(name, "lo") == 0) s->lo = val;
+                    else if (strcmp(name, "fcr31") == 0) s->fcr31 = val;
+                }
+            }
+            tok = strtok(NULL, " \t\n");
+        }
+        break;
+    }
+    fclose(f);
+    if (!found) { fprintf(stderr, "no '# init' in %s\n", trace_path); exit(2); }
+}
+
+static int sr_driver_seed_boot_arguments(CpuState *state) {
+    const char *path = getenv("SR_BOOT_PATH");
+    if (!path || !path[0]) return 1;
+
+    size_t path_len = strlen(path);
+    if (path_len == 0u || path_len >= 4096u) {
+        fprintf(stderr, "SR_BOOT_PATH must contain a path shorter than 4096 bytes\n");
+        return 0;
+    }
+    uint32_t arglen = (uint32_t)path_len + 1u;
+    if (arglen > UINT32_MAX - 15u) {
+        fprintf(stderr, "SR_BOOT_PATH argument block size overflows stack alignment\n");
+        return 0;
+    }
+    uint32_t rounded = (arglen + 15u) & ~15u;
+    uint32_t sp = state->r[29];
+    if (sp < rounded) {
+        fprintf(stderr, "SR_BOOT_PATH could not be placed below the guest stack pointer\n");
+        return 0;
+    }
+    uint32_t argp = sp - rounded;
+    /* sched_start_thread copies this temporary source block onto the entry
+       thread's own stack before guest code runs; keep boot args off the heap. */
+    if (argp == 0u || !sr_guest_span_writable(argp, arglen)) {
+        fprintf(stderr, "SR_BOOT_PATH could not be placed in guest memory\n");
+        return 0;
+    }
+
+    memcpy(SR_HOST(argp), path, arglen);
+    state->r[4] = arglen;
+    state->r[5] = argp;
+    sr_driver_boot_event("BOOT_EVENT phase=boot_arguments_seeded bytes=%u", arglen);
+    return 1;
+}
+
+static int sr_driver_seed_loadexec_arguments(CpuState *state,
+                                            const SrLoadExecRequest *request,
+                                            uint32_t entry, uint32_t gp) {
+    /* LoadExec arguments are copied into a bounded guest staging span above the
+     * modeled user partition. sched_run then applies the normal thread argument
+     * copy to the new root stack, keeping the host request buffer out of guest state. */
+    const uint32_t arg_base = 0x0bff0000u;
+    if (!state || !request || request->arglen > 0x10000u ||
+        (request->arglen && (!request->args ||
+         !sr_guest_span_writable(arg_base, request->arglen)))) {
+        fprintf(stderr, "LOAD_EXEC_ARGUMENT_STAGE_REFUSED: argument block is outside the "
+                        "bounded guest staging span\n");
+        return 0;
+    }
+    if (request->arglen)
+        memcpy(SR_HOST(arg_base), request->args, request->arglen);
+    state->pc = entry;
+    state->r[28] = gp;
+    state->r[29] = 0x09f00000u;
+    state->r[4] = request->arglen;
+    state->r[5] = request->arglen ? arg_base : 0u;
+    return 1;
+}
+
+#ifdef SR_SELFTEST_ONLY
+int driver_main(int argc, char **argv) {
+#else
+int main(int argc, char **argv) {
+#endif
+    uint32_t entry;
+    const char *ref_trace, *out;
+    DriverExpectedU32 expectations[DRIVER_MAX_EXPECT_U32];
+    memset(expectations, 0, sizeof(expectations));
+    sr_flight_init();
+
+#ifndef SR_SELFTEST_ONLY
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(sr_crash_filter);
+#endif
+#endif
+
+    /* Performance is an explicit visual/audio smoke-test mode. Redirecting both C
+     * streams to the null device removes terminal/file I/O without scattering a
+     * behavior-changing quiet check through every compatibility diagnostic. */
+    {
+        const char *quiet = getenv("SR_QUIET");
+        if (quiet && quiet[0] && strcmp(quiet, "0") != 0) {
+#ifdef _WIN32
+            sr_redirect_quiet_stream(stdout, "NUL", "stdout");
+            sr_redirect_quiet_stream(stderr, "NUL", "stderr");
+#else
+            sr_redirect_quiet_stream(stdout, "/dev/null", "stdout");
+            sr_redirect_quiet_stream(stderr, "/dev/null", "stderr");
+#endif
+        }
+    }
+    /* With the player attaching stdout and stderr to the per-session log, keep each
+       diagnostic line durable even if the player later stops the child, without a
+       system call per byte on the thread that prints it (#1296). */
+    (void)sr_debug_streams_init();
+
+    /* Initialize debug framework from SR_DEBUG env var (or legacy SR_* vars) */
+    g_sr_debug = sr_debug_init();
+    sr_debug_init_watches();
+    sr_perf_init();
+    sr_profile_init();
+    /* Fired-patch report (#1274) at an ordinary exit; the _Exit paths call it directly. */
+    (void)atexit(sr_compat_report);
+    /* Execution share at every exit: the _Exit paths reach it through sr_perf_shutdown. */
+    sr_exec_share_arm();
+    (void)atexit(sr_exec_share_report);
+    /* Ace Mode (ace.h): SR_ACE is read once, before any renderer or presenter starts, so the
+     * device, the samplers and the present path all see the run's one switch. An Ace run is
+     * stamped in the flight recorder, and its per-run report and exit line are written at an
+     * ordinary exit (exit(), the window closing); a fatal _Exit path writes no report. */
+    if (ace_init_from_env()) {
+        sr_flight_set_enhancements(ace_spec_text());
+        (void)atexit(ace_finish);
+    }
+
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--expect-u32", 12) != 0) continue;
+        if (!parse_expected_u32(argv[i], expectations, DRIVER_MAX_EXPECT_U32)) {
+            fprintf(stderr, "invalid or duplicate --expect-u32 option: %s\n", argv[i]);
+            return 2;
+        }
+    }
+
+    if (g_sr_debug) {
+        fprintf(stderr, "Debug: SR_DEBUG=0x%02x (", g_sr_debug);
+        if (g_sr_debug & SR_DBG_MEM)   fprintf(stderr, "MEM ");
+        if (g_sr_debug & SR_DBG_HLE)   fprintf(stderr, "HLE ");
+        if (g_sr_debug & SR_DBG_SCHED) fprintf(stderr, "SCHED ");
+        if (g_sr_debug & SR_DBG_GE)    fprintf(stderr, "GE ");
+        if (g_sr_debug & SR_DBG_INPUT) fprintf(stderr, "INPUT ");
+        if (g_sr_debug & SR_DBG_FS)    fprintf(stderr, "FS ");
+        if (g_sr_debug & SR_DBG_VIDEO) fprintf(stderr, "VIDEO ");
+        if (g_sr_debug & SR_DBG_MISC)  fprintf(stderr, "MISC ");
+        fprintf(stderr, ")\n");
+    }
+
+#ifdef SR_PUBLIC_SAFE
+    sr_driver_boot_event("BOOT_EVENT phase=init public_safe=1");
+#else
+    sr_driver_boot_event("BOOT_EVENT phase=init public_safe=0");
+#endif
+
+    /* Image mode: a pre-relocated flat image (e.g. a rebased PRX from tools/prxload.py) is
+     * loaded at <base> and run from <entry>. Required for relocatable PRXs, which must be
+     * rebased + relocated before they have concrete addresses.
+     *   driver --image <image.bin> <base-hex> <entry-hex> <ref-trace> <out-trace>  */
+    if (argc >= 7 && strcmp(argv[1], "--image") == 0) {
+        size_t len = 0;
+        uint8_t *img = read_file(argv[2], &len);
+        uint32_t base = 0;
+        if (!parse_hex32(argv[3], &base) || !parse_hex32(argv[4], &entry)) {
+            fprintf(stderr, "invalid base or entry address: base=%s entry=%s\n", argv[3], argv[4]);
+            free(img);
+            exit(2);
+        }
+        ref_trace = argv[5];
+        out = argv[6];
+        if (len > 0xFFFFFFFFu || !sr_guest_span_writable(base, (uint32_t)len)) {
+            fprintf(stderr, "image guest span invalid: base=0x%08x len=0x%zx\n", base, (size_t)len);
+            free(img);
+            exit(2);
+        }
+        sr_mem_init();
+        sr_load_segment(base, img, (uint32_t)len);
+        goto have_image;
+    }
+    if (argc < 4) {
+        fprintf(stderr, "usage: driver <elf> <ref-trace> <out-trace> [--sched] [--expect-u32=ADDR:VALUE]\n"
+                        "       driver --image <image.bin> <base-hex> <entry-hex> <ref-trace> <out-trace> [--sched] [--expect-u32=ADDR:VALUE]\n");
+        return 2;
+    }
+    {
+        size_t len = 0;
+        uint8_t *elf = read_file(argv[1], &len);
+        entry = load_elf(elf, len);
+    }
+    ref_trace = argv[2];
+    out = argv[3];
+have_image:;
+    sr_driver_boot_event("BOOT_EVENT phase=image_loaded entry=0x%08x", entry);
+    if (!validate_expectations(expectations, DRIVER_MAX_EXPECT_U32)) {
+        return 2;
+    }
+
+    CpuState s;
+    memset(&s, 0, sizeof(s));
+    sr_vfpu_thread_ctrl_init(&s);  /* identity S/T, no D prefix, measured RCX0-7 */
+    /* The direct entry is a host entry (#1375): its $ra is the host return address unless the
+     * reference trace recorded one, which then seeds both sides of the comparison (the
+     * reference runner, src/ref/run_elf.cpp, starts the same way). */
+    s.r[31] = SR_HOST_RETURN_PC;
+    seed_from_init(ref_trace, &s);
+    if (s.r[29] == 0) s.r[29] = 0x09F00000;   /* default stack: top of user RAM (0x08000000..0x0BFFFFFF); was 0x00400000 (kernel driver region — wrong) */
+    s.pc = entry;
+    if (!sr_driver_seed_boot_arguments(&s)) return 2;
+
+    fprintf(stderr, "Calling sr_register_all()...\n");
+    sr_register_all();
+    fprintf(stderr, "sr_register_all() returned\n");
+    sr_driver_boot_event("BOOT_EVENT phase=runtime_registered entry=0x%08x", entry);
+    /* "none" as the out path disables tracing -- much faster for HLE bring-up, where the goal
+     * is to reach the next unimplemented import rather than diff a trace. */
+    if (strcmp(out, "none") != 0 && sr_trace_open(out, "cgtest", entry) != 0) {
+        fprintf(stderr, "cannot open out trace %s\n", out);
+        return 2;
+    }
+    /* A guest can spin before its first VBLANK, so arm an opted-in trace window
+     * once the trace sink exists and before any guest instruction can run. */
+    if (strcmp(out, "none") != 0) sr_trace_window_configure();
+    RecompFn fn = sr_lookup(entry);
+    if (!fn) {
+        /* Entry point not compiled — the codegen likely skipped it (e.g. a module-start
+         * wrapper whose first instruction is a syscall the analyzer treats as a HLE boundary).
+         * A title configuration may name that module-start address; with no configured
+         * fallback there is nothing generic to try, so the existing failure path stands. */
+        uint32_t fallback = sr_title_config_fallback_entry();
+        if (!fallback) {
+            fprintf(stderr, "no recompiled function at entry 0x%08x "
+                            "(no title fallback entry is configured)\n", entry);
+            return 2;
+        }
+        fprintf(stderr, "entry 0x%08x not compiled, trying configured fallback 0x%08x\n", entry, fallback);
+        fn = sr_lookup(fallback);
+        if (!fn) { fprintf(stderr, "no recompiled function at entry 0x%08x (fallback also missing)\n", entry); return 2; }
+        entry = fallback;
+        s.pc = entry;
+    }
+
+    /* Cold extracted-data census: prepare BEFORE the GUI, the scheduler, or any
+     * direct guest invocation exists. This is the last safe point -- title and
+     * runtime configuration are final here (image loaded, sr_register_all done,
+     * entry validated/fallback resolved) and no guest thread exists that could
+     * starve on host filesystem contention. The historical lazy data_init()
+     * inside h_IoOpen ran this whole census from the first guest sceIoOpen on
+     * the scheduler thread. */
+    sr_driver_boot_event("BOOT_EVENT phase=index_prepare_begin");
+    int data_state = sr_host_data_prepare();
+    sr_driver_boot_event("BOOT_EVENT phase=index_prepare_end state=%d ready=%zu",
+            data_state, sr_host_data_entry_count());
+
+    int use_sched = 0;
+    int gui_requested = 0;
+    for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--sched") == 0) use_sched = 1;
+    for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--gui") == 0) {
+        char caption[SR_WINDOW_TITLE_CAP];
+        sr_window_title_format(getenv("SR_GAME_TITLE"), caption, sizeof(caption));
+        gui_init(caption);
+        gui_requested = 1;
+        use_sched = 1;
+    }
+
+    if (gui_headless_acceptance_requested() &&
+        (!gui_requested || !gui_headless_acceptance_ready())) {
+        sr_driver_boot_event("BOOT_EVENT phase=headless_acceptance status=FAIL reason=window_presenter_unavailable");
+        return SR_HEADLESS_ACCEPTANCE_EXIT_PRESENTER_UNAVAILABLE;
+    }
+    /* An acceptance launch ends the scheduler once its requested frames were presented; a
+     * quit or a finished GE capture ends it the same way, at a scheduler boundary. */
+    if (use_sched) {
+        sr_sched_stop_requested = driver_stop_requested;
+        ge_capture_exit_set_deferred(1);
+    }
+    if (gui_pause_presenter()) {
+        s_driver_pause_host.enter = gui_pause_enter;
+        s_driver_pause_host.frame = gui_pause_frame;
+        s_driver_pause_host.leave = gui_pause_leave;
+    }
+    sr_sched_pause_host = &s_driver_pause_host;
+
+    if (use_sched) {
+        /* Run with the cooperative scheduler so the program's threads interleave. A
+         * package-local sceKernelLoadExec request stops this scheduler at its next
+         * guest-thread exit boundary; the outer loop then clears guest state and boots
+         * the declared project program from the same runtime module package. sched_init
+         * is process-start-only; LoadExec uses the explicit teardown/rebind seam below. */
+        sched_init(&s);
+        sched_preempt_timer_start();
+        for (;;) {
+            sr_driver_boot_event("BOOT_EVENT phase=guest_start mode=scheduler entry=0x%08x", entry);
+            sched_run(entry, s.r[4], s.r[5]);
+
+            /* A run stopped from outside the guest ends here, even with a LoadExec queued, and
+             * so does one the person asked to quit before the stop was due (a LoadExec from the
+             * guest's exit callback): no replacement program is booted. */
+            if (driver_stop_requested() || gui_quit_requested()) {
+                sr_hle_loadexec_finish();
+                break;
+            }
+            SrLoadExecRequest request;
+            memset(&request, 0, sizeof(request));
+            if (!sr_hle_loadexec_take(&request)) {
+                sr_hle_loadexec_finish();
+                break;
+            }
+
+            if (!sched_reset_for_loadexec()) {
+                fprintf(stderr, "LOAD_EXEC_SCHEDULER_RESET_REFUSED: unable to retire old guest threads\n");
+                sr_hle_loadexec_release(&request);
+                return 2;
+            }
+            sr_hle_loadexec_reset_guest_state();
+            sr_mem_reset();
+            /* The replacement module is the first image in a new user process.
+             * Its project-owned runtime loader allocates above this synthetic image
+             * floor; a real program ELF is loaded by load_elf and supplies its own end. */
+            sr_loaded_end_set(0x08800000u);
+            uint32_t next_entry = 0u, next_gp = 0u;
+            if (!sr_hle_loadexec_boot_module(request.guest_path, &next_entry, &next_gp)) {
+                sr_hle_loadexec_release(&request);
+                return 2;
+            }
+            memset(&s, 0, sizeof(s));
+            sr_vfpu_thread_ctrl_init(&s);
+            if (!sr_driver_seed_loadexec_arguments(&s, &request, next_entry, next_gp)) {
+                sr_hle_loadexec_release(&request);
+                return 2;
+            }
+            sched_set_guest_process_gp(next_gp);
+            sr_driver_boot_event("BOOT_EVENT phase=loadexec_restart entry=0x%08x args=%u",
+                                 next_entry, request.arglen);
+            entry = next_entry;
+            sr_hle_loadexec_release(&request);
+        }
+    } else {
+        const char *boot_path = getenv("SR_BOOT_PATH");
+        if (boot_path && boot_path[0]) {
+            /* The block begins at r[5]; start the direct entry below it so its
+               stack prologue cannot overwrite the guest-visible argument. */
+            s.r[29] = s.r[5];
+        }
+        /* The entry is a host entry like every other (#1375): a linked call that returns to
+         * SR_HOST_RETURN_PC (its $ra, seeded above), so a TAIL step into interpreted code still
+         * returns to the host. The dispatch owns the AOT tier and its SR_PERF span. */
+        if (sr_perf_enabled) sr_perf_guest_begin();
+        dispatch_from_host(&s, entry);
+        if (sr_perf_enabled) sr_perf_guest_end();
+    }
+    /* The SR_PERF summary first, while the GPU GE it samples still exists; then the presenter,
+     * so no Vulkan device outlives main into the driver's process teardown. Returning from
+     * main flushes stdio and runs every atexit handler (#1377). */
+    sr_perf_shutdown();
+    gui_shutdown();
+    sr_trace_close();
+
+    const char *ppm_path = getenv("SR_PPM_DUMP");
+    if (ppm_path) {
+        uint32_t fb_addr = 0x09000000;
+        FILE *pf = fopen(ppm_path, "wb");
+        if (pf) {
+            fprintf(pf, "P6\n64 64\n255\n");
+            for (int i = 0; i < 64 * 64; i++) {
+                uint32_t pixel = MEM_R32(fb_addr + i * 4);
+                uint8_t r = pixel & 0xFF;
+                uint8_t g = (pixel >> 8) & 0xFF;
+                uint8_t b = (pixel >> 16) & 0xFF;
+                fputc(r, pf);
+                fputc(g, pf);
+                fputc(b, pf);
+            }
+            fclose(pf);
+            fprintf(stderr, "[driver] Framebuffer PPM dumped to %s\n", ppm_path);
+        }
+    }
+
+    fprintf(stderr, "done (hit_hle=%d)\n", sr_hit_hle);
+
+    int any_failure = 0;
+    for (int i = 0; i < DRIVER_MAX_EXPECT_U32; i++) {
+        if (!expectations[i].enabled) continue;
+        uint32_t actual = MEM_R32(expectations[i].address);
+        int matches = actual == expectations[i].value;
+        fprintf(
+            stderr,
+            "DRIVER_EXPECT_U32 addr=0x%08x got=0x%08x expected=0x%08x status=%s\n",
+            expectations[i].address,
+            actual,
+            expectations[i].value,
+            matches ? "PASS" : "FAIL"
+        );
+        if (!matches) any_failure = 1;
+    }
+    if (any_failure) return 3;
+
+    if (gui_headless_acceptance_requested()) {
+        if (gui_headless_acceptance_complete()) {
+            uint32_t presented = gui_headless_acceptance_presented_frames();
+            sr_driver_boot_event("BOOT_EVENT phase=headless_acceptance status=PASS presented_frames=%u",
+                                 presented);
+            return SR_HEADLESS_ACCEPTANCE_EXIT_REACHED;
+        }
+        sr_driver_boot_event("BOOT_EVENT phase=headless_acceptance status=FAIL reason=checkpoint_not_reached presented_frames=%u",
+                             gui_headless_acceptance_presented_frames());
+        return SR_HEADLESS_ACCEPTANCE_EXIT_NOT_REACHED;
+    }
+
+    return 0;
+}

@@ -1,0 +1,1523 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 the Nakagawa Recomp authors */
+
+#include "nk_font.h"
+#include "nk_types.h"
+#include "nk_platform.h"
+#include "nk_json.h"
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* -----------------------------------------------------------------------------
+ * Embedded SHA-256 Digest Implementation (self-contained, public-domain design)
+ * -------------------------------------------------------------------------- */
+typedef struct {
+    uint32_t state[8];
+    uint64_t bit_count;
+    uint8_t block[64];
+    size_t block_len;
+} FontSha256;
+
+static uint32_t font_sha256_rotr(uint32_t value, unsigned int amount) {
+    return (value >> amount) | (value << (32u - amount));
+}
+
+static void font_sha256_transform(FontSha256 *ctx, const uint8_t block[64]) {
+    static const uint32_t k[64] = {
+        0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+        0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+        0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+        0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+        0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+        0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+        0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+        0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+        0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+        0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+        0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+        0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+        0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+        0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+        0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+        0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
+    };
+    uint32_t words[64];
+    for (size_t i = 0; i < 16; i++) {
+        words[i] = ((uint32_t)block[i * 4] << 24) |
+                   ((uint32_t)block[i * 4 + 1] << 16) |
+                   ((uint32_t)block[i * 4 + 2] << 8) |
+                   (uint32_t)block[i * 4 + 3];
+    }
+    for (size_t i = 16; i < 64; i++) {
+        uint32_t s0 = font_sha256_rotr(words[i - 15], 7) ^
+                      font_sha256_rotr(words[i - 15], 18) ^ (words[i - 15] >> 3);
+        uint32_t s1 = font_sha256_rotr(words[i - 2], 17) ^
+                      font_sha256_rotr(words[i - 2], 19) ^ (words[i - 2] >> 10);
+        words[i] = words[i - 16] + s0 + words[i - 7] + s1;
+    }
+
+    uint32_t a = ctx->state[0], b = ctx->state[1], c = ctx->state[2], d = ctx->state[3];
+    uint32_t e = ctx->state[4], f = ctx->state[5], g = ctx->state[6], h = ctx->state[7];
+    for (size_t i = 0; i < 64; i++) {
+        uint32_t sum1 = font_sha256_rotr(e, 6) ^ font_sha256_rotr(e, 11) ^ font_sha256_rotr(e, 25);
+        uint32_t choose = (e & f) ^ (~e & g);
+        uint32_t t1 = h + sum1 + choose + k[i] + words[i];
+        uint32_t sum0 = font_sha256_rotr(a, 2) ^ font_sha256_rotr(a, 13) ^ font_sha256_rotr(a, 22);
+        uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = sum0 + majority;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c; ctx->state[3] += d;
+    ctx->state[4] += e; ctx->state[5] += f; ctx->state[6] += g; ctx->state[7] += h;
+}
+
+static void font_sha256_init(FontSha256 *ctx) {
+    static const uint32_t initial[8] = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
+    };
+    memcpy(ctx->state, initial, sizeof(initial));
+    ctx->bit_count = 0;
+    ctx->block_len = 0;
+}
+
+static void font_sha256_update(FontSha256 *ctx, const uint8_t *data, size_t len) {
+    ctx->bit_count += (uint64_t)len * 8u;
+    while (len > 0) {
+        size_t room = sizeof(ctx->block) - ctx->block_len;
+        size_t take = len < room ? len : room;
+        memcpy(ctx->block + ctx->block_len, data, take);
+        ctx->block_len += take;
+        data += take;
+        len -= take;
+        if (ctx->block_len == sizeof(ctx->block)) {
+            font_sha256_transform(ctx, ctx->block);
+            ctx->block_len = 0;
+        }
+    }
+}
+
+static void font_sha256_final(FontSha256 *ctx, uint8_t digest[32]) {
+    ctx->block[ctx->block_len++] = 0x80u;
+    if (ctx->block_len > 56) {
+        memset(ctx->block + ctx->block_len, 0, sizeof(ctx->block) - ctx->block_len);
+        font_sha256_transform(ctx, ctx->block);
+        ctx->block_len = 0;
+    }
+    memset(ctx->block + ctx->block_len, 0, 56 - ctx->block_len);
+    for (size_t i = 0; i < 8; i++) {
+        ctx->block[56 + i] = (uint8_t)(ctx->bit_count >> ((7 - i) * 8u));
+    }
+    font_sha256_transform(ctx, ctx->block);
+    for (size_t i = 0; i < 8; i++) {
+        digest[i * 4] = (uint8_t)(ctx->state[i] >> 24);
+        digest[i * 4 + 1] = (uint8_t)(ctx->state[i] >> 16);
+        digest[i * 4 + 2] = (uint8_t)(ctx->state[i] >> 8);
+        digest[i * 4 + 3] = (uint8_t)ctx->state[i];
+    }
+}
+
+/* -----------------------------------------------------------------------------
+ * Inspection: the native reader's verdict, the slot rule, and the file identity
+ * -------------------------------------------------------------------------- */
+static const char *const kSlotRole[NK_FONT_SLOT_COUNT] = { "Japanese", "Latin", "Korean" };
+static const char *const kSlotId[NK_FONT_SLOT_COUNT] = { "japanese", "latin", "korean" };
+static const char *const kSlotFile[NK_FONT_SLOT_COUNT] = {
+    NK_FONT_SLOT_JAPANESE_FILE, NK_FONT_SLOT_LATIN_FILE, NK_FONT_SLOT_KOREAN_FILE
+};
+
+static const char *const kLatinIndexFile[NK_FONT_LATIN_INDEX_COUNT] = {
+    "ltn0.pgf",  "ltn1.pgf",  "ltn2.pgf",  "ltn3.pgf",
+    "ltn4.pgf",  "ltn5.pgf",  "ltn6.pgf",  "ltn7.pgf",
+    "ltn8.pgf",  "ltn9.pgf",  "ltn10.pgf", "ltn11.pgf",
+    "ltn12.pgf", "ltn13.pgf", "ltn14.pgf", "ltn15.pgf",
+};
+
+const char *nk_font_latin_index_filename(int index) {
+    return (unsigned)index < NK_FONT_LATIN_INDEX_COUNT ? kLatinIndexFile[index] : NULL;
+}
+
+const char *nk_font_slot_psp_filename(NkFontSlot slot) {
+    switch (slot) {
+    case NK_FONT_SLOT_JAPANESE: return "jpn0.pgf";
+    case NK_FONT_SLOT_KOREAN:   return "kr0.pgf";
+    default:                    return NULL;
+    }
+}
+
+int nk_font_latin_index_from_filename(const char *name) {
+    if (!name) return -1;
+    for (int index = 0; index < NK_FONT_LATIN_INDEX_COUNT; index++) {
+        const char *candidate = kLatinIndexFile[index];
+        const unsigned char *a = (const unsigned char *)name;
+        const unsigned char *b = (const unsigned char *)candidate;
+        while (*a && *b && tolower(*a) == tolower(*b)) { a++; b++; }
+        if (*a == 0 && *b == 0) return index;
+    }
+    return -1;
+}
+
+static void font_copy_text(char *out, size_t out_len, const char *text) {
+    if (!out || out_len == 0) return;
+    snprintf(out, out_len, "%s", text ? text : "");
+}
+
+static const char *font_refusal_text(PgfRefusal refusal) {
+    switch (refusal) {
+    case PGF_REFUSE_TOO_LARGE: return "larger than the 16 MiB reader ceiling";
+    case PGF_REFUSE_TRUNCATED: return "truncated";
+    case PGF_REFUSE_HEADER_OFFSET: return "header offset is not zero";
+    case PGF_REFUSE_MAGIC: return "invalid PGF magic (expected PGF0)";
+    case PGF_REFUSE_REVISION: return "unsupported revision or version";
+    case PGF_REFUSE_HEADER_SIZE: return "header size does not match the revision";
+    case PGF_REFUSE_GLYPH_RANGE: return "corrupt glyph indices (first exceeds last)";
+    case PGF_REFUSE_COUNTS: return "count or bit width out of range";
+    case PGF_REFUSE_NO_GLYPHS: return "no glyph records";
+    case PGF_REFUSE_GLYPH: return "a glyph record fails the reader's checks";
+    case PGF_REFUSE_NONE: return "";
+    }
+    return "refused by the reader";
+}
+
+static void font_sha256_hex(const uint8_t *bytes, size_t length, char out[65]) {
+    FontSha256 sha;
+    uint8_t digest[32];
+    font_sha256_init(&sha);
+    font_sha256_update(&sha, bytes, length);
+    font_sha256_final(&sha, digest);
+    for (size_t i = 0; i < 32; i++) {
+        snprintf(out + i * 2, 3, "%02x", digest[i]);
+    }
+    out[64] = '\0';
+}
+
+int nk_font_classify_verdict(const PgfVerdict *verdict, char *reason, size_t reason_len) {
+    if (!verdict || verdict->refusal != PGF_REFUSE_NONE) {
+        font_copy_text(reason, reason_len, "the reader refused the file");
+        return -1;
+    }
+    if (verdict->has_hangul && verdict->has_kana) {
+        font_copy_text(reason, reason_len, "covers both Hangul and kana, so it names no slot");
+        return -1;
+    }
+    if (verdict->has_hangul) return NK_FONT_SLOT_KOREAN;
+    if (verdict->has_kana) return NK_FONT_SLOT_JAPANESE;
+    if (verdict->has_latin) return NK_FONT_SLOT_LATIN;
+    font_copy_text(reason, reason_len, "covers none of the slot probe characters");
+    return -1;
+}
+
+/* Read a whole open file no larger than the reader ceiling, from its start, and leave the
+ * handle at its start again. The caller frees *out. */
+static bool font_read_stream(FILE *f, uint8_t **out, size_t *out_len,
+                             char *out_error, size_t error_len) {
+    int64_t size;
+    uint8_t *bytes;
+    size_t received;
+    *out = NULL;
+    *out_len = 0;
+    if (fseek(f, 0, SEEK_END) != 0 || (size = nk_ftell64(f)) < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        font_copy_text(out_error, error_len, "cannot read the file size");
+        return false;
+    }
+    if ((uint64_t)size > NK_FONT_PGF_MAX_BYTES) {
+        font_copy_text(out_error, error_len, "larger than the 16 MiB reader ceiling");
+        return false;
+    }
+    bytes = (uint8_t *)malloc(size > 0 ? (size_t)size : 1u);
+    if (!bytes) {
+        font_copy_text(out_error, error_len, "out of memory");
+        return false;
+    }
+    received = size > 0 ? fread(bytes, 1u, (size_t)size, f) : 0u;
+    if (received != (size_t)size || ferror(f) || fseek(f, 0, SEEK_SET) != 0) {
+        free(bytes);
+        font_copy_text(out_error, error_len, "cannot read the file");
+        return false;
+    }
+    *out = bytes;
+    *out_len = (size_t)size;
+    return true;
+}
+
+/* Read a whole file no larger than the reader ceiling. The caller frees *out. */
+static bool font_read_file(const char *path, uint8_t **out, size_t *out_len,
+                           char *out_error, size_t error_len) {
+    FILE *f = nk_fopen_utf8(path, "rb");
+    bool ok;
+    *out = NULL;
+    *out_len = 0;
+    if (!f) {
+        font_copy_text(out_error, error_len, "cannot open the file");
+        return false;
+    }
+    ok = font_read_stream(f, out, out_len, out_error, error_len);
+    fclose(f);
+    return ok;
+}
+
+/* Check bytes already in memory. Returns true when the reader accepts them. */
+static bool font_inspect_bytes(const uint8_t *bytes, size_t length, NkFontInspection *out) {
+    memset(out, 0, sizeof(*out));
+    out->size = (uint64_t)length;
+    out->slot = -1;
+    font_sha256_hex(bytes, length, out->sha256);
+    if (!pgf_validate_memory(bytes, length, &out->verdict)) {
+        font_copy_text(out->slot_reason, sizeof(out->slot_reason),
+                       font_refusal_text(out->verdict.refusal));
+        return false;
+    }
+    out->slot = nk_font_classify_verdict(&out->verdict, out->slot_reason, sizeof(out->slot_reason));
+    return true;
+}
+
+bool nk_font_inspect_pgf(const char *file_path, NkFontInspection *out,
+                         char *out_error, size_t error_len) {
+    uint8_t *bytes = NULL;
+    size_t length = 0;
+    bool accepted;
+    if (!file_path || !*file_path || !out) {
+        font_copy_text(out_error, error_len, "no font file was named");
+        return false;
+    }
+    if (!font_read_file(file_path, &bytes, &length, out_error, error_len)) return false;
+    accepted = font_inspect_bytes(bytes, length, out);
+    free(bytes);
+    if (!accepted) {
+        char text[NK_FONT_DETAIL_MAX * 2];
+        snprintf(text, sizeof(text), "the PGF reader refused the file: %s", out->slot_reason);
+        font_copy_text(out_error, error_len, text);
+        return false;
+    }
+    return true;
+}
+
+bool nk_font_validate_pgf(const char *file_path, uint64_t *out_size,
+                          char *out_sha256, char *out_error, size_t error_len) {
+    NkFontInspection inspection;
+    if (!nk_font_inspect_pgf(file_path, &inspection, out_error, error_len)) return false;
+    if (out_size) *out_size = inspection.size;
+    if (out_sha256) memcpy(out_sha256, inspection.sha256, sizeof(inspection.sha256));
+    return true;
+}
+
+/* -----------------------------------------------------------------------------
+ * The schema-2 imported-font manifest keeps generic slots in `files` and indexed Latin files
+ * in the optional `latin_indices` object under <user data>/fonts/v2/manifest.json.
+ * -------------------------------------------------------------------------- */
+typedef struct {
+    bool present[NK_FONT_SLOT_COUNT];
+    uint64_t size[NK_FONT_SLOT_COUNT];
+    char sha256[NK_FONT_SLOT_COUNT][65];
+    bool latin_index_present[NK_FONT_LATIN_INDEX_COUNT];
+    uint64_t latin_index_size[NK_FONT_LATIN_INDEX_COUNT];
+    char latin_index_sha256[NK_FONT_LATIN_INDEX_COUNT][65];
+} FontManifest;
+
+bool nk_font_get_cache_dir(const char *user_data_root, char *out_dir, size_t max_len) {
+    if (!out_dir || max_len == 0) return false;
+    char base[NK_MAX_PATH];
+    if (user_data_root && *user_data_root) {
+        snprintf(base, sizeof(base), "%s", user_data_root);
+    } else {
+        if (!nk_platform_get_path(NK_PATH_DATA, base, sizeof(base))) return false;
+    }
+    char sep = nk_platform_path_separator();
+    int written = snprintf(out_dir, max_len, "%s%c%s%c%s", base, sep,
+                           NK_FONT_CACHE_PARENT, sep, NK_FONT_CACHE_SUBDIR);
+    return written > 0 && (size_t)written < max_len;
+}
+
+static void font_join(char *out, size_t out_len, const char *dir, const char *name) {
+    snprintf(out, out_len, "%s%c%s", dir, nk_platform_path_separator(), name);
+}
+
+/* The staging name for a target path: the target with ".tmp" appended. */
+static void font_staging_name(char *out, size_t out_len, const char *target) {
+    size_t length = strlen(target);
+    if (out_len == 0) return;
+    if (length + 5u > out_len) {
+        out[0] = '\0';
+        return;
+    }
+    memcpy(out, target, length);
+    memcpy(out + length, ".tmp", 4u);
+    out[length + 4u] = '\0';
+}
+
+static NkFontStatus font_load_manifest(const char *cache_dir, FontManifest *manifest,
+                                       char *message, size_t message_len) {
+    char path[NK_MAX_PATH * 2];
+    FILE *mf;
+    long length;
+    char *json_buf;
+    size_t read_bytes;
+    char parse_err[128] = "";
+    NkJsonNode *root;
+    NkJsonNode *version;
+    NkJsonNode *files;
+    int64_t schema = 0;
+    size_t count;
+
+    memset(manifest, 0, sizeof(*manifest));
+    font_join(path, sizeof(path), cache_dir, NK_FONT_MANIFEST_NAME);
+    if (!nk_platform_file_exists(path)) {
+        font_copy_text(message, message_len, "No imported PSP font.");
+        return NK_FONT_STATUS_MISSING;
+    }
+    mf = nk_fopen_utf8(path, "rb");
+    if (!mf || fseek(mf, 0, SEEK_END) != 0 || (length = ftell(mf)) <= 0 || length > 1024 * 1024 ||
+        fseek(mf, 0, SEEK_SET) != 0) {
+        if (mf) fclose(mf);
+        font_copy_text(message, message_len, "PSP font manifest is unreadable; run fonts import <folder>.");
+        return NK_FONT_STATUS_INVALID;
+    }
+    json_buf = (char *)malloc((size_t)length + 1u);
+    if (!json_buf) {
+        fclose(mf);
+        return NK_FONT_STATUS_INVALID;
+    }
+    read_bytes = fread(json_buf, 1u, (size_t)length, mf);
+    fclose(mf);
+    json_buf[read_bytes] = '\0';
+    root = nk_json_parse(json_buf, read_bytes, parse_err, sizeof(parse_err));
+    free(json_buf);
+    if (!root || !nk_json_is_object(root)) {
+        if (root) nk_json_free(root);
+        font_copy_text(message, message_len, "PSP font manifest is malformed; run fonts import <folder>.");
+        return NK_FONT_STATUS_INVALID;
+    }
+    version = nk_json_obj_get(root, "schema_version");
+    if (!version || !nk_json_get_int64(version, &schema) || schema != NK_FONT_CACHE_SCHEMA_VERSION) {
+        nk_json_free(root);
+        font_copy_text(message, message_len, "PSP font manifest schema is not version 2; run fonts import <folder>.");
+        return NK_FONT_STATUS_INVALID;
+    }
+    files = nk_json_obj_get(root, "files");
+    if (!files || !nk_json_is_object(files)) {
+        nk_json_free(root);
+        font_copy_text(message, message_len, "PSP font manifest lists no files; run fonts import <folder>.");
+        return NK_FONT_STATUS_INVALID;
+    }
+    for (count = 0; count < files->u.obj.count; count++) {
+        const char *name = files->u.obj.members[count].key;
+        NkJsonNode *entry = files->u.obj.members[count].val;
+        NkJsonNode *slot_node;
+        NkJsonNode *size_node;
+        NkJsonNode *sha_node;
+        NkJsonNode *source_node;
+        const char *slot_text;
+        const char *sha_text;
+        const char *source_text;
+        int64_t size = 0;
+        int slot = -1;
+        int i;
+        bool entry_ok = false;
+        if (!name || !entry || !nk_json_is_object(entry)) break;
+        for (i = 0; i < NK_FONT_SLOT_COUNT; i++) {
+            if (strcmp(name, kSlotFile[i]) == 0) slot = i;
+        }
+        if (slot < 0 || manifest->present[slot]) break;
+        slot_node = nk_json_obj_get(entry, "slot");
+        size_node = nk_json_obj_get(entry, "size");
+        sha_node = nk_json_obj_get(entry, "sha256");
+        source_node = nk_json_obj_get(entry, "source");
+        slot_text = nk_json_get_string(slot_node);
+        sha_text = nk_json_get_string(sha_node);
+        source_text = nk_json_get_string(source_node);
+        entry_ok = slot_text && strcmp(slot_text, kSlotId[slot]) == 0 &&
+                   size_node && nk_json_get_int64(size_node, &size) && size > 0 &&
+                   sha_text && strlen(sha_text) == 64u &&
+                   source_text && strcmp(source_text, NK_FONT_MANIFEST_SOURCE_USER) == 0;
+        if (!entry_ok) break;
+        manifest->present[slot] = true;
+        manifest->size[slot] = (uint64_t)size;
+        snprintf(manifest->sha256[slot], sizeof(manifest->sha256[slot]), "%s", sha_text);
+    }
+    if (count < files->u.obj.count) {
+        nk_json_free(root);
+        font_copy_text(message, message_len,
+                       "PSP font manifest has an entry this build does not accept; run fonts import <folder>.");
+        return NK_FONT_STATUS_INVALID;
+    }
+    {
+        NkJsonNode *latin_indices = nk_json_obj_get(root, "latin_indices");
+        if (latin_indices) {
+            if (!nk_json_is_object(latin_indices)) {
+                nk_json_free(root);
+                font_copy_text(message, message_len,
+                               "PSP font manifest has invalid Latin index entries; run fonts import <folder>.");
+                return NK_FONT_STATUS_INVALID;
+            }
+            for (count = 0; count < latin_indices->u.obj.count; count++) {
+                const char *name = latin_indices->u.obj.members[count].key;
+                NkJsonNode *entry = latin_indices->u.obj.members[count].val;
+                NkJsonNode *slot_node;
+                NkJsonNode *index_node;
+                NkJsonNode *size_node;
+                NkJsonNode *sha_node;
+                NkJsonNode *source_node;
+                const char *slot_text;
+                const char *sha_text;
+                const char *source_text;
+                int64_t index_value = -1;
+                int64_t size = 0;
+                int index = nk_font_latin_index_from_filename(name);
+                bool entry_ok;
+                if (index < 0 || strcmp(name, kLatinIndexFile[index]) != 0 ||
+                    !entry || !nk_json_is_object(entry)) break;
+                slot_node = nk_json_obj_get(entry, "slot");
+                index_node = nk_json_obj_get(entry, "index");
+                size_node = nk_json_obj_get(entry, "size");
+                sha_node = nk_json_obj_get(entry, "sha256");
+                source_node = nk_json_obj_get(entry, "source");
+                slot_text = nk_json_get_string(slot_node);
+                sha_text = nk_json_get_string(sha_node);
+                source_text = nk_json_get_string(source_node);
+                entry_ok = !manifest->latin_index_present[index] && slot_text &&
+                           strcmp(slot_text, "latin") == 0 && index_node &&
+                           nk_json_get_int64(index_node, &index_value) && index_value == index &&
+                           size_node && nk_json_get_int64(size_node, &size) && size > 0 &&
+                           sha_text && strlen(sha_text) == 64u && source_text &&
+                           strcmp(source_text, NK_FONT_MANIFEST_SOURCE_USER) == 0;
+                if (!entry_ok) break;
+                manifest->latin_index_present[index] = true;
+                manifest->latin_index_size[index] = (uint64_t)size;
+                snprintf(manifest->latin_index_sha256[index],
+                         sizeof(manifest->latin_index_sha256[index]), "%s", sha_text);
+            }
+            if (count < latin_indices->u.obj.count) {
+                nk_json_free(root);
+                font_copy_text(message, message_len,
+                               "PSP font manifest has a Latin index entry this build does not accept; run fonts import <folder>.");
+                return NK_FONT_STATUS_INVALID;
+            }
+        }
+    }
+    {
+        bool has_entry = files->u.obj.count != 0u;
+        for (int index = 0; index < NK_FONT_LATIN_INDEX_COUNT; index++)
+            if (manifest->latin_index_present[index]) has_entry = true;
+        if (!has_entry) {
+            nk_json_free(root);
+            font_copy_text(message, message_len,
+                           "PSP font manifest lists no files; run fonts import <folder>.");
+            return NK_FONT_STATUS_INVALID;
+        }
+    }
+    nk_json_free(root);
+    font_copy_text(message, message_len, "Imported PSP fonts are listed in the manifest.");
+    return NK_FONT_STATUS_OK;
+}
+
+/* Check one slot's bytes against its manifest entry: the reader accepts them, they name the slot,
+ * and their size and SHA-256 match the entry. */
+static bool font_check_slot_bytes(int slot, const FontManifest *manifest, const uint8_t *bytes,
+                                  size_t length, char *reason, size_t reason_len) {
+    NkFontInspection inspection;
+    if (!font_inspect_bytes(bytes, length, &inspection)) {
+        snprintf(reason, reason_len, "the reader refused it: %s", inspection.slot_reason);
+        return false;
+    }
+    if (inspection.slot != slot) {
+        snprintf(reason, reason_len, "it does not name the %s slot", kSlotRole[slot]);
+        return false;
+    }
+    if (inspection.size != manifest->size[slot] || strcmp(inspection.sha256, manifest->sha256[slot]) != 0) {
+        font_copy_text(reason, reason_len, "its size or SHA-256 differs from the manifest");
+        return false;
+    }
+    return true;
+}
+
+/* Check one manifest entry against its file: the file exists, its size and SHA-256 match,
+ * the reader accepts it, and it names the slot the manifest gives. */
+static bool font_check_slot_file(const char *cache_dir, int slot, const FontManifest *manifest,
+                                 char *reason, size_t reason_len) {
+    char path[NK_MAX_PATH * 2];
+    uint8_t *bytes = NULL;
+    size_t length = 0;
+    bool ok;
+    font_join(path, sizeof(path), cache_dir, kSlotFile[slot]);
+    if (!font_read_file(path, &bytes, &length, reason, reason_len)) return false;
+    ok = font_check_slot_bytes(slot, manifest, bytes, length, reason, reason_len);
+    free(bytes);
+    return ok;
+}
+
+static bool font_check_latin_index_bytes(int index, const FontManifest *manifest,
+                                        const uint8_t *bytes, size_t length,
+                                        char *reason, size_t reason_len) {
+    NkFontInspection inspection;
+    if (!font_inspect_bytes(bytes, length, &inspection)) {
+        snprintf(reason, reason_len, "the reader refused it: %s", inspection.slot_reason);
+        return false;
+    }
+    if (inspection.slot != NK_FONT_SLOT_LATIN) {
+        font_copy_text(reason, reason_len, "it does not name the Latin slot");
+        return false;
+    }
+    if (inspection.size != manifest->latin_index_size[index] ||
+        strcmp(inspection.sha256, manifest->latin_index_sha256[index]) != 0) {
+        font_copy_text(reason, reason_len, "its size or SHA-256 differs from the manifest");
+        return false;
+    }
+    return true;
+}
+
+static bool font_check_latin_index_file(const char *cache_dir, int index,
+                                        const FontManifest *manifest,
+                                        char *reason, size_t reason_len) {
+    char path[NK_MAX_PATH * 2];
+    uint8_t *bytes = NULL;
+    size_t length = 0;
+    bool ok;
+    const char *name = nk_font_latin_index_filename(index);
+    if (!name) {
+        font_copy_text(reason, reason_len, "the Latin index is outside the supported range");
+        return false;
+    }
+    font_join(path, sizeof(path), cache_dir, name);
+    if (!font_read_file(path, &bytes, &length, reason, reason_len)) return false;
+    ok = font_check_latin_index_bytes(index, manifest, bytes, length, reason, reason_len);
+    free(bytes);
+    return ok;
+}
+
+NkFontStatus nk_font_check_cache(const char *user_data_root, char *out_message, size_t message_max_len) {
+    char cache_dir[NK_MAX_PATH];
+    FontManifest manifest;
+    NkFontStatus status;
+    char message[NK_FONT_TEXT_MAX] = "";
+    if (!nk_font_get_cache_dir(user_data_root, cache_dir, sizeof(cache_dir))) {
+        font_copy_text(out_message, message_max_len, "PSP font cache location is unavailable.");
+        return NK_FONT_STATUS_MISSING;
+    }
+    status = font_load_manifest(cache_dir, &manifest, message, sizeof(message));
+    if (status == NK_FONT_STATUS_OK) {
+        for (int slot = 0; slot < NK_FONT_SLOT_COUNT && status == NK_FONT_STATUS_OK; slot++) {
+            char reason[NK_FONT_TEXT_MAX] = "";
+            if (!manifest.present[slot]) continue;
+            if (!font_check_slot_file(cache_dir, slot, &manifest, reason, sizeof(reason))) {
+                snprintf(message, sizeof(message), "Imported %s font is invalid: %.400s; run fonts import <folder>.",
+                         kSlotRole[slot], reason);
+                status = NK_FONT_STATUS_INVALID;
+            }
+        }
+        for (int index = 0; index < NK_FONT_LATIN_INDEX_COUNT && status == NK_FONT_STATUS_OK; index++) {
+            char reason[NK_FONT_TEXT_MAX] = "";
+            if (!manifest.latin_index_present[index]) continue;
+            if (!font_check_latin_index_file(cache_dir, index, &manifest, reason, sizeof(reason))) {
+                snprintf(message, sizeof(message), "Imported Latin index %d font is invalid: %.400s; run fonts import <folder>.",
+                         index + 1, reason);
+                status = NK_FONT_STATUS_INVALID;
+            }
+        }
+    }
+    font_copy_text(out_message, message_max_len, message);
+    return status;
+}
+
+NkFontSlotCheck nk_font_check_cache_slot_file(const char *user_data_root, NkFontSlot slot,
+                                              FILE *cache_file, char *reason, size_t reason_len) {
+    char cache_dir[NK_MAX_PATH];
+    FontManifest manifest;
+    NkFontStatus status;
+    char message[NK_FONT_TEXT_MAX] = "";
+    uint8_t *bytes = NULL;
+    size_t length = 0;
+    bool ok;
+    if (reason_len > 0) reason[0] = '\0';
+    if (!cache_file || (unsigned)slot >= NK_FONT_SLOT_COUNT) {
+        font_copy_text(reason, reason_len, "no cache file or font slot was named");
+        return NK_FONT_SLOT_CHECK_FILE_INVALID;
+    }
+    if (!nk_font_get_cache_dir(user_data_root, cache_dir, sizeof(cache_dir))) {
+        font_copy_text(reason, reason_len, "the per-user font cache location is unavailable");
+        return NK_FONT_SLOT_CHECK_NO_MANIFEST;
+    }
+    status = font_load_manifest(cache_dir, &manifest, message, sizeof(message));
+    if (status == NK_FONT_STATUS_MISSING) {
+        font_copy_text(reason, reason_len,
+                       "the font cache has no manifest.json (import the font from your PSP to write one)");
+        return NK_FONT_SLOT_CHECK_NO_MANIFEST;
+    }
+    if (status != NK_FONT_STATUS_OK) {
+        font_copy_text(reason, reason_len, message);
+        return NK_FONT_SLOT_CHECK_MANIFEST_INVALID;
+    }
+    if (!manifest.present[slot]) {
+        snprintf(reason, reason_len, "the manifest does not list the %s slot", kSlotRole[slot]);
+        return NK_FONT_SLOT_CHECK_NOT_LISTED;
+    }
+    if (!font_read_stream(cache_file, &bytes, &length, reason, reason_len)) return NK_FONT_SLOT_CHECK_FILE_INVALID;
+    ok = font_check_slot_bytes((int)slot, &manifest, bytes, length, reason, reason_len);
+    free(bytes);
+    return ok ? NK_FONT_SLOT_CHECK_OK : NK_FONT_SLOT_CHECK_FILE_INVALID;
+}
+
+NkFontSlotCheck nk_font_check_cache_latin_index_file(const char *user_data_root, int index,
+                                                      FILE *cache_file, char *reason,
+                                                      size_t reason_len) {
+    char cache_dir[NK_MAX_PATH];
+    FontManifest manifest;
+    NkFontStatus status;
+    char message[NK_FONT_TEXT_MAX] = "";
+    uint8_t *bytes = NULL;
+    size_t length = 0;
+    bool ok;
+    if (reason_len > 0) reason[0] = '\0';
+    if ((unsigned)index >= NK_FONT_LATIN_INDEX_COUNT || !cache_file) {
+        font_copy_text(reason, reason_len, "no cache file or Latin index was named");
+        return NK_FONT_SLOT_CHECK_FILE_INVALID;
+    }
+    if (!nk_font_get_cache_dir(user_data_root, cache_dir, sizeof(cache_dir))) {
+        font_copy_text(reason, reason_len, "the per-user font cache location is unavailable");
+        return NK_FONT_SLOT_CHECK_NO_MANIFEST;
+    }
+    status = font_load_manifest(cache_dir, &manifest, message, sizeof(message));
+    if (status == NK_FONT_STATUS_MISSING) {
+        font_copy_text(reason, reason_len,
+                       "the font cache has no manifest.json (import the font from your PSP to write one)");
+        return NK_FONT_SLOT_CHECK_NO_MANIFEST;
+    }
+    if (status != NK_FONT_STATUS_OK) {
+        font_copy_text(reason, reason_len, message);
+        return NK_FONT_SLOT_CHECK_MANIFEST_INVALID;
+    }
+    if (!manifest.latin_index_present[index]) {
+        snprintf(reason, reason_len, "the manifest does not list Latin index %d", index + 1);
+        return NK_FONT_SLOT_CHECK_NOT_LISTED;
+    }
+    if (!font_read_stream(cache_file, &bytes, &length, reason, reason_len))
+        return NK_FONT_SLOT_CHECK_FILE_INVALID;
+    ok = font_check_latin_index_bytes(index, &manifest, bytes, length, reason, reason_len);
+    free(bytes);
+    return ok ? NK_FONT_SLOT_CHECK_OK : NK_FONT_SLOT_CHECK_FILE_INVALID;
+}
+
+void nk_font_slot_states(const char *user_data_root, const char *project_root,
+                         NkFontSlotState states[NK_FONT_SLOT_COUNT]) {
+    char cache_dir[NK_MAX_PATH];
+    FontManifest manifest;
+    char manifest_message[NK_FONT_TEXT_MAX] = "";
+    NkFontStatus manifest_status = NK_FONT_STATUS_MISSING;
+    if (!states) return;
+    memset(&manifest, 0, sizeof(manifest));
+    if (nk_font_get_cache_dir(user_data_root, cache_dir, sizeof(cache_dir))) {
+        manifest_status = font_load_manifest(cache_dir, &manifest, manifest_message, sizeof(manifest_message));
+    }
+    for (int slot = 0; slot < NK_FONT_SLOT_COUNT; slot++) {
+        NkFontSlotState *state = &states[slot];
+        char reason[NK_FONT_TEXT_MAX] = "";
+        memset(state, 0, sizeof(*state));
+        state->source = NK_FONT_SOURCE_NONE;
+        if (manifest_status == NK_FONT_STATUS_OK && manifest.present[slot]) {
+            if (font_check_slot_file(cache_dir, slot, &manifest, reason, sizeof(reason))) {
+                state->source = NK_FONT_SOURCE_USER;
+                snprintf(state->detail, sizeof(state->detail), "%s: your imported font.", kSlotRole[slot]);
+                continue;
+            }
+        } else if (manifest_status == NK_FONT_STATUS_INVALID) {
+            font_copy_text(reason, sizeof(reason), manifest_message);
+        }
+        if (project_root && *project_root) {
+            char project_dir[NK_MAX_PATH * 2];
+            char project_path[NK_MAX_PATH * 2];
+            NkFontInspection inspection;
+            char error[NK_FONT_DETAIL_MAX] = "";
+            snprintf(project_dir, sizeof(project_dir), "%s%c%s", project_root,
+                     nk_platform_path_separator(), NK_FONT_PROJECT_SUBDIR);
+            font_join(project_path, sizeof(project_path), project_dir, kSlotFile[slot]);
+            if (nk_platform_file_exists(project_path) &&
+                nk_font_inspect_pgf(project_path, &inspection, error, sizeof(error)) &&
+                inspection.slot == slot) {
+                state->source = NK_FONT_SOURCE_PROJECT;
+                snprintf(state->detail, sizeof(state->detail), "%s: project font.", kSlotRole[slot]);
+                continue;
+            }
+        }
+        if (reason[0]) {
+            snprintf(state->detail, sizeof(state->detail), "%s: missing (%.400s).", kSlotRole[slot], reason);
+        } else {
+            snprintf(state->detail, sizeof(state->detail),
+                     "%s: missing. Import a font from your PSP or install the project font.", kSlotRole[slot]);
+        }
+    }
+}
+
+bool nk_font_resolve_latin_index(const char *user_data_root, const char *project_font_dir,
+                                 int index, NkFontLatinResolution *out) {
+    char cache_dir[NK_MAX_PATH];
+    char manifest_message[NK_FONT_TEXT_MAX] = "";
+    FontManifest manifest;
+    NkFontStatus manifest_status = NK_FONT_STATUS_MISSING;
+    if (!out || (unsigned)index >= NK_FONT_LATIN_INDEX_COUNT) return false;
+    out->source = NK_FONT_SOURCE_NONE;
+    out->served_index = -3;
+    out->project_file = NULL;
+    memset(&manifest, 0, sizeof(manifest));
+    if (nk_font_get_cache_dir(user_data_root, cache_dir, sizeof(cache_dir)))
+        manifest_status = font_load_manifest(cache_dir, &manifest, manifest_message,
+                                             sizeof(manifest_message));
+    if (manifest_status == NK_FONT_STATUS_OK) {
+        char reason[NK_FONT_TEXT_MAX] = "";
+        int has_latin_indices = 0;
+        if (manifest.latin_index_present[index] &&
+            font_check_latin_index_file(cache_dir, index, &manifest, reason, sizeof(reason))) {
+            out->source = NK_FONT_SOURCE_USER;
+            out->served_index = index;
+            return true;
+        }
+        int group_start = (index / NK_FONT_LATIN_SIZE_GROUP_COUNT) * NK_FONT_LATIN_SIZE_GROUP_COUNT;
+        int group_end = group_start + NK_FONT_LATIN_SIZE_GROUP_COUNT;
+        for (int distance = 1; distance < NK_FONT_LATIN_SIZE_GROUP_COUNT; distance++) {
+            int candidates[2] = { index - distance, index + distance };
+            for (int side = 0; side < 2; side++) {
+                int candidate = candidates[side];
+                if (candidate < group_start || candidate >= group_end ||
+                    !manifest.latin_index_present[candidate]) continue;
+                reason[0] = '\0';
+                if (!font_check_latin_index_file(cache_dir, candidate, &manifest,
+                                                 reason, sizeof(reason))) continue;
+                out->source = NK_FONT_SOURCE_USER;
+                out->served_index = candidate;
+                return true;
+            }
+        }
+        for (int candidate = 0; candidate < NK_FONT_LATIN_INDEX_COUNT; candidate++)
+            has_latin_indices |= manifest.latin_index_present[candidate];
+        /* A cache created before per-index imports contains only nkltn.pgf. Keep serving that
+         * face for all indices even when the project font is now available. */
+        if (!has_latin_indices && manifest.present[NK_FONT_SLOT_LATIN] &&
+            font_check_slot_file(cache_dir, NK_FONT_SLOT_LATIN, &manifest,
+                                 reason, sizeof(reason))) {
+            out->source = NK_FONT_SOURCE_USER;
+            out->served_index = -2;
+            return true;
+        }
+    }
+
+    if (project_font_dir && *project_font_dir) {
+        const char *const candidates[2] = {
+            index >= NK_FONT_LATIN_SIZE_GROUP_COUNT ? NK_FONT_PROJECT_LATIN_SMALL_FILE : NK_FONT_SLOT_LATIN_FILE,
+            NK_FONT_SLOT_LATIN_FILE
+        };
+        for (int candidate = 0; candidate < 2; candidate++) {
+            char project_path[NK_MAX_PATH * 2];
+            NkFontInspection inspection;
+            char error[NK_FONT_DETAIL_MAX] = "";
+            font_join(project_path, sizeof(project_path), project_font_dir, candidates[candidate]);
+            if (nk_platform_file_exists(project_path) &&
+                nk_font_inspect_pgf(project_path, &inspection, error, sizeof(error)) &&
+                inspection.slot == NK_FONT_SLOT_LATIN) {
+                out->source = NK_FONT_SOURCE_PROJECT;
+                out->served_index = -1;
+                out->project_file = candidates[candidate];
+                return true;
+            }
+        }
+    }
+
+    /* Keep a legacy Latin import as the last fallback for mixed/newer caches when the project
+     * Latin PGF is unavailable. Its lack of an index is explicit in the resolution and status. */
+    if (manifest_status == NK_FONT_STATUS_OK && manifest.present[NK_FONT_SLOT_LATIN]) {
+        char reason[NK_FONT_TEXT_MAX] = "";
+        if (font_check_slot_file(cache_dir, NK_FONT_SLOT_LATIN, &manifest,
+                                 reason, sizeof(reason))) {
+            out->source = NK_FONT_SOURCE_USER;
+            out->served_index = -2;
+            return true;
+        }
+    }
+    return false;
+}
+
+void nk_font_latin_index_states(const char *user_data_root, const char *project_font_dir,
+                                NkFontLatinIndexState states[NK_FONT_LATIN_INDEX_COUNT]) {
+    if (!states) return;
+    for (int index = 0; index < NK_FONT_LATIN_INDEX_COUNT; index++) {
+        NkFontLatinResolution resolution;
+        const char *requested = nk_font_latin_index_filename(index);
+        bool resolved = nk_font_resolve_latin_index(user_data_root, project_font_dir, index, &resolution);
+        states[index].source = resolved ? resolution.source : NK_FONT_SOURCE_NONE;
+        states[index].served_index = resolved ? resolution.served_index : -3;
+        if (!resolved) {
+            snprintf(states[index].detail, sizeof(states[index].detail),
+                     "L%d missing %s", index + 1, requested);
+        } else if (resolution.source == NK_FONT_SOURCE_USER && resolution.served_index == index) {
+            snprintf(states[index].detail, sizeof(states[index].detail),
+                     "L%d exact %s", index + 1, requested);
+        } else if (resolution.source == NK_FONT_SOURCE_USER && resolution.served_index >= 0) {
+            snprintf(states[index].detail, sizeof(states[index].detail),
+                     "L%d missing; fallback %s", index + 1,
+                     nk_font_latin_index_filename(resolution.served_index));
+        } else if (resolution.source == NK_FONT_SOURCE_PROJECT) {
+            snprintf(states[index].detail, sizeof(states[index].detail),
+                     "L%d missing; project %s", index + 1, resolution.project_file);
+        } else {
+            snprintf(states[index].detail, sizeof(states[index].detail),
+                     "L%d missing; legacy nkltn.pgf", index + 1);
+        }
+    }
+}
+
+/* -----------------------------------------------------------------------------
+ * Writing: file replacement and the manifest
+ * -------------------------------------------------------------------------- */
+static bool font_write_bytes(const char *path, const uint8_t *bytes, size_t length) {
+    FILE *f = nk_fopen_utf8(path, "wb");
+    bool ok;
+    if (!f) return false;
+    ok = length == 0u || fwrite(bytes, 1u, length, f) == length;
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
+/* Write the manifest for the slots marked present. An empty manifest is not written. */
+static bool font_write_manifest(const char *cache_dir, const FontManifest *manifest) {
+    char path[NK_MAX_PATH * 2];
+    char tmp[NK_MAX_PATH * 2];
+    char stamp[32] = "unknown";
+    char text[8192];
+    size_t used = 0;
+    bool any = false;
+    time_t now = time(NULL);
+    struct tm *utc = gmtime(&now);
+    font_join(path, sizeof(path), cache_dir, NK_FONT_MANIFEST_NAME);
+    font_staging_name(tmp, sizeof(tmp), path);
+    if (utc) strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%SZ", utc);
+    for (int slot = 0; slot < NK_FONT_SLOT_COUNT; slot++) if (manifest->present[slot]) any = true;
+    for (int index = 0; index < NK_FONT_LATIN_INDEX_COUNT; index++)
+        if (manifest->latin_index_present[index]) any = true;
+    if (!any) return false;
+    used += (size_t)snprintf(text + used, sizeof(text) - used,
+                             "{\n  \"schema_version\": %d,\n  \"import_time\": \"%s\",\n  \"files\": {\n",
+                             NK_FONT_CACHE_SCHEMA_VERSION, stamp);
+    any = false;
+    for (int slot = 0; slot < NK_FONT_SLOT_COUNT; slot++) {
+        if (!manifest->present[slot]) continue;
+        used += (size_t)snprintf(text + used, sizeof(text) - used,
+                                 "%s    \"%s\": {\"slot\": \"%s\", \"size\": %llu, \"sha256\": \"%s\", "
+                                 "\"source\": \"%s\", \"reader_version\": %d}",
+                                 any ? ",\n" : "", kSlotFile[slot], kSlotId[slot],
+                                 (unsigned long long)manifest->size[slot], manifest->sha256[slot],
+                                 NK_FONT_MANIFEST_SOURCE_USER, NK_FONT_READER_VERSION);
+        any = true;
+    }
+    used += (size_t)snprintf(text + used, sizeof(text) - used, "\n  },\n  \"latin_indices\": {");
+    any = false;
+    for (int index = 0; index < NK_FONT_LATIN_INDEX_COUNT; index++) {
+        if (!manifest->latin_index_present[index]) continue;
+        used += (size_t)snprintf(text + used, sizeof(text) - used,
+                                 "%s\n    \"%s\": {\"slot\": \"latin\", \"index\": %d, \"size\": %llu, \"sha256\": \"%s\", "
+                                 "\"source\": \"%s\", \"reader_version\": %d}",
+                                 any ? "," : "", kLatinIndexFile[index], index,
+                                 (unsigned long long)manifest->latin_index_size[index],
+                                 manifest->latin_index_sha256[index], NK_FONT_MANIFEST_SOURCE_USER,
+                                 NK_FONT_READER_VERSION);
+        any = true;
+    }
+    used += (size_t)snprintf(text + used, sizeof(text) - used, "\n  }\n}\n");
+    if (used >= sizeof(text)) return false;
+    if (!font_write_bytes(tmp, (const uint8_t *)text, used)) return false;
+    if (nk_rename_utf8(tmp, path) != 0) {
+        nk_remove_utf8(tmp);
+        return false;
+    }
+    return true;
+}
+
+/* -----------------------------------------------------------------------------
+ * Import and removal
+ * -------------------------------------------------------------------------- */
+typedef struct {
+    char names[NK_FONT_IMPORT_MAX_FILES][256];
+    int count;
+    bool overflow;
+} FontFolderScan;
+
+/* A name of at least one character before ".pgf", in any case. */
+static bool font_name_is_pgf(const char *name) {
+    size_t length = strlen(name);
+    if (length < 5u) return false;
+    return tolower((unsigned char)name[length - 4u]) == '.' &&
+           tolower((unsigned char)name[length - 3u]) == 'p' &&
+           tolower((unsigned char)name[length - 2u]) == 'g' &&
+           tolower((unsigned char)name[length - 1u]) == 'f';
+}
+
+static bool font_collect_pgf(const char *name, void *context) {
+    FontFolderScan *scan = (FontFolderScan *)context;
+    if (!font_name_is_pgf(name)) return true;
+    if (scan->count >= NK_FONT_IMPORT_MAX_FILES) {
+        scan->overflow = true;
+        return false;
+    }
+    snprintf(scan->names[scan->count], sizeof(scan->names[scan->count]), "%s", name);
+    scan->count++;
+    return true;
+}
+
+static void font_sort_names(FontFolderScan *scan) {
+    for (int i = 1; i < scan->count; i++) {
+        char held[256];
+        int j = i;
+        memcpy(held, scan->names[i], sizeof(held));
+        while (j > 0 && strcmp(scan->names[j - 1], held) > 0) {
+            memcpy(scan->names[j], scan->names[j - 1], sizeof(held));
+            j--;
+        }
+        memcpy(scan->names[j], held, sizeof(held));
+    }
+}
+
+/* -----------------------------------------------------------------------------
+ * The font-copy folder on a connected PSP
+ * -------------------------------------------------------------------------- */
+typedef struct {
+    char *out;
+    size_t out_len;
+    int found;
+} FontPspSearch;
+
+static bool font_any_pgf(const char *name, void *context) {
+    if (!font_name_is_pgf(name)) return true;
+    *(bool *)context = true;
+    return false;
+}
+
+/* <root>/<first>[/<second>] in out; false when it does not fit. */
+static bool font_drive_path(char *out, size_t out_len, const char *root, const char *first,
+                            const char *second) {
+    const char separator = nk_platform_path_separator();
+    const size_t length = strlen(root);
+    const bool ends_with_separator = length > 0u &&
+                                     (root[length - 1u] == '/' || root[length - 1u] == '\\');
+    int written = snprintf(out, out_len, "%s%s%s%s%s", root,
+                           ends_with_separator ? "" : (separator == '\\' ? "\\" : "/"),
+                           first, second ? (separator == '\\' ? "\\" : "/") : "",
+                           second ? second : "");
+    return written > 0 && (size_t)written < out_len;
+}
+
+static bool font_folder_has_pgf(const char *folder) {
+    bool any = false;
+    return nk_platform_dir_exists(folder) && nk_platform_list_files(folder, font_any_pgf, &any) &&
+           any;
+}
+
+static bool font_psp_root(const char *root, void *context) {
+    FontPspSearch *search = (FontPspSearch *)context;
+    char folder[NK_MAX_PATH];
+    char mark_a[NK_MAX_PATH];
+    char mark_b[NK_MAX_PATH];
+    size_t length;
+    if (root[0] == '\0') return true;
+    /* The system storage's font folder counts only beside its kd and vsh folders, so another
+       drive that happens to have a "font" folder is not taken for a PSP. */
+    if (!(font_drive_path(folder, sizeof(folder), root, NK_FONT_PSP_SYSTEM_FOLDER, NULL) &&
+          font_drive_path(mark_a, sizeof(mark_a), root, NK_FONT_PSP_SYSTEM_MARK_A, NULL) &&
+          font_drive_path(mark_b, sizeof(mark_b), root, NK_FONT_PSP_SYSTEM_MARK_B, NULL) &&
+          nk_platform_dir_exists(mark_a) && nk_platform_dir_exists(mark_b) &&
+          font_folder_has_pgf(folder)) &&
+        !(font_drive_path(folder, sizeof(folder), root, NK_FONT_PSP_COPY_PARENT,
+                          NK_FONT_PSP_COPY_FOLDER) &&
+          font_folder_has_pgf(folder))) {
+        return true;
+    }
+    if (search->found == 0) {
+        length = strlen(folder);
+        if (length >= search->out_len) return true;
+        memcpy(search->out, folder, length + 1u);
+    }
+    search->found++;
+    return true;
+}
+
+int nk_font_find_psp_folder_in(const char *const *roots, int root_count, char *out,
+                               size_t out_len) {
+    FontPspSearch search = { out, out_len, 0 };
+    if (!out || out_len == 0u) return 0;
+    out[0] = '\0';
+    for (int i = 0; roots && i < root_count; i++) {
+        if (roots[i] != NULL) (void)font_psp_root(roots[i], &search);
+    }
+    return search.found;
+}
+
+int nk_font_find_psp_folder(char *out, size_t out_len) {
+    FontPspSearch search = { out, out_len, 0 };
+    if (!out || out_len == 0u) return 0;
+    out[0] = '\0';
+    nk_platform_list_drive_roots(font_psp_root, &search);
+    return search.found;
+}
+
+int nk_font_own_font_count(const char *user_data_root, const char *project_root) {
+    NkFontSlotState states[NK_FONT_SLOT_COUNT];
+    char project_font_dir[NK_MAX_PATH * 2];
+    int own = 0;
+    nk_font_slot_states(user_data_root, project_root, states);
+    if (states[NK_FONT_SLOT_JAPANESE].source == NK_FONT_SOURCE_USER) own++;
+    if (states[NK_FONT_SLOT_KOREAN].source == NK_FONT_SOURCE_USER) own++;
+    snprintf(project_font_dir, sizeof(project_font_dir), "%s%c%s",
+             project_root ? project_root : ".", nk_platform_path_separator(),
+             NK_FONT_PROJECT_SUBDIR);
+    for (int index = 0; index < NK_FONT_LATIN_INDEX_COUNT; index++) {
+        NkFontLatinResolution resolution;
+        if (nk_font_resolve_latin_index(user_data_root, project_font_dir, index, &resolution) &&
+            resolution.source == NK_FONT_SOURCE_USER && resolution.served_index == index) {
+            own++;
+        }
+    }
+    return own;
+}
+
+bool nk_font_import_folder(const char *user_data_root, const char *folder,
+                           const char *const choose[NK_FONT_SLOT_COUNT],
+                           NkFontImportResult *result, char *out_error, size_t error_len) {
+    FontFolderScan scan;
+    NkFontInspection inspections[NK_FONT_IMPORT_MAX_FILES];
+    int candidates[NK_FONT_SLOT_COUNT][NK_FONT_IMPORT_MAX_FILES];
+    int candidate_count[NK_FONT_SLOT_COUNT] = { 0, 0, 0 };
+    int selected[NK_FONT_SLOT_COUNT] = { -1, -1, -1 };
+    int latin_candidates[NK_FONT_LATIN_INDEX_COUNT][NK_FONT_IMPORT_MAX_FILES];
+    int latin_candidate_count[NK_FONT_LATIN_INDEX_COUNT] = { 0 };
+    int latin_selected[NK_FONT_LATIN_INDEX_COUNT];
+    char cache_dir[NK_MAX_PATH];
+    FontManifest manifest;
+    char manifest_message[NK_FONT_TEXT_MAX] = "";
+    NkFontStatus manifest_status;
+    uint8_t *bytes_for_slot[NK_FONT_SLOT_COUNT] = { NULL, NULL, NULL };
+    size_t length_for_slot[NK_FONT_SLOT_COUNT] = { 0, 0, 0 };
+
+    for (int index = 0; index < NK_FONT_LATIN_INDEX_COUNT; index++) latin_selected[index] = -1;
+
+    if (!result || !folder || !*folder) {
+        font_copy_text(out_error, error_len, "no folder was given");
+        return false;
+    }
+    memset(result, 0, sizeof(*result));
+    memset(&scan, 0, sizeof(scan));
+    if (!nk_platform_list_files(folder, font_collect_pgf, &scan)) {
+        font_copy_text(out_error, error_len, "the folder cannot be read");
+        return false;
+    }
+    if (scan.overflow) {
+        snprintf(out_error, error_len, "the folder holds more than %d .pgf files", NK_FONT_IMPORT_MAX_FILES);
+        return false;
+    }
+    if (scan.count == 0) {
+        font_copy_text(out_error, error_len, "no .pgf files are in the folder");
+        return false;
+    }
+    font_sort_names(&scan);
+    if (!nk_font_get_cache_dir(user_data_root, cache_dir, sizeof(cache_dir)) ||
+        !nk_platform_mkdir_p_private(cache_dir)) {
+        font_copy_text(out_error, error_len, "the PSP font cache folder cannot be created");
+        return false;
+    }
+
+    /* Read and classify every candidate. Only the metadata is kept; the bytes are read again
+     * for the chosen file, so the copy is the file that was checked. */
+    result->file_count = scan.count;
+    for (int i = 0; i < scan.count; i++) {
+        char path[NK_MAX_PATH * 2];
+        uint8_t *bytes = NULL;
+        size_t length = 0;
+        char error[NK_FONT_DETAIL_MAX] = "";
+        NkFontFileOutcome *outcome = &result->files[i];
+        snprintf(outcome->name, sizeof(outcome->name), "%s", scan.names[i]);
+        outcome->slot = -1;
+        outcome->latin_index = -1;
+        font_join(path, sizeof(path), folder, scan.names[i]);
+        if (!font_read_file(path, &bytes, &length, error, sizeof(error))) {
+            snprintf(outcome->detail, sizeof(outcome->detail), "refused: %s", error);
+            continue;
+        }
+        if (!font_inspect_bytes(bytes, length, &inspections[i])) {
+            snprintf(outcome->detail, sizeof(outcome->detail), "refused: %s", inspections[i].slot_reason);
+        } else if (inspections[i].slot < 0) {
+            snprintf(outcome->detail, sizeof(outcome->detail), "refused: %s", inspections[i].slot_reason);
+        } else {
+            int latin_index = nk_font_latin_index_from_filename(scan.names[i]);
+            if (latin_index >= 0) {
+                if (inspections[i].slot != NK_FONT_SLOT_LATIN) {
+                    snprintf(outcome->detail, sizeof(outcome->detail),
+                             "refused: %s does not name a Latin font", kLatinIndexFile[latin_index]);
+                } else {
+                    outcome->slot = NK_FONT_SLOT_LATIN;
+                    outcome->latin_index = latin_index;
+                    snprintf(outcome->detail, sizeof(outcome->detail),
+                             "names Latin index %d", latin_index + 1);
+                    latin_candidates[latin_index][latin_candidate_count[latin_index]++] = i;
+                }
+            } else {
+                outcome->slot = inspections[i].slot;
+                snprintf(outcome->detail, sizeof(outcome->detail), "names the %s slot", kSlotRole[outcome->slot]);
+                candidates[outcome->slot][candidate_count[outcome->slot]++] = i;
+            }
+        }
+        free(bytes);
+    }
+
+    /* Choose one file per slot: the named choice, else the only candidate. A slot with several
+     * candidates and no choice is left alone. */
+    for (int slot = 0; slot < NK_FONT_SLOT_COUNT; slot++) {
+        const char *want = choose ? choose[slot] : NULL;
+        if (want && *want) {
+            bool found = false;
+            for (int c = 0; c < candidate_count[slot]; c++) {
+                int index = candidates[slot][c];
+                if (strcmp(result->files[index].name, want) == 0) {
+                    selected[slot] = index;
+                    found = true;
+                }
+            }
+            if (!found) {
+                snprintf(out_error, error_len, "the chosen %s file does not name that slot", kSlotRole[slot]);
+                for (int s = 0; s < NK_FONT_SLOT_COUNT; s++) free(bytes_for_slot[s]);
+                return false;
+            }
+        } else if (candidate_count[slot] == 1) {
+            selected[slot] = candidates[slot][0];
+        } else if (candidate_count[slot] > 1) {
+            for (int c = 0; c < candidate_count[slot]; c++) {
+                NkFontFileOutcome *outcome = &result->files[candidates[slot][c]];
+                snprintf(outcome->detail, sizeof(outcome->detail),
+                         "not imported: %d files name the %s slot; choose one",
+                         candidate_count[slot], kSlotRole[slot]);
+            }
+        }
+        if (selected[slot] >= 0) {
+            for (int c = 0; c < candidate_count[slot]; c++) {
+                NkFontFileOutcome *outcome = &result->files[candidates[slot][c]];
+                if (candidates[slot][c] != selected[slot]) {
+                    snprintf(outcome->detail, sizeof(outcome->detail), "not chosen for the %s slot",
+                             kSlotRole[slot]);
+                }
+            }
+        }
+    }
+
+    /* The firmware filenames themselves select the Latin registry index. Duplicate names that
+     * differ only in case are ambiguous and remain unimported instead of silently choosing one. */
+    for (int index = 0; index < NK_FONT_LATIN_INDEX_COUNT; index++) {
+        if (latin_candidate_count[index] == 1) {
+            latin_selected[index] = latin_candidates[index][0];
+        } else if (latin_candidate_count[index] > 1) {
+            for (int c = 0; c < latin_candidate_count[index]; c++) {
+                NkFontFileOutcome *outcome = &result->files[latin_candidates[index][c]];
+                snprintf(outcome->detail, sizeof(outcome->detail),
+                         "not imported: multiple files name Latin index %d", index + 1);
+            }
+        }
+    }
+
+    /* Read each chosen file once more, check the bytes that will be copied, and stage them. */
+    for (int slot = 0; slot < NK_FONT_SLOT_COUNT; slot++) {
+        char source[NK_MAX_PATH * 2];
+        char error[NK_FONT_DETAIL_MAX] = "";
+        NkFontInspection checked;
+        if (selected[slot] < 0) continue;
+        font_join(source, sizeof(source), folder, result->files[selected[slot]].name);
+        if (!font_read_file(source, &bytes_for_slot[slot], &length_for_slot[slot], error, sizeof(error)) ||
+            !font_inspect_bytes(bytes_for_slot[slot], length_for_slot[slot], &checked) ||
+            checked.slot != slot ||
+            strcmp(checked.sha256, inspections[selected[slot]].sha256) != 0) {
+            snprintf(out_error, error_len, "the chosen %s file changed or failed its check; try again", kSlotRole[slot]);
+            for (int s = 0; s < NK_FONT_SLOT_COUNT; s++) free(bytes_for_slot[s]);
+            return false;
+        }
+    }
+
+    for (int index = 0; index < NK_FONT_LATIN_INDEX_COUNT; index++) {
+        char source[NK_MAX_PATH * 2];
+        char target[NK_MAX_PATH * 2];
+        char staged[NK_MAX_PATH * 2];
+        char error[NK_FONT_DETAIL_MAX] = "";
+        NkFontInspection checked;
+        uint8_t *bytes = NULL;
+        size_t length = 0;
+        if (latin_selected[index] < 0) continue;
+        font_join(source, sizeof(source), folder, result->files[latin_selected[index]].name);
+        if (!font_read_file(source, &bytes, &length, error, sizeof(error)) ||
+            !font_inspect_bytes(bytes, length, &checked) ||
+            checked.slot != NK_FONT_SLOT_LATIN ||
+            strcmp(checked.sha256, inspections[latin_selected[index]].sha256) != 0) {
+            snprintf(out_error, error_len,
+                     "the chosen Latin index %d file changed or failed its check; try again", index + 1);
+            for (int s = 0; s < NK_FONT_SLOT_COUNT; s++) free(bytes_for_slot[s]);
+            free(bytes);
+            for (int i = 0; i < index; i++) {
+                char earlier[NK_MAX_PATH * 2], earlier_tmp[NK_MAX_PATH * 2];
+                font_join(earlier, sizeof(earlier), cache_dir, kLatinIndexFile[i]);
+                font_staging_name(earlier_tmp, sizeof(earlier_tmp), earlier);
+                nk_remove_utf8(earlier_tmp);
+            }
+            return false;
+        }
+        font_join(target, sizeof(target), cache_dir, kLatinIndexFile[index]);
+        font_staging_name(staged, sizeof(staged), target);
+        if (!font_write_bytes(staged, bytes, length)) {
+            snprintf(out_error, error_len,
+                     "the indexed Latin font %d could not be staged in the cache", index + 1);
+            for (int s = 0; s < NK_FONT_SLOT_COUNT; s++) free(bytes_for_slot[s]);
+            free(bytes);
+            for (int i = 0; i <= index; i++) {
+                char earlier[NK_MAX_PATH * 2], earlier_tmp[NK_MAX_PATH * 2];
+                font_join(earlier, sizeof(earlier), cache_dir, kLatinIndexFile[i]);
+                font_staging_name(earlier_tmp, sizeof(earlier_tmp), earlier);
+                nk_remove_utf8(earlier_tmp);
+            }
+            return false;
+        }
+        free(bytes);
+    }
+
+    /* Merge into the manifest: keep the entries for slots this run does not change. */
+    manifest_status = font_load_manifest(cache_dir, &manifest, manifest_message, sizeof(manifest_message));
+    if (manifest_status != NK_FONT_STATUS_OK) memset(&manifest, 0, sizeof(manifest));
+    for (int slot = 0; slot < NK_FONT_SLOT_COUNT; slot++) {
+        char target[NK_MAX_PATH * 2];
+        char staged[NK_MAX_PATH * 2];
+        if (selected[slot] < 0) continue;
+        font_join(target, sizeof(target), cache_dir, kSlotFile[slot]);
+        font_staging_name(staged, sizeof(staged), target);
+        if (!font_write_bytes(staged, bytes_for_slot[slot], length_for_slot[slot])) {
+            for (int s = 0; s < NK_FONT_SLOT_COUNT; s++) {
+                char target_path[NK_MAX_PATH * 2];
+                char left[NK_MAX_PATH * 2];
+                font_join(target_path, sizeof(target_path), cache_dir, kSlotFile[s]);
+                font_staging_name(left, sizeof(left), target_path);
+                nk_remove_utf8(left);
+            }
+            for (int i = 0; i < NK_FONT_LATIN_INDEX_COUNT; i++) {
+                char target_path[NK_MAX_PATH * 2];
+                char left[NK_MAX_PATH * 2];
+                font_join(target_path, sizeof(target_path), cache_dir, kLatinIndexFile[i]);
+                font_staging_name(left, sizeof(left), target_path);
+                nk_remove_utf8(left);
+            }
+            font_copy_text(out_error, error_len, "the font could not be written to the cache");
+            for (int s = 0; s < NK_FONT_SLOT_COUNT; s++) free(bytes_for_slot[s]);
+            return false;
+        }
+    }
+    for (int slot = 0; slot < NK_FONT_SLOT_COUNT; slot++) {
+        char target[NK_MAX_PATH * 2];
+        char staged[NK_MAX_PATH * 2];
+        if (selected[slot] < 0) continue;
+        font_join(target, sizeof(target), cache_dir, kSlotFile[slot]);
+        font_staging_name(staged, sizeof(staged), target);
+        if (nk_rename_utf8(staged, target) != 0) {
+            nk_remove_utf8(staged);
+            for (int i = 0; i < NK_FONT_LATIN_INDEX_COUNT; i++) {
+                char target_path[NK_MAX_PATH * 2];
+                char left[NK_MAX_PATH * 2];
+                font_join(target_path, sizeof(target_path), cache_dir, kLatinIndexFile[i]);
+                font_staging_name(left, sizeof(left), target_path);
+                nk_remove_utf8(left);
+            }
+            font_copy_text(out_error, error_len, "the font could not be committed to the cache");
+            for (int s = 0; s < NK_FONT_SLOT_COUNT; s++) free(bytes_for_slot[s]);
+            return false;
+        }
+        manifest.present[slot] = true;
+        manifest.size[slot] = inspections[selected[slot]].size;
+        snprintf(manifest.sha256[slot], sizeof(manifest.sha256[slot]), "%s", inspections[selected[slot]].sha256);
+        result->slot_imported[slot] = true;
+        result->imported_count++;
+        result->files[selected[slot]].imported = true;
+        snprintf(result->files[selected[slot]].detail, sizeof(result->files[selected[slot]].detail),
+                 "imported as the %s font", kSlotRole[slot]);
+    }
+    for (int index = 0; index < NK_FONT_LATIN_INDEX_COUNT; index++) {
+        char target[NK_MAX_PATH * 2];
+        char staged[NK_MAX_PATH * 2];
+        if (latin_selected[index] < 0) continue;
+        font_join(target, sizeof(target), cache_dir, kLatinIndexFile[index]);
+        font_staging_name(staged, sizeof(staged), target);
+        if (nk_rename_utf8(staged, target) != 0) {
+            nk_remove_utf8(staged);
+            for (int i = index + 1; i < NK_FONT_LATIN_INDEX_COUNT; i++) {
+                char target_path[NK_MAX_PATH * 2];
+                char left[NK_MAX_PATH * 2];
+                font_join(target_path, sizeof(target_path), cache_dir, kLatinIndexFile[i]);
+                font_staging_name(left, sizeof(left), target_path);
+                nk_remove_utf8(left);
+            }
+            font_copy_text(out_error, error_len,
+                           "the indexed Latin font could not be committed to the cache");
+            for (int s = 0; s < NK_FONT_SLOT_COUNT; s++) free(bytes_for_slot[s]);
+            return false;
+        }
+        manifest.latin_index_present[index] = true;
+        manifest.latin_index_size[index] = inspections[latin_selected[index]].size;
+        snprintf(manifest.latin_index_sha256[index], sizeof(manifest.latin_index_sha256[index]),
+                 "%s", inspections[latin_selected[index]].sha256);
+        result->latin_index_imported[index] = true;
+        result->imported_count++;
+        result->files[latin_selected[index]].imported = true;
+        snprintf(result->files[latin_selected[index]].detail,
+                 sizeof(result->files[latin_selected[index]].detail),
+                 "imported as Latin index %d", index + 1);
+    }
+    for (int s = 0; s < NK_FONT_SLOT_COUNT; s++) free(bytes_for_slot[s]);
+    if (result->imported_count > 0 && !font_write_manifest(cache_dir, &manifest)) {
+        font_copy_text(out_error, error_len, "the font manifest could not be written");
+        return false;
+    }
+    return true;
+}
+
+/* Append text to a bounded message, keeping what is already there. */
+static void font_append_text(char *out, size_t out_len, const char *text) {
+    size_t used;
+    if (!out || out_len == 0) return;
+    used = strlen(out);
+    if (used >= out_len) return;
+    snprintf(out + used, out_len - used, "%s", text);
+}
+
+/* Add one problem to a removal's failure text, separated from the problem before it. */
+static void font_add_problem(char *problems, size_t problems_len, const char *text) {
+    if (problems[0] != '\0') font_append_text(problems, problems_len, "; ");
+    font_append_text(problems, problems_len, text);
+}
+
+int nk_font_remove_imports(const char *user_data_root,
+                           const bool remove[NK_FONT_SLOT_COUNT],
+                           char *out_error, size_t error_len) {
+    char cache_dir[NK_MAX_PATH];
+    char manifest_path[NK_MAX_PATH * 2];
+    FontManifest manifest;
+    char message[NK_FONT_TEXT_MAX] = "";
+    char problems[NK_FONT_TEXT_MAX] = "";
+    NkFontStatus status;
+    int removed = 0;
+    int dropped = 0;
+    int failed = 0;
+    if (!remove) {
+        font_copy_text(out_error, error_len, "no slot was named");
+        return -1;
+    }
+    if (!nk_font_get_cache_dir(user_data_root, cache_dir, sizeof(cache_dir))) {
+        font_copy_text(out_error, error_len, "PSP font cache location is unavailable");
+        return -1;
+    }
+    font_join(manifest_path, sizeof(manifest_path), cache_dir, NK_FONT_MANIFEST_NAME);
+    status = font_load_manifest(cache_dir, &manifest, message, sizeof(message));
+    /* A named slot's entry is dropped only once its file is gone: deleted now, or absent
+     * already. A file that is still there after the delete failed keeps its entry, so the
+     * manifest keeps describing the cache, and the other named slots are still processed. The
+     * cache folder holds only this flow's slot files, so a named slot's file is removed even
+     * when the manifest is unreadable. */
+    for (int slot = 0; slot < NK_FONT_SLOT_COUNT; slot++) {
+        char path[NK_MAX_PATH * 2];
+        char line[NK_FONT_DETAIL_MAX];
+        if (!remove[slot]) continue;
+        font_join(path, sizeof(path), cache_dir, kSlotFile[slot]);
+        if (nk_remove_utf8(path) == 0) {
+            removed++;
+        } else if (!nk_platform_path_missing(path)) {
+            failed++;
+            snprintf(line, sizeof(line),
+                     "could not delete the %s font file %s, which is still in the cache and keeps its manifest entry",
+                     kSlotRole[slot], kSlotFile[slot]);
+            font_add_problem(problems, sizeof(problems), line);
+            continue;
+        }
+        if (manifest.present[slot]) {
+            manifest.present[slot] = false;
+            dropped++;
+        }
+    }
+    if (remove[NK_FONT_SLOT_LATIN]) {
+        for (int index = 0; index < NK_FONT_LATIN_INDEX_COUNT; index++) {
+            char path[NK_MAX_PATH * 2];
+            char line[NK_FONT_DETAIL_MAX];
+            font_join(path, sizeof(path), cache_dir, kLatinIndexFile[index]);
+            if (nk_remove_utf8(path) == 0) {
+                removed++;
+            } else if (!nk_platform_path_missing(path)) {
+                failed++;
+                snprintf(line, sizeof(line),
+                         "could not delete Latin index %d file %s, which is still in the cache and keeps its manifest entry",
+                         index + 1, kLatinIndexFile[index]);
+                font_add_problem(problems, sizeof(problems), line);
+                continue;
+            }
+            if (manifest.latin_index_present[index]) {
+                manifest.latin_index_present[index] = false;
+                dropped++;
+            }
+        }
+    }
+    /* The manifest is rewritten only when an entry was dropped, so a call that changes nothing
+     * leaves its bytes as they are. An unreadable manifest is removed, as before, unless a named
+     * file stayed; it is then left in place, since its entries cannot be rewritten faithfully. */
+    if (status == NK_FONT_STATUS_OK && dropped > 0) {
+        bool any_left = false;
+        for (int slot = 0; slot < NK_FONT_SLOT_COUNT; slot++) if (manifest.present[slot]) any_left = true;
+        for (int index = 0; index < NK_FONT_LATIN_INDEX_COUNT; index++)
+            if (manifest.latin_index_present[index]) any_left = true;
+        if (any_left) {
+            if (!font_write_manifest(cache_dir, &manifest)) {
+                font_add_problem(problems, sizeof(problems),
+                                 "the font manifest could not be rewritten, so it still lists the removed fonts");
+            }
+        } else if (nk_platform_file_exists(manifest_path) && nk_remove_utf8(manifest_path) != 0) {
+            font_add_problem(problems, sizeof(problems), "the font manifest could not be removed");
+        }
+    } else if (status != NK_FONT_STATUS_OK && failed == 0) {
+        if (nk_platform_file_exists(manifest_path) && nk_remove_utf8(manifest_path) != 0) {
+            font_add_problem(problems, sizeof(problems), "the font manifest could not be removed");
+        }
+    }
+    if (problems[0] != '\0') {
+        char text[NK_FONT_TEXT_MAX + 64];
+        if (removed > 0) {
+            snprintf(text, sizeof(text), "removed %d font file(s); %s", removed, problems);
+        } else {
+            snprintf(text, sizeof(text), "%s", problems);
+        }
+        font_copy_text(out_error, error_len, text);
+        return -1;
+    }
+    return removed;
+}
+
+bool nk_font_resolve_directory(const char *user_data_root,
+                               const char *fallback_root,
+                               char *out_dir,
+                               size_t max_len) {
+    char cache_dir[NK_MAX_PATH];
+    char message[NK_FONT_TEXT_MAX] = "";
+    if (!out_dir || max_len == 0) return false;
+    if (nk_font_check_cache(user_data_root, message, sizeof(message)) == NK_FONT_STATUS_OK &&
+        nk_font_get_cache_dir(user_data_root, cache_dir, sizeof(cache_dir))) {
+        snprintf(out_dir, max_len, "%s", cache_dir);
+        return true;
+    }
+    if (fallback_root && *fallback_root) {
+        char fpath[NK_MAX_PATH * 2];
+        snprintf(fpath, sizeof(fpath), "%s%c%s", fallback_root, nk_platform_path_separator(), NK_FONT_PROJECT_SUBDIR);
+        if (nk_platform_dir_exists(fpath)) {
+            char abs_font[NK_MAX_PATH];
+            if (nk_platform_absolute_path(fpath, abs_font, sizeof(abs_font))) {
+                snprintf(out_dir, max_len, "%s", abs_font);
+            } else {
+                snprintf(out_dir, max_len, "%s", fpath);
+            }
+            return true;
+        }
+    }
+    return false;
+}

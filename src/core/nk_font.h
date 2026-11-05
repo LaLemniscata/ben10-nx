@@ -1,0 +1,226 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 the Nakagawa Recomp authors */
+
+#ifndef NK_FONT_H
+#define NK_FONT_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "../rt/pgf_api.h"
+#include "nk_font_slots.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    NK_FONT_STATUS_OK = 0,
+    NK_FONT_STATUS_MISSING,
+    NK_FONT_STATUS_INVALID
+} NkFontStatus;
+
+/* Where a slot's font comes from. Served in this order: the user's imported font, then the
+ * project's font, then a named refusal (NK_FONT_SOURCE_NONE). */
+typedef enum {
+    NK_FONT_SOURCE_NONE = 0,
+    NK_FONT_SOURCE_USER,
+    NK_FONT_SOURCE_PROJECT
+} NkFontSource;
+
+#define NK_FONT_DETAIL_MAX 512
+/* Plain-language status text: a per-slot detail or a per-file outcome. */
+#define NK_FONT_TEXT_MAX 1024
+#define NK_FONT_IMPORT_MAX_FILES 64
+
+typedef struct {
+    NkFontSource source;
+    char detail[NK_FONT_TEXT_MAX];
+} NkFontSlotState;
+
+/* A registry Latin index resolves to its exact imported PGF, the nearest imported PGF in
+ * the same nominal-size group, a legacy file when it is the cache's only Latin import, the
+ * project PGF, or a legacy file as a last fallback when the project PGF is absent. served_index
+ * is 0..15 for an indexed cache file, -1 for the project PGF, -2 for the legacy unindexed cache
+ * entry, and -3 when no source exists. project_file names the served file for the project PGF, and
+ * is NULL otherwise. */
+typedef struct {
+    NkFontSource source;
+    int served_index;
+    const char *project_file;
+} NkFontLatinResolution;
+
+typedef struct {
+    NkFontSource source;
+    int served_index; /* as in NkFontLatinResolution */
+    char detail[160];
+} NkFontLatinIndexState;
+
+/* One PGF file read and checked: the reader's verdict, the file's size and SHA-256, and the
+ * slot it names (or -1 with the reason in slot_reason). */
+typedef struct {
+    uint64_t size;
+    char sha256[65];
+    PgfVerdict verdict;
+    int slot;
+    char slot_reason[NK_FONT_DETAIL_MAX];
+} NkFontInspection;
+
+/* Read one PGF file (at most NK_FONT_PGF_MAX_BYTES) and check it with the native reader and
+ * the slot rule. Returns false with out_error naming the failure. */
+bool nk_font_inspect_pgf(const char *file_path, NkFontInspection *out,
+                         char *out_error, size_t error_len);
+
+/* Structurally validate a PGF font file with the native reader. Computes the file size and
+ * lowercase SHA-256 hex string (65 bytes including NUL). Returns false with a diagnostic
+ * in out_error when the reader refuses the file. */
+bool nk_font_validate_pgf(const char *file_path, uint64_t *out_size,
+                          char *out_sha256, char *out_error, size_t error_len);
+
+/* Retrieve the per-user font cache directory (<user_data_root>/fonts/v2). The per-user data
+ * directory is the one font root: the importer, the launcher and the runtime all read it. If
+ * user_data_root is NULL or empty, queries nk_platform_get_path(NK_PATH_DATA). */
+bool nk_font_get_cache_dir(const char *user_data_root, char *out_dir, size_t max_len);
+
+/* Check the imported-font manifest in the cache. MISSING: no manifest. INVALID: the manifest
+ * or a listed file is malformed, mismatched, or refused by the reader. OK: every listed
+ * file validates and names its slot. */
+NkFontStatus nk_font_check_cache(const char *user_data_root,
+                                 char *out_message,
+                                 size_t message_max_len);
+
+/* The verdict for one slot of the cache. OK: the manifest lists the slot and the file checks.
+ * NO_MANIFEST: the cache has no manifest. MANIFEST_INVALID: the manifest is unreadable, malformed,
+ * another schema, or lists an entry this build does not accept. NOT_LISTED: the manifest is valid
+ * and does not list the slot. FILE_INVALID: the listed file is unreadable, refused by the reader,
+ * names another slot, or differs from its recorded size or SHA-256. */
+typedef enum {
+    NK_FONT_SLOT_CHECK_OK = 0,
+    NK_FONT_SLOT_CHECK_NO_MANIFEST,
+    NK_FONT_SLOT_CHECK_MANIFEST_INVALID,
+    NK_FONT_SLOT_CHECK_NOT_LISTED,
+    NK_FONT_SLOT_CHECK_FILE_INVALID
+} NkFontSlotCheck;
+
+/* Vouch for one slot's cache file as the import flow does: the manifest in user_data_root's
+ * cache directory (the same directory nk_font_get_cache_dir names) must be valid and list the
+ * slot, and the bytes of cache_file must match its recorded size and SHA-256 and be accepted by
+ * the reader as that slot. cache_file must be an open handle on that slot's cache file. Its bytes
+ * are read from the start, the handle is left at its start, and the file is hashed on every call.
+ * reason must point to reason_len bytes the caller owns; it receives plain text for the caller to
+ * name, on every verdict. */
+NkFontSlotCheck nk_font_check_cache_slot_file(const char *user_data_root, NkFontSlot slot,
+                                              FILE *cache_file, char *reason, size_t reason_len);
+
+/* Firmware Latin files are named ltn0.pgf through ltn15.pgf. The filename helper accepts
+ * ASCII case variants and returns the file ordinal 0..15, or -1 when the name is not one of
+ * those sixteen files. */
+const char *nk_font_latin_index_filename(int index);
+int nk_font_latin_index_from_filename(const char *name);
+/* The file name a PSP keeps the Japanese or Korean system font under in flash0:/font
+ * (jpn0.pgf, kr0.pgf), which the slot's served name stands for. NULL for the Latin slot, whose
+ * sixteen files nk_font_latin_index_filename names, and for any other value. */
+const char *nk_font_slot_psp_filename(NkFontSlot slot);
+NkFontSlotCheck nk_font_check_cache_latin_index_file(const char *user_data_root, int index,
+                                                      FILE *cache_file, char *reason,
+                                                      size_t reason_len);
+
+/* Resolve one registry Latin index in this order: exact imported file, nearest imported file in
+ * its eight-index size group (lower index wins a tie), an old single-file import when it is the
+ * cache's only Latin import, project Latin PGF, then a legacy unindexed import as a last fallback
+ * when the project PGF is unavailable. */
+bool nk_font_resolve_latin_index(const char *user_data_root, const char *project_font_dir,
+                                 int index, NkFontLatinResolution *out);
+void nk_font_latin_index_states(const char *user_data_root, const char *project_font_dir,
+                                NkFontLatinIndexState states[NK_FONT_LATIN_INDEX_COUNT]);
+
+/* Per-slot preflight: the user's imported font when it validates, else the project font
+ * at <project_root>/font/<slot file> when it validates, else NONE with the reason. */
+void nk_font_slot_states(const char *user_data_root, const char *project_root,
+                         NkFontSlotState states[NK_FONT_SLOT_COUNT]);
+
+/* Name the slot for an accepted verdict (the rule the import flow applies). Returns the
+ * slot, or -1 with the reason in reason. */
+int nk_font_classify_verdict(const PgfVerdict *verdict, char *reason, size_t reason_len);
+
+/* Two ways a PSP connected by USB shows its fonts as a drive on the PC:
+ *  - custom firmware shows the PSP's system storage itself, read-only: the fonts are in
+ *    <root>/font, next to the system folders <root>/kd and <root>/vsh (docs/SETUP.md, "Copying
+ *    the fonts from your PSP");
+ *  - Nakagawa Font Copy (src/psp_companion) copies them to the Memory Stick: <root>/NAKAGAWA/fonts. */
+#define NK_FONT_PSP_SYSTEM_FOLDER "font"
+#define NK_FONT_PSP_SYSTEM_MARK_A "kd"
+#define NK_FONT_PSP_SYSTEM_MARK_B "vsh"
+#define NK_FONT_PSP_COPY_PARENT "NAKAGAWA"
+#define NK_FONT_PSP_COPY_FOLDER "fonts"
+
+/* Look under each of roots, in order, for a PSP's font folder (the system storage's font folder
+ * first, then the Font Copy folder) holding at least one .pgf file directly inside it. The first
+ * such folder is written to out (empty when none); returns how many roots have one. A folder
+ * whose path does not fit out is skipped. Nothing is read but folder listings. */
+int nk_font_find_psp_folder_in(const char *const *roots, int root_count, char *out,
+                               size_t out_len);
+
+/* The same over the drives mounted now (nk_platform_list_drive_roots). */
+int nk_font_find_psp_folder(char *out, size_t out_len);
+
+/* How many of the eighteen PSP system fonts (Japanese, Korean and the sixteen Latin registry
+ * indices) are served by the user's own import of exactly that font, not a stand-in. */
+int nk_font_own_font_count(const char *user_data_root, const char *project_root);
+#define NK_FONT_PSP_FONT_COUNT (NK_FONT_LATIN_INDEX_COUNT + 2)
+
+/* One file the import considered. imported is true when this file's bytes now serve the
+ * slot named by slot. */
+typedef struct {
+    char name[256];
+    int slot;
+    int latin_index; /* 0..15 for a named ltnN.pgf, or -1 for a generic file */
+    bool imported;
+    char detail[NK_FONT_TEXT_MAX];
+} NkFontFileOutcome;
+
+typedef struct {
+    int file_count;
+    NkFontFileOutcome files[NK_FONT_IMPORT_MAX_FILES];
+    bool slot_imported[NK_FONT_SLOT_COUNT];
+    bool latin_index_imported[NK_FONT_LATIN_INDEX_COUNT];
+    int imported_count;
+} NkFontImportResult;
+
+/* Import the .pgf files directly inside folder (not subfolders). Each file is read and checked
+ * by the native reader. ltn0.pgf..ltn15.pgf select their exact Latin indices; other files use
+ * coverage classification and choose[slot] for generic slots. A generic slot named by several
+ * files with no choice is not imported. Selected files are copied into the cache and the
+ * manifest is rewritten; originals are not touched. Returns false with out_error when the
+ * folder cannot be read or holds no .pgf. */
+bool nk_font_import_folder(const char *user_data_root, const char *folder,
+                           const char *const choose[NK_FONT_SLOT_COUNT],
+                           NkFontImportResult *result, char *out_error, size_t error_len);
+
+/* Remove the imported font for each slot with remove[slot] set. Deletes only the cache's slot
+ * files. A slot's manifest entry is dropped once its file is gone, deleted now or already
+ * absent; a file that cannot be deleted keeps its entry, and the other named slots are still
+ * processed. The manifest is rewritten only when an entry was dropped, and removed when no
+ * entry is left. Returns the number of slot files removed. Returns -1 with out_error when a
+ * named file could not be deleted or the manifest could not be rewritten or removed; out_error
+ * then names each file that stayed and the manifest problem, and gives the count of files that
+ * were removed when there were any. */
+int nk_font_remove_imports(const char *user_data_root,
+                           const bool remove[NK_FONT_SLOT_COUNT],
+                           char *out_error, size_t error_len);
+
+/* Resolve the active font directory for runtime launch. user_data_root is the per-user data
+ * directory, the same root the import writes; a runtime root does not move it. If the cache
+ * manifest is OK, resolves <user_data_root>/fonts/v2; else <fallback_root>/font when it exists. */
+bool nk_font_resolve_directory(const char *user_data_root,
+                               const char *fallback_root,
+                               char *out_dir,
+                               size_t max_len);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* NK_FONT_H */

@@ -1,0 +1,2590 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 the Nakagawa Recomp authors */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include "nk_input_profile.h"
+#include "nk_json.h"
+#include "nk_platform.h"
+#include "nk_user_data_schema.h"
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
+/* -----------------------------------------------------------------------------
+ * String Helpers
+ * -------------------------------------------------------------------------- */
+
+static int nk_ascii_lower(int c) {
+    return (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c;
+}
+
+static int nk_ascii_casecmp(const char *a, const char *b) {
+    if (!a || !b) return a == b ? 0 : (a ? 1 : -1);
+    while (*a && *b) {
+        int ca = nk_ascii_lower((unsigned char)*a);
+        int cb = nk_ascii_lower((unsigned char)*b);
+        if (ca != cb) return ca - cb;
+        a++;
+        b++;
+    }
+    return nk_ascii_lower((unsigned char)*a) - nk_ascii_lower((unsigned char)*b);
+}
+
+static FILE *nk_input_fopen(const char *path, const char *mode) {
+#if defined(_WIN32) || defined(_WIN64)
+    if (!path || !mode) return NULL;
+    WCHAR wpath[32768];
+    WCHAR wmode[32];
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1,
+                            wpath, (int)(sizeof(wpath) / sizeof(wpath[0]))) <= 0 ||
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, mode, -1,
+                            wmode, (int)(sizeof(wmode) / sizeof(wmode[0]))) <= 0) {
+        return NULL;
+    }
+    return _wfopen(wpath, wmode);
+#else
+    return fopen(path, mode);
+#endif
+}
+
+static void diag_set(char *buf, size_t sz, const char *fmt, ...) {
+    if (!buf || sz == 0) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sz, fmt, ap);
+    va_end(ap);
+}
+
+/* -----------------------------------------------------------------------------
+ * Name Registries
+ * -------------------------------------------------------------------------- */
+
+static const struct {
+    NkPspButton btn;
+    const char *name;
+    uint32_t mask;
+} kPspButtons[] = {
+    { NK_PSP_BTN_SELECT,   "select",   0x0001 },
+    { NK_PSP_BTN_START,    "start",    0x0008 },
+    { NK_PSP_BTN_UP,       "up",       0x0010 },
+    { NK_PSP_BTN_RIGHT,    "right",    0x0020 },
+    { NK_PSP_BTN_DOWN,     "down",     0x0040 },
+    { NK_PSP_BTN_LEFT,     "left",     0x0080 },
+    { NK_PSP_BTN_LTRIGGER, "ltrigger", 0x0100 },
+    { NK_PSP_BTN_RTRIGGER, "rtrigger", 0x0200 },
+    { NK_PSP_BTN_TRIANGLE, "triangle", 0x1000 },
+    { NK_PSP_BTN_CIRCLE,   "circle",   0x2000 },
+    { NK_PSP_BTN_CROSS,    "cross",    0x4000 },
+    { NK_PSP_BTN_SQUARE,   "square",   0x8000 },
+    { NK_PSP_BTN_HOME,     "home",     0x010000 },
+    { NK_PSP_BTN_HOLD,     "hold",     0x020000 }
+};
+
+static const struct {
+    NkPspStickDir dir;
+    const char *name;
+} kPspStickDirs[] = {
+    { NK_PSP_STICK_UP,    "stick_up" },
+    { NK_PSP_STICK_DOWN,  "stick_down" },
+    { NK_PSP_STICK_LEFT,  "stick_left" },
+    { NK_PSP_STICK_RIGHT, "stick_right" }
+};
+
+/* The keyboard controls are the 14 buttons followed by the 4 stick directions. A key
+ * drives at most one of them, so validation and the JSON parser number them in one
+ * space: 0..NK_PSP_BTN_COUNT-1 are buttons, then the stick directions. */
+#define NK_KEY_CONTROL_COUNT (NK_PSP_BTN_COUNT + NK_PSP_STICK_DIR_COUNT)
+
+static const NkKeyBinding *key_control_binding(const NkInputProfile *profile, int control) {
+    return control < NK_PSP_BTN_COUNT ? &profile->psp_keys[control]
+                                      : &profile->stick_keys[control - NK_PSP_BTN_COUNT];
+}
+
+static const char *key_control_name(int control) {
+    return control < NK_PSP_BTN_COUNT
+               ? nk_psp_button_name((NkPspButton)control)
+               : nk_psp_stick_dir_name((NkPspStickDir)(control - NK_PSP_BTN_COUNT));
+}
+
+static const struct {
+    NkPspAxis axis;
+    const char *name;
+} kPspAxes[] = {
+    { NK_PSP_AXIS_ANALOG_X, "analog_x" },
+    { NK_PSP_AXIS_ANALOG_Y, "analog_y" }
+};
+
+static const struct {
+    NkHostGamepadButton btn;
+    const char *name;
+} kHostButtons[] = {
+    { NK_HOST_BUTTON_SOUTH,          "south" },
+    { NK_HOST_BUTTON_EAST,           "east" },
+    { NK_HOST_BUTTON_WEST,           "west" },
+    { NK_HOST_BUTTON_NORTH,          "north" },
+    { NK_HOST_BUTTON_BACK,           "back" },
+    { NK_HOST_BUTTON_GUIDE,          "guide" },
+    { NK_HOST_BUTTON_START,          "start" },
+    { NK_HOST_BUTTON_LEFT_STICK,     "left_stick" },
+    { NK_HOST_BUTTON_RIGHT_STICK,    "right_stick" },
+    { NK_HOST_BUTTON_LEFT_SHOULDER,  "left_shoulder" },
+    { NK_HOST_BUTTON_RIGHT_SHOULDER, "right_shoulder" },
+    { NK_HOST_BUTTON_DPAD_UP,        "dpad_up" },
+    { NK_HOST_BUTTON_DPAD_DOWN,      "dpad_down" },
+    { NK_HOST_BUTTON_DPAD_LEFT,      "dpad_left" },
+    { NK_HOST_BUTTON_DPAD_RIGHT,     "dpad_right" },
+    { NK_HOST_BUTTON_MISC1,          "misc1" },
+    { NK_HOST_BUTTON_RIGHT_PADDLE1,  "right_paddle1" },
+    { NK_HOST_BUTTON_LEFT_PADDLE1,   "left_paddle1" },
+    { NK_HOST_BUTTON_RIGHT_PADDLE2,  "right_paddle2" },
+    { NK_HOST_BUTTON_LEFT_PADDLE2,   "left_paddle2" },
+    { NK_HOST_BUTTON_TOUCHPAD,       "touchpad" }
+};
+
+static const struct {
+    NkHostGamepadAxis axis;
+    const char *name;
+} kHostAxes[] = {
+    { NK_HOST_AXIS_LEFTX,         "leftx" },
+    { NK_HOST_AXIS_LEFTY,         "lefty" },
+    { NK_HOST_AXIS_RIGHTX,        "rightx" },
+    { NK_HOST_AXIS_RIGHTY,        "righty" },
+    { NK_HOST_AXIS_LEFT_TRIGGER,  "left_trigger" },
+    { NK_HOST_AXIS_RIGHT_TRIGGER, "right_trigger" }
+};
+
+static const struct {
+    NkNavAction action;
+    const char *name;
+} kNavActions[] = {
+    { NK_NAV_ACTION_CONFIRM,   "confirm" },
+    { NK_NAV_ACTION_CANCEL,    "cancel" },
+    { NK_NAV_ACTION_UP,        "up" },
+    { NK_NAV_ACTION_DOWN,      "down" },
+    { NK_NAV_ACTION_LEFT,      "left" },
+    { NK_NAV_ACTION_RIGHT,     "right" },
+    { NK_NAV_ACTION_PAGE_PREV, "page_prev" },
+    { NK_NAV_ACTION_PAGE_NEXT, "page_next" },
+    { NK_NAV_ACTION_MENU,      "menu" }
+};
+
+/* Bindable host keys by USB HID keyboard usage ID (HID Usage Tables, Keyboard/Keypad
+ * page 0x07), which SDL_Scancode shares. Escape (41) and the function keys are absent
+ * on purpose: the runtime keeps Escape and F1 for its pause and F3 for its HUD, and a key that is
+ * not in this table cannot be bound. */
+static const struct {
+    int key;
+    const char *name;
+} kHostKeys[] = {
+    { 4, "a" },  { 5, "b" },  { 6, "c" },  { 7, "d" },  { 8, "e" },  { 9, "f" },
+    { 10, "g" }, { 11, "h" }, { 12, "i" }, { 13, "j" }, { 14, "k" }, { 15, "l" },
+    { 16, "m" }, { 17, "n" }, { 18, "o" }, { 19, "p" }, { 20, "q" }, { 21, "r" },
+    { 22, "s" }, { 23, "t" }, { 24, "u" }, { 25, "v" }, { 26, "w" }, { 27, "x" },
+    { 28, "y" }, { 29, "z" },
+    { 30, "1" }, { 31, "2" }, { 32, "3" }, { 33, "4" }, { 34, "5" },
+    { 35, "6" }, { 36, "7" }, { 37, "8" }, { 38, "9" }, { 39, "0" },
+    { 40, "return" },
+    { 42, "backspace" },
+    { 43, "tab" },
+    { 44, "space" },
+    { 45, "minus" },
+    { 46, "equals" },
+    { 47, "leftbracket" },
+    { 48, "rightbracket" },
+    { 49, "backslash" },
+    { 51, "semicolon" },
+    { 52, "apostrophe" },
+    { 53, "grave" },
+    { 54, "comma" },
+    { 55, "period" },
+    { 56, "slash" },
+    { 73, "insert" },
+    { 74, "home" },
+    { 75, "pageup" },
+    { 76, "delete" },
+    { 77, "end" },
+    { 78, "pagedown" },
+    { 79, "right" },
+    { 80, "left" },
+    { 81, "down" },
+    { 82, "up" },
+    { 84, "kp_divide" },
+    { 85, "kp_multiply" },
+    { 86, "kp_minus" },
+    { 87, "kp_plus" },
+    { 88, "kp_enter" },
+    { 89, "kp_1" }, { 90, "kp_2" }, { 91, "kp_3" }, { 92, "kp_4" }, { 93, "kp_5" },
+    { 94, "kp_6" }, { 95, "kp_7" }, { 96, "kp_8" }, { 97, "kp_9" }, { 98, "kp_0" },
+    { 99, "kp_period" },
+    { 224, "lctrl" },
+    { 225, "lshift" },
+    { 226, "lalt" },
+    { 228, "rctrl" },
+    { 229, "rshift" },
+    { 230, "ralt" }
+};
+
+uint32_t nk_psp_button_bitmask(NkPspButton btn) {
+    if ((int)btn >= 0 && (int)btn < NK_PSP_BTN_COUNT) {
+        return kPspButtons[btn].mask;
+    }
+    return 0;
+}
+
+const char *nk_psp_button_name(NkPspButton btn) {
+    if ((int)btn >= 0 && (int)btn < NK_PSP_BTN_COUNT) {
+        return kPspButtons[btn].name;
+    }
+    return "unknown";
+}
+
+NkPspButton nk_psp_button_from_name(const char *name) {
+    if (!name) return (NkPspButton)-1;
+    for (size_t i = 0; i < sizeof(kPspButtons) / sizeof(kPspButtons[0]); i++) {
+        if (nk_ascii_casecmp(name, kPspButtons[i].name) == 0) {
+            return kPspButtons[i].btn;
+        }
+    }
+    return (NkPspButton)-1;
+}
+
+const char *nk_psp_stick_dir_name(NkPspStickDir dir) {
+    if ((int)dir >= 0 && (int)dir < NK_PSP_STICK_DIR_COUNT) {
+        return kPspStickDirs[dir].name;
+    }
+    return "unknown";
+}
+
+NkPspStickDir nk_psp_stick_dir_from_name(const char *name) {
+    if (!name) return (NkPspStickDir)-1;
+    for (size_t i = 0; i < sizeof(kPspStickDirs) / sizeof(kPspStickDirs[0]); i++) {
+        if (nk_ascii_casecmp(name, kPspStickDirs[i].name) == 0) {
+            return kPspStickDirs[i].dir;
+        }
+    }
+    return (NkPspStickDir)-1;
+}
+
+const char *nk_psp_axis_name(NkPspAxis axis) {
+    if ((int)axis >= 0 && (int)axis < NK_PSP_AXIS_COUNT) {
+        return kPspAxes[axis].name;
+    }
+    return "unknown";
+}
+
+NkPspAxis nk_psp_axis_from_name(const char *name) {
+    if (!name) return (NkPspAxis)-1;
+    for (size_t i = 0; i < sizeof(kPspAxes) / sizeof(kPspAxes[0]); i++) {
+        if (nk_ascii_casecmp(name, kPspAxes[i].name) == 0) {
+            return kPspAxes[i].axis;
+        }
+    }
+    return (NkPspAxis)-1;
+}
+
+const char *nk_host_button_name(NkHostGamepadButton btn) {
+    for (size_t i = 0; i < sizeof(kHostButtons) / sizeof(kHostButtons[0]); i++) {
+        if (kHostButtons[i].btn == btn) return kHostButtons[i].name;
+    }
+    return "unknown";
+}
+
+NkHostGamepadButton nk_host_button_from_name(const char *name) {
+    if (!name) return NK_HOST_BUTTON_INVALID;
+    for (size_t i = 0; i < sizeof(kHostButtons) / sizeof(kHostButtons[0]); i++) {
+        if (nk_ascii_casecmp(name, kHostButtons[i].name) == 0) {
+            return kHostButtons[i].btn;
+        }
+    }
+    return NK_HOST_BUTTON_INVALID;
+}
+
+const char *nk_host_axis_name(NkHostGamepadAxis axis) {
+    for (size_t i = 0; i < sizeof(kHostAxes) / sizeof(kHostAxes[0]); i++) {
+        if (kHostAxes[i].axis == axis) return kHostAxes[i].name;
+    }
+    return "unknown";
+}
+
+NkHostGamepadAxis nk_host_axis_from_name(const char *name) {
+    if (!name) return NK_HOST_AXIS_INVALID;
+    for (size_t i = 0; i < sizeof(kHostAxes) / sizeof(kHostAxes[0]); i++) {
+        if (nk_ascii_casecmp(name, kHostAxes[i].name) == 0) {
+            return kHostAxes[i].axis;
+        }
+    }
+    return NK_HOST_AXIS_INVALID;
+}
+
+const char *nk_nav_action_name(NkNavAction action) {
+    if ((int)action >= 0 && (int)action < NK_NAV_ACTION_COUNT) {
+        return kNavActions[action].name;
+    }
+    return "unknown";
+}
+
+NkNavAction nk_nav_action_from_name(const char *name) {
+    if (!name) return (NkNavAction)-1;
+    for (size_t i = 0; i < sizeof(kNavActions) / sizeof(kNavActions[0]); i++) {
+        if (nk_ascii_casecmp(name, kNavActions[i].name) == 0) {
+            return kNavActions[i].action;
+        }
+    }
+    return (NkNavAction)-1;
+}
+
+const char *nk_host_key_name(int key) {
+    if (key == NK_HOST_KEY_NONE) return NULL;
+    for (size_t i = 0; i < sizeof(kHostKeys) / sizeof(kHostKeys[0]); i++) {
+        if (kHostKeys[i].key == key) return kHostKeys[i].name;
+    }
+    return NULL;
+}
+
+/* Key names in plain words where the profile's own name is not one already. */
+static const struct {
+    const char *name;
+    const char *words;
+} kKeyWords[] = {
+    { "return", "Enter" },          { "backspace", "Backspace" },   { "tab", "Tab" },
+    { "space", "Space" },           { "minus", "-" },               { "equals", "=" },
+    { "leftbracket", "[" },         { "rightbracket", "]" },        { "backslash", "\\" },
+    { "semicolon", ";" },           { "apostrophe", "'" },          { "grave", "`" },
+    { "comma", "," },               { "period", "." },              { "slash", "/" },
+    { "insert", "Insert" },         { "home", "Home" },             { "pageup", "Page Up" },
+    { "delete", "Delete" },         { "end", "End" },               { "pagedown", "Page Down" },
+    { "right", "Right Arrow" },     { "left", "Left Arrow" },       { "down", "Down Arrow" },
+    { "up", "Up Arrow" },           { "kp_divide", "Keypad /" },    { "kp_multiply", "Keypad *" },
+    { "kp_minus", "Keypad -" },     { "kp_plus", "Keypad +" },      { "kp_enter", "Keypad Enter" },
+    { "kp_period", "Keypad ." },    { "lctrl", "Left Ctrl" },       { "lshift", "Left Shift" },
+    { "lalt", "Left Alt" },         { "rctrl", "Right Ctrl" },      { "rshift", "Right Shift" },
+    { "ralt", "Right Alt" }
+};
+
+void nk_host_key_words(int key, char *buf, size_t buf_sz) {
+    const char *name = nk_host_key_name(key);
+    if (!buf || buf_sz == 0) return;
+    if (!name) {
+        snprintf(buf, buf_sz, "None");
+        return;
+    }
+    for (size_t i = 0; i < sizeof(kKeyWords) / sizeof(kKeyWords[0]); i++) {
+        if (strcmp(name, kKeyWords[i].name) == 0) {
+            snprintf(buf, buf_sz, "%s", kKeyWords[i].words);
+            return;
+        }
+    }
+    /* What is left is a letter or digit, on the main keys or the keypad. */
+    if (strncmp(name, "kp_", 3) == 0) {
+        snprintf(buf, buf_sz, "Keypad %s", name + 3);
+    } else if (name[0] >= 'a' && name[0] <= 'z' && name[1] == '\0') {
+        snprintf(buf, buf_sz, "%c", name[0] - 'a' + 'A');
+    } else {
+        snprintf(buf, buf_sz, "%s", name);
+    }
+}
+
+int nk_host_key_from_name(const char *name) {
+    if (!name) return NK_HOST_KEY_NONE;
+    for (size_t i = 0; i < sizeof(kHostKeys) / sizeof(kHostKeys[0]); i++) {
+        if (nk_ascii_casecmp(name, kHostKeys[i].name) == 0) return kHostKeys[i].key;
+    }
+    return NK_HOST_KEY_NONE;
+}
+
+/* -----------------------------------------------------------------------------
+ * Transforms
+ * -------------------------------------------------------------------------- */
+
+uint8_t nk_input_profile_transform_axis_calibrated(
+    int16_t raw_axis,
+    int16_t deadzone_inner,
+    int16_t deadzone_outer,
+    bool inverted,
+    int16_t rest,
+    int16_t min_val,
+    int16_t max_val
+) {
+    int32_t val = (int32_t)raw_axis;
+    if (min_val < max_val && rest >= min_val && rest <= max_val) {
+        if (val > (int32_t)rest) {
+            if ((int32_t)max_val > (int32_t)rest) {
+                int32_t span = (int32_t)max_val - (int32_t)rest;
+                val = ((val - (int32_t)rest) * 32767) / span;
+                if (val > 32767) val = 32767;
+                if (val < 0) val = 0;
+            } else {
+                val = 32767;
+            }
+        } else if (val < (int32_t)rest) {
+            if ((int32_t)rest > (int32_t)min_val) {
+                int32_t span = (int32_t)rest - (int32_t)min_val;
+                val = ((val - (int32_t)rest) * 32768) / span;
+                if (val < -32768) val = -32768;
+                if (val > 0) val = 0;
+            } else {
+                val = -32768;
+            }
+        } else {
+            val = 0;
+        }
+    }
+
+    if (inverted) {
+        val = -val;
+        if (val > 32767) val = 32767;
+        if (val < -32768) val = -32768;
+    }
+
+    if (val >= -deadzone_inner && val <= deadzone_inner) {
+        return 128;
+    }
+
+    if (deadzone_outer > 0) {
+        int32_t outer_threshold = 32767 - (int32_t)deadzone_outer;
+        if (val >= outer_threshold) {
+            val = 32767;
+        } else if (val <= -outer_threshold) {
+            val = -32768;
+        }
+    }
+
+    return (uint8_t)(((int32_t)val + 32768) * 255 / 65535);
+}
+
+uint8_t nk_input_profile_transform_axis(
+    int16_t raw_axis,
+    int16_t deadzone_inner,
+    int16_t deadzone_outer,
+    bool inverted
+) {
+    return nk_input_profile_transform_axis_calibrated(
+        raw_axis, deadzone_inner, deadzone_outer, inverted, 0, -32768, 32767);
+}
+
+bool nk_input_profile_eval_trigger_calibrated(
+    int16_t raw_trigger,
+    int16_t trigger_threshold,
+    int16_t trigger_rest,
+    int16_t trigger_extreme
+) {
+    if (trigger_extreme <= trigger_rest) {
+        return raw_trigger > trigger_threshold;
+    }
+    int32_t raw = (int32_t)raw_trigger;
+    if (raw <= (int32_t)trigger_rest) {
+        return false;
+    }
+    int32_t span = (int32_t)trigger_extreme - (int32_t)trigger_rest;
+    int32_t normalized = ((raw - (int32_t)trigger_rest) * 32767) / span;
+    if (normalized > 32767) normalized = 32767;
+    return normalized > (int32_t)trigger_threshold;
+}
+
+bool nk_input_profile_eval_trigger(int16_t raw_trigger, int16_t trigger_threshold) {
+    return nk_input_profile_eval_trigger_calibrated(raw_trigger, trigger_threshold, 0, 32767);
+}
+
+/* -----------------------------------------------------------------------------
+ * Profile Default Initialization
+ * -------------------------------------------------------------------------- */
+
+/* The default key of each stick direction, the I/J/K/L diamond. None of them is a
+ * default button key, so the default profile validates; a schema 3 file that binds
+ * one of them to a button keeps its button (migrate_stick_keys). */
+static int default_stick_key(NkPspStickDir dir) {
+    static const char *const kNames[NK_PSP_STICK_DIR_COUNT] = { "i", "k", "j", "l" };
+    return nk_host_key_from_name(kNames[dir]);
+}
+
+void nk_input_profile_init_default(NkInputProfile *profile) {
+    if (!profile) return;
+    memset(profile, 0, sizeof(*profile));
+
+    profile->schema_version = NK_INPUT_PROFILE_SCHEMA_VERSION;
+    snprintf(profile->guid, sizeof(profile->guid), "default");
+    snprintf(profile->name_hint, sizeof(profile->name_hint), "Standard Gamepad");
+    profile->trigger_threshold = NK_INPUT_DEFAULT_TRIGGER_THRESHOLD;
+    profile->trigger_rest = 0;
+    profile->trigger_extreme = 32767;
+
+    /* Axes: Left Stick X/Y */
+    profile->axes[NK_PSP_AXIS_ANALOG_X].host_axis = NK_HOST_AXIS_LEFTX;
+    profile->axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner = NK_INPUT_DEFAULT_DEADZONE_INNER;
+    profile->axes[NK_PSP_AXIS_ANALOG_X].deadzone_outer = NK_INPUT_DEFAULT_DEADZONE_OUTER;
+    profile->axes[NK_PSP_AXIS_ANALOG_X].inverted = false;
+    profile->axes[NK_PSP_AXIS_ANALOG_X].rest = 0;
+    profile->axes[NK_PSP_AXIS_ANALOG_X].min_val = -32768;
+    profile->axes[NK_PSP_AXIS_ANALOG_X].max_val = 32767;
+
+    profile->axes[NK_PSP_AXIS_ANALOG_Y].host_axis = NK_HOST_AXIS_LEFTY;
+    profile->axes[NK_PSP_AXIS_ANALOG_Y].deadzone_inner = NK_INPUT_DEFAULT_DEADZONE_INNER;
+    profile->axes[NK_PSP_AXIS_ANALOG_Y].deadzone_outer = NK_INPUT_DEFAULT_DEADZONE_OUTER;
+    profile->axes[NK_PSP_AXIS_ANALOG_Y].inverted = false;
+    profile->axes[NK_PSP_AXIS_ANALOG_Y].rest = 0;
+    profile->axes[NK_PSP_AXIS_ANALOG_Y].min_val = -32768;
+    profile->axes[NK_PSP_AXIS_ANALOG_Y].max_val = 32767;
+
+    /* PSP buttons: the pad map of src/rt/gpu_sdl3vk/sdl3vk.c. */
+    profile->psp_buttons[NK_PSP_BTN_SELECT].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->psp_buttons[NK_PSP_BTN_SELECT].primary.index = NK_HOST_BUTTON_BACK;
+
+    profile->psp_buttons[NK_PSP_BTN_START].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->psp_buttons[NK_PSP_BTN_START].primary.index = NK_HOST_BUTTON_START;
+
+    profile->psp_buttons[NK_PSP_BTN_UP].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->psp_buttons[NK_PSP_BTN_UP].primary.index = NK_HOST_BUTTON_DPAD_UP;
+
+    profile->psp_buttons[NK_PSP_BTN_RIGHT].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->psp_buttons[NK_PSP_BTN_RIGHT].primary.index = NK_HOST_BUTTON_DPAD_RIGHT;
+
+    profile->psp_buttons[NK_PSP_BTN_DOWN].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->psp_buttons[NK_PSP_BTN_DOWN].primary.index = NK_HOST_BUTTON_DPAD_DOWN;
+
+    profile->psp_buttons[NK_PSP_BTN_LEFT].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->psp_buttons[NK_PSP_BTN_LEFT].primary.index = NK_HOST_BUTTON_DPAD_LEFT;
+
+    profile->psp_buttons[NK_PSP_BTN_LTRIGGER].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->psp_buttons[NK_PSP_BTN_LTRIGGER].primary.index = NK_HOST_BUTTON_LEFT_SHOULDER;
+    profile->psp_buttons[NK_PSP_BTN_LTRIGGER].secondary.type = NK_BINDING_HOST_TRIGGER;
+    profile->psp_buttons[NK_PSP_BTN_LTRIGGER].secondary.index = NK_HOST_AXIS_LEFT_TRIGGER;
+
+    profile->psp_buttons[NK_PSP_BTN_RTRIGGER].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->psp_buttons[NK_PSP_BTN_RTRIGGER].primary.index = NK_HOST_BUTTON_RIGHT_SHOULDER;
+    profile->psp_buttons[NK_PSP_BTN_RTRIGGER].secondary.type = NK_BINDING_HOST_TRIGGER;
+    profile->psp_buttons[NK_PSP_BTN_RTRIGGER].secondary.index = NK_HOST_AXIS_RIGHT_TRIGGER;
+
+    profile->psp_buttons[NK_PSP_BTN_TRIANGLE].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->psp_buttons[NK_PSP_BTN_TRIANGLE].primary.index = NK_HOST_BUTTON_NORTH;
+
+    profile->psp_buttons[NK_PSP_BTN_CIRCLE].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->psp_buttons[NK_PSP_BTN_CIRCLE].primary.index = NK_HOST_BUTTON_EAST;
+
+    profile->psp_buttons[NK_PSP_BTN_CROSS].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->psp_buttons[NK_PSP_BTN_CROSS].primary.index = NK_HOST_BUTTON_SOUTH;
+
+    profile->psp_buttons[NK_PSP_BTN_SQUARE].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->psp_buttons[NK_PSP_BTN_SQUARE].primary.index = NK_HOST_BUTTON_WEST;
+
+    /* HOME stays unbound by default: the pre-profile runtime never mapped the host GUIDE
+     * button, and the default must reproduce that mapping exactly. Users may bind it. */
+    profile->psp_buttons[NK_PSP_BTN_HOME].primary.type = NK_BINDING_NONE;
+
+    profile->psp_buttons[NK_PSP_BTN_HOLD].primary.type = NK_BINDING_NONE;
+
+    /* Keyboard keys: the map the runtime hard-coded before schema 3 (src/rt/gui.c
+     * read_keys, src/rt/gpu_sdl3vk/sdl3vk.c poll_input). HOME and HOLD stay unbound. */
+    profile->psp_keys[NK_PSP_BTN_SELECT].primary   = nk_host_key_from_name("lshift");
+    profile->psp_keys[NK_PSP_BTN_SELECT].secondary = nk_host_key_from_name("rshift");
+    profile->psp_keys[NK_PSP_BTN_START].primary    = nk_host_key_from_name("return");
+    profile->psp_keys[NK_PSP_BTN_UP].primary       = nk_host_key_from_name("up");
+    profile->psp_keys[NK_PSP_BTN_RIGHT].primary    = nk_host_key_from_name("right");
+    profile->psp_keys[NK_PSP_BTN_DOWN].primary     = nk_host_key_from_name("down");
+    profile->psp_keys[NK_PSP_BTN_LEFT].primary     = nk_host_key_from_name("left");
+    profile->psp_keys[NK_PSP_BTN_LTRIGGER].primary = nk_host_key_from_name("q");
+    profile->psp_keys[NK_PSP_BTN_RTRIGGER].primary = nk_host_key_from_name("w");
+    profile->psp_keys[NK_PSP_BTN_TRIANGLE].primary = nk_host_key_from_name("s");
+    profile->psp_keys[NK_PSP_BTN_CIRCLE].primary   = nk_host_key_from_name("z");
+    profile->psp_keys[NK_PSP_BTN_CROSS].primary    = nk_host_key_from_name("x");
+    profile->psp_keys[NK_PSP_BTN_SQUARE].primary   = nk_host_key_from_name("a");
+
+    /* The analog stick from the keyboard (schema 4): I up, K down, J left, L right. */
+    for (int d = 0; d < NK_PSP_STICK_DIR_COUNT; d++) {
+        profile->stick_keys[d].primary = default_stick_key((NkPspStickDir)d);
+    }
+
+    /* Navigation bindings matching player/main.c */
+    profile->nav_bindings[NK_NAV_ACTION_CONFIRM].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->nav_bindings[NK_NAV_ACTION_CONFIRM].primary.index = NK_HOST_BUTTON_SOUTH;
+
+    profile->nav_bindings[NK_NAV_ACTION_CANCEL].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->nav_bindings[NK_NAV_ACTION_CANCEL].primary.index = NK_HOST_BUTTON_EAST;
+
+    profile->nav_bindings[NK_NAV_ACTION_UP].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->nav_bindings[NK_NAV_ACTION_UP].primary.index = NK_HOST_BUTTON_DPAD_UP;
+
+    profile->nav_bindings[NK_NAV_ACTION_DOWN].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->nav_bindings[NK_NAV_ACTION_DOWN].primary.index = NK_HOST_BUTTON_DPAD_DOWN;
+
+    profile->nav_bindings[NK_NAV_ACTION_LEFT].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->nav_bindings[NK_NAV_ACTION_LEFT].primary.index = NK_HOST_BUTTON_DPAD_LEFT;
+
+    profile->nav_bindings[NK_NAV_ACTION_RIGHT].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->nav_bindings[NK_NAV_ACTION_RIGHT].primary.index = NK_HOST_BUTTON_DPAD_RIGHT;
+
+    profile->nav_bindings[NK_NAV_ACTION_PAGE_PREV].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->nav_bindings[NK_NAV_ACTION_PAGE_PREV].primary.index = NK_HOST_BUTTON_LEFT_SHOULDER;
+
+    profile->nav_bindings[NK_NAV_ACTION_PAGE_NEXT].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->nav_bindings[NK_NAV_ACTION_PAGE_NEXT].primary.index = NK_HOST_BUTTON_RIGHT_SHOULDER;
+
+    profile->nav_bindings[NK_NAV_ACTION_MENU].primary.type = NK_BINDING_HOST_BUTTON;
+    profile->nav_bindings[NK_NAV_ACTION_MENU].primary.index = NK_HOST_BUTTON_START;
+}
+
+/* -----------------------------------------------------------------------------
+ * Profile Validation & Conflict Detection
+ * -------------------------------------------------------------------------- */
+
+/* Refuse a binding whose host index is outside the host device, before the
+ * conflict pass runs. The conflict pass used to be the only place an
+ * out-of-range index was caught, and it reported it as a conflict between two
+ * names it no longer had, formatting two NULL strings where the named
+ * diagnostic should have been. An out-of-range index handed in by a caller
+ * (the player, a future writer) now fails closed naming the field. */
+static bool check_binding_index_range(
+    const NkBindingSource *src,
+    const char *owner_kind,
+    int owner_idx,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (!src || src->type == NK_BINDING_NONE) return true;
+    if (src->type == NK_BINDING_HOST_BUTTON) {
+        if (src->index < 0 || src->index >= NK_HOST_BUTTON_COUNT) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "%s %d binds host button index %d, out of range [0, %d]",
+                     owner_kind, owner_idx, src->index, NK_HOST_BUTTON_COUNT - 1);
+            return false;
+        }
+        return true;
+    }
+    if (src->index < 0 || src->index >= NK_HOST_AXIS_COUNT) {
+        diag_set(diag_buf, diag_buf_sz,
+                 "%s %d binds host axis index %d, out of range [0, %d]",
+                 owner_kind, owner_idx, src->index, NK_HOST_AXIS_COUNT - 1);
+        return false;
+    }
+    return true;
+}
+
+static bool check_source_conflict(
+    const NkBindingSource *src,
+    int owner_idx,
+    int button_owners[NK_HOST_BUTTON_COUNT],
+    int trigger_owners[NK_HOST_AXIS_COUNT],
+    int axis_pos_owners[NK_HOST_AXIS_COUNT],
+    int axis_neg_owners[NK_HOST_AXIS_COUNT],
+    int *out_conflict_owner,
+    const char **out_kind,
+    const char **out_name
+) {
+    if (!src || src->type == NK_BINDING_NONE) return true;
+
+    if (src->type == NK_BINDING_HOST_BUTTON) {
+        if (src->index < 0 || src->index >= NK_HOST_BUTTON_COUNT) {
+            /* Unreachable: nk_input_profile_validate range-checks every binding
+             * index before this conflict pass, and names the offending field
+             * there. The guard stays, but never hands the caller's %s
+             * arguments a NULL, which is what the diagnostic below formats. */
+            *out_conflict_owner = owner_idx;
+            *out_kind = "button";
+            *out_name = nk_host_button_name(NK_HOST_BUTTON_INVALID);
+            return false;
+        }
+        if (button_owners[src->index] != -1 && button_owners[src->index] != owner_idx) {
+            *out_conflict_owner = button_owners[src->index];
+            *out_kind = "button";
+            *out_name = nk_host_button_name((NkHostGamepadButton)src->index);
+            return false;
+        }
+        button_owners[src->index] = owner_idx;
+    } else if (src->type == NK_BINDING_HOST_TRIGGER) {
+        if (src->index < 0 || src->index >= NK_HOST_AXIS_COUNT) {
+            *out_conflict_owner = owner_idx;
+            *out_kind = "trigger";
+            *out_name = nk_host_axis_name(NK_HOST_AXIS_INVALID);
+            return false;
+        }
+        if (trigger_owners[src->index] != -1 && trigger_owners[src->index] != owner_idx) {
+            *out_conflict_owner = trigger_owners[src->index];
+            *out_kind = "trigger";
+            *out_name = nk_host_axis_name((NkHostGamepadAxis)src->index);
+            return false;
+        }
+        trigger_owners[src->index] = owner_idx;
+    } else if (src->type == NK_BINDING_HOST_AXIS_POS) {
+        if (src->index < 0 || src->index >= NK_HOST_AXIS_COUNT) {
+            *out_conflict_owner = owner_idx;
+            *out_kind = "axis_pos";
+            *out_name = nk_host_axis_name(NK_HOST_AXIS_INVALID);
+            return false;
+        }
+        if (axis_pos_owners[src->index] != -1 && axis_pos_owners[src->index] != owner_idx) {
+            *out_conflict_owner = axis_pos_owners[src->index];
+            *out_kind = "axis_pos";
+            *out_name = nk_host_axis_name((NkHostGamepadAxis)src->index);
+            return false;
+        }
+        axis_pos_owners[src->index] = owner_idx;
+    } else if (src->type == NK_BINDING_HOST_AXIS_NEG) {
+        if (src->index < 0 || src->index >= NK_HOST_AXIS_COUNT) {
+            *out_conflict_owner = owner_idx;
+            *out_kind = "axis_neg";
+            *out_name = nk_host_axis_name(NK_HOST_AXIS_INVALID);
+            return false;
+        }
+        if (axis_neg_owners[src->index] != -1 && axis_neg_owners[src->index] != owner_idx) {
+            *out_conflict_owner = axis_neg_owners[src->index];
+            *out_kind = "axis_neg";
+            *out_name = nk_host_axis_name((NkHostGamepadAxis)src->index);
+            return false;
+        }
+        axis_neg_owners[src->index] = owner_idx;
+    }
+    return true;
+}
+
+NkResult nk_input_profile_validate(
+    const NkInputProfile *profile,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (diag_buf && diag_buf_sz > 0) diag_buf[0] = '\0';
+    if (!profile) {
+        diag_set(diag_buf, diag_buf_sz, "profile pointer is null");
+        return NK_ERROR_GENERIC;
+    }
+
+    if (profile->schema_version != NK_INPUT_PROFILE_SCHEMA_VERSION) {
+        if (profile->schema_version > NK_INPUT_PROFILE_SCHEMA_VERSION) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "unsupported future schema_version %d (current version is %d)",
+                     profile->schema_version, NK_INPUT_PROFILE_SCHEMA_VERSION);
+        } else {
+            diag_set(diag_buf, diag_buf_sz,
+                     "unsupported or invalid schema_version %d (expected %d)",
+                     profile->schema_version, NK_INPUT_PROFILE_SCHEMA_VERSION);
+        }
+        return NK_ERROR_GENERIC;
+    }
+
+    if (profile->guid[0] == '\0') {
+        diag_set(diag_buf, diag_buf_sz, "device GUID is required");
+        return NK_ERROR_GENERIC;
+    }
+
+    if (profile->trigger_threshold < 0) {
+        diag_set(diag_buf, diag_buf_sz,
+                 "trigger_threshold %d out of range [0, 32767]",
+                 profile->trigger_threshold);
+        return NK_ERROR_GENERIC;
+    }
+
+    if (profile->trigger_rest >= profile->trigger_extreme) {
+        diag_set(diag_buf, diag_buf_sz,
+                 "trigger_rest (%d) must be less than trigger_extreme (%d)",
+                 profile->trigger_rest, profile->trigger_extreme);
+        return NK_ERROR_GENERIC;
+    }
+
+    /* Validate axes */
+    for (int i = 0; i < NK_PSP_AXIS_COUNT; i++) {
+        const NkAxisCalibration *ax = &profile->axes[i];
+        if (ax->host_axis < 0 || ax->host_axis >= NK_HOST_AXIS_COUNT) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "axis '%s' has invalid host axis index %d",
+                     nk_psp_axis_name((NkPspAxis)i), ax->host_axis);
+            return NK_ERROR_GENERIC;
+        }
+        if (ax->deadzone_inner < 0) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "axis '%s' deadzone_inner %d out of range [0, 32767]",
+                     nk_psp_axis_name((NkPspAxis)i), ax->deadzone_inner);
+            return NK_ERROR_GENERIC;
+        }
+        if (ax->deadzone_outer < 0) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "axis '%s' deadzone_outer %d out of range [0, 32767]",
+                     nk_psp_axis_name((NkPspAxis)i), ax->deadzone_outer);
+            return NK_ERROR_GENERIC;
+        }
+        if ((int32_t)ax->deadzone_inner + (int32_t)ax->deadzone_outer >= 32767) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "axis '%s' combined deadzones (%d + %d) out of range (< 32767)",
+                     nk_psp_axis_name((NkPspAxis)i), ax->deadzone_inner, ax->deadzone_outer);
+            return NK_ERROR_GENERIC;
+        }
+        if (ax->min_val >= ax->max_val) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "axis '%s' min_val (%d) must be less than max_val (%d)",
+                     nk_psp_axis_name((NkPspAxis)i), ax->min_val, ax->max_val);
+            return NK_ERROR_GENERIC;
+        }
+        if (ax->rest < ax->min_val || ax->rest > ax->max_val) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "axis '%s' rest (%d) out of range [%d, %d]",
+                     nk_psp_axis_name((NkPspAxis)i), ax->rest, ax->min_val, ax->max_val);
+            return NK_ERROR_GENERIC;
+        }
+    }
+
+    if (profile->axes[NK_PSP_AXIS_ANALOG_X].host_axis == profile->axes[NK_PSP_AXIS_ANALOG_Y].host_axis) {
+        diag_set(diag_buf, diag_buf_sz,
+                 "conflicting axis binding: host axis '%s' is bound to both 'analog_x' and 'analog_y'",
+                 nk_host_axis_name(profile->axes[NK_PSP_AXIS_ANALOG_X].host_axis));
+        return NK_ERROR_GENERIC;
+    }
+
+    /* Host binding indices are range-checked before the conflict pass. */
+    for (int i = 0; i < NK_PSP_BTN_COUNT; i++) {
+        if (!check_binding_index_range(&profile->psp_buttons[i].primary, "PSP button", i,
+                                       diag_buf, diag_buf_sz) ||
+            !check_binding_index_range(&profile->psp_buttons[i].secondary, "PSP button", i,
+                                       diag_buf, diag_buf_sz)) {
+            return NK_ERROR_GENERIC;
+        }
+    }
+    for (int i = 0; i < NK_NAV_ACTION_COUNT; i++) {
+        if (!check_binding_index_range(&profile->nav_bindings[i].primary, "navigation action", i,
+                                       diag_buf, diag_buf_sz) ||
+            !check_binding_index_range(&profile->nav_bindings[i].secondary, "navigation action", i,
+                                       diag_buf, diag_buf_sz)) {
+            return NK_ERROR_GENERIC;
+        }
+    }
+
+    /* Conflict detection across PSP digital buttons */
+    int button_owners[NK_HOST_BUTTON_COUNT];
+    int trigger_owners[NK_HOST_AXIS_COUNT];
+    int axis_pos_owners[NK_HOST_AXIS_COUNT];
+    int axis_neg_owners[NK_HOST_AXIS_COUNT];
+    for (int i = 0; i < NK_HOST_BUTTON_COUNT; i++) button_owners[i] = -1;
+    for (int i = 0; i < NK_HOST_AXIS_COUNT; i++) {
+        trigger_owners[i] = -1;
+        axis_pos_owners[i] = -1;
+        axis_neg_owners[i] = -1;
+    }
+
+    for (int i = 0; i < NK_PSP_BTN_COUNT; i++) {
+        int conflict_owner = -1;
+        const char *kind = NULL;
+        const char *name = NULL;
+
+        if (!check_source_conflict(&profile->psp_buttons[i].primary, i,
+                                   button_owners, trigger_owners, axis_pos_owners, axis_neg_owners,
+                                   &conflict_owner, &kind, &name)) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "conflicting binding: host %s '%s' is bound to both '%s' and '%s'",
+                     kind, name,
+                     nk_psp_button_name((NkPspButton)conflict_owner),
+                     nk_psp_button_name((NkPspButton)i));
+            return NK_ERROR_GENERIC;
+        }
+
+        if (!check_source_conflict(&profile->psp_buttons[i].secondary, i,
+                                   button_owners, trigger_owners, axis_pos_owners, axis_neg_owners,
+                                   &conflict_owner, &kind, &name)) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "conflicting binding: host %s '%s' is bound to both '%s' and '%s'",
+                     kind, name,
+                     nk_psp_button_name((NkPspButton)conflict_owner),
+                     nk_psp_button_name((NkPspButton)i));
+            return NK_ERROR_GENERIC;
+        }
+    }
+
+    /* Conflict detection across Navigation bindings */
+    for (int i = 0; i < NK_HOST_BUTTON_COUNT; i++) button_owners[i] = -1;
+    for (int i = 0; i < NK_HOST_AXIS_COUNT; i++) {
+        trigger_owners[i] = -1;
+        axis_pos_owners[i] = -1;
+        axis_neg_owners[i] = -1;
+    }
+
+    for (int i = 0; i < NK_NAV_ACTION_COUNT; i++) {
+        int conflict_owner = -1;
+        const char *kind = NULL;
+        const char *name = NULL;
+
+        if (!check_source_conflict(&profile->nav_bindings[i].primary, i,
+                                   button_owners, trigger_owners, axis_pos_owners, axis_neg_owners,
+                                   &conflict_owner, &kind, &name)) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "conflicting navigation binding: host %s '%s' is bound to both '%s' and '%s'",
+                     kind, name,
+                     nk_nav_action_name((NkNavAction)conflict_owner),
+                     nk_nav_action_name((NkNavAction)i));
+            return NK_ERROR_GENERIC;
+        }
+
+        if (!check_source_conflict(&profile->nav_bindings[i].secondary, i,
+                                   button_owners, trigger_owners, axis_pos_owners, axis_neg_owners,
+                                   &conflict_owner, &kind, &name)) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "conflicting navigation binding: host %s '%s' is bound to both '%s' and '%s'",
+                     kind, name,
+                     nk_nav_action_name((NkNavAction)conflict_owner),
+                     nk_nav_action_name((NkNavAction)i));
+            return NK_ERROR_GENERIC;
+        }
+    }
+
+    /* Keyboard keys: each must be a bindable key, and one key drives at most one
+     * control across the PSP buttons and the stick directions (a control may list the
+     * same key in both slots). */
+    int key_owners[NK_HOST_KEY_LIMIT];
+    for (int k = 0; k < NK_HOST_KEY_LIMIT; k++) key_owners[k] = -1;
+    for (int i = 0; i < NK_KEY_CONTROL_COUNT; i++) {
+        const NkKeyBinding *binding = key_control_binding(profile, i);
+        const int slots[2] = { binding->primary, binding->secondary };
+        for (int s = 0; s < 2; s++) {
+            int key = slots[s];
+            if (key == NK_HOST_KEY_NONE) continue;
+            if (key < 0 || key >= NK_HOST_KEY_LIMIT || !nk_host_key_name(key)) {
+                diag_set(diag_buf, diag_buf_sz,
+                         "PSP %s '%s' binds host key code %d, which is not a bindable key",
+                         i < NK_PSP_BTN_COUNT ? "button" : "stick direction",
+                         key_control_name(i), key);
+                return NK_ERROR_GENERIC;
+            }
+            if (key_owners[key] != -1 && key_owners[key] != i) {
+                diag_set(diag_buf, diag_buf_sz,
+                         "conflicting keyboard binding: host key '%s' is bound to both '%s' and '%s'",
+                         nk_host_key_name(key),
+                         key_control_name(key_owners[key]),
+                         key_control_name(i));
+                return NK_ERROR_GENERIC;
+            }
+            key_owners[key] = i;
+        }
+    }
+
+    return NK_OK;
+}
+
+/* -----------------------------------------------------------------------------
+ * JSON Serialization & Deserialization
+ * -------------------------------------------------------------------------- */
+
+static bool parse_binding_source_str(
+    const char *str,
+    NkBindingSource *out_src,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    out_src->threshold = 0;
+    if (!str || !*str || nk_ascii_casecmp(str, "none") == 0) {
+        out_src->type = NK_BINDING_NONE;
+        out_src->index = 0;
+        return true;
+    }
+    /* Reserved for #1791 (mouse movement as a source): refused by name, never read as
+       something else. */
+    if (strncmp(str, "mouse:", 6) == 0) {
+        diag_set(diag_buf, diag_buf_sz,
+                 "mouse source '%s' is not supported by this version of Nakagawa", str);
+        return false;
+    }
+    /* A stick direction may carry its own threshold: "+rightx@20000". */
+    if (str[0] == '+' || str[0] == '-') {
+        const char *at = strchr(str, '@');
+        if (at != NULL) {
+            char name[32];
+            char *end = NULL;
+            long value = strtol(at + 1, &end, 10);
+            size_t length = (size_t)(at - (str + 1));
+            if (length == 0 || length >= sizeof(name) || end == at + 1 || *end != '\0' ||
+                value < 1 || value > 32767) {
+                diag_set(diag_buf, diag_buf_sz,
+                         "binding '%s' needs a threshold from 1 to 32767 after '@'", str);
+                return false;
+            }
+            memcpy(name, str + 1, length);
+            name[length] = '\0';
+            NkHostGamepadAxis ax = nk_host_axis_from_name(name);
+            if (ax == NK_HOST_AXIS_INVALID) {
+                diag_set(diag_buf, diag_buf_sz, "unknown host axis '%s'", name);
+                return false;
+            }
+            out_src->type = str[0] == '+' ? NK_BINDING_HOST_AXIS_POS : NK_BINDING_HOST_AXIS_NEG;
+            out_src->index = (int)ax;
+            out_src->threshold = (int16_t)value;
+            return true;
+        }
+    }
+
+    /* Check prefix "button:" or "axis:" */
+    if (strncmp(str, "button:", 7) == 0) {
+        NkHostGamepadButton btn = nk_host_button_from_name(str + 7);
+        if (btn == NK_HOST_BUTTON_INVALID) {
+            diag_set(diag_buf, diag_buf_sz, "unknown host button '%s'", str + 7);
+            return false;
+        }
+        out_src->type = NK_BINDING_HOST_BUTTON;
+        out_src->index = (int)btn;
+        return true;
+    }
+
+    if (strncmp(str, "trigger:", 8) == 0) {
+        NkHostGamepadAxis ax = nk_host_axis_from_name(str + 8);
+        if (ax == NK_HOST_AXIS_INVALID) {
+            diag_set(diag_buf, diag_buf_sz, "unknown host axis '%s'", str + 8);
+            return false;
+        }
+        out_src->type = NK_BINDING_HOST_TRIGGER;
+        out_src->index = (int)ax;
+        return true;
+    }
+
+    if (str[0] == '+') {
+        NkHostGamepadAxis ax = nk_host_axis_from_name(str + 1);
+        if (ax == NK_HOST_AXIS_INVALID) {
+            diag_set(diag_buf, diag_buf_sz, "unknown host axis '%s'", str + 1);
+            return false;
+        }
+        out_src->type = NK_BINDING_HOST_AXIS_POS;
+        out_src->index = (int)ax;
+        return true;
+    }
+
+    if (str[0] == '-') {
+        NkHostGamepadAxis ax = nk_host_axis_from_name(str + 1);
+        if (ax == NK_HOST_AXIS_INVALID) {
+            diag_set(diag_buf, diag_buf_sz, "unknown host axis '%s'", str + 1);
+            return false;
+        }
+        out_src->type = NK_BINDING_HOST_AXIS_NEG;
+        out_src->index = (int)ax;
+        return true;
+    }
+
+    /* Direct button check */
+    NkHostGamepadButton btn = nk_host_button_from_name(str);
+    if (btn != NK_HOST_BUTTON_INVALID) {
+        out_src->type = NK_BINDING_HOST_BUTTON;
+        out_src->index = (int)btn;
+        return true;
+    }
+
+    /* Direct axis trigger check */
+    NkHostGamepadAxis ax = nk_host_axis_from_name(str);
+    if (ax == NK_HOST_AXIS_LEFT_TRIGGER || ax == NK_HOST_AXIS_RIGHT_TRIGGER) {
+        out_src->type = NK_BINDING_HOST_TRIGGER;
+        out_src->index = (int)ax;
+        return true;
+    }
+
+    diag_set(diag_buf, diag_buf_sz, "unrecognized host input identifier '%s'", str);
+    return false;
+}
+
+static void format_binding_source(const NkBindingSource *src, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    if (!src || src->type == NK_BINDING_NONE) {
+        snprintf(out, out_sz, "none");
+        return;
+    }
+    switch (src->type) {
+    case NK_BINDING_HOST_BUTTON:
+        snprintf(out, out_sz, "%s", nk_host_button_name((NkHostGamepadButton)src->index));
+        break;
+    case NK_BINDING_HOST_TRIGGER:
+        snprintf(out, out_sz, "%s", nk_host_axis_name((NkHostGamepadAxis)src->index));
+        break;
+    case NK_BINDING_HOST_AXIS_POS:
+    case NK_BINDING_HOST_AXIS_NEG:
+        if (src->threshold > 0) {
+            snprintf(out, out_sz, "%c%s@%d", src->type == NK_BINDING_HOST_AXIS_POS ? '+' : '-',
+                     nk_host_axis_name((NkHostGamepadAxis)src->index), (int)src->threshold);
+        } else {
+            snprintf(out, out_sz, "%c%s", src->type == NK_BINDING_HOST_AXIS_POS ? '+' : '-',
+                     nk_host_axis_name((NkHostGamepadAxis)src->index));
+        }
+        break;
+    default:
+        snprintf(out, out_sz, "none");
+        break;
+    }
+}
+
+static inline void json_free(JsonNode *node) {
+    nk_json_free(node);
+}
+
+static inline JsonNode *obj_get(const JsonNode *obj, const char *key) {
+    return nk_json_obj_get(obj, key);
+}
+
+/* -----------------------------------------------------------------------------
+ * Parse JSON into NkInputProfile
+ * -------------------------------------------------------------------------- */
+
+static bool parse_axis_node(
+    const JsonNode *node,
+    NkAxisCalibration *out_axis,
+    const char *axis_name,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (!node || node->type != JSON_OBJECT) {
+        diag_set(diag_buf, diag_buf_sz, "axis '%s' definition must be an object", axis_name);
+        return false;
+    }
+
+    JsonNode *ha = obj_get(node, "host_axis");
+    if (!ha || ha->type != JSON_STRING) {
+        diag_set(diag_buf, diag_buf_sz, "axis '%s' missing 'host_axis' string", axis_name);
+        return false;
+    }
+    NkHostGamepadAxis axis_idx = nk_host_axis_from_name(ha->u.str_val);
+    if (axis_idx == NK_HOST_AXIS_INVALID) {
+        diag_set(diag_buf, diag_buf_sz, "axis '%s' unknown host axis '%s'", axis_name, ha->u.str_val);
+        return false;
+    }
+    out_axis->host_axis = axis_idx;
+
+    JsonNode *dz_in = obj_get(node, "deadzone_inner");
+    if (!dz_in || dz_in->type != JSON_NUMBER) {
+        diag_set(diag_buf, diag_buf_sz, "axis '%s' missing 'deadzone_inner' number", axis_name);
+        return false;
+    }
+    if (dz_in->u.num.num_val < 0 || dz_in->u.num.num_val > 32767) {
+        diag_set(diag_buf, diag_buf_sz, "axis '%s' deadzone_inner %.0f out of range [0, 32767]",
+                 axis_name, dz_in->u.num.num_val);
+        return false;
+    }
+    out_axis->deadzone_inner = (int16_t)dz_in->u.num.num_val;
+
+    JsonNode *dz_out = obj_get(node, "deadzone_outer");
+    if (dz_out) {
+        if (dz_out->type != JSON_NUMBER || dz_out->u.num.num_val < 0 || dz_out->u.num.num_val > 32767) {
+            diag_set(diag_buf, diag_buf_sz, "axis '%s' deadzone_outer out of range [0, 32767]", axis_name);
+            return false;
+        }
+        out_axis->deadzone_outer = (int16_t)dz_out->u.num.num_val;
+    } else {
+        out_axis->deadzone_outer = 0;
+    }
+
+    if ((int32_t)out_axis->deadzone_inner + (int32_t)out_axis->deadzone_outer >= 32767) {
+        diag_set(diag_buf, diag_buf_sz, "axis '%s' combined deadzones (%d + %d) out of range (< 32767)",
+                 axis_name, out_axis->deadzone_inner, out_axis->deadzone_outer);
+        return false;
+    }
+
+    JsonNode *inv = obj_get(node, "inverted");
+    if (inv) {
+        if (inv->type != JSON_BOOL) {
+            diag_set(diag_buf, diag_buf_sz, "axis '%s' 'inverted' must be boolean", axis_name);
+            return false;
+        }
+        out_axis->inverted = inv->u.bool_val;
+    } else {
+        out_axis->inverted = false;
+    }
+
+    JsonNode *rest_n = obj_get(node, "rest");
+    if (rest_n) {
+        if (rest_n->type != JSON_NUMBER || rest_n->u.num.num_val < -32768 || rest_n->u.num.num_val > 32767) {
+            diag_set(diag_buf, diag_buf_sz, "axis '%s' rest out of range [-32768, 32767]", axis_name);
+            return false;
+        }
+        out_axis->rest = (int16_t)rest_n->u.num.num_val;
+    } else {
+        out_axis->rest = 0;
+    }
+
+    JsonNode *min_n = obj_get(node, "min_val");
+    if (min_n) {
+        if (min_n->type != JSON_NUMBER || min_n->u.num.num_val < -32768 || min_n->u.num.num_val > 32767) {
+            diag_set(diag_buf, diag_buf_sz, "axis '%s' min_val out of range [-32768, 32767]", axis_name);
+            return false;
+        }
+        out_axis->min_val = (int16_t)min_n->u.num.num_val;
+    } else {
+        out_axis->min_val = -32768;
+    }
+
+    JsonNode *max_n = obj_get(node, "max_val");
+    if (max_n) {
+        if (max_n->type != JSON_NUMBER || max_n->u.num.num_val < -32768 || max_n->u.num.num_val > 32767) {
+            diag_set(diag_buf, diag_buf_sz, "axis '%s' max_val out of range [-32768, 32767]", axis_name);
+            return false;
+        }
+        out_axis->max_val = (int16_t)max_n->u.num.num_val;
+    } else {
+        out_axis->max_val = 32767;
+    }
+    return true;
+}
+
+static bool parse_binding_node(
+    const JsonNode *node,
+    NkDigitalBinding *out_binding,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (!node) return false;
+    out_binding->primary.type = NK_BINDING_NONE;
+    out_binding->secondary.type = NK_BINDING_NONE;
+
+    if (node->type == JSON_STRING) {
+        if (node->u.str_val[0] == '\0') {
+            diag_set(diag_buf, diag_buf_sz,
+                     "binding is an empty string; write \"none\" to leave a control unbound");
+            return false;
+        }
+        return parse_binding_source_str(node->u.str_val, &out_binding->primary, diag_buf, diag_buf_sz);
+    }
+
+    if (node->type == JSON_OBJECT) {
+        JsonNode *pri = obj_get(node, "primary");
+        JsonNode *sec = obj_get(node, "secondary");
+        /* An entry that names a control but not what it binds would otherwise
+         * load as a control the guest can never press, with no diagnostic:
+         * a mapping the player cannot see is indistinguishable from a frozen
+         * game. "none" is how a control is deliberately left unbound. */
+        if (!pri && !sec) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "binding object names neither 'primary' nor 'secondary'; "
+                     "write \"none\" to leave a control unbound");
+            return false;
+        }
+        if (pri) {
+            if (pri->type != JSON_STRING) {
+                diag_set(diag_buf, diag_buf_sz, "binding 'primary' must be string");
+                return false;
+            }
+            if (pri->u.str_val[0] == '\0') {
+                diag_set(diag_buf, diag_buf_sz,
+                         "binding 'primary' is an empty string; write \"none\" to leave a control unbound");
+                return false;
+            }
+            if (!parse_binding_source_str(pri->u.str_val, &out_binding->primary, diag_buf, diag_buf_sz)) {
+                return false;
+            }
+        }
+        if (sec) {
+            if (sec->type != JSON_STRING) {
+                diag_set(diag_buf, diag_buf_sz, "binding 'secondary' must be string");
+                return false;
+            }
+            if (sec->u.str_val[0] == '\0') {
+                diag_set(diag_buf, diag_buf_sz,
+                         "binding 'secondary' is an empty string; write \"none\" to leave a control unbound");
+                return false;
+            }
+            if (!parse_binding_source_str(sec->u.str_val, &out_binding->secondary, diag_buf, diag_buf_sz)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    diag_set(diag_buf, diag_buf_sz, "binding must be a string or object");
+    return false;
+}
+
+/* One keyboard slot: a bindable key name, or "none". */
+static bool parse_key_slot(
+    const JsonNode *node,
+    const char *slot,
+    const char *control,
+    int *out_key,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (node->type != JSON_STRING) {
+        diag_set(diag_buf, diag_buf_sz, "keyboard binding '%s' for '%s' must be a string",
+                 slot, control);
+        return false;
+    }
+    if (node->u.str_val[0] == '\0') {
+        diag_set(diag_buf, diag_buf_sz,
+                 "keyboard binding '%s' for '%s' is an empty string; write \"none\" to leave a "
+                 "control unbound", slot, control);
+        return false;
+    }
+    if (nk_ascii_casecmp(node->u.str_val, "none") == 0) {
+        *out_key = NK_HOST_KEY_NONE;
+        return true;
+    }
+    int key = nk_host_key_from_name(node->u.str_val);
+    if (key == NK_HOST_KEY_NONE) {
+        diag_set(diag_buf, diag_buf_sz, "unknown host key '%s' for '%s'",
+                 node->u.str_val, control);
+        return false;
+    }
+    *out_key = key;
+    return true;
+}
+
+/* The optional keyboard_bindings list (schema 3; stick directions from schema 4).
+ * Like psp_bindings, a present list replaces the defaults and a control it does not
+ * name is unbound, stick directions included. `doc_version` is the document's
+ * schema_version: a stick entry in an older document is refused. */
+static bool parse_keyboard_bindings(
+    const JsonNode *kb,
+    int doc_version,
+    NkInputProfile *out,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (kb->type != JSON_ARRAY) {
+        diag_set(diag_buf, diag_buf_sz, "'keyboard_bindings' must be an array");
+        return false;
+    }
+    bool bound[NK_KEY_CONTROL_COUNT];
+    memset(bound, 0, sizeof(bound));
+    for (int i = 0; i < NK_PSP_BTN_COUNT; i++) {
+        out->psp_keys[i].primary = NK_HOST_KEY_NONE;
+        out->psp_keys[i].secondary = NK_HOST_KEY_NONE;
+    }
+    for (int i = 0; i < NK_PSP_STICK_DIR_COUNT; i++) {
+        out->stick_keys[i].primary = NK_HOST_KEY_NONE;
+        out->stick_keys[i].secondary = NK_HOST_KEY_NONE;
+    }
+    for (size_t i = 0; i < kb->u.arr.count; i++) {
+        const JsonNode *item = kb->u.arr.items[i];
+        if (!item || item->type != JSON_OBJECT) {
+            diag_set(diag_buf, diag_buf_sz, "keyboard_bindings entry %zu must be an object", i);
+            return false;
+        }
+        JsonNode *ctrl = obj_get(item, "control");
+        if (!ctrl || ctrl->type != JSON_STRING) {
+            diag_set(diag_buf, diag_buf_sz, "keyboard_bindings entry %zu missing 'control' name", i);
+            return false;
+        }
+        /* A button name, else a stick direction; `control` numbers both together. */
+        NkKeyBinding *target = NULL;
+        int control = -1;
+        NkPspButton btn = nk_psp_button_from_name(ctrl->u.str_val);
+        if ((int)btn >= 0 && (int)btn < NK_PSP_BTN_COUNT) {
+            control = (int)btn;
+            target = &out->psp_keys[btn];
+        } else {
+            NkPspStickDir dir = nk_psp_stick_dir_from_name(ctrl->u.str_val);
+            if ((int)dir >= 0 && (int)dir < NK_PSP_STICK_DIR_COUNT) {
+                if (doc_version < NK_INPUT_PROFILE_STICK_KEYS_SCHEMA_VERSION) {
+                    diag_set(diag_buf, diag_buf_sz,
+                             "schema_version %d cannot carry stick keys (introduced in %d)",
+                             doc_version, NK_INPUT_PROFILE_STICK_KEYS_SCHEMA_VERSION);
+                    return false;
+                }
+                control = NK_PSP_BTN_COUNT + (int)dir;
+                target = &out->stick_keys[dir];
+            }
+        }
+        if (!target) {
+            diag_set(diag_buf, diag_buf_sz, "unknown PSP control '%s' in keyboard_bindings",
+                     ctrl->u.str_val);
+            return false;
+        }
+        if (bound[control]) {
+            diag_set(diag_buf, diag_buf_sz, "duplicate keyboard binding for control '%s'",
+                     ctrl->u.str_val);
+            return false;
+        }
+        bound[control] = true;
+
+        JsonNode *pri = obj_get(item, "primary");
+        JsonNode *sec = obj_get(item, "secondary");
+        if (!pri && !sec) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "keyboard binding for '%s' names neither 'primary' nor 'secondary'; "
+                     "write \"none\" to leave a control unbound", ctrl->u.str_val);
+            return false;
+        }
+        if (pri && !parse_key_slot(pri, "primary", ctrl->u.str_val,
+                                   &target->primary, diag_buf, diag_buf_sz)) {
+            return false;
+        }
+        if (sec && !parse_key_slot(sec, "secondary", ctrl->u.str_val,
+                                   &target->secondary, diag_buf, diag_buf_sz)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* True when `key` drives any PSP button of `profile` (either slot). */
+static bool key_drives_button(const NkInputProfile *profile, int key) {
+    for (int i = 0; i < NK_PSP_BTN_COUNT; i++) {
+        if (profile->psp_keys[i].primary == key || profile->psp_keys[i].secondary == key) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Schema 3 -> 4: a schema 3 mapping that has a keyboard_bindings list names no stick
+ * directions, so each gets its default key (default_stick_key) -- except a default
+ * the mapping already binds to a PSP button, which the direction leaves unbound. The
+ * button keys of the file are never changed, and the migrated mapping always
+ * validates. */
+static void migrate_stick_keys(NkInputProfile *profile) {
+    for (int d = 0; d < NK_PSP_STICK_DIR_COUNT; d++) {
+        int key = default_stick_key((NkPspStickDir)d);
+        profile->stick_keys[d].primary = key_drives_button(profile, key) ? NK_HOST_KEY_NONE : key;
+        profile->stick_keys[d].secondary = NK_HOST_KEY_NONE;
+    }
+}
+
+/**
+ * Parse one mapping (device identity, calibration, PSP bindings, navigation
+ * bindings, keyboard bindings) out of a JSON object and validate it. Shared by
+ * the document's global mapping and by every per-title entry, so a per-title
+ * mapping is held to exactly the same rules as the global one. Any failure
+ * leaves `out` at the safe default mapping.
+ */
+static bool parse_mapping_node(
+    const JsonNode *node,
+    int doc_version,
+    NkInputProfile *out,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    nk_input_profile_init_default(out);
+
+    /* Device Identity */
+    JsonNode *dev = obj_get(node, "device");
+    if (!dev || dev->type != JSON_OBJECT) {
+        diag_set(diag_buf, diag_buf_sz, "missing 'device' object");
+        nk_input_profile_init_default(out);
+        return false;
+    }
+    JsonNode *guid = obj_get(dev, "guid");
+    if (!guid || guid->type != JSON_STRING || guid->u.str_val[0] == '\0') {
+        diag_set(diag_buf, diag_buf_sz, "device missing non-empty 'guid' string");
+        nk_input_profile_init_default(out);
+        return false;
+    }
+    snprintf(out->guid, sizeof(out->guid), "%s", guid->u.str_val);
+
+    JsonNode *name = obj_get(dev, "name_hint");
+    if (name && name->type == JSON_STRING) {
+        snprintf(out->name_hint, sizeof(out->name_hint), "%s", name->u.str_val);
+    } else {
+        snprintf(out->name_hint, sizeof(out->name_hint), "Generic Controller");
+    }
+
+    /* Calibration */
+    JsonNode *cal = obj_get(node, "calibration");
+    if (!cal || cal->type != JSON_OBJECT) {
+        diag_set(diag_buf, diag_buf_sz, "missing 'calibration' object");
+        nk_input_profile_init_default(out);
+        return false;
+    }
+
+    JsonNode *tt = obj_get(cal, "trigger_threshold");
+    if (!tt || tt->type != JSON_NUMBER) {
+        diag_set(diag_buf, diag_buf_sz, "calibration missing 'trigger_threshold'");
+        nk_input_profile_init_default(out);
+        return false;
+    }
+    if (tt->u.num.num_val < 0 || tt->u.num.num_val > 32767) {
+        diag_set(diag_buf, diag_buf_sz, "trigger_threshold %.0f out of range [0, 32767]", tt->u.num.num_val);
+        nk_input_profile_init_default(out);
+        return false;
+    }
+    out->trigger_threshold = (int16_t)tt->u.num.num_val;
+
+    JsonNode *tr_rest = obj_get(cal, "trigger_rest");
+    if (tr_rest) {
+        if (tr_rest->type != JSON_NUMBER || tr_rest->u.num.num_val < -32768 || tr_rest->u.num.num_val > 32767) {
+            diag_set(diag_buf, diag_buf_sz, "trigger_rest out of range [-32768, 32767]");
+            nk_input_profile_init_default(out);
+            return false;
+        }
+        out->trigger_rest = (int16_t)tr_rest->u.num.num_val;
+    } else {
+        out->trigger_rest = 0;
+    }
+
+    JsonNode *tr_ext = obj_get(cal, "trigger_extreme");
+    if (tr_ext) {
+        if (tr_ext->type != JSON_NUMBER || tr_ext->u.num.num_val < -32768 || tr_ext->u.num.num_val > 32767) {
+            diag_set(diag_buf, diag_buf_sz, "trigger_extreme out of range [-32768, 32767]");
+            nk_input_profile_init_default(out);
+            return false;
+        }
+        out->trigger_extreme = (int16_t)tr_ext->u.num.num_val;
+    } else {
+        out->trigger_extreme = 32767;
+    }
+
+    JsonNode *ax_x = obj_get(cal, "analog_x");
+    if (!parse_axis_node(ax_x, &out->axes[NK_PSP_AXIS_ANALOG_X], "analog_x", diag_buf, diag_buf_sz)) {
+        nk_input_profile_init_default(out);
+        return false;
+    }
+
+    JsonNode *ax_y = obj_get(cal, "analog_y");
+    if (!parse_axis_node(ax_y, &out->axes[NK_PSP_AXIS_ANALOG_Y], "analog_y", diag_buf, diag_buf_sz)) {
+        nk_input_profile_init_default(out);
+        return false;
+    }
+
+    /* PSP Bindings */
+    JsonNode *pb = obj_get(node, "psp_bindings");
+    if (!pb || pb->type != JSON_ARRAY) {
+        diag_set(diag_buf, diag_buf_sz, "missing 'psp_bindings' array");
+        nk_input_profile_init_default(out);
+        return false;
+    }
+
+    bool bound_psp[NK_PSP_BTN_COUNT];
+    memset(bound_psp, 0, sizeof(bound_psp));
+    /* Clear default buttons before applying file's bindings */
+    for (int i = 0; i < NK_PSP_BTN_COUNT; i++) {
+        out->psp_buttons[i].primary.type = NK_BINDING_NONE;
+        out->psp_buttons[i].secondary.type = NK_BINDING_NONE;
+    }
+
+    for (size_t i = 0; i < pb->u.arr.count; i++) {
+        const JsonNode *item = pb->u.arr.items[i];
+        if (!item || item->type != JSON_OBJECT) {
+            diag_set(diag_buf, diag_buf_sz, "psp_bindings entry %zu must be an object", i);
+            nk_input_profile_init_default(out);
+            return false;
+        }
+
+        JsonNode *ctrl = obj_get(item, "control");
+        if (!ctrl || ctrl->type != JSON_STRING) {
+            diag_set(diag_buf, diag_buf_sz, "psp_bindings entry %zu missing 'control' name", i);
+            nk_input_profile_init_default(out);
+            return false;
+        }
+
+        NkPspButton btn = nk_psp_button_from_name(ctrl->u.str_val);
+        if ((int)btn < 0 || (int)btn >= NK_PSP_BTN_COUNT) {
+            diag_set(diag_buf, diag_buf_sz, "unknown PSP control '%s'", ctrl->u.str_val);
+            nk_input_profile_init_default(out);
+            return false;
+        }
+
+        if (bound_psp[btn]) {
+            diag_set(diag_buf, diag_buf_sz, "duplicate binding for control '%s'", ctrl->u.str_val);
+            nk_input_profile_init_default(out);
+            return false;
+        }
+        bound_psp[btn] = true;
+
+        if (!parse_binding_node(item, &out->psp_buttons[btn], diag_buf, diag_buf_sz)) {
+            nk_input_profile_init_default(out);
+            return false;
+        }
+    }
+
+    /* Navigation Bindings */
+    JsonNode *nb = obj_get(node, "navigation_bindings");
+    if (!nb || nb->type != JSON_ARRAY) {
+        diag_set(diag_buf, diag_buf_sz, "missing 'navigation_bindings' array");
+        nk_input_profile_init_default(out);
+        return false;
+    }
+
+    bool bound_nav[NK_NAV_ACTION_COUNT];
+    memset(bound_nav, 0, sizeof(bound_nav));
+    for (int i = 0; i < NK_NAV_ACTION_COUNT; i++) {
+        out->nav_bindings[i].primary.type = NK_BINDING_NONE;
+        out->nav_bindings[i].secondary.type = NK_BINDING_NONE;
+    }
+
+    for (size_t i = 0; i < nb->u.arr.count; i++) {
+        const JsonNode *item = nb->u.arr.items[i];
+        if (!item || item->type != JSON_OBJECT) {
+            diag_set(diag_buf, diag_buf_sz, "navigation_bindings entry %zu must be an object", i);
+            nk_input_profile_init_default(out);
+            return false;
+        }
+
+        JsonNode *act = obj_get(item, "action");
+        if (!act || act->type != JSON_STRING) {
+            diag_set(diag_buf, diag_buf_sz, "navigation_bindings entry %zu missing 'action' name", i);
+            nk_input_profile_init_default(out);
+            return false;
+        }
+
+        NkNavAction action = nk_nav_action_from_name(act->u.str_val);
+        if ((int)action < 0 || (int)action >= NK_NAV_ACTION_COUNT) {
+            diag_set(diag_buf, diag_buf_sz, "unknown navigation action '%s'", act->u.str_val);
+            nk_input_profile_init_default(out);
+            return false;
+        }
+
+        if (bound_nav[action]) {
+            diag_set(diag_buf, diag_buf_sz, "duplicate binding for navigation action '%s'", act->u.str_val);
+            nk_input_profile_init_default(out);
+            return false;
+        }
+        bound_nav[action] = true;
+
+        if (!parse_binding_node(item, &out->nav_bindings[action], diag_buf, diag_buf_sz)) {
+            nk_input_profile_init_default(out);
+            return false;
+        }
+    }
+
+    /* Keyboard Bindings (schema 3, stick directions from schema 4). Absent: the default
+     * keys stay, so a schema 1 or 2 file keeps the keyboard map it always had, and a
+     * mapping with no list gets the default stick keys too. */
+    JsonNode *kb = obj_get(node, "keyboard_bindings");
+    if (kb) {
+        if (doc_version < NK_INPUT_PROFILE_KEYBOARD_SCHEMA_VERSION) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "schema_version %d cannot carry keyboard_bindings (introduced in %d)",
+                     doc_version, NK_INPUT_PROFILE_KEYBOARD_SCHEMA_VERSION);
+            nk_input_profile_init_default(out);
+            return false;
+        }
+        if (!parse_keyboard_bindings(kb, doc_version, out, diag_buf, diag_buf_sz)) {
+            nk_input_profile_init_default(out);
+            return false;
+        }
+        if (doc_version < NK_INPUT_PROFILE_STICK_KEYS_SCHEMA_VERSION) {
+            migrate_stick_keys(out);
+        }
+    }
+
+    /* Final validation pass (checks range, deadzone sum, and conflicting bindings) */
+    if (nk_input_profile_validate(out, diag_buf, diag_buf_sz) != NK_OK) {
+        nk_input_profile_init_default(out);
+        return false;
+    }
+
+    return true;
+}
+
+void nk_input_profile_file_init_default(NkInputProfileFile *doc) {
+    if (!doc) return;
+    memset(doc, 0, sizeof(*doc));
+    doc->schema_version = NK_INPUT_PROFILE_SCHEMA_VERSION;
+    nk_input_profile_init_default(&doc->global);
+    doc->title_count = 0;
+}
+
+bool nk_input_profile_disc_id_safe(const char *disc_id) {
+    if (!disc_id || !disc_id[0]) return false;
+    size_t len = strlen(disc_id);
+    if (len >= NK_MAX_DISC_ID_LEN) return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)disc_id[i];
+        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+        if (!ok) return false;
+    }
+    /* A name made only of dots names "." or "..", never a file of its own. */
+    if (strcmp(disc_id, ".") == 0 || strcmp(disc_id, "..") == 0) return false;
+    /* Windows drops a trailing dot, so "X." would alias "X". */
+    if (disc_id[len - 1] == '.') return false;
+    /* Windows reserves device names regardless of extension ("NUL", "com1.json"). */
+    char stem[NK_MAX_DISC_ID_LEN];
+    size_t stem_len = strcspn(disc_id, ".");
+    memcpy(stem, disc_id, stem_len);
+    stem[stem_len] = '\0';
+    static const char * const reserved[] = {"CON", "PRN", "AUX", "NUL", NULL};
+    for (size_t i = 0; reserved[i]; i++) {
+        if (nk_ascii_casecmp(stem, reserved[i]) == 0) return false;
+    }
+    if (stem_len == 4 && stem[3] >= '1' && stem[3] <= '9') {
+        char device[4] = {stem[0], stem[1], stem[2], '\0'};
+        if (nk_ascii_casecmp(device, "COM") == 0 ||
+            nk_ascii_casecmp(device, "LPT") == 0) return false;
+    }
+    return true;
+}
+
+int nk_input_profile_file_find_title(const NkInputProfileFile *doc, const char *disc_id) {
+    if (!doc || !disc_id || !disc_id[0]) return -1;
+    for (int i = 0; i < doc->title_count; i++) {
+        if (nk_ascii_casecmp(doc->title_disc_id[i], disc_id) == 0) return i;
+    }
+    return -1;
+}
+
+/**
+ * Effective mapping for `disc_id`: its own entry, else the global one.
+ *
+ * An entry that fails validation is reported through `diag_buf` and the global
+ * mapping is returned instead, because a partially applied per-title mapping
+ * would hand the guest buttons the screen does not show. Returns NULL only for
+ * a null document.
+ */
+const NkInputProfile *nk_input_profile_file_resolve(
+    const NkInputProfileFile *doc,
+    const char *disc_id,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (diag_buf && diag_buf_sz > 0) diag_buf[0] = '\0';
+    if (!doc) return NULL;
+    if (!disc_id || !disc_id[0]) return &doc->global;
+
+    int idx = nk_input_profile_file_find_title(doc, disc_id);
+    if (idx < 0) return &doc->global;
+
+    char entry_diag[NK_INPUT_DIAGNOSTIC_MAX_LEN];
+    if (nk_input_profile_validate(&doc->title[idx], entry_diag, sizeof(entry_diag)) != NK_OK) {
+        diag_set(diag_buf, diag_buf_sz,
+                 "per-title input profile for '%s' is invalid (%s); using the global mapping",
+                 doc->title_disc_id[idx], entry_diag);
+        return &doc->global;
+    }
+    return &doc->title[idx];
+}
+
+NkResult nk_input_profile_file_set_title(
+    NkInputProfileFile *doc,
+    const char *disc_id,
+    const NkInputProfile *mapping,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (diag_buf && diag_buf_sz > 0) diag_buf[0] = '\0';
+    if (!doc || !mapping) {
+        diag_set(diag_buf, diag_buf_sz, "null profile document or mapping");
+        return NK_ERROR_GENERIC;
+    }
+    if (!nk_input_profile_disc_id_safe(disc_id)) {
+        diag_set(diag_buf, diag_buf_sz,
+                 "disc ID '%s' is missing or not usable as a per-title profile name",
+                 disc_id ? disc_id : "");
+        return NK_ERROR_GENERIC;
+    }
+
+    NkInputProfile candidate = *mapping;
+    candidate.schema_version = NK_INPUT_PROFILE_SCHEMA_VERSION;
+    if (nk_input_profile_validate(&candidate, diag_buf, diag_buf_sz) != NK_OK) {
+        return NK_ERROR_GENERIC;
+    }
+
+    int idx = nk_input_profile_file_find_title(doc, disc_id);
+    if (idx < 0) {
+        if (doc->title_count >= NK_INPUT_MAX_PER_TITLE) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "per-title input profile table is full (%d entries); refusing to drop a disc mapping",
+                     NK_INPUT_MAX_PER_TITLE);
+            return NK_ERROR_GENERIC;
+        }
+        idx = doc->title_count++;
+        snprintf(doc->title_disc_id[idx], sizeof(doc->title_disc_id[idx]), "%s", disc_id);
+    }
+    doc->title[idx] = candidate;
+    return NK_OK;
+}
+
+bool nk_input_profile_file_remove_title(NkInputProfileFile *doc, const char *disc_id) {
+    int idx = nk_input_profile_file_find_title(doc, disc_id);
+    if (idx < 0) return false;
+    for (int i = idx; i + 1 < doc->title_count; i++) {
+        memmove(doc->title_disc_id[i], doc->title_disc_id[i + 1], sizeof(doc->title_disc_id[i]));
+        doc->title[i] = doc->title[i + 1];
+    }
+    doc->title_count--;
+    memset(&doc->title[doc->title_count], 0, sizeof(doc->title[0]));
+    doc->title_disc_id[doc->title_count][0] = '\0';
+    return true;
+}
+
+NkResult nk_input_profile_file_parse_json(
+    NkInputProfileFile *doc,
+    const char *json_str,
+    size_t json_len,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (diag_buf && diag_buf_sz > 0) diag_buf[0] = '\0';
+    if (!doc) return NK_ERROR_GENERIC;
+
+    nk_input_profile_file_init_default(doc);
+
+    if (!json_str || json_len == 0) {
+        diag_set(diag_buf, diag_buf_sz, "empty JSON input");
+        return NK_ERROR_GENERIC;
+    }
+
+    JsonNode *root = nk_json_parse(json_str, json_len, diag_buf, diag_buf_sz);
+    if (!root) {
+        nk_input_profile_file_init_default(doc);
+        return NK_ERROR_GENERIC;
+    }
+
+    if (root->type != JSON_OBJECT) {
+        diag_set(diag_buf, diag_buf_sz, "root JSON node must be an object");
+        json_free(root);
+        nk_input_profile_file_init_default(doc);
+        return NK_ERROR_GENERIC;
+    }
+
+    /* 1. schema_version. Each older version migrates forward in memory, one step
+     *    at a time, as the members it could not carry are read:
+     *      v1 -> v2: no per_title map, so every disc uses the global mapping;
+     *      v2 -> v3: no keyboard_bindings, so each mapping keeps the default keys;
+     *      v3 -> v4: no stick directions in keyboard_bindings, so each mapping that has
+     *      a keyboard_bindings list gets the default stick keys (I, K, J, L), except
+     *      that a default key the mapping already binds to a PSP button leaves that
+     *      direction unbound. The button keys of the file are never changed, and the
+     *      migrated mapping always validates (migrate_stick_keys). A mapping with no
+     *      keyboard_bindings list keeps every default key, stick included.
+     *    v0.0.1 wrote version 3. The file on disk is rewritten only by the next
+     *    save, which keeps the original as <file>.v<n>.bak first. A future version
+     *    is never downgraded: it is refused with NK_ERROR_NEWER_SCHEMA, and the
+     *    writer will not replace it (nk_user_data_schema.h). */
+    JsonNode *sv = obj_get(root, "schema_version");
+    if (!sv || sv->type != JSON_NUMBER) {
+        diag_set(diag_buf, diag_buf_sz, "missing or non-numeric schema_version");
+        json_free(root);
+        nk_input_profile_file_init_default(doc);
+        return NK_ERROR_GENERIC;
+    }
+    int ver = (int)sv->u.num.num_val;
+    if (ver > NK_INPUT_PROFILE_SCHEMA_VERSION) {
+        diag_set(diag_buf, diag_buf_sz,
+                 "unsupported future schema_version %d (current version is %d): a newer "
+                 "Nakagawa saved this profile; it is kept as it is and changes here are "
+                 "not saved", ver, NK_INPUT_PROFILE_SCHEMA_VERSION);
+        json_free(root);
+        nk_input_profile_file_init_default(doc);
+        return NK_ERROR_NEWER_SCHEMA;
+    }
+    if (ver < NK_INPUT_PROFILE_MIN_SCHEMA_VERSION) {
+        diag_set(diag_buf, diag_buf_sz,
+                 "unsupported schema_version %d (supported versions are %d to %d)",
+                 ver, NK_INPUT_PROFILE_MIN_SCHEMA_VERSION, NK_INPUT_PROFILE_SCHEMA_VERSION);
+        json_free(root);
+        nk_input_profile_file_init_default(doc);
+        return NK_ERROR_GENERIC;
+    }
+
+    /* 2. The global mapping every disc inherits. */
+    if (!parse_mapping_node(root, ver, &doc->global, diag_buf, diag_buf_sz)) {
+        char detail[NK_INPUT_DIAGNOSTIC_MAX_LEN];
+        snprintf(detail, sizeof(detail), "%s", diag_buf ? diag_buf : "");
+        diag_set(diag_buf, diag_buf_sz, "global mapping: %s", detail);
+        json_free(root);
+        nk_input_profile_file_init_default(doc);
+        return NK_ERROR_GENERIC;
+    }
+
+    /* 3. Optional per-title map (schema 2 and later). An invalid entry refuses the whole
+     *    document rather than leaving one disc half-mapped. */
+    JsonNode *pt = obj_get(root, "per_title");
+    if (pt) {
+        if (ver < NK_INPUT_PROFILE_PER_TITLE_SCHEMA_VERSION) {
+            diag_set(diag_buf, diag_buf_sz,
+                     "schema_version %d cannot carry a per_title map (introduced in %d)",
+                     ver, NK_INPUT_PROFILE_PER_TITLE_SCHEMA_VERSION);
+            json_free(root);
+            nk_input_profile_file_init_default(doc);
+            return NK_ERROR_GENERIC;
+        }
+        if (pt->type != JSON_ARRAY) {
+            diag_set(diag_buf, diag_buf_sz, "'per_title' must be an array");
+            json_free(root);
+            nk_input_profile_file_init_default(doc);
+            return NK_ERROR_GENERIC;
+        }
+        for (size_t i = 0; i < pt->u.arr.count; i++) {
+            const JsonNode *item = pt->u.arr.items[i];
+            if (!item || item->type != JSON_OBJECT) {
+                diag_set(diag_buf, diag_buf_sz, "per_title entry %zu must be an object", i);
+                json_free(root);
+                nk_input_profile_file_init_default(doc);
+                return NK_ERROR_GENERIC;
+            }
+            if (doc->title_count >= NK_INPUT_MAX_PER_TITLE) {
+                diag_set(diag_buf, diag_buf_sz,
+                         "per_title holds more than %d entries; refusing to drop a disc mapping",
+                         NK_INPUT_MAX_PER_TITLE);
+                json_free(root);
+                nk_input_profile_file_init_default(doc);
+                return NK_ERROR_GENERIC;
+            }
+
+            JsonNode *did = obj_get(item, "disc_id");
+            if (!did || did->type != JSON_STRING ||
+                !nk_input_profile_disc_id_safe(did->u.str_val)) {
+                diag_set(diag_buf, diag_buf_sz,
+                         "per_title entry %zu missing a usable 'disc_id' string", i);
+                json_free(root);
+                nk_input_profile_file_init_default(doc);
+                return NK_ERROR_GENERIC;
+            }
+            if (nk_input_profile_file_find_title(doc, did->u.str_val) >= 0) {
+                diag_set(diag_buf, diag_buf_sz,
+                         "duplicate per_title entry for disc '%s'", did->u.str_val);
+                json_free(root);
+                nk_input_profile_file_init_default(doc);
+                return NK_ERROR_GENERIC;
+            }
+
+            JsonNode *prof = obj_get(item, "profile");
+            if (!prof || prof->type != JSON_OBJECT) {
+                diag_set(diag_buf, diag_buf_sz,
+                         "per_title entry for '%s' missing 'profile' object", did->u.str_val);
+                json_free(root);
+                nk_input_profile_file_init_default(doc);
+                return NK_ERROR_GENERIC;
+            }
+
+            NkInputProfile entry;
+            char entry_diag[NK_INPUT_DIAGNOSTIC_MAX_LEN];
+            if (!parse_mapping_node(prof, ver, &entry, entry_diag, sizeof(entry_diag))) {
+                diag_set(diag_buf, diag_buf_sz,
+                         "per-title mapping for '%s': %s", did->u.str_val, entry_diag);
+                json_free(root);
+                nk_input_profile_file_init_default(doc);
+                return NK_ERROR_GENERIC;
+            }
+
+            int slot = doc->title_count++;
+            snprintf(doc->title_disc_id[slot], sizeof(doc->title_disc_id[slot]), "%s",
+                     did->u.str_val);
+            doc->title[slot] = entry;
+        }
+    }
+
+    json_free(root);
+    return NK_OK;
+}
+
+NkResult nk_input_profile_parse_json(
+    NkInputProfile *out_profile,
+    const char *json_str,
+    size_t json_len,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (diag_buf && diag_buf_sz > 0) diag_buf[0] = '\0';
+    if (!out_profile) return NK_ERROR_GENERIC;
+
+    NkInputProfileFile doc;
+    NkResult res = nk_input_profile_file_parse_json(&doc, json_str, json_len,
+                                                    diag_buf, diag_buf_sz);
+    *out_profile = doc.global;
+    return res;
+}
+
+/* -----------------------------------------------------------------------------
+ * File Load and Atomic Save
+ * -------------------------------------------------------------------------- */
+
+static void escape_json(const char *src, char *dst, size_t dst_sz) {
+    if (!dst || dst_sz == 0) return;
+    size_t d = 0;
+    for (size_t s = 0; src && src[s] && d + 2 < dst_sz; s++) {
+        char c = src[s];
+        if (c == '"' || c == '\\') {
+            dst[d++] = '\\';
+            dst[d++] = c;
+        } else if (c == '\n') {
+            dst[d++] = '\\'; dst[d++] = 'n';
+        } else if (c == '\r') {
+            dst[d++] = '\\'; dst[d++] = 'r';
+        } else if (c == '\t') {
+            dst[d++] = '\\'; dst[d++] = 't';
+        } else {
+            dst[d++] = c;
+        }
+    }
+    dst[d] = '\0';
+}
+
+static void write_mapping_body(FILE *f, const NkInputProfile *profile, int indent) {
+    char pad[16];
+    char pad2[20];
+    int width = indent < 14 ? indent : 14;
+    memset(pad, ' ', (size_t)width);
+    pad[width] = '\0';
+    snprintf(pad2, sizeof(pad2), "%s  ", pad);
+
+    char esc_guid[NK_INPUT_GUID_MAX_LEN * 2];
+    char esc_name[NK_INPUT_NAME_HINT_MAX_LEN * 2];
+    escape_json(profile->guid, esc_guid, sizeof(esc_guid));
+    escape_json(profile->name_hint, esc_name, sizeof(esc_name));
+
+    fprintf(f, "%s\"device\": {\n", pad);
+    fprintf(f, "%s\"guid\": \"%s\",\n", pad2, esc_guid);
+    fprintf(f, "%s\"name_hint\": \"%s\"\n", pad2, esc_name);
+    fprintf(f, "%s},\n", pad);
+    fprintf(f, "%s\"calibration\": {\n", pad);
+    fprintf(f, "%s\"trigger_threshold\": %d,\n", pad2, profile->trigger_threshold);
+    fprintf(f, "%s\"trigger_rest\": %d,\n", pad2, profile->trigger_rest);
+    fprintf(f, "%s\"trigger_extreme\": %d,\n", pad2, profile->trigger_extreme);
+
+    for (int i = 0; i < NK_PSP_AXIS_COUNT; i++) {
+        const NkAxisCalibration *ax = &profile->axes[i];
+        fprintf(f, "%s\"%s\": {\n", pad2, nk_psp_axis_name((NkPspAxis)i));
+        fprintf(f, "%s  \"host_axis\": \"%s\",\n", pad2, nk_host_axis_name(ax->host_axis));
+        fprintf(f, "%s  \"deadzone_inner\": %d,\n", pad2, ax->deadzone_inner);
+        fprintf(f, "%s  \"deadzone_outer\": %d,\n", pad2, ax->deadzone_outer);
+        fprintf(f, "%s  \"inverted\": %s,\n", pad2, ax->inverted ? "true" : "false");
+        fprintf(f, "%s  \"rest\": %d,\n", pad2, ax->rest);
+        fprintf(f, "%s  \"min_val\": %d,\n", pad2, ax->min_val);
+        fprintf(f, "%s  \"max_val\": %d\n", pad2, ax->max_val);
+        fprintf(f, "%s}%s\n", pad2, (i < NK_PSP_AXIS_COUNT - 1) ? "," : "");
+    }
+    fprintf(f, "%s},\n", pad);
+
+    /* PSP bindings */
+    fprintf(f, "%s\"psp_bindings\": [\n", pad);
+    for (int i = 0; i < NK_PSP_BTN_COUNT; i++) {
+        char pri_str[64], sec_str[64];
+        format_binding_source(&profile->psp_buttons[i].primary, pri_str, sizeof(pri_str));
+        format_binding_source(&profile->psp_buttons[i].secondary, sec_str, sizeof(sec_str));
+
+        fprintf(f, "%s{\n", pad2);
+        fprintf(f, "%s  \"control\": \"%s\",\n", pad2, nk_psp_button_name((NkPspButton)i));
+        fprintf(f, "%s  \"primary\": \"%s\"", pad2, pri_str);
+        if (profile->psp_buttons[i].secondary.type != NK_BINDING_NONE) {
+            fprintf(f, ",\n%s  \"secondary\": \"%s\"\n", pad2, sec_str);
+        } else {
+            fprintf(f, "\n");
+        }
+        fprintf(f, "%s}%s\n", pad2, (i < NK_PSP_BTN_COUNT - 1) ? "," : "");
+    }
+    fprintf(f, "%s],\n", pad);
+
+    /* Navigation bindings */
+    fprintf(f, "%s\"navigation_bindings\": [\n", pad);
+    for (int i = 0; i < NK_NAV_ACTION_COUNT; i++) {
+        char pri_str[64], sec_str[64];
+        format_binding_source(&profile->nav_bindings[i].primary, pri_str, sizeof(pri_str));
+        format_binding_source(&profile->nav_bindings[i].secondary, sec_str, sizeof(sec_str));
+
+        fprintf(f, "%s{\n", pad2);
+        fprintf(f, "%s  \"action\": \"%s\",\n", pad2, nk_nav_action_name((NkNavAction)i));
+        fprintf(f, "%s  \"primary\": \"%s\"", pad2, pri_str);
+        if (profile->nav_bindings[i].secondary.type != NK_BINDING_NONE) {
+            fprintf(f, ",\n%s  \"secondary\": \"%s\"\n", pad2, sec_str);
+        } else {
+            fprintf(f, "\n");
+        }
+        fprintf(f, "%s}%s\n", pad2, (i < NK_NAV_ACTION_COUNT - 1) ? "," : "");
+    }
+    fprintf(f, "%s],\n", pad);
+
+    /* Keyboard bindings (schema 3, stick directions from schema 4): every control is
+     * written, the 14 buttons then the 4 stick directions, "none" when unbound. */
+    fprintf(f, "%s\"keyboard_bindings\": [\n", pad);
+    for (int i = 0; i < NK_KEY_CONTROL_COUNT; i++) {
+        const NkKeyBinding *binding = key_control_binding(profile, i);
+        const char *pri = nk_host_key_name(binding->primary);
+        const char *sec = nk_host_key_name(binding->secondary);
+        fprintf(f, "%s{\n", pad2);
+        fprintf(f, "%s  \"control\": \"%s\",\n", pad2, key_control_name(i));
+        fprintf(f, "%s  \"primary\": \"%s\"", pad2, pri ? pri : "none");
+        if (sec) {
+            fprintf(f, ",\n%s  \"secondary\": \"%s\"\n", pad2, sec);
+        } else {
+            fprintf(f, "\n");
+        }
+        fprintf(f, "%s}%s\n", pad2, (i < NK_KEY_CONTROL_COUNT - 1) ? "," : "");
+    }
+    fprintf(f, "%s]\n", pad);
+}
+
+/**
+ * Write `doc` to disk atomically: a temporary file beside the target is fully
+ * written and flushed, then renamed over it. An interrupted write therefore
+ * leaves the previous file exactly as it was, and a refused document is never
+ * written at all.
+ */
+static NkResult profile_document_write(
+    const NkInputProfileFile *doc,
+    const char *file_path,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (diag_buf && diag_buf_sz > 0) diag_buf[0] = '\0';
+    if (!doc || !file_path || !*file_path) {
+        diag_set(diag_buf, diag_buf_sz, "invalid profile or file path");
+        return NK_ERROR_GENERIC;
+    }
+
+    if (nk_input_profile_validate(&doc->global, diag_buf, diag_buf_sz) != NK_OK) {
+        return NK_ERROR_GENERIC;
+    }
+    for (int i = 0; i < doc->title_count; i++) {
+        char entry_diag[NK_INPUT_DIAGNOSTIC_MAX_LEN];
+        if (nk_input_profile_validate(&doc->title[i], entry_diag, sizeof(entry_diag)) != NK_OK) {
+            diag_set(diag_buf, diag_buf_sz, "per-title mapping for '%s': %s",
+                     doc->title_disc_id[i], entry_diag);
+            return NK_ERROR_GENERIC;
+        }
+    }
+
+    /* A profile a newer player saved is never replaced, and an older one is kept
+       as <file>.v<n>.bak before this one replaces it (nk_user_data_schema.h). */
+    long found_version = NK_USER_DATA_VERSION_ABSENT;
+    NkResult guard = nk_user_data_prepare_replace(file_path, NK_INPUT_PROFILE_SCHEMA_VERSION,
+                                                  NK_INPUT_PROFILE_MAX_FILE_BYTES,
+                                                  &found_version);
+    if (guard == NK_ERROR_NEWER_SCHEMA) {
+        diag_set(diag_buf, diag_buf_sz,
+                 "not saved: a newer Nakagawa saved this profile (schema_version %ld; this "
+                 "one writes %d), and it is kept as it is", found_version,
+                 NK_INPUT_PROFILE_SCHEMA_VERSION);
+        return guard;
+    }
+    if (guard != NK_OK) {
+        diag_set(diag_buf, diag_buf_sz,
+                 "not saved: the schema_version %ld profile could not be copied to its "
+                 ".v%ld.bak backup first", found_version, found_version);
+        return guard;
+    }
+
+    char tmp_path[NK_MAX_PATH + 8];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", file_path);
+
+    FILE *f = nk_input_fopen(tmp_path, "wb");
+    if (!f) {
+        diag_set(diag_buf, diag_buf_sz, "failed to open temporary file '%s' for writing", tmp_path);
+        return NK_ERROR_IO;
+    }
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"schema_version\": %d,\n", NK_INPUT_PROFILE_SCHEMA_VERSION);
+    write_mapping_body(f, &doc->global, 2);
+    fprintf(f, ",\n");
+    fprintf(f, "  \"per_title\": [\n");
+    for (int i = 0; i < doc->title_count; i++) {
+        char esc_disc[NK_MAX_DISC_ID_LEN * 2];
+        escape_json(doc->title_disc_id[i], esc_disc, sizeof(esc_disc));
+        fprintf(f, "    {\n");
+        fprintf(f, "      \"disc_id\": \"%s\",\n", esc_disc);
+        fprintf(f, "      \"profile\": {\n");
+        write_mapping_body(f, &doc->title[i], 8);
+        fprintf(f, "      }\n");
+        fprintf(f, "    }%s\n", (i < doc->title_count - 1) ? "," : "");
+    }
+    fprintf(f, "  ]\n");
+    fprintf(f, "}\n");
+
+    if (fflush(f) != 0) {
+        fclose(f);
+        nk_remove_utf8(tmp_path);
+        diag_set(diag_buf, diag_buf_sz, "failed to flush temporary profile file '%s'", tmp_path);
+        return NK_ERROR_IO;
+    }
+
+#if defined(_WIN32) || defined(_WIN64)
+    int fd = _fileno(f);
+    if (fd >= 0) {
+        HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            FlushFileBuffers(hFile);
+        }
+    }
+    fclose(f);
+
+    WCHAR wtmp[32768], wtarget[32768];
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, tmp_path, -1, wtmp, 32768) <= 0 ||
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, file_path, -1, wtarget, 32768) <= 0) {
+        nk_remove_utf8(tmp_path);
+        diag_set(diag_buf, diag_buf_sz, "failed UTF-8 conversion for path '%s'", file_path);
+        return NK_ERROR_IO;
+    }
+
+    if (!MoveFileExW(wtmp, wtarget, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(wtmp);
+        diag_set(diag_buf, diag_buf_sz, "atomic replace failed for '%s'", file_path);
+        return NK_ERROR_IO;
+    }
+#else
+    int fd = fileno(f);
+    if (fd >= 0) fsync(fd);
+    fclose(f);
+
+    if (rename(tmp_path, file_path) != 0) {
+        remove(tmp_path);
+        diag_set(diag_buf, diag_buf_sz, "atomic rename failed from '%s' to '%s'", tmp_path, file_path);
+        return NK_ERROR_IO;
+    }
+#endif
+
+    return NK_OK;
+}
+
+NkResult nk_input_profile_file_save(
+    const NkInputProfileFile *doc,
+    const char *file_path,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (!doc) {
+        if (diag_buf && diag_buf_sz > 0) diag_buf[0] = '\0';
+        diag_set(diag_buf, diag_buf_sz, "null profile document");
+        return NK_ERROR_GENERIC;
+    }
+    return profile_document_write(doc, file_path, diag_buf, diag_buf_sz);
+}
+
+NkResult nk_input_profile_save(
+    const NkInputProfile *profile,
+    const char *file_path,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (diag_buf && diag_buf_sz > 0) diag_buf[0] = '\0';
+    if (!profile) {
+        diag_set(diag_buf, diag_buf_sz, "invalid profile or file path");
+        return NK_ERROR_GENERIC;
+    }
+
+    /* The single-profile entry point keeps its v1 meaning: the global mapping,
+     * written at the current schema version with no per-title entries. */
+    NkInputProfileFile doc;
+    nk_input_profile_file_init_default(&doc);
+    doc.global = *profile;
+    return profile_document_write(&doc, file_path, diag_buf, diag_buf_sz);
+}
+
+NkResult nk_input_profile_file_load(
+    NkInputProfileFile *doc,
+    const char *file_path,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (diag_buf && diag_buf_sz > 0) diag_buf[0] = '\0';
+    if (!doc) return NK_ERROR_GENERIC;
+
+    nk_input_profile_file_init_default(doc);
+
+    if (!file_path || !*file_path) {
+        diag_set(diag_buf, diag_buf_sz, "file path is null or empty");
+        return NK_ERROR_GENERIC;
+    }
+
+    if (!nk_platform_file_exists(file_path)) {
+        diag_set(diag_buf, diag_buf_sz, "input profile file not found: '%s'", file_path);
+        return NK_ERROR_FILE_NOT_FOUND;
+    }
+
+    FILE *f = nk_input_fopen(file_path, "rb");
+    if (!f) {
+        diag_set(diag_buf, diag_buf_sz, "failed to open profile file '%s'", file_path);
+        return NK_ERROR_IO;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (sz <= 0 || sz > NK_INPUT_PROFILE_MAX_FILE_BYTES) {
+        fclose(f);
+        diag_set(diag_buf, diag_buf_sz, "profile file size %ld is invalid or exceeds 1 MB", sz);
+        return NK_ERROR_IO;
+    }
+
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        diag_set(diag_buf, diag_buf_sz, "out of memory allocating file buffer");
+        return NK_ERROR_OUT_OF_MEMORY;
+    }
+
+    size_t read_bytes = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[read_bytes] = '\0';
+
+    NkResult res = nk_input_profile_file_parse_json(doc, buf, read_bytes, diag_buf, diag_buf_sz);
+    free(buf);
+    return res;
+}
+
+NkResult nk_input_profile_load(
+    NkInputProfile *out_profile,
+    const char *file_path,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (diag_buf && diag_buf_sz > 0) diag_buf[0] = '\0';
+    if (!out_profile) return NK_ERROR_GENERIC;
+
+    NkInputProfileFile doc;
+    NkResult res = nk_input_profile_file_load(&doc, file_path, diag_buf, diag_buf_sz);
+    *out_profile = doc.global;
+    return res;
+}
+
+NkResult nk_input_profile_resolve_path(char *out_path, size_t out_path_sz) {
+    if (!out_path || out_path_sz == 0) return NK_ERROR_GENERIC;
+    out_path[0] = '\0';
+
+    const char *env_path = getenv("NK_INPUT_PROFILE");
+    if (!env_path || !env_path[0]) {
+        env_path = getenv("SR_INPUT_PROFILE");
+    }
+
+    if (env_path && env_path[0]) {
+        if (strlen(env_path) >= out_path_sz) return NK_ERROR_GENERIC;
+        strncpy(out_path, env_path, out_path_sz - 1);
+        out_path[out_path_sz - 1] = '\0';
+        return NK_OK;
+    }
+
+    char config_dir[1024] = {0};
+    if (nk_platform_get_path(NK_PATH_CONFIG, config_dir, sizeof(config_dir))) {
+        char sep = nk_platform_path_separator();
+        int n = snprintf(out_path, out_path_sz, "%s%cinput_profile.json", config_dir, sep);
+        if (n < 0 || (size_t)n >= out_path_sz) return NK_ERROR_GENERIC;
+        return NK_OK;
+    }
+
+    return NK_ERROR_GENERIC;
+}
+
+bool nk_input_profile_padscript_active(void) {
+    const char *sp = getenv("SR_PADSCRIPT");
+    return sp && sp[0] != '\0';
+}
+
+/* -----------------------------------------------------------------------------
+ * Runtime Evaluation Helpers
+ * -------------------------------------------------------------------------- */
+
+static bool eval_source(
+    const NkBindingSource *src,
+    const bool host_buttons[NK_HOST_BUTTON_COUNT],
+    const int16_t host_axes[NK_HOST_AXIS_COUNT],
+    int16_t trigger_threshold,
+    int16_t trigger_rest,
+    int16_t trigger_extreme
+) {
+    if (!src || src->type == NK_BINDING_NONE) return false;
+    switch (src->type) {
+    case NK_BINDING_HOST_BUTTON:
+        if (host_buttons && src->index >= 0 && src->index < NK_HOST_BUTTON_COUNT) {
+            return host_buttons[src->index];
+        }
+        break;
+    case NK_BINDING_HOST_TRIGGER:
+        if (host_axes && src->index >= 0 && src->index < NK_HOST_AXIS_COUNT) {
+            return nk_input_profile_eval_trigger_calibrated(
+                host_axes[src->index], trigger_threshold, trigger_rest, trigger_extreme);
+        }
+        break;
+    case NK_BINDING_HOST_AXIS_POS:
+        if (host_axes && src->index >= 0 && src->index < NK_HOST_AXIS_COUNT) {
+            return host_axes[src->index] > (src->threshold > 0 ? src->threshold
+                                                               : trigger_threshold);
+        }
+        break;
+    case NK_BINDING_HOST_AXIS_NEG:
+        if (host_axes && src->index >= 0 && src->index < NK_HOST_AXIS_COUNT) {
+            return host_axes[src->index] < -(src->threshold > 0 ? src->threshold
+                                                                : trigger_threshold);
+        }
+        break;
+    default:
+        break;
+    }
+    return false;
+}
+
+uint32_t nk_input_profile_eval_buttons(
+    const NkInputProfile *profile,
+    const bool host_buttons[NK_HOST_BUTTON_COUNT],
+    const int16_t host_axes[NK_HOST_AXIS_COUNT]
+) {
+    if (!profile) return 0;
+    uint32_t mask = 0;
+    for (int i = 0; i < NK_PSP_BTN_COUNT; i++) {
+        const NkDigitalBinding *b = &profile->psp_buttons[i];
+        bool pressed = false;
+        if (eval_source(&b->primary, host_buttons, host_axes,
+                        profile->trigger_threshold, profile->trigger_rest, profile->trigger_extreme)) {
+            pressed = true;
+        } else if (eval_source(&b->secondary, host_buttons, host_axes,
+                               profile->trigger_threshold, profile->trigger_rest, profile->trigger_extreme)) {
+            pressed = true;
+        }
+        if (pressed) {
+            mask |= nk_psp_button_bitmask((NkPspButton)i);
+        }
+    }
+    return mask;
+}
+
+void nk_input_profile_eval_analog(
+    const NkInputProfile *profile,
+    const int16_t host_axes[NK_HOST_AXIS_COUNT],
+    uint8_t *out_lx,
+    uint8_t *out_ly
+) {
+    if (out_lx) *out_lx = 128;
+    if (out_ly) *out_ly = 128;
+    if (!profile || !host_axes) return;
+
+    int ax_idx = profile->axes[NK_PSP_AXIS_ANALOG_X].host_axis;
+    if (ax_idx >= 0 && ax_idx < NK_HOST_AXIS_COUNT && out_lx) {
+        *out_lx = nk_input_profile_transform_axis_calibrated(
+            host_axes[ax_idx],
+            profile->axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner,
+            profile->axes[NK_PSP_AXIS_ANALOG_X].deadzone_outer,
+            profile->axes[NK_PSP_AXIS_ANALOG_X].inverted,
+            profile->axes[NK_PSP_AXIS_ANALOG_X].rest,
+            profile->axes[NK_PSP_AXIS_ANALOG_X].min_val,
+            profile->axes[NK_PSP_AXIS_ANALOG_X].max_val
+        );
+    }
+
+    int ay_idx = profile->axes[NK_PSP_AXIS_ANALOG_Y].host_axis;
+    if (ay_idx >= 0 && ay_idx < NK_HOST_AXIS_COUNT && out_ly) {
+        *out_ly = nk_input_profile_transform_axis_calibrated(
+            host_axes[ay_idx],
+            profile->axes[NK_PSP_AXIS_ANALOG_Y].deadzone_inner,
+            profile->axes[NK_PSP_AXIS_ANALOG_Y].deadzone_outer,
+            profile->axes[NK_PSP_AXIS_ANALOG_Y].inverted,
+            profile->axes[NK_PSP_AXIS_ANALOG_Y].rest,
+            profile->axes[NK_PSP_AXIS_ANALOG_Y].min_val,
+            profile->axes[NK_PSP_AXIS_ANALOG_Y].max_val
+        );
+    }
+}
+
+uint32_t nk_input_profile_eval_keys(
+    const NkInputProfile *profile,
+    const bool *key_down,
+    int key_count
+) {
+    if (!profile || !key_down || key_count <= 0) return 0;
+    uint32_t mask = 0;
+    for (int i = 0; i < NK_PSP_BTN_COUNT; i++) {
+        int pri = profile->psp_keys[i].primary;
+        int sec = profile->psp_keys[i].secondary;
+        if ((pri > NK_HOST_KEY_NONE && pri < key_count && key_down[pri]) ||
+            (sec > NK_HOST_KEY_NONE && sec < key_count && key_down[sec])) {
+            mask |= nk_psp_button_bitmask((NkPspButton)i);
+        }
+    }
+    return mask;
+}
+
+/* True while a bound key of `binding` is held. */
+static bool key_binding_held(const NkKeyBinding *binding, const bool *key_down, int key_count) {
+    const int slots[2] = { binding->primary, binding->secondary };
+    for (int s = 0; s < 2; s++) {
+        if (slots[s] > NK_HOST_KEY_NONE && slots[s] < key_count && key_down[slots[s]]) return true;
+    }
+    return false;
+}
+
+bool nk_input_profile_eval_key_analog(
+    const NkInputProfile *profile,
+    const bool *key_down,
+    int key_count,
+    uint8_t *lx,
+    uint8_t *ly
+) {
+    if (!profile || !key_down || key_count <= 0) return false;
+    bool moved = false;
+    if (lx) {
+        bool left = key_binding_held(&profile->stick_keys[NK_PSP_STICK_LEFT], key_down, key_count);
+        bool right = key_binding_held(&profile->stick_keys[NK_PSP_STICK_RIGHT], key_down, key_count);
+        if (left != right) {
+            *lx = right ? 255 : 0;
+            moved = true;
+        }
+    }
+    if (ly) {
+        bool up = key_binding_held(&profile->stick_keys[NK_PSP_STICK_UP], key_down, key_count);
+        bool down = key_binding_held(&profile->stick_keys[NK_PSP_STICK_DOWN], key_down, key_count);
+        if (up != down) {
+            *ly = down ? 255 : 0;
+            moved = true;
+        }
+    }
+    return moved;
+}
+
+uint32_t nk_input_profile_key_buttons(const NkInputProfile *profile, int key) {
+    if (!profile || key <= NK_HOST_KEY_NONE) return 0;
+    uint32_t mask = 0;
+    for (int i = 0; i < NK_PSP_BTN_COUNT; i++) {
+        if (profile->psp_keys[i].primary == key || profile->psp_keys[i].secondary == key) {
+            mask |= nk_psp_button_bitmask((NkPspButton)i);
+        }
+    }
+    return mask;
+}
+
+uint32_t nk_input_profile_eval_navigation(
+    const NkInputProfile *profile,
+    const bool host_buttons[NK_HOST_BUTTON_COUNT],
+    const int16_t host_axes[NK_HOST_AXIS_COUNT]
+) {
+    if (!profile) return 0;
+    uint32_t mask = 0;
+    for (int i = 0; i < NK_NAV_ACTION_COUNT; i++) {
+        const NkDigitalBinding *b = &profile->nav_bindings[i];
+        bool active = false;
+        if (eval_source(&b->primary, host_buttons, host_axes,
+                        profile->trigger_threshold, profile->trigger_rest, profile->trigger_extreme)) {
+            active = true;
+        } else if (eval_source(&b->secondary, host_buttons, host_axes,
+                               profile->trigger_threshold, profile->trigger_rest, profile->trigger_extreme)) {
+            active = true;
+        }
+        if (active) {
+            mask |= (1u << i);
+        }
+    }
+    return mask;
+}
+
+/* -----------------------------------------------------------------------------
+ * Overlay input gate (#1159)
+ * -------------------------------------------------------------------------- */
+
+#define NK_INPUT_GATE_STICK_CENTRE 128u
+
+void nk_input_gate_init(NkInputGate *gate) {
+    if (!gate) return;
+    gate->claimed = false;
+    gate->hidden = 0u;
+    gate->stick_hidden = false;
+}
+
+void nk_input_gate_claim(NkInputGate *gate) {
+    if (!gate) return;
+    gate->claimed = true;
+    gate->hidden = 0u;
+    gate->stick_hidden = false;
+}
+
+void nk_input_gate_release(NkInputGate *gate, uint32_t held, uint8_t lx, uint8_t ly) {
+    if (!gate || !gate->claimed) return;
+    gate->claimed = false;
+    gate->hidden = held;
+    gate->stick_hidden = lx != NK_INPUT_GATE_STICK_CENTRE || ly != NK_INPUT_GATE_STICK_CENTRE;
+}
+
+void nk_input_gate_apply(NkInputGate *gate, uint32_t *held, uint32_t *pressed,
+                         uint8_t *lx, uint8_t *ly) {
+    if (!gate) return;
+    if (gate->claimed) {
+        if (held) *held = 0u;
+        if (pressed) *pressed = 0u;
+        if (lx) *lx = NK_INPUT_GATE_STICK_CENTRE;
+        if (ly) *ly = NK_INPUT_GATE_STICK_CENTRE;
+        return;
+    }
+    if (held) {
+        /* A hidden button shows again once it is up, or once it went down anew. */
+        gate->hidden &= *held & ~(pressed ? *pressed : 0u);
+        *held &= ~gate->hidden;
+    }
+    if (pressed) *pressed &= ~gate->hidden;
+    if (gate->stick_hidden && lx && ly && *lx == NK_INPUT_GATE_STICK_CENTRE &&
+        *ly == NK_INPUT_GATE_STICK_CENTRE) {
+        gate->stick_hidden = false;
+    }
+    if (gate->stick_hidden) {
+        if (lx) *lx = NK_INPUT_GATE_STICK_CENTRE;
+        if (ly) *ly = NK_INPUT_GATE_STICK_CENTRE;
+    }
+}

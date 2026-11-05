@@ -1,0 +1,589 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+"""Hermetic HST manager/build planning and precedence tests against the public HST manifest."""
+
+from __future__ import annotations
+
+import copy
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+
+import test_public_title_isolation
+MANAGER = ROOT / "nk_manager.ps1"
+MANIFEST = ROOT / "assets" / "titles" / "hst-ucus98701.json"
+SYNTHETIC_MANIFEST = ROOT / "assets" / "titles" / "synthetic.json"
+HELPER = ROOT / "tools" / "title_manager_plan.ps1"
+VULKAN_HELPER = ROOT / "tools" / "vulkan_sdk.ps1"
+#: Every documented HST manager command passes -GameName hst; the manifest itself
+#: carries no game_name, so the player keeps its derived default.
+HST_GAME_NAME = "hst"
+
+
+class HstManagerManifestTests(unittest.TestCase):
+    make: str
+    shell: str
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        shell = shutil.which("pwsh")
+        make = shutil.which("mingw32-make") or shutil.which("make")
+        if shell is None or make is None:
+            raise unittest.SkipTest("PowerShell 7.4+ (pwsh) and GNU Make are required")
+        cls.shell = shell
+        cls.make = make
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="nakagawa-issue197-manager-")
+        self.root = Path(self.temp.name)
+        fake_sdk = self.root / "fake-sdk"
+        (fake_sdk / "Include" / "vulkan").mkdir(parents=True)
+        (fake_sdk / "Include" / "vulkan" / "vulkan.h").write_text("// synthetic Vulkan header\n", encoding="ascii")
+        (fake_sdk / "Lib").mkdir()
+        (fake_sdk / "Lib" / "vulkan-1.lib").write_bytes(b"synthetic Vulkan import library")
+        private = self.root / "place_game_here"
+        (private / "EXTRACTED" / "decrypted").mkdir(parents=True)
+        (private / "EXTRACTED" / "PSP_GAME" / "SYSDIR").mkdir(parents=True)
+        (private / "EBOOT.elf").write_text("synthetic private binding\n", encoding="ascii")
+        for name in ("libfont.prx", "scePsmf_library.prx", "scePsmfP_library.prx"):
+            (private / "EXTRACTED" / "decrypted" / name).write_text("synthetic\n", encoding="ascii")
+        (private / "EXTRACTED" / "PSP_GAME" / "SYSDIR" / "EBOOT.BIN").write_text(
+            "synthetic\n", encoding="ascii"
+        )
+        # Synthetic/generic manifests no longer discover the
+        # legacy retail layout. The synthetic route discovers its ELF from the
+        # generic fixtures/ candidates instead.
+        fixtures = self.root / "fixtures"
+        fixtures.mkdir(exist_ok=True)
+        (fixtures / "synthetic.elf").write_text("synthetic private binding\n", encoding="ascii")
+        # The manager now anchors every managed path to its own script location and fails
+        # closed when the workspace identity anchors are missing, so the harness
+        # stages a complete fake workspace: the manager itself, its dot-sourced helpers
+        # and the repository identity files.
+        self.manager_copy = self.root / MANAGER.name
+        shutil.copy2(MANAGER, self.manager_copy)
+        tools_dir = self.root / "tools"
+        tools_dir.mkdir(exist_ok=True)
+        for helper in (
+            "nk_safety.ps1",
+            "vulkan_sdk.ps1",
+            "gpu_selftest_status.ps1",
+            "title_manager_plan.ps1",
+            "title_codegen_plan.py",
+            "title_manifest.py",
+        ):
+            shutil.copy2(ROOT / "tools" / helper, tools_dir / helper)
+        (self.root / "assets").mkdir(parents=True, exist_ok=True)
+        shutil.copytree(ROOT / "assets" / "titles", self.root / "assets" / "titles", dirs_exist_ok=True)
+        (self.root / "AGENTS.md").write_text("synthetic anchors\n", encoding="utf-8")
+        (self.root / "src" / "rt").mkdir(parents=True)
+        (self.root / "src" / "rt" / "recomp.c").write_text("synthetic\n", encoding="ascii")
+        (tools_dir / "codegen.py").write_text("synthetic\n", encoding="ascii")
+        (self.root / "capture.py").write_text(
+            textwrap.dedent(
+                """
+                import json
+                import os
+                from pathlib import Path
+                import sys
+
+                target, game_name, game_elf, base, entry, extra, header, profile, build_dir, funcs, runtime, recomp, sdk = sys.argv[1:]
+                record = {
+                    "target": target,
+                    "game_name": game_name,
+                    "game_elf": game_elf,
+                    "base": base,
+                    "entry": entry,
+                    "extra": extra,
+                    "header": header,
+                    "profile": profile,
+                    "build_dir": build_dir,
+                    "funcs": funcs,
+                    "runtime": runtime,
+                    "recomp": recomp,
+                    "sdk": sdk,
+                    "title_extra_spans": os.environ.get("TITLE_EXTRA_SPANS"),
+                }
+                with (Path("capture.jsonl")).open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record, sort_keys=True) + "\\n")
+                if target == "all":
+                    # The manager expects the host's executable name: .exe on Windows only.
+                    output = Path(build_dir) / (game_name + (".exe" if os.name == "nt" else ""))
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    output.write_bytes(b"synthetic manager output")
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (self.root / "Makefile").write_text(
+            textwrap.dedent(
+                """
+                PYTHON ?= python
+                GAME_NAME ?= mygame
+                GAME_ELF ?= eboot.elf
+                GAME_BASE ?= 0x08804000
+                GAME_ENTRY ?= 0x08804000
+                CODEGEN_PROFILE_ARG ?=
+                GAME_EXTRA_ELFS ?=
+                GAME_PSP_HEADER ?=
+                BUILD_DIR ?= build/$(GAME_NAME)
+                FUNCS_PER_CHUNK ?= 2000
+                RUNTIME_OPT ?= -O0
+                RECOMP_OPT ?= -O0
+                .PHONY: all clean selftest vfpu_fuzz
+                vfpu_fuzz:
+                __RECIPE_TAB__$(PYTHON) capture.py vfpu_fuzz "$(GAME_NAME)" "$(GAME_ELF)" "$(GAME_BASE)" "$(GAME_ENTRY)" "$(GAME_EXTRA_ELFS)" "$(GAME_PSP_HEADER)" "$(CODEGEN_PROFILE_ARG)" "$(BUILD_DIR)" "$(FUNCS_PER_CHUNK)" "$(RUNTIME_OPT)" "$(RECOMP_OPT)" "$(VULKAN_SDK)"
+                all:
+                __RECIPE_TAB__$(PYTHON) capture.py all "$(GAME_NAME)" "$(GAME_ELF)" "$(GAME_BASE)" "$(GAME_ENTRY)" "$(GAME_EXTRA_ELFS)" "$(GAME_PSP_HEADER)" "$(CODEGEN_PROFILE_ARG)" "$(BUILD_DIR)" "$(FUNCS_PER_CHUNK)" "$(RUNTIME_OPT)" "$(RECOMP_OPT)" "$(VULKAN_SDK)"
+                clean:
+                __RECIPE_TAB__$(PYTHON) capture.py clean "$(GAME_NAME)" "$(GAME_ELF)" "$(GAME_BASE)" "$(GAME_ENTRY)" "$(GAME_EXTRA_ELFS)" "$(GAME_PSP_HEADER)" "$(CODEGEN_PROFILE_ARG)" "$(BUILD_DIR)" "$(FUNCS_PER_CHUNK)" "$(RUNTIME_OPT)" "$(RECOMP_OPT)" "$(VULKAN_SDK)"
+                selftest:
+                __RECIPE_TAB__$(PYTHON) capture.py selftest "$(GAME_NAME)" "$(GAME_ELF)" "$(GAME_BASE)" "$(GAME_ENTRY)" "$(GAME_EXTRA_ELFS)" "$(GAME_PSP_HEADER)" "$(CODEGEN_PROFILE_ARG)" "$(BUILD_DIR)" "$(FUNCS_PER_CHUNK)" "$(RUNTIME_OPT)" "$(RECOMP_OPT)" "$(VULKAN_SDK)"
+                """
+            ).replace("__RECIPE_TAB__", "\t").lstrip(),
+            encoding="utf-8",
+        )
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def run_manager(self, action: str, manifest: Path | None = None, **overrides) -> subprocess.CompletedProcess[str]:
+        make_executable = overrides.pop("MakeExecutable", self.make)
+        command = [
+            self.shell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(self.manager_copy),
+            "-Action",
+            action,
+            "-MsysPath",
+            str(Path(self.make).parent),
+            "-MakeExecutable",
+            str(make_executable),
+            "-VulkanSdk",
+            str(self.root / "fake-sdk"),
+        ]
+        if manifest is not None:
+            command.extend(["-TitleManifest", str(manifest), "-GameName", HST_GAME_NAME])
+        for key, value in overrides.items():
+            command.extend([f"-{key}", str(value)])
+        env = os.environ.copy()
+        env.pop("TITLE_EXTRA_SPANS", None)
+        return subprocess.run(
+            command,
+            cwd=self.root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+
+    def run_in_one_shell(self, body: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        """Run several manager invocations inside a single PowerShell process.
+
+        Environment leakage is only observable when the manager shares a process with a
+        later caller, which `-File` per-invocation runs can never demonstrate.
+        """
+        env = os.environ.copy()
+        env.pop("TITLE_EXTRA_SPANS", None)
+        return subprocess.run(
+            [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", body],
+            cwd=str(cwd or self.root),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=180,
+        )
+
+    def manager_call(self, action: str, manifest: Path | None = None) -> str:
+        call = (
+            f"& '{self.manager_copy}' -Action {action} "
+            f"-MsysPath '{Path(self.make).parent}' -MakeExecutable '{self.make}' "
+            f"-VulkanSdk '{self.root / 'fake-sdk'}'"
+        )
+        if manifest is not None:
+            call += f" -TitleManifest '{manifest}' -GameName {HST_GAME_NAME}"
+        return call
+
+    def make_sdk(self, name: str, *, complete: bool = True) -> Path:
+        sdk = self.root / name
+        (sdk / "Include" / "vulkan").mkdir(parents=True, exist_ok=True)
+        (sdk / "Include" / "vulkan" / "vulkan.h").write_text("// synthetic header\n", encoding="ascii")
+        if complete:
+            (sdk / "Lib").mkdir(exist_ok=True)
+            (sdk / "Lib" / "vulkan-1.lib").write_bytes(b"synthetic import library")
+        return sdk
+
+    def resolve_sdk(self, *, explicit: Path | None = None, environment: Path | None = None) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        if environment is None:
+            env.pop("VULKAN_SDK", None)
+        else:
+            env["VULKAN_SDK"] = str(environment)
+        explicit_arg = str(explicit) if explicit else ""
+        command = (
+            f". '{VULKAN_HELPER}'; "
+            f"try {{ Resolve-VulkanSdk -ExplicitPath '{explicit_arg}' -InstallRoot '{self.root}' }} "
+            "catch { Write-Error $_; exit 1 }"
+        )
+        return subprocess.run(
+            [self.shell, "-NoProfile", "-NonInteractive", "-Command", command],
+            cwd=self.root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
+    SPAN = "0x00303194,0x00306e24"
+
+    def test_manifest_span_is_scoped_and_never_leaks_into_a_later_generic_run(self) -> None:
+        self.require_hst_manifest()
+        proc = self.run_in_one_shell(
+            "\n".join(
+                [
+                    self.manager_call("BuildFast", MANIFEST),
+                    self.manager_call("BuildFast"),
+                    "if (Test-Path -LiteralPath 'Env:TITLE_EXTRA_SPANS') "
+                    "{ Write-Output \"FINAL=PRESENT:$env:TITLE_EXTRA_SPANS\" } "
+                    "else { Write-Output 'FINAL=ABSENT' }",
+                ]
+            )
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertIn("FINAL=ABSENT", combined, combined)
+        records = [record for record in self.records() if record["target"] == "all"]
+        self.assertEqual(len(records), 2, combined)
+        manifest_run, generic_run = records
+        self.assertEqual(manifest_run["title_extra_spans"], self.SPAN)
+        self.assertIsNone(generic_run["title_extra_spans"])
+
+    def test_preexisting_caller_span_is_restored_exactly_after_the_manager_exits(self) -> None:
+        self.require_hst_manifest()
+        caller = "0x00000010,0x00000020"
+        proc = self.run_in_one_shell(
+            "\n".join(
+                [
+                    f"$env:TITLE_EXTRA_SPANS = '{caller}'",
+                    self.manager_call("BuildFast", MANIFEST),
+                    'Write-Output "FINAL=$env:TITLE_EXTRA_SPANS"',
+                ]
+            )
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertIn(f"FINAL={caller}", combined, combined)
+        record = [item for item in self.records() if item["target"] == "all"][-1]
+        self.assertEqual(record["title_extra_spans"], self.SPAN)
+
+    def test_scoped_span_unwinds_when_the_scoped_operation_throws(self) -> None:
+        body = "\n".join(
+            [
+                f". '{HELPER}'",
+                "function Invoke-Failing {",
+                "  $state = Push-TitleAnalyzerEnvironment -Value 'SCOPED-VALUE'",
+                "  try { throw 'synthetic spawn failure' }",
+                "  finally { Pop-TitleAnalyzerEnvironment -State $state }",
+                "}",
+                "$env:TITLE_EXTRA_SPANS = 'ORIGINAL-VALUE'",
+                "try { Invoke-Failing } catch { }",
+                'Write-Output "RESTORED=$env:TITLE_EXTRA_SPANS"',
+                "Remove-Item -LiteralPath 'Env:TITLE_EXTRA_SPANS' -Force",
+                "try { Invoke-Failing } catch { }",
+                "if (Test-Path -LiteralPath 'Env:TITLE_EXTRA_SPANS') "
+                "{ Write-Output 'ABSENT=NO' } else { Write-Output 'ABSENT=YES' }",
+            ]
+        )
+        proc = self.run_in_one_shell(body, cwd=ROOT)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("RESTORED=ORIGINAL-VALUE", combined, combined)
+        self.assertIn("ABSENT=YES", combined, combined)
+        self.assert_no_make()
+
+    def records(self) -> list[dict[str, str | None]]:
+        path = self.root / "capture.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def write_manifest(self, name: str, mutate) -> Path:
+        value = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        mutate(value)
+        path = self.root / name
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return path
+
+    def assert_manager_success(self, proc: subprocess.CompletedProcess[str]) -> None:
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def assert_no_make(self) -> None:
+        self.assertEqual(self.records(), [])
+
+    def require_hst_manifest(self) -> None:
+        # The HST manifest is public and tracked, so
+        # these routes always run: a missing or untracked manifest is a failure,
+        # never a skip, and an ignored local lookalike cannot stand in for it.
+        self.assertTrue(
+            test_public_title_isolation.is_tracked("assets/titles/hst-ucus98701.json"),
+            "assets/titles/hst-ucus98701.json must be tracked: the HST title manifest is public",
+        )
+
+    def test_buildfull_manifest_mode_matches_the_validated_plan(self) -> None:
+        self.require_hst_manifest()
+        manifest = self.run_manager("BuildFull", MANIFEST)
+        self.assert_manager_success(manifest)
+        record = [item for item in self.records() if item["target"] == "all"][-1]
+        self.assertEqual(record["runtime"], "-O2")
+        self.assertEqual(record["recomp"], "-O1")
+        self.assertEqual(record["title_extra_spans"], "0x00303194,0x00306e24")
+        planner = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "title_codegen_plan.py"),
+                str(MANIFEST),
+                "--manager-plan",
+                "--game-name=hst",
+                "--game-elf=place_game_here/EBOOT.elf",
+                "--build-dir=build/hst",
+                "--module-dir=place_game_here/EXTRACTED/decrypted",
+                "--psp-header=place_game_here/EXTRACTED/PSP_GAME/SYSDIR/EBOOT.BIN",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        direct_plan = json.loads(planner.stdout)
+        self.assertEqual(record["game_name"], direct_plan["make"]["game_name"])
+        self.assertEqual(record["base"], direct_plan["make"]["game_base"])
+        self.assertEqual(record["entry"], direct_plan["make"]["game_entry"])
+        self.assertEqual(record["profile"], direct_plan["make"]["codegen_profile_arg"])
+        self.assertEqual(record["build_dir"], direct_plan["make"]["build_dir"])
+        self.assertEqual(record["funcs"], str(direct_plan["make"]["funcs_per_chunk"]))
+        self.assertEqual(record["title_extra_spans"], direct_plan["environment"]["TITLE_EXTRA_SPANS"])
+        self.assertIn("Using title manifest: hst-ucus98701-v1 (target: hst)", manifest.stdout)
+
+    def test_fast_and_test_routes_use_manifest_values(self) -> None:
+        self.require_hst_manifest()
+        for action, target, spans in (
+            ("BuildFast", "all", self.SPAN),
+            ("Test", "selftest", None),
+        ):
+            with self.subTest(action=action):
+                manifest = self.run_manager(action, MANIFEST)
+                self.assert_manager_success(manifest)
+                records = [record for record in self.records() if record["target"] == target]
+                self.assertEqual(len(records), 1)
+                record = records[-1]
+                self.assertEqual(record["runtime"], "-O2")
+                self.assertEqual(record["recomp"], "-O1")
+                self.assertEqual(record["title_extra_spans"], spans)
+
+    def test_fuzz_receives_the_scoped_span_because_it_runs_the_pipeline(self) -> None:
+        self.require_hst_manifest()
+        manifest = self.run_manager("Fuzz", MANIFEST)
+        self.assert_manager_success(manifest)
+        records = [record for record in self.records() if record["target"] == "vfpu_fuzz"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["title_extra_spans"], self.SPAN)
+
+    def test_explicit_make_path_is_required_to_be_a_real_executable(self) -> None:
+        missing = self.root / "does-not-exist-make"
+        proc = self.run_manager("BuildFast", MakeExecutable=missing)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("could not resolve make", (proc.stdout + proc.stderr).lower())
+        self.assert_no_make()
+
+    def test_operational_overrides_win_without_mutating_manifest(self) -> None:
+        self.require_hst_manifest()
+        before = MANIFEST.read_bytes()
+        proc = self.run_manager(
+            "BuildFast",
+            MANIFEST,
+            RuntimeOpt="O0",
+            RecompOpt="O0",
+            FuncsPerChunk=64,
+        )
+        self.assert_manager_success(proc)
+        record = [item for item in self.records() if item["target"] == "all"][-1]
+        self.assertEqual(record["runtime"], "-O0")
+        self.assertEqual(record["recomp"], "-O0")
+        self.assertEqual(record["funcs"], "64")
+        self.assertEqual(MANIFEST.read_bytes(), before)
+
+    def test_manifest_validation_and_private_binding_fail_before_make(self) -> None:
+        self.require_hst_manifest()
+        cases = [
+            ("missing.json", None),
+            ("malformed.json", "malformed"),
+            ("duplicate.json", "duplicate"),
+            ("unknown-field.json", "unknown-field"),
+            ("bad-schema.json", lambda value: value.update(schema_version=2)),
+            ("bad-identity.json", lambda value: value.update(id="other-title-v1")),
+            ("bad-base.json", lambda value: value["executable"].update(base=1)),
+            ("bad-entry.json", lambda value: value["executable"].update(entry=1)),
+            ("bad-bss.json", lambda value: value["executable"].update(bss_metadata_source="elf")),
+            ("bad-span.json", lambda value: value["executable"].update(
+                extra_executable_spans=[{"start": 1, "end": 2}]
+            )),
+            ("bad-disc.json", lambda value: value["disc"].update(id="TEST80006")),
+            ("bad-module.json", lambda value: value["modules"][0].update(name="other.prx")),
+            ("bad-address.json", lambda value: value["modules"][0].update(load_address=1)),
+        ]
+        for name, mutation in cases:
+            with self.subTest(name=name):
+                if mutation == "malformed":
+                    path = self.root / name
+                    path.write_text("{", encoding="ascii")
+                elif mutation == "duplicate":
+                    path = self.root / name
+                    path.write_text('{"schema_version":1,"schema_version":1}', encoding="ascii")
+                elif mutation == "unknown-field":
+                    path = self.root / name
+                    path.write_text('{"schema_version":1,"unexpected":true}', encoding="ascii")
+                elif mutation is None:
+                    path = self.root / name
+                else:
+                    path = self.write_manifest(name, mutation)
+                proc = self.run_manager("BuildFast", path)
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assert_no_make()
+
+        # Dropping the hst codegen profile makes the manifest an ordinary generic
+        # title to the manager: it takes the generic route, so none of the HST
+        # adapter's contract (profile argument, -O2/-O1 split) reaches Make.
+        generic = self.write_manifest("generic-profile.json", lambda value: value.update(codegen_profile="none"))
+        proc = self.run_manager("BuildFast", generic)
+        self.assert_manager_success(proc)
+        records = [item for item in self.records() if item["target"] == "all"]
+        self.assertEqual(len(records), 1, proc.stdout + proc.stderr)
+        self.assertEqual(records[0]["profile"], "")
+        self.assertNotEqual((records[0]["runtime"], records[0]["recomp"]), ("-O2", "-O1"))
+        (self.root / "capture.jsonl").unlink()
+
+        missing_elf = self.root / "place_game_here" / "EBOOT.elf"
+        missing_elf.unlink()
+        proc = self.run_manager("BuildFast", MANIFEST)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("missing required private binding", (proc.stdout + proc.stderr).lower())
+        self.assert_no_make()
+
+    def test_manager_plan_parser_rejects_invalid_json_version_unknown_fields_and_controls(self) -> None:
+        plan_proc = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools" / "title_codegen_plan.py"),
+                str(SYNTHETIC_MANIFEST),
+                "--manager-plan",
+                "--game-name=synthetic",
+                "--game-elf=fixtures/synthetic.elf",
+                "--build-dir=build/synthetic",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        base = json.loads(plan_proc.stdout)
+
+        def assert_helper_rejects(value: str) -> None:
+            path = self.root / "plan.json"
+            path.write_text(value, encoding="utf-8")
+            command = (
+                f". '{HELPER}'; "
+                f"$p=Get-Content -LiteralPath '{path}' -Raw; "
+                "try { $o=$p | ConvertFrom-Json; Assert-TitleManagerPlan $o | Out-Null; exit 1 } "
+                "catch { exit 0 }"
+            )
+            proc = subprocess.run(
+                [self.shell, "-NoProfile", "-Command", command],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        assert_helper_rejects("not-json")
+        version = copy.deepcopy(base)
+        version["plan_version"] = 99
+        assert_helper_rejects(json.dumps(version))
+        unknown = copy.deepcopy(base)
+        unknown["unexpected"] = True
+        assert_helper_rejects(json.dumps(unknown))
+        control = copy.deepcopy(base)
+        control["make"]["build_dir"] = "bad\npath"
+        assert_helper_rejects(json.dumps(control))
+
+    def test_nonzero_python_planner_is_rejected_without_make(self) -> None:
+        # The stand-in planner must be directly executable on this host. A .cmd file is
+        # not executable under PowerShell on Linux: pwsh hands it to xdg-open, which can
+        # start an editor that holds the output pipe forever (or, with no handler, fails
+        # for a reason unrelated to the planner's exit code).
+        if os.name == "nt":
+            failing = self.root / "failing-python.cmd"
+            failing.write_text("@echo planner failed 1>&2\r\n@exit /b 7\r\n", encoding="ascii")
+        else:
+            failing = self.root / "failing-python.sh"
+            failing.write_text("#!/bin/sh\necho 'planner failed' >&2\nexit 7\n", encoding="ascii")
+            failing.chmod(0o755)
+        command = (
+            f". '{HELPER}'; "
+            f"try {{ Invoke-TitleManagerPlan -PlannerScript 'missing.py' -ManifestPath '{SYNTHETIC_MANIFEST}' "
+            f"-GameName synthetic -GameElf fixtures/synthetic.elf -BuildDir build/synthetic -ModuleDir modules "
+            f"-PspHeader header.bin -FuncsPerChunk 2000 -PythonCommand '{failing}'; exit 1 }} "
+            "catch { Write-Output $_.Exception.Message; exit 0 }"
+        )
+        proc = subprocess.run(
+            [self.shell, "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        # Rejected because the planner itself exited 7, not because it could not be started.
+        self.assertIn("exit code 7", proc.stdout, proc.stdout + proc.stderr)
+        self.assert_no_make()
+
+    def test_vulkan_sdk_helper_precedence_and_validity(self) -> None:
+        explicit = self.make_sdk("explicit-sdk")
+        environment = self.make_sdk("environment-sdk")
+        self.make_sdk("1.10.0.0", complete=False)
+        scanned = self.make_sdk("1.9.0.0")
+        self.make_sdk("not-a-version")
+
+        explicit_result = self.resolve_sdk(explicit=explicit, environment=environment)
+        self.assertEqual(explicit_result.returncode, 0, explicit_result.stdout + explicit_result.stderr)
+        self.assertEqual(Path(explicit_result.stdout.strip()), explicit.resolve())
+
+        environment_result = self.resolve_sdk(environment=environment)
+        self.assertEqual(environment_result.returncode, 0, environment_result.stdout + environment_result.stderr)
+        self.assertEqual(Path(environment_result.stdout.strip()), environment.resolve())
+
+        scan_result = self.resolve_sdk()
+        self.assertEqual(scan_result.returncode, 0, scan_result.stdout + scan_result.stderr)
+        self.assertEqual(Path(scan_result.stdout.strip()), scanned.resolve())
+
+        invalid_result = self.resolve_sdk(environment=self.root / "missing-sdk")
+        self.assertNotEqual(invalid_result.returncode, 0)
+        self.assertIn("unusable Vulkan SDK", invalid_result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

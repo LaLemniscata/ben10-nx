@@ -1,0 +1,199 @@
+# Online mode and developer mode (design)
+
+Status: step 1 of the implementation order is built (the switches, the wizard step and the developer log panel).
+The update check is built too, as its own opt-in feature outside online mode (see
+[Update check](#update-check)); news and reports are not. The player is offline unless the user asks
+([`SETUP.md`](SETUP.md#network-use)). This page is the contract the implementation follows. The launcher gets an update check, a reporting system and a news feed, all behind an
+**online mode** that the setup wizard asks about, and a **developer mode** that shows a developer log for
+diagnosing new issues.
+
+## Principles
+
+- **Asked once, changeable anytime.** The setup wizard step offers the switches for online mode and developer
+  mode, and each is a switch in Settings afterwards. Both start switched off. Until the online features exist
+  the Online mode switch is not shown to anyone whose stored setting is Off (see the note under the table).
+- **One host.** Online mode talks to `nakagawa.jaycast.net` over HTTPS and nothing else. The news site (The
+  FreshWire) cross-posts to it, so the player's allowlist stays one host. (The update check, outside online mode,
+  uses GitHub's hosts for the releases themselves.)
+- **Nothing is sent on its own.** No telemetry, analytics, crash upload or identifier. The only automatic traffic is
+  fetching the news feed while online mode is on, and the one update check at start when the user turned it on. Requests carry no cookie and no ID; the
+  user agent names the version and operating system only (`NakagawaRecomp/0.0.1 (Windows)`).
+- **Game data never leaves the PC.** No game code, game data, decrypted module, package, save, guest memory or
+  capture is ever uploaded (`AGENTS.md`, section 5). A report sends only the fields the user sees in its preview.
+- **Offline stays complete.** Every feature works without online mode except news and reports. A network failure is
+  shown once, quietly, and never blocks the library or a game.
+- **Games stay offline.** Online mode is a launcher feature. The PSP network services a game calls stay fail-closed
+  whatever this setting says.
+
+## Setup wizard step: "Online and developer options"
+
+Shown right after Welcome, before the game step, so every first run sees it (it needs no game). The design is two
+switches, each with one plain sentence (today the Online mode row is hidden, as the note below the table says):
+
+| Switch | Default | Sentence |
+| --- | --- | --- |
+| Online mode | Off | "When on, Nakagawa checks nakagawa.jaycast.net for news and lets you send reports. Nothing is sent without you." |
+| Developer mode | Off | "Show a developer log on screen to help track down problems. Stays on this PC." |
+
+Until news and reports exist, the wizard step and Settings > Online and developer do not show the Online mode
+switch or its two parts (news, reports): they say in one line that online features are not built yet, and
+only the Developer mode switch is there. A user whose stored `online_mode` is On still gets the Online mode
+switch (with a sentence that it does nothing yet), so it can be turned off. The `online_mode`, `online_news` and `online_reports` settings are still
+stored and still default to off, so a build that adds the features keeps what the user chose; with online mode
+on, Settings will show its two parts again, each on by default and each switchable alone. The step is skippable;
+skipping keeps developer mode off.
+
+## Update check
+
+Built for v0.0.2: a way for users to Check for Updates and have the newer version
+automatically downloaded optionally. It replaces the signed `updates.json` design this section held before:
+the update check is its own opt-in feature, not a part of online mode, and it uses GitHub, where the releases
+already are.
+
+- **Settings > Updates.** CHECK FOR UPDATES asks GitHub's public Releases API for this repository once
+  (`src/player/update_check.c`), anonymously. The page shows this version, the newest one (pre-releases count,
+  since every v0.0.x release is one), its date, the release page link and the first lines of its notes.
+- **Check at start** is a switch on that page, off by default (`check_updates_at_start` in `settings.json`).
+  When on, the player asks once at start. A newer version shows one quiet "Version x is out" button on the
+  library; a failure is not shown, only logged in the developer log.
+- **DOWNLOAD** and **INSTALL** are separate clicks. DOWNLOAD first checks the release's `.sha256` file
+  against its minisign signature, `.sha256.minisig`, made offline by the owner with the update-signing key
+  whose public half is built into the player ([`RELEASE_SIGNING.md`](RELEASE_SIGNING.md)). The Windows ZIP is
+  fetched only after that, and kept only if its SHA-256 matches the signed checksum file and GitHub's own
+  digest of the asset; Install unpacks it into a new folder and tells the user how to start it. Nothing is
+  replaced and nothing runs on its own.
+- A build without the key, a release without a signature, and a signature that does not verify all fail
+  closed: no download, a plain card, and the release page link. The signed checksum names the ZIP, whose name
+  carries the version, so an older signed checksum served for a newer release is refused. A build-provenance
+  attestation for the ZIP does not exist yet.
+
+Hosts, the exact request and the failure cards are in [`SETUP.md`](SETUP.md#network-use).
+
+## News
+
+- The library shows a small news strip from `https://nakagawa.jaycast.net/news.json` (title, date, one-line summary,
+  link), fetched at most every few hours and cached for offline display.
+- Text only: no remote images, HTML or scripts are rendered. **Read** opens the post in the browser.
+
+## Reports
+
+Built for v0.0.2: browser links, with no network call from the player.
+
+- **Report this game** is on the card of a game that stopped early, closed unexpectedly or did not start; each
+  game's title page has a smaller **Report a problem**. Either opens the user's browser at a new discussion in
+  the [Compatibility reports](https://github.com/Jstar269/nakagawa-recomp/discussions/categories/compatibility-reports)
+  category, with the title ("game title (disc ID): boundary or crash code") and the body filled in: the disc ID
+  and version, the Nakagawa version and commit, the system, the named boundary or crash code, and empty "What I
+  did" and "What I saw" sections. The link carries no path, user name, log or setting, is percent-encoded and
+  stays under 2000 characters (Windows' shell takes links up to 2083). Nothing is posted until the user posts it
+  on GitHub.
+- **See existing reports** opens the same category searched for the disc ID.
+- **Known causes.** When the named boundary is in the player's table of known causes (`k_known_causes` in
+  `src/player/player_state.c`), the card says "This is a known issue", links that issue, and shows Report as a
+  smaller button. Only open issues are listed.
+- **Copy details** puts a longer report on the clipboard: the boundary, the last boot events, the renderer and
+  the package check. The profile folder is shown as `~` and the user name as `<user>`.
+- If a `.github/DISCUSSION_TEMPLATE/compatibility-reports.yml` form is added later, its fields are filled by
+  their ids instead of `body`.
+
+The plan below is the later in-player report, once online mode ships.
+
+- A **Report** action on a game's title page and on every error card composes a report inside the player: player
+  version and build date, operating system, disc ID and title, the furthest stage reached and the named boundary
+  (for example `unsupported-import-sceUmdReplaceProhibit`), and the user's own comment.
+- The user sees the exact text before sending, can edit the comment and remove any field, and chooses **Send** or
+  **Cancel**. With developer mode on, the user may also attach the developer log, shown in the same preview.
+- Until the report endpoint exists, **Send** opens the browser on a pre-filled form (forum or issue tracker) instead
+  of posting from the player. The endpoint, when built, rate-limits and stores reports without IP logging.
+- Never included: game files, saves, memory, screenshots, file paths outside the redaction below.
+
+## Developer mode
+
+- Adds a **Developer log** panel (toggle with F12 or the controller's Select + R): the player's and the runtime's
+  log lines, boot events, the named stop boundary and the first missing imports, with copy and save buttons.
+- Local only: developer mode sends nothing. Saving or attaching the log replaces the user's profile path and user
+  name with placeholders (`%USERPROFILE%`, `<user>`) before display.
+- Release builds keep the panel; it adds no performance cost while hidden.
+
+## Online play (later)
+
+A separate, later switch, **Online play**, lets games use the PSP's own network services. It is not part of online
+mode: online mode lets the launcher talk to one host, while online play lets game code reach the network, so it is
+its own explicit choice with its own sentence in Settings.
+
+- **Ad-hoc multiplayer first.** Most PSP multiplayer is local wireless ad-hoc play. Nakagawa implements the PSP ad-hoc
+  services for real and carries the traffic to a relay server the project hosts, or directly between devices on the
+  user's local network. One implementation covers many titles. Speaking the protocol of PPSSPP's ad-hoc server would
+  let Nakagawa players join PPSSPP players; its code may be adapted under the import rules in `AGENTS.md`, section 4.
+- **Infrastructure revivals, per title, later.** A game whose official servers are gone can be revived only by
+  rebuilding that game's own server protocol, one title at a time, from interoperability study of the game itself.
+- **Never:** anything that needs the console vendor's online-account sign-in or DNAS authentication. Those depend on
+  the vendor's keys and certificates, which stay out of the project like firmware and decryption.
+- **Still fail-closed where unbuilt.** A network service a title calls that Nakagawa does not implement stays a named,
+  visible stop, whatever this switch says; no setting makes a refusal permissive.
+- **Scope of traffic:** the project's relay host and the user's local network only, each listed in `docs/SETUP.md`
+  "Network use" when it ships.
+- **Hardware evidence:** ad-hoc behaviour is measured on PSP hardware (two consoles where the test needs a peer)
+  before it is claimed, as for every other runtime behaviour.
+
+## Testing online features
+
+- **The default test suite and hosted CI stay offline.** Online code is tested against a stub server on the loopback
+  interface with fixed signed fixtures (a valid update notice, a tampered one, a malformed feed, a timeout), and ad-hoc
+  play against a local relay with two player instances on loopback.
+- **One labelled online smoke check may use the internet,** opt-in only: it runs when the maintainer starts it or on a
+  schedule the maintainer sets, talks only to the project's own host, checks the live update notice's signature,
+  fetches the news feed and joins the relay. It is never part of the default suite; without network it reports
+  `NOT_RUN`, not a failure.
+- When the first online feature ships, the `AGENTS.md` section 5 sentence "Tests never touch the internet" becomes:
+  "The default test suite and hosted CI never touch the internet; the labelled online smoke check may, opt-in, and
+  only against the project's own host."
+
+## Policy and code changes this needs
+
+1. `AGENTS.md`, section 5: offline by default becomes "offline until the user turns on online mode; then only
+   news and user-sent reports, only to `nakagawa.jaycast.net`". The update check already has its own entry there.
+2. Until the first network feature ships, `network_mode` in `settings.json` stays `"offline"` (the only value
+   `AGENTS.md` section 5 accepts) and the user's choice lives in a separate `online_mode` key, with the per-feature
+   switches (`online_news`, `online_reports`) and `developer_mode` beside it. The update check has its own key,
+   `check_updates_at_start`, outside online mode. `network_mode` gains
+   `"online"` when step 2 ships, together with the section 5 change in item 1; any unknown value still reads as
+   offline.
+3. `docs/SETUP.md` "Network use" gains one row per feature when each ships; the egress allowlist test
+   (`tools/test_prereq_fetcher.py`) gains the one host and the one module allowed to use it.
+4. Tests never touch the internet: a local stub server and fixed signed fixtures cover the client.
+
+## Maintainer tasks
+
+- DNS and hosting for `nakagawa.jaycast.net`, serving `updates.json`, `news.json` and a privacy page.
+- Generating and keeping the update-signing key offline and signing each release's checksum file; committing
+  its public key as `assets/update_signing_key.pub` ([`RELEASE_SIGNING.md`](RELEASE_SIGNING.md)).
+
+## Implementation order
+
+1. Settings fields, the wizard step and the developer log panel (no network). **Built.**
+   - The settings keys are as item 2 below describes.
+   - The switches live on Settings > ONLINE & DEVELOPER and on the wizard step "Online and developer options"
+     (right after Welcome), both saying that news and reports aren't built yet. CONTINUE is the step's
+     default focus, so Enter never flips a switch; SKIP turns both off.
+   - The developer log (F12, or Select + R on a controller, with developer mode on) holds the player's errors,
+     launches, setting changes, the game's exit code and the runtime's boot events (phases, the named stop boundary,
+     missing imports), redacted as they are added. COPY puts it on the clipboard; SAVE writes `developer-log.txt` in
+     the logs folder. Tests: `tests/native/test_player_state.c` (redaction, the ring, the panel, the step) and
+     `tests/native/test_player_ui.py`.
+2. A small HTTPS client behind one host allowlist (WinHTTP on Windows, which the build-tool download already uses;
+   a portable backend on Linux), with the stub-server tests.
+3. Update check. **Built** as its own opt-in feature on GitHub's Releases API, with a SHA-256 check of the
+   download ([Update check](#update-check)); tests: `tests/native/test_update_check.c` and
+   `tests/native/test_player_ui.py`, on recorded and synthetic answers, never the internet.
+   - **Built:** signature verification before any SHA-256 is trusted. Each release's checksum file is signed
+     offline with stock `minisign` ([`RELEASE_SIGNING.md`](RELEASE_SIGNING.md)); the player checks the
+     `.minisig` with `nk_minisign_verify` (`src/core/nk_sig.h`: minisign's prehashed `ED` and legacy `Ed`
+     forms, the key ID and the trusted comment's global signature), on `nk_ed25519_verify` and the vendored
+     Monocypher 4.0.3 Ed25519 and BLAKE2b code (`third_party/monocypher/`). The public key is read at build
+     time from `assets/update_signing_key.pub`; until the owner commits that file, the build carries no key and
+     offers only the release page. Tests: `ed25519-verify-selftest` (the RFC 8032 vectors and real minisign
+     output, TEST-ONLY key) and the update tests above (TEST-ONLY keys derived at run time).
+4. News strip.
+5. Reports, browser hand-off first, then the endpoint.
+6. Online play: ad-hoc relay first, then per-title infrastructure revivals.

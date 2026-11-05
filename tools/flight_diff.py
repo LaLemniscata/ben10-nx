@@ -1,0 +1,821 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from itertools import zip_longest
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+SCHEMA_PATH = ROOT / "assets" / "flight_recorder_schema.json"
+CLASS_ORDER = ("hle", "unsupported", "sched", "prx", "media", "fault", "fatal", "ge", "present",
+               "watch")
+EVENT_KIND_NAMES = {
+    1: "hle-import",
+    2: "unsupported-nid",
+    3: "sched-pick",
+    4: "sched-block",
+    5: "sched-wake",
+    6: "prx-load",
+    7: "prx-start",
+    8: "prx-stop",
+    9: "prx-unload",
+    10: "fault-exception",
+    11: "fatal-break",
+    12: "fatal-raw-syscall",
+    13: "fatal-dispatch",
+    14: "fatal-unimplemented",
+    15: "fatal-cpu-flow",
+    16: "fatal-import",
+    17: "fatal-host",
+    18: "media-test-milestone",
+    19: "media-stream-rejected",
+    20: "ge-list-enqueue",
+    21: "ge-list-dequeue",
+    22: "ge-list-sync",
+    23: "ge-draw-sync",
+    24: "ge-list-stall-update",
+    25: "ge-draw",
+    26: "ge-list-finish",
+    27: "ge-finish-command",
+    28: "present-set-framebuf",
+    29: "present-frame",
+    30: "nan-origin",
+    31: "watch-change",
+}
+
+# SR_FLIGHT_KIND_NAN_ORIGIN (issue #320): arg1 packs domain (bits 0-7), result class
+# (bits 8-15) and destination register (bits 16-23); arg0 is the guest pc, arg2 the lane,
+# arg3 the VBLANK count. The limits are the register file and vector lane count per domain.
+NAN_ORIGIN_KIND = 30
+NAN_ORIGIN_CLASS = "fault"
+NAN_DOMAIN_NAMES = {1: "fpu", 2: "vfpu"}
+NAN_DOMAIN_REGISTERS = {1: ("f", 32), 2: ("v", 128)}
+NAN_DOMAIN_LANES = {1: 1, 2: 16}
+NAN_RESULT_NAMES = {1: "nan", 2: "+inf", 3: "-inf"}
+
+# Verdict tokens of the comparison contract. MATCH is printed only when the two
+# bundles are comparable and every compared field agrees; the full contract is
+# documented on diff_bundles.
+MATCH = "MATCH"
+DIVERGENCE = "DIVERGENCE"
+INCOMPARABLE = "INCOMPARABLE"
+
+# Exit codes: 0 MATCH, 1 DIVERGENCE, 2 error/malformed bundle, 3 INCOMPARABLE.
+EXIT_MATCH = 0
+EXIT_DIVERGENCE = 1
+EXIT_ERROR = 2
+EXIT_INCOMPARABLE = 3
+
+
+class FlightDiffError(ValueError):
+    pass
+
+
+class BundleIncomparable(FlightDiffError):
+    """Two individually valid bundles are not evidence of comparable executions.
+
+    Raised only for pairs whose recorder configuration, retained-history
+    completeness, or terminal state would let "same retained events" stand in
+    for "same execution" -- the failure mode this tool must never report as
+    MATCH. ``reasons`` lists every violated comparability condition.
+    """
+
+    def __init__(self, reasons: list[str]) -> None:
+        super().__init__("; ".join(reasons))
+        self.reasons = list(reasons)
+
+
+def _fail(path: str, message: str) -> None:
+    raise FlightDiffError(f"{path}: {message}")
+
+
+def _validate_schema(value: Any, schema: dict[str, Any], path: str = "$") -> None:
+    if "const" in schema and value != schema["const"]:
+        _fail(path, f"expected {schema['const']!r}")
+    if "enum" in schema and value not in schema["enum"]:
+        _fail(path, f"expected one of {schema['enum']!r}")
+
+    expected = schema.get("type")
+    if expected is not None:
+        expected_types = expected if isinstance(expected, list) else [expected]
+        valid = False
+        for type_name in expected_types:
+            if type_name == "object" and isinstance(value, dict):
+                valid = True
+            elif type_name == "array" and isinstance(value, list):
+                valid = True
+            elif type_name == "string" and isinstance(value, str):
+                valid = True
+            elif type_name == "boolean" and isinstance(value, bool):
+                valid = True
+            elif type_name == "integer" and isinstance(value, int) and not isinstance(value, bool):
+                valid = True
+            elif type_name == "number" and isinstance(value, (int, float)) and not isinstance(value, bool):
+                valid = True
+            elif type_name == "null" and value is None:
+                valid = True
+        if not valid:
+            _fail(path, f"expected {expected!r}")
+
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            _fail(path, "string is too short")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            _fail(path, "string is too long")
+        pattern = schema.get("pattern")
+        if pattern is not None and re.search(pattern, value) is None:
+            _fail(path, "string does not match its schema pattern")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            _fail(path, "number is below its minimum")
+        if "maximum" in schema and value > schema["maximum"]:
+            _fail(path, "number is above its maximum")
+    if isinstance(value, list):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            _fail(path, "array is too short")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            _fail(path, "array is too long")
+        if schema.get("uniqueItems"):
+            serialized = [json.dumps(item, sort_keys=True, separators=(",", ":")) for item in value]
+            if len(serialized) != len(set(serialized)):
+                _fail(path, "array items are not unique")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                _validate_schema(item, item_schema, f"{path}[{index}]")
+    if isinstance(value, dict):
+        for key in schema.get("required", ()):
+            if key not in value:
+                _fail(path, f"missing required property {key!r}")
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            for key in value:
+                if key not in properties:
+                    _fail(path, f"property {key!r} is not allowed")
+        for key, child_schema in properties.items():
+            if key in value:
+                _validate_schema(value[key], child_schema, f"{path}.{key}")
+    if "allOf" in schema:
+        for child_schema in schema["allOf"]:
+            _validate_schema(value, child_schema, path)
+    if "not" in schema:
+        try:
+            _validate_schema(value, schema["not"], path)
+        except FlightDiffError:
+            pass
+        else:
+            _fail(path, "value matches a forbidden schema")
+    if "if" in schema:
+        try:
+            _validate_schema(value, schema["if"], path)
+        except FlightDiffError:
+            branch = schema.get("else")
+        else:
+            branch = schema.get("then")
+        if branch is not None:
+            _validate_schema(value, branch, path)
+
+
+def _forbid_embedded_text(value: Any, path: str = "$") -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            lowered = key.casefold()
+            if any(token in lowered for token in ("path", "payload", "memory", "guest", "text", "string")):
+                _fail(path, f"source-unsafe property {key!r}")
+            _forbid_embedded_text(child, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _forbid_embedded_text(child, f"{path}[{index}]")
+    elif isinstance(value, str):
+        if "C:\\" in value or "c:\\" in value or ".." in value or "/" in value or "\\" in value:
+            _fail(path, "path-like or guest-derived text is not allowed")
+
+
+def validate_bundle(bundle: Any, schema: dict[str, Any] | None = None) -> None:
+    if schema is None:
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    # The schema also forbids an identity-less v3 build block; this check runs first so
+    # the operator gets the specific reason rather than a generic schema mismatch.
+    build = bundle.get("build") if isinstance(bundle, dict) else None
+    version = bundle.get("schema_version") if isinstance(bundle, dict) else None
+    if (isinstance(version, int) and not isinstance(version, bool) and version >= 3
+            and isinstance(build, dict)
+            and build.get("source_date_epoch") is None and build.get("build_id") is None):
+        _fail("$.build", "bundle must record a reproducible build identity "
+                         "(source_date_epoch or build_id); a clock stamp is never recorded")
+    _validate_schema(bundle, schema)
+    _forbid_embedded_text(bundle)
+    version = bundle["schema_version"]
+    if any(event["schema_version"] != version for event in bundle["events"]):
+        _fail("$.events", "event schema versions must match the bundle")
+    recorder = bundle["recorder"]
+    events = bundle["events"]
+    if recorder["recorded"] != len(events) + recorder["dropped"]:
+        _fail("$.recorder", "recorded must equal retained plus dropped events")
+    if len(events) > recorder["limit"]:
+        _fail("$.events", "retained events exceed the configured limit")
+    # The recorder assigns sequences 1..recorded and its ring retains the last
+    # min(recorded, limit) of them; "dropped" is exactly the ring overflow. A
+    # bundle that deviates from that window does not describe a capture this
+    # tool can reason about, so it is malformed rather than merely divergent.
+    if recorder["dropped"] != max(0, recorder["recorded"] - recorder["limit"]):
+        _fail("$.recorder", "dropped must equal recorded minus min(recorded, limit)")
+    sequences = [event["sequence"] for event in events]
+    if sequences != sorted(set(sequences)):
+        _fail("$.events", "sequence numbers must be strictly increasing")
+    if sequences != list(range(recorder["dropped"] + 1, recorder["recorded"] + 1)):
+        _fail("$.events", "retained sequences must be exactly dropped+1..recorded")
+    enabled = set(recorder["enabled_classes"])
+    if any(event["class"] not in enabled for event in events):
+        _fail("$.events", "event class is not enabled")
+    _validate_nan_origin_events(events)
+    if bundle["terminal"]["sequence"] and bundle["terminal"]["sequence"] not in sequences:
+        _fail("$.terminal", "terminal sequence is not retained")
+    fired = recorder["triggers"]["fired"]
+    reason = bundle["terminal"]["reason"]
+    if version >= 5:
+        _validate_schema5_terminal(fired, reason)
+        _validate_refusals(bundle["refusals"])
+    else:
+        if fired and reason == "exit":
+            _fail("$.terminal", "a triggered bundle cannot have an exit terminal reason")
+        if not fired and reason != "exit":
+            _fail("$.terminal", "an untriggered bundle must terminate at exit")
+    if version >= 6:
+        _validate_threads(bundle["threads"])
+    if version >= 7:
+        _validate_watch_events(bundle)
+        _validate_trigger_policy(bundle)
+
+
+def _nan_origin_operands(event: dict[str, Any]) -> tuple[int, int, int]:
+    """(domain, result, destination register) packed into a nan-origin event's arg1."""
+    packed = event["arg1"]
+    return packed & 0xFF, (packed >> 8) & 0xFF, (packed >> 16) & 0xFF
+
+
+def _validate_nan_origin_events(events: list[dict[str, Any]]) -> None:
+    """A nan-origin event is an SR_NAN_TRAP origin; its operands must fit the packing."""
+    for index, event in enumerate(events):
+        if event["kind"] != NAN_ORIGIN_KIND:
+            continue
+        path = f"$.events[{index}]"
+        if event["class"] != NAN_ORIGIN_CLASS:
+            _fail(path, "a nan-origin event belongs to the fault class")
+        if event["arg1"] >> 24:
+            _fail(path, "nan-origin arg1 has bits above its packed domain, result and register")
+        domain, result, register = _nan_origin_operands(event)
+        if domain not in NAN_DOMAIN_NAMES:
+            _fail(path, "nan-origin domain must be fpu (1) or vfpu (2)")
+        if result not in NAN_RESULT_NAMES:
+            _fail(path, "nan-origin result must be nan (1), +inf (2) or -inf (3)")
+        if register >= NAN_DOMAIN_REGISTERS[domain][1]:
+            _fail(path, "nan-origin destination register is out of range for its domain")
+        if event["arg2"] >= NAN_DOMAIN_LANES[domain]:
+            _fail(path, "nan-origin lane is out of range for its domain")
+
+
+# A schema 5 terminal is what ended the run. Only a fatal, an unknown NID with no handler, or a
+# watchdog hang fires a trigger; a clean exit, a vblank budget stop, or a record still running
+# (a provisional write) does not. A named refusal never ends the record at all.
+SCHEMA5_FIRED_REASONS = frozenset({"fatal", "unsupported-nid", "hang", "trigger"})
+SCHEMA5_UNFIRED_REASONS = frozenset({"exit", "budget", "running"})
+
+
+def _validate_schema5_terminal(fired: int, reason: str) -> None:
+    if fired:
+        if reason == "budget":
+            _fail("$.terminal", "a budget stop ends without a fired trigger")
+        if reason not in SCHEMA5_FIRED_REASONS:
+            _fail("$.terminal", "a fired trigger must end in a fatal, unsupported-nid, hang or trigger terminal")
+        return
+    if reason == "hang":
+        _fail("$.terminal", "a watchdog hang is a fired trigger")
+    if reason not in SCHEMA5_UNFIRED_REASONS:
+        _fail("$.terminal", "an untriggered bundle must terminate at exit, budget or running")
+
+
+def _validate_refusals(refusals: dict[str, Any]) -> None:
+    nids = refusals["nids"]
+    if refusals["count"] == 0:
+        if refusals["first_nid"] is not None or refusals["first_pc"] is not None:
+            _fail("$.refusals", "a bundle with no refusals cannot name a first refused NID")
+    elif refusals["first_nid"] is None or refusals["first_pc"] is None:
+        _fail("$.refusals", "a first refused NID and pc must be recorded when refusals are counted")
+    if nids and nids[0]["nid"] != refusals["first_nid"]:
+        _fail("$.refusals", "the first listed NID must be the first refused NID")
+    if sum(entry["count"] for entry in nids) + refusals["nids_unlisted"] != refusals["count"]:
+        _fail("$.refusals", "refusal counts must account for every refusal (listed plus unlisted)")
+    if len({entry["nid"] for entry in nids}) != len(nids):
+        _fail("$.refusals", "each refused NID is listed once")
+
+
+def _validate_threads(threads: list[dict[str, Any]]) -> None:
+    """Schema 6 terminal thread snapshot: one entry per thread, at most one on the CPU."""
+    uids = [thread["uid"] for thread in threads]
+    if len(set(uids)) != len(uids):
+        _fail("$.threads", "each thread is listed once")
+    if sum(1 for thread in threads if thread["state"] == "running") > 1:
+        _fail("$.threads", "at most one thread is running")
+
+
+# Schema 7 watch class and trigger modes (issue #320; folded from #1433).
+WATCH_CHANGE_KIND = 31
+WATCH_CHANGE_CLASS = "watch"
+WATCH_KNOWN_BIT = 1 << 8
+GE_DRAW_KIND = 25
+
+
+def _kind_class(kind: int) -> str | None:
+    """The class an event kind belongs to, as src/rt/flight_recorder.c kind_class() has it."""
+    if kind == 1:
+        return "hle"
+    if kind == 2:
+        return "unsupported"
+    if 3 <= kind <= 5:
+        return "sched"
+    if 6 <= kind <= 9:
+        return "prx"
+    if kind in (10, 30):
+        return "fault"
+    if 11 <= kind <= 17:
+        return "fatal"
+    if kind in (18, 19):
+        return "media"
+    if 20 <= kind <= 27:
+        return "ge"
+    if kind in (28, 29):
+        return "present"
+    if kind == WATCH_CHANGE_KIND:
+        return WATCH_CHANGE_CLASS
+    return None
+
+
+def _event_pc(event: dict[str, Any]) -> int | None:
+    """The guest pc operand the pc trigger mode matches, for the kinds that carry one.
+
+    Only kinds recorded by a non-terminal path are listed: an HLE import (arg2), a named
+    refusal (arg3), a GE list dequeue (arg1), the LLE exception entry (arg1), a NaN origin
+    (arg0) and a watch change (arg0).
+    """
+    field = {1: "arg2", 2: "arg3", 21: "arg1", 10: "arg1", 30: "arg0", 31: "arg0"}.get(event["kind"])
+    return None if field is None else event[field]
+
+
+def _validate_watch_events(bundle: dict[str, Any]) -> None:
+    """A watch change lies in the recorded watch range and packs only width and the known bit."""
+    recorder = bundle["recorder"]
+    watch_range = recorder["watch_range"]
+    if (watch_range is not None) != (WATCH_CHANGE_CLASS in recorder["enabled_classes"]):
+        _fail("$.recorder.watch_range", "a watch range is recorded exactly when the watch class is on")
+    for index, event in enumerate(bundle["events"]):
+        if event["kind"] != WATCH_CHANGE_KIND:
+            continue
+        path = f"$.events[{index}]"
+        if event["class"] != WATCH_CHANGE_CLASS:
+            _fail(path, "a watch-change event belongs to the watch class")
+        width = event["arg2"] & 0xFF
+        if event["arg2"] & ~(0xFF | WATCH_KNOWN_BIT) or width == 0:
+            _fail(path, "watch-change arg2 packs a nonzero width and the known bit only")
+        start = watch_range["address"]
+        if event["arg1"] >= start + watch_range["length"] or event["arg1"] + width <= start:
+            _fail(path, "watch-change store does not touch the recorded watch range")
+
+
+_TRIGGER_PARAMETERS = (("pc", "pc"), ("ge-draw", "ge_draw"), ("checkpoint", "checkpoint"))
+
+
+def _validate_trigger_policy(bundle: dict[str, Any]) -> None:
+    """Schema 7: the armed mode, its parameters and a trigger terminal agree with the events."""
+    recorder = bundle["recorder"]
+    triggers = recorder["triggers"]
+    mode = triggers["mode"]
+    enabled = set(recorder["enabled_classes"])
+    for name, key in _TRIGGER_PARAMETERS:
+        if (mode == name) != (triggers[key] is not None):
+            _fail("$.recorder.triggers", f"{key} is set exactly when the mode is {name}")
+    if mode == "watch" and WATCH_CHANGE_CLASS not in enabled:
+        _fail("$.recorder.triggers", "the watch mode needs the watch class")
+    if mode == "ge-draw" and "ge" not in enabled:
+        _fail("$.recorder.triggers", "the ge-draw mode needs the ge class")
+    checkpoint = triggers["checkpoint"]
+    if checkpoint is not None:
+        checkpoint_class = _kind_class(checkpoint["kind"])
+        if checkpoint_class is None or checkpoint_class == "fatal":
+            _fail("$.recorder.triggers", "a checkpoint names a non-fatal event kind")
+        if checkpoint_class not in enabled:
+            _fail("$.recorder.triggers", "a checkpoint kind belongs to an enabled class")
+        if checkpoint["after"] >= recorder["limit"]:
+            _fail("$.recorder.triggers", "a checkpoint window is shorter than the limit")
+
+    terminal = bundle["terminal"]
+    if terminal["reason"] != "trigger":
+        return
+    if mode == "none":
+        _fail("$.terminal", "a trigger terminal needs an armed trigger mode")
+    events = bundle["events"]
+    by_sequence = {event["sequence"]: event for event in events}
+    matched = by_sequence.get(terminal["sequence"])
+    if matched is None:
+        _fail("$.terminal", "a trigger terminal names a retained event")
+    if matched["kind"] != terminal["kind"]:
+        _fail("$.terminal", "a trigger terminal kind is the kind of the event it names")
+    before = [event for event in events if event["sequence"] < matched["sequence"]]
+    after = [event for event in events if event["sequence"] > matched["sequence"]]
+    complete = recorder["dropped"] == 0
+    if mode == "pc":
+        if _event_pc(matched) != triggers["pc"] or terminal["arg0"] != triggers["pc"]:
+            _fail("$.terminal", "a pc trigger names an event at the armed pc")
+        if any(_event_pc(event) == triggers["pc"] for event in before):
+            _fail("$.terminal", "a pc trigger fires at the first event at the armed pc")
+    elif mode == "ge-draw":
+        if matched["class"] != "ge" or matched["kind"] != GE_DRAW_KIND \
+                or terminal["arg0"] != triggers["ge_draw"]:
+            _fail("$.terminal", "a ge-draw trigger names the armed GE draw")
+        draws = sum(1 for event in before if event["class"] == "ge" and event["kind"] == GE_DRAW_KIND)
+        if (draws + 1 != triggers["ge_draw"]) if complete else (draws + 1 > triggers["ge_draw"]):
+            _fail("$.terminal", "a ge-draw trigger fires at the armed draw ordinal")
+    elif mode == "watch":
+        if matched["class"] != WATCH_CHANGE_CLASS or matched["kind"] != WATCH_CHANGE_KIND \
+                or terminal["arg0"] != matched["arg1"]:
+            _fail("$.terminal", "a watch trigger names a watch change and its address")
+        if any(event["kind"] == WATCH_CHANGE_KIND for event in before):
+            _fail("$.terminal", "a watch trigger fires at the first watch change")
+    else:
+        if matched["kind"] != checkpoint["kind"] or terminal["arg0"] != checkpoint["occurrence"]:
+            _fail("$.terminal", "a checkpoint trigger names the armed kind and occurrence")
+        seen = sum(1 for event in before if event["kind"] == checkpoint["kind"])
+        if (seen + 1 != checkpoint["occurrence"]) if complete else (seen + 1 > checkpoint["occurrence"]):
+            _fail("$.terminal", "a checkpoint trigger fires at the armed occurrence")
+    window = checkpoint["after"] if mode == "checkpoint" else 0
+    if len(after) > window:
+        _fail("$.events", "the record freezes at the trigger or at the end of its window")
+
+
+def load_bundle(path: Path) -> dict[str, Any]:
+    try:
+        bundle = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FlightDiffError(f"{path}: cannot read JSON: {exc}") from exc
+    validate_bundle(bundle)
+    returned: dict[str, Any] = bundle
+    return returned
+
+
+def _event_equal(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return left == right
+
+
+def _first_sequence_divergence(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None] | None:
+    left = {event["sequence"]: event for event in baseline["events"]}
+    right = {event["sequence"]: event for event in candidate["events"]}
+    for sequence in sorted(set(left) & set(right)):
+        first = left[sequence]
+        second = right[sequence]
+        if not _event_equal(first, second):
+            return f"sequence {sequence}", first, second
+    return None
+
+
+def _first_class_divergence(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None] | None:
+    max_common_sequence = min(
+        max((event["sequence"] for event in baseline["events"]), default=0),
+        max((event["sequence"] for event in candidate["events"]), default=0),
+    )
+    candidates: list[tuple[int, str, dict[str, Any] | None, dict[str, Any] | None]] = []
+    for event_class in CLASS_ORDER:
+        left = [event for event in baseline["events"] if event["class"] == event_class]
+        right = [event for event in candidate["events"] if event["class"] == event_class]
+        for occurrence, (first, second) in enumerate(zip_longest(left, right)):
+            if first is None or second is None or not _event_equal(first, second):
+                sequences = [event["sequence"] for event in (first, second) if event is not None]
+                order = min(sequences, default=0)
+                if order <= max_common_sequence:
+                    candidates.append((order, f"class {event_class} occurrence {occurrence}", first, second))
+                break
+    if not candidates:
+        return None
+    _, label, first, second = min(candidates, key=lambda item: (item[0], item[1]))
+    return label, first, second
+
+
+def _format_event(event: dict[str, Any] | None) -> str:
+    return "<absent>" if event is None else json.dumps(event, sort_keys=True, separators=(",", ":"))
+
+
+# Event divergences are labelled "sequence N" or "class C occurrence N". The terminal and
+# refusals labels name a field of a block, and their values are blocks rather than events.
+_EVENT_LABEL_PREFIXES = ("sequence ", "class ")
+
+
+def _nan_origin_detail(event: dict[str, Any]) -> str:
+    """The decoded origin of a nan-origin event: where it ran, what it produced, which lane."""
+    if event["kind"] != NAN_ORIGIN_KIND or event["class"] != NAN_ORIGIN_CLASS:
+        return ""
+    domain, result, register = _nan_origin_operands(event)
+    prefix, _ = NAN_DOMAIN_REGISTERS.get(domain, ("?", 0))
+    return (f" pc=0x{event['arg0']:08x} domain={NAN_DOMAIN_NAMES.get(domain, 'unknown')} "
+            f"dst={prefix}{register} result={NAN_RESULT_NAMES.get(result, 'unknown')} "
+            f"lane={event['arg2']} vbl={event['arg3']}")
+
+
+def _watch_change_detail(event: dict[str, Any]) -> str:
+    """The decoded store of a watch-change event: where it ran, what it wrote, how wide."""
+    if event["kind"] != WATCH_CHANGE_KIND or event["class"] != WATCH_CHANGE_CLASS:
+        return ""
+    known = "change" if event["arg2"] & WATCH_KNOWN_BIT else "first-write"
+    return (f" pc=0x{event['arg0']:08x} address=0x{event['arg1']:08x} "
+            f"width={event['arg2'] & 0xFF} value=0x{event['arg3']:08x} {known}")
+
+
+def _event_identity(event: dict[str, Any] | None) -> str:
+    if event is None:
+        return "<absent>"
+    kind = event["kind"]
+    name = EVENT_KIND_NAMES.get(kind, "unknown-kind")
+    return f"event index {event['sequence'] - 1} class={event['class']} kind={name} ({kind}) " \
+           f"sequence={event['sequence']}" + _nan_origin_detail(event) \
+        + _watch_change_detail(event)
+
+
+def _event_field_differences(
+    baseline: dict[str, Any] | None, candidate: dict[str, Any] | None
+) -> list[tuple[str, Any, Any]]:
+    if baseline is None or candidate is None:
+        return [("event", baseline is not None, candidate is not None)]
+    fields = sorted(set(baseline) | set(candidate))
+    return [
+        (field, baseline.get(field), candidate.get(field))
+        for field in fields
+        if baseline.get(field) != candidate.get(field)
+    ]
+
+
+def _trigger_policy(recorder: dict[str, Any]) -> dict[str, Any]:
+    """The armed trigger modes, as opposed to the ``fired`` outcome field."""
+    return {key: value for key, value in recorder["triggers"].items() if key != "fired"}
+
+
+def _comparability_reasons(baseline: dict[str, Any], candidate: dict[str, Any]) -> list[str]:
+    """Every condition under which the pair must not be trusted as comparable."""
+    reasons: list[str] = []
+    if baseline["schema_version"] != candidate["schema_version"]:
+        reasons.append(
+            "bundle schema versions differ: "
+            f"{baseline['schema_version']} vs {candidate['schema_version']}"
+        )
+    for side, bundle in (("baseline", baseline), ("candidate", candidate)):
+        if "enhancements" in bundle["runtime"]:
+            reasons.append(
+                f"the {side} is an Ace Mode run ({bundle['runtime']['enhancements']}); an "
+                "enhanced run is not authentic evidence and is never compared"
+            )
+    if baseline["runtime"] != candidate["runtime"]:
+        reasons.append(f"runtime blocks differ: {baseline['runtime']} vs {candidate['runtime']}")
+    if set(baseline["recorder"]["enabled_classes"]) != set(
+        candidate["recorder"]["enabled_classes"]
+    ):
+        reasons.append(
+            "enabled event classes differ: "
+            f"{baseline['recorder']['enabled_classes']} vs "
+            f"{candidate['recorder']['enabled_classes']}; a class one side "
+            "could not record is silence, not agreement"
+        )
+    if _trigger_policy(baseline["recorder"]) != _trigger_policy(candidate["recorder"]):
+        reasons.append(
+            "trigger policies differ: "
+            f"{_trigger_policy(baseline['recorder'])} vs "
+            f"{_trigger_policy(candidate['recorder'])}; different capture-stop "
+            "semantics do not bound the same retained window"
+        )
+    if baseline["recorder"].get("watch_range") != candidate["recorder"].get("watch_range"):
+        reasons.append(
+            "watch ranges differ: "
+            f"{baseline['recorder'].get('watch_range')} vs "
+            f"{candidate['recorder'].get('watch_range')}; the watch class saw different bytes"
+        )
+    for name, bundle in (("baseline", baseline), ("candidate", candidate)):
+        dropped = bundle["recorder"]["dropped"]
+        if dropped:
+            reasons.append(
+                f"{name} dropped {dropped} events; the retained window slid, so "
+                "an earlier divergence inside the dropped events is invisible"
+            )
+    return reasons
+
+
+_TERMINAL_FIELDS = ("reason", "sequence", "kind", "arg0")
+
+
+def _terminal_divergence(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None] | None:
+    """First differing terminal field; the runs' outcomes are evidence too."""
+    left = baseline["terminal"]
+    right = candidate["terminal"]
+    for field in _TERMINAL_FIELDS:
+        if left[field] != right[field]:
+            return f"terminal {field}", left, right
+    return None
+
+
+# The schema 5 refusals fields that are compared, in order. nids_unlisted is implied: the
+# validator pins count to the sum of the nids counts plus nids_unlisted, so equal count and
+# nids force it equal. first_sequence is compared because the validator does not tie it to
+# the events, so the block alone can carry a difference.
+_REFUSALS_FIELDS = ("count", "first_nid", "first_pc", "first_sequence", "nids")
+
+
+def _refusals_divergence(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None] | None:
+    """First differing refusals field; a schema 5 block is evidence like the terminal.
+
+    Schema 1 to 4 bundles carry no block: their named refusals are the kind-2 events and
+    the frozen terminal, which the earlier checks already compare. Comparability pins equal
+    schema versions, so either both bundles carry the block or neither does.
+    """
+    if "refusals" not in baseline or "refusals" not in candidate:
+        return None
+    left = baseline["refusals"]
+    right = candidate["refusals"]
+    for field in _REFUSALS_FIELDS:
+        if left[field] != right[field]:
+            return f"refusals.{field}", left, right
+    return None
+
+
+def diff_bundles(
+    baseline: dict[str, Any], candidate: dict[str, Any], align: str
+) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None] | None:
+    """Compare two validated bundles under the comparability contract.
+
+    Contract, in the order the checks run:
+
+    1. Each bundle must pass ``validate_bundle`` (schema, sanitizer, and the
+       recorder truncation invariants). A violation is an error (exit 2).
+    2. The pair is comparable only when ``schema_version``, the ``runtime``
+       block, the enabled event classes, and the armed trigger policy agree,
+       and neither side dropped any event. Otherwise ``BundleIncomparable`` is
+       raised (exit 3): "same retained events" is not evidence that the
+       executions matched. A "running" terminal is compared like any other
+       terminal value; it cannot hide events before the cut.
+    3. Build identity (``build_id``, ``source_date_epoch``, ``compiler``,
+       ``pointer_bits``) and the recorder limit never block a comparison:
+       differing identities are the cross-build use case, and with zero drops
+       on both sides the retained window is the complete execution regardless
+       of each limit. The CLI reports identities on stdout.
+    4. Events are compared first (sequence or class alignment), then the
+       terminal reason/sequence/kind/arg0, then, when both bundles carry a
+       schema 5 ``refusals`` block, its count, first_nid, first_pc,
+       first_sequence and nids (nids_unlisted follows from count and nids).
+       Any difference is DIVERGENCE (exit 1); only full agreement prints
+       MATCH (exit 0).
+    5. A schema 6 ``threads`` block is the thread state at the cut. It is
+       validated but never compared; the CLI prints each side's waiting
+       threads after the verdict, so a stall comparison shows what each side
+       waits on.
+    """
+    validate_bundle(baseline)
+    validate_bundle(candidate)
+    reasons = _comparability_reasons(baseline, candidate)
+    if reasons:
+        raise BundleIncomparable(reasons)
+    if align == "sequence":
+        divergence = _first_sequence_divergence(baseline, candidate)
+    else:
+        divergence = _first_class_divergence(baseline, candidate)
+    if divergence is None:
+        divergence = _terminal_divergence(baseline, candidate)
+    if divergence is None:
+        divergence = _refusals_divergence(baseline, candidate)
+    return divergence
+
+
+def _waiting_thread_lines(bundle: dict[str, Any], name: str) -> list[str]:
+    """What each waiting thread of a schema 6 bundle waits on; empty for older schemas.
+
+    The thread snapshot is the state at the cut, so it is reported and never compared: a
+    stall comparison needs to see what each side is blocked in, whatever the verdict.
+    """
+    if "threads" not in bundle:
+        return []
+    waiting = [thread for thread in bundle["threads"]
+               if thread["state"] in ("wait-delay", "wait-object")]
+    lines = [f"waiting threads ({name}): {len(waiting) if waiting else 'none'}"]
+    for thread in waiting:
+        nid = "none" if thread["block_nid"] is None else f"0x{thread['block_nid']:08x}"
+        waited = "unknown" if thread["waited_us"] is None else str(thread["waited_us"])
+        lines.append(
+            f"  uid=0x{thread['uid']:x} why={thread['why']} "
+            f"wait_object=0x{thread['wait_object']:x} block_nid={nid} waited_us={waited}"
+        )
+    return lines
+
+
+def _print_waiting_threads(baseline: dict[str, Any], candidate: dict[str, Any]) -> None:
+    for line in _waiting_thread_lines(candidate, "candidate") +             _waiting_thread_lines(baseline, "baseline"):
+        print(line)
+
+
+def _identity_fields(bundle: dict[str, Any]) -> str:
+    """One comparable identity line; identities are reported, never compared."""
+    build = bundle["build"]
+    fields = [f"compiler={build['compiler']}", f"pointer_bits={build['pointer_bits']}"]
+    for key in ("build_id", "source_date_epoch", "compiled_date", "compiled_time"):
+        if key in build:
+            fields.append(f"{key}={build[key]}")
+    return " ".join(fields)
+
+
+def _enabled_classes(bundle: dict[str, Any]) -> str:
+    """The recorder's class coverage, which is what bounds the verdict.
+
+    Comparability already requires both sides to agree on this set, so one
+    line describes a MATCH or DIVERGENCE; printing it is what keeps a MATCH
+    honest about the channel it was actually able to observe.
+    """
+    classes = bundle["recorder"]["enabled_classes"]
+    return ", ".join(classes) if classes else "<none>"
+
+
+def _trigger_line(bundle: dict[str, Any]) -> str:
+    """The armed schema 7 trigger mode; comparability pins both sides to the same policy."""
+    triggers = bundle["recorder"]["triggers"]
+    mode = triggers.get("mode", "none")
+    if mode == "none":
+        return ""
+    if mode == "pc":
+        armed = f"pc=0x{triggers['pc']:08x}"
+    elif mode == "ge-draw":
+        armed = f"ge-draw={triggers['ge_draw']}"
+    elif mode == "checkpoint":
+        checkpoint = triggers["checkpoint"]
+        name = EVENT_KIND_NAMES.get(checkpoint["kind"], "unknown-kind")
+        armed = (f"checkpoint={name} ({checkpoint['kind']}) occurrence={checkpoint['occurrence']} "
+                 f"after={checkpoint['after']}")
+    else:
+        armed = "watch"
+    return f"trigger mode: {armed}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Compare two source-safe flight-recorder bundles")
+    parser.add_argument("baseline", type=Path)
+    parser.add_argument("candidate", type=Path)
+    parser.add_argument("--align", choices=("sequence", "class"), default="sequence")
+    args = parser.parse_args(argv)
+    try:
+        baseline = load_bundle(args.baseline)
+        candidate = load_bundle(args.candidate)
+        divergence = diff_bundles(baseline, candidate, args.align)
+    except BundleIncomparable as exc:
+        print(f"{INCOMPARABLE}: {exc.reasons[0]}")
+        for reason in exc.reasons[1:]:
+            print(f"  {reason}")
+        _print_waiting_threads(baseline, candidate)
+        return EXIT_INCOMPARABLE
+    except FlightDiffError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    print(f"identity baseline: {_identity_fields(baseline)}")
+    print(f"identity candidate: {_identity_fields(candidate)}")
+    print(f"enabled classes: {_enabled_classes(baseline)}")
+    trigger = _trigger_line(baseline)
+    if trigger:
+        print(trigger)
+    if divergence is None:
+        print(f"{MATCH}: {len(baseline['events'])} events aligned by {args.align}; "
+              "agrees on these enabled classes and the terminal outcome")
+        _print_waiting_threads(baseline, candidate)
+        return EXIT_MATCH
+    label, first, second = divergence
+    print(f"{DIVERGENCE}: {label}")
+    if label.startswith(_EVENT_LABEL_PREFIXES):
+        print(f"  baseline event: {_event_identity(first)}")
+        print(f"  candidate event: {_event_identity(second)}")
+        differences = _event_field_differences(first, second)
+        if differences:
+            print("  fields differ:")
+            for field, left, right in differences:
+                print(f"    {field}: baseline={json.dumps(left, sort_keys=True)} "
+                      f"candidate={json.dumps(right, sort_keys=True)}")
+    print(f"  baseline: {_format_event(first)}")
+    print(f"  candidate: {_format_event(second)}")
+    _print_waiting_threads(baseline, candidate)
+    return EXIT_DIVERGENCE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

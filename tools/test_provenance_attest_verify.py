@@ -1,0 +1,4327 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+"""Adversarial regression: a coherent candidate cannot self-authorize provenance.
+
+The property under test is the one ordinary pull request CI could not state
+before ``tools/provenance_attest_verify.py`` existed: a pull request author who
+knows the implementation can make the public ledger, the policy, the export
+digests and the content hashes agree with each other perfectly, and the merge
+path must still refuse the change when the external trusted authority does not
+back it.
+
+Every case below builds a real Git repository, commits a *self-consistent*
+attack -- the ledger entry is well formed, the hash matches the bytes, the
+policy includes the path -- and asserts the exact finding code that stops it.
+A test that only proved a malformed ledger is rejected would prove nothing; the
+threat is a well-formed lie.
+
+Fixtures are synthetic.  No private detailed ledger, key material, game data, or
+real repository content is used or copied.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+import contextlib
+import hashlib
+import io
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import unittest
+from typing import Any, cast
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tools"))
+
+from nk_core.git_isolation import run_git  # noqa: E402
+import provenance_attest_verify as verifier  # noqa: E402
+import provenance_ledger  # noqa: E402
+import provenance_refresh  # noqa: E402
+import public_export  # noqa: E402
+from publication_policy import load_policy  # noqa: E402
+
+class CanonicalJsonTests(unittest.TestCase):
+    def test_shared_canonical_bytes(self):
+        import provenance_ledger
+
+        self.assertIs(verifier._canonical_json_bytes, provenance_ledger._canonical_json_bytes)
+        document = {"z": "é", "a": [True, None]}
+        expected = '{\n  "z": "é",\n  "a": [\n    true,\n    null\n  ]\n}\n'.encode("utf-8")
+        self.assertEqual(verifier._canonical_json_bytes(document), expected)
+
+
+RESERVED_CONTEXT = verifier.TRUSTED_CONTEXT
+TRUSTED_WORKFLOW = verifier.TRUSTED_WORKFLOW
+
+#: A synthetic stand-in for the private detailed ledger.  ``blanket-tools``
+#: deliberately mirrors the real ledger's ``tools/*`` catch-all so the tests can
+#: prove a blanket record is inert for classification while still being a valid
+#: anchor for a path it already covers.
+AUTHORITY_RECORDS = {
+    "schema_version": 1,
+    "records": [
+        {
+            "id": "core-runtime",
+            "paths": ["src/rt/core.c"],
+            "classification": "derived-translated",
+            "upstream": "upstream-project",
+            "upstream_paths": ["Private/Upstream/Path.cpp"],
+            "upstream_revision": None,
+            "upstream_license": "GPL-2.0-or-later",
+            "evidence_tier": "H",
+        },
+        {
+            "id": "widget-independent",
+            "paths": ["src/rt/widget.c"],
+            "classification": "project-authored-independent",
+            "upstream": None,
+            "evidence_tier": "S",
+        },
+        {
+            # Covers a path whose public ledger entry names no record at all,
+            # so its id is private knowledge the report must not disclose.
+            "id": "private-only-record",
+            "paths": ["README.md"],
+            "classification": "project-authored-independent",
+            "upstream": None,
+            "evidence_tier": "S",
+        },
+        {
+            # ``font/README.md`` is the one path _class_for special-cases
+            # *before* consulting records, so it is the only shape where a
+            # record exists but the derived evidence carries no record id.
+            # Without it in the corpus, taking the id from the raw record map
+            # instead of from the derived evidence is undetectable.
+            "id": "font-binaries",
+            "paths": ["font/README.md"],
+            "classification": "project-authored-independent",
+            "upstream": None,
+            "evidence_tier": "S",
+        },
+        {
+            "id": "blanket-tools",
+            "paths": ["tools/*"],
+            "classification": "project-authored-independent",
+            "upstream": None,
+            "evidence_tier": "S",
+            "catch_all": True,
+        },
+    ],
+}
+
+POLICY = {
+    "name": "public-safe-test",
+    "profile_version": "2.0.0",
+    "min_tool_version": "1.0.0",
+    "build_mode": "PUBLIC_SAFE",
+    "default_disposition": "REJECT",
+    "exclude_prefixes": ["private/"],
+    "exclude_globs": ["*.iso"],
+    "exclude_paths": ["secret.txt"],
+    "include_paths": [],
+}
+
+
+def _sha(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+class Repository:
+    """A throwaway Git repository whose trees are the verifier's input."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._git("init", "--quiet", "--initial-branch=main")
+        self._git("config", "commit.gpgsign", "false")
+        # Keep Git from starting background maintenance while TemporaryDirectory
+        # is removing this throwaway repository on hosted Python 3.15 runners.
+        self._git("config", "gc.auto", "0")
+        self._git("config", "maintenance.auto", "false")
+
+    def _git(self, *args: str) -> str:
+        result = run_git(
+            args, cwd=self.root, capture_output=True, text=True, check=True,
+        )
+        return cast(str, result.stdout.strip())
+
+    def write(self, path: str, raw: bytes | str) -> None:
+        target = self.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        # This is synthetic fixture data written only below a temporary test root.
+        # codeql[py/clear-text-storage-sensitive-data]
+        target.write_bytes(raw)
+
+    def remove(self, path: str) -> None:
+        (self.root / path).unlink()
+
+    #: Called just before staging so the export always describes the tree that
+    #: is about to be committed, whatever order the case wrote its files in.
+    before_commit: Callable[[], None] | None = None
+
+    def commit(self, message: str) -> str:
+        if self.before_commit is not None:
+            self.before_commit()
+        self._git("add", "--all")
+        self._git("commit", "--quiet", "--allow-empty", "-m", message)
+        return self._git("rev-parse", "HEAD")
+
+    def tracked_files(self) -> list[tuple[str, bytes]]:
+        files = []
+        for path in sorted(self.root.rglob("*")):
+            if path.is_dir() or ".git" in path.relative_to(self.root).parts:
+                continue
+            rel = path.relative_to(self.root).as_posix()
+            files.append((rel, b"" if rel == verifier.EXPORT_PATH else path.read_bytes()))
+        return files
+
+    def branch(self, name: str, start: str) -> None:
+        self._git("checkout", "--quiet", "-B", name, start)
+
+    def head(self) -> str:
+        return self._git("rev-parse", "HEAD")
+
+
+class GateCase(unittest.TestCase):
+    """Base fixture: a clean base commit that the verifier accepts."""
+
+    #: The base tree's public files and the claim each one carries.  ``core.c``
+    #: is derived, ``widget.c`` independent, ``legacy.py`` is a grandfathered
+    #: over-claim with no exact trusted record -- the shape the real repository
+    #: carries 317 times.
+    FILES = {
+        "src/rt/core.c": b"int core(void) { return 1; }\n",
+        "src/rt/widget.c": b"int widget(void) { return 2; }\n",
+        "tools/legacy.py": b"print('legacy')\n",
+        "tools/test_recordless.py": b"def test_recordless():\n    return 0\n",
+        "README.md": b"# fixture\n",
+        # No trusted record of any kind names this one, so it is classified by
+        # path rule alone -- the "deterministic" backing case.
+        "docs/notes.md": b"# fixture notes\n",
+        # Special-cased in _class_for ahead of the record lookup, so a record
+        # names it yet the derived evidence carries no record id.
+        "font/README.md": b"# optional fonts\n",
+    }
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.repo = Repository(base / "repo")
+        self.outside = base / "outside"
+        self.outside.mkdir()
+        self.trusted_ledger = self.outside / "IMPLEMENTATION_PROVENANCE.json"
+        self.repo.before_commit = self.regenerate_export
+        self.write_trusted(AUTHORITY_RECORDS)
+
+        entries = []
+        for path, raw in self.FILES.items():
+            entries.append(self.entry(path, raw))
+        self.repo.write(TRUSTED_WORKFLOW, self.workflow_bytes())
+        entries.append(self.entry(TRUSTED_WORKFLOW, self.workflow_bytes(),
+                                  classification="reviewed_configuration",
+                                  evidence={"source": "configuration review"}))
+        for path, raw in self.FILES.items():
+            self.repo.write(path, raw)
+        self.write_policy(list(self.FILES) + [TRUSTED_WORKFLOW, verifier.LEDGER_PATH])
+        for control in (verifier.LEDGER_PATH, verifier.EXPORT_PATH):
+            entries.append({
+                "path": control,
+                "classification": "reviewed_configuration",
+                "evidence": {"source": "configuration review"},
+            })
+        self.write_ledger(entries)
+        self.base = self.repo.commit("base")
+
+    # -- fixture helpers -----------------------------------------------------
+
+    def workflow_bytes(self, *, trigger: bytes = b"pull_request_target", context: str | None = None) -> bytes:
+        name = RESERVED_CONTEXT if context is None else context
+        return (
+            b"on:\n  " + trigger + b":\njobs:\n  attest:\n    name: "
+            + name.encode("utf-8") + b"\n"
+        )
+
+    def approve_blob(self, path: str, raw: bytes, *, record_id: str, classification: str,
+                     document: dict | None = None) -> dict:
+        """Add a trusted reviewed-blob approval for exactly these bytes."""
+        document = json.loads(json.dumps(document or AUTHORITY_RECORDS))
+        document.setdefault("reviewed_blobs", []).append({
+            "path": path, "sha256": _sha(raw),
+            "classification": classification, "record_id": record_id,
+        })
+        self.write_trusted(document)
+        return document
+
+    def write_trusted(self, document: dict) -> None:
+        # The authority document is synthetic test input in a temporary directory.
+        # codeql[py/clear-text-storage-sensitive-data]
+        self.trusted_ledger.write_text(json.dumps(document, indent=2), encoding="utf-8", newline="\n")
+
+    def write_policy(self, include_paths: list[str]) -> None:
+        """Publish the given paths plus whichever control files the tree has.
+
+        The two generated control files are always public, and the gate
+        workflow is public whenever it exists; folding that in here keeps every
+        call site about the paths the case actually cares about.
+        """
+        paths = set(include_paths) | {verifier.LEDGER_PATH, verifier.EXPORT_PATH}
+        if (self.repo.root / TRUSTED_WORKFLOW).exists():
+            paths.add(TRUSTED_WORKFLOW)
+        else:
+            paths.discard(TRUSTED_WORKFLOW)
+        document = dict(POLICY)
+        document["include_paths"] = sorted(paths)
+        self.repo.write(verifier.POLICY_PATH, json.dumps(document, indent=2) + "\n")
+
+    def write_ledger(self, entries: list[dict], *, export_ledger_sha: str | None = None) -> None:
+        """Write the ledger and the export that pins its digest.
+
+        The export records the SHA-256 of the ledger blob it was generated
+        against.  Passing ``export_ledger_sha`` writes a *stale* pin: exactly
+        what a candidate that edits the ledger without regenerating looks like.
+        """
+        document = {
+            "schema_version": 1,
+            "generated_by": "tools/provenance_ledger.py",
+            "policy_profile": POLICY["name"],
+            "classification_vocabulary": sorted(verifier.ALLOWED_CLASSES),
+            "entries": sorted(entries, key=lambda item: item["path"]),
+        }
+        raw = (json.dumps(document, indent=2) + "\n").encode("utf-8")
+        self.repo.write(verifier.LEDGER_PATH, raw)
+        self._export_ledger_sha = export_ledger_sha
+        self.regenerate_export()
+
+    def regenerate_export(self, **field_overrides) -> None:
+        """Write the canonical public export for the tree as it stands.
+
+        The verifier recomputes every security-relevant export field, so a
+        hand-written stub would fail for reasons that have nothing to do with
+        the case under test. Building it with the same generator the release
+        process uses keeps each case about its own attack; ``field_overrides``
+        is how a case forges exactly one field.
+        """
+        policy_path = self.repo.root / verifier.POLICY_PATH
+        ledger_path = self.repo.root / verifier.LEDGER_PATH
+        if not policy_path.is_file() or not ledger_path.is_file():
+            return
+        if not (self.repo.root / verifier.EXPORT_PATH).exists():
+            self.repo.write(verifier.EXPORT_PATH, b"{}")
+        policy = load_policy(policy_path)
+        document = public_export.build_document(
+            policy, self.repo.tracked_files(),
+            provenance_ledger=ledger_path.read_bytes(),
+        )
+        stale = getattr(self, "_export_ledger_sha", None)
+        if stale is not None:
+            document["provenance_ledger_sha256"] = stale
+        document.update(field_overrides)
+        self.repo.write(
+            verifier.EXPORT_PATH,
+            json.dumps(document, indent=2, ensure_ascii=False) + "\n",
+        )
+
+    def entry(self, path: str, raw: bytes, *, classification: str | None = None,
+              evidence: dict | None = None, sha256: str | None = None) -> dict:
+        """Build a ledger entry, defaulting to the truthful claim for the path."""
+        if classification is None or evidence is None:
+            defaults = {
+                "src/rt/core.c": ("upstream_derived", {
+                    "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                    "record_id": "core-runtime", "evidence_tier": "H",
+                    "upstream": "upstream-project",
+                }),
+                "src/rt/widget.c": ("project_authored_attested", {
+                    "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                    "record_id": "widget-independent", "evidence_tier": "S",
+                    "authorship": "independent implementation record",
+                }),
+                "tools/legacy.py": ("project_authored_attested", {
+                    "source": "public provenance census",
+                    "authorship": "independent project implementation",
+                }),
+                "tools/test_recordless.py": ("synthetic_fixture", {
+                    "source": "path-reviewed fixture/test census",
+                }),
+                "README.md": ("reviewed_documentation", {"source": "public documentation review"}),
+                "docs/notes.md": ("reviewed_documentation", {"source": "public documentation review"}),
+                "font/README.md": ("reviewed_documentation", {
+                    "source": "public documentation review",
+                    "statement": (
+                        "generic user-supplied optional font instructions; unresolved font "
+                        "binaries and license packet are excluded"
+                    ),
+                }),
+            }
+            fallback = ("reviewed_configuration", {"source": "configuration review"})
+            classification, evidence = defaults.get(path, fallback)
+        result = {"path": path, "classification": classification, "evidence": evidence}
+        if path not in verifier.UNHASHED_PATHS:
+            result["sha256"] = sha256 or _sha(raw)
+        return result
+
+    def current_entries(self, rev: str = "HEAD") -> list[dict]:
+        raw = run_git(
+            ["show", f"{rev}:{verifier.LEDGER_PATH}"], cwd=self.repo.root,
+            capture_output=True, check=True,
+        ).stdout
+        return cast(list[dict[str, Any]], json.loads(raw.decode("utf-8"))["entries"])
+
+    # -- invocation ----------------------------------------------------------
+
+    def run_verify(self, candidate: str, *, base: str | None = None,
+                   trusted_ledger: Path | None = None,
+                   require_exact_blob_approvals: bool = False) -> dict:
+        return cast(dict[str, Any], verifier.verify(
+            repo=self.repo.root,
+            candidate_rev=candidate,
+            base_rev=base or self.base,
+            trusted_ledger=trusted_ledger or self.trusted_ledger,
+            workdir=self.outside / "work",
+            require_exact_blob_approvals=require_exact_blob_approvals,
+        ))
+
+    def codes(self, verdict: dict, *, fatal_only: bool = True) -> set[str]:
+        return {
+            item["code"] for item in verdict["findings"]
+            if item["fatal"] or not fatal_only
+        }
+
+    def assertFatal(self, verdict: dict, code: str) -> None:
+        self.assertEqual(verdict["verdict"], "fail")
+        self.assertIn(code, self.codes(verdict), msg=f"findings: {verdict['findings']}")
+
+    def assertPasses(self, verdict: dict) -> None:
+        self.assertEqual(
+            verdict["verdict"], "pass",
+            msg=f"unexpected fatal findings: {[f for f in verdict['findings'] if f['fatal']]}",
+        )
+
+
+class BaselineTests(GateCase):
+    """The fixture itself must pass, or every failure assertion below is vacuous."""
+
+    def test_base_tree_passes(self) -> None:
+        self.assertPasses(self.run_verify(self.base))
+
+    def test_verdict_binds_the_exact_candidate_tree(self) -> None:
+        verdict = self.run_verify(self.base)
+        scope = verdict["repository_scope"]
+        self.assertEqual(scope["candidate_commit"], self.base)
+        self.assertEqual(len(scope["candidate_tree"]), 40)
+        self.assertEqual(
+            verdict["trusted_ledger_sha256"], _sha(self.trusted_ledger.read_bytes()),
+        )
+
+    def test_grandfathered_over_claim_is_reported_not_fatal(self) -> None:
+        verdict = self.run_verify(self.base)
+        self.assertPasses(verdict)
+        debt = {item["path"] for item in verdict["grandfathered_debt"]}
+        self.assertIn("tools/legacy.py", debt)
+
+    def test_a_private_record_id_is_never_disclosed(self) -> None:
+        """The report may repeat what the public ledger says, and nothing more.
+
+        ``README.md`` is covered by a trusted record the public ledger does not
+        name.  Reporting that id would publish a private record name through a
+        CI log, so the debt entry must be redacted -- while the ids the public
+        ledger already carries stay legible.
+        """
+        verdict = self.run_verify(self.base)
+        blob = json.dumps(verdict)
+        self.assertNotIn("private-only-record", blob)
+        entry = next(item for item in verdict["grandfathered_debt"] if item["path"] == "README.md")
+        self.assertEqual(entry["trusted_record_id"], verifier.WITHHELD)
+        self.assertNotIn(
+            "src/rt/core.c", {item["path"] for item in verdict["grandfathered_debt"]},
+            "core.c agrees with the trusted authority and is not debt",
+        )
+
+
+class UnbackedAttestationTests(GateCase):
+    """A candidate cannot mint authority the trusted ledger does not hold."""
+
+    def _add_public_file(self, path: str, raw: bytes, entry: dict) -> str:
+        self.repo.branch("attack", self.base)
+        self.repo.write(path, raw)
+        entries = self.current_entries(self.base) + [entry]
+        self.write_ledger(entries)
+        self.write_policy(list(self.FILES) + [TRUSTED_WORKFLOW, verifier.LEDGER_PATH, path])
+        return self.repo.commit("attack")
+
+    def test_invented_record_id_is_refused(self) -> None:
+        """The live finding this gate was built for: a plausible, absent record."""
+        raw = b"int fresh(void) { return 3; }\n"
+        head = self._add_public_file("src/rt/fresh.c", raw, {
+            "path": "src/rt/fresh.c",
+            "classification": "project_authored_attested",
+            "evidence": {
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "fresh-runtime-attestation",
+                "evidence_tier": "S",
+                "authorship": "independent implementation record",
+            },
+            "sha256": _sha(raw),
+        })
+        verdict = self.run_verify(head)
+        self.assertFatal(verdict, "TRUSTED_RECORD_UNRESOLVED")
+
+    def test_borrowed_record_id_is_refused(self) -> None:
+        """A record that exists but says nothing about this path is not cover."""
+        raw = b"int borrowed(void) { return 4; }\n"
+        head = self._add_public_file("src/rt/borrowed.c", raw, {
+            "path": "src/rt/borrowed.c",
+            "classification": "project_authored_attested",
+            "evidence": {
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "widget-independent",
+                "evidence_tier": "S",
+                "authorship": "independent implementation record",
+            },
+            "sha256": _sha(raw),
+        })
+        verdict = self.run_verify(head)
+        self.assertFatal(verdict, "TRUSTED_RECORD_UNRESOLVED")
+
+    def test_blanket_record_cannot_attest_a_new_path(self) -> None:
+        """The subtle one: anchor integrity accepts ``tools/*``, Tier B does not.
+
+        ``blanket-tools`` exists and its pattern does cover ``tools/new.py``, so
+        RECORD_ABSENT and RECORD_NOT_COVERING both stay silent.  Classification
+        must still refuse it, because a blanket authorship statement written
+        before a file existed cannot attest that file.
+        """
+        raw = b"print('new tool')\n"
+        head = self._add_public_file("tools/new.py", raw, {
+            "path": "tools/new.py",
+            "classification": "project_authored_attested",
+            "evidence": {
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "blanket-tools",
+                "evidence_tier": "S",
+                "authorship": "independent implementation record",
+            },
+            "sha256": _sha(raw),
+        })
+        verdict = self.run_verify(head)
+        self.assertNotIn("TRUSTED_RECORD_UNRESOLVED", self.codes(verdict))
+        self.assertNotIn("TRUSTED_RECORD_UNRESOLVED", self.codes(verdict))
+        self.assertFatal(verdict, "CLAIM_UNBACKED")
+
+    def test_no_record_at_all_is_refused(self) -> None:
+        raw = b"int silent(void) { return 5; }\n"
+        head = self._add_public_file("src/rt/silent.c", raw, {
+            "path": "src/rt/silent.c",
+            "classification": "project_authored_attested",
+            "evidence": {
+                "source": "public provenance census",
+                "authorship": "independent project implementation",
+            },
+            "sha256": _sha(raw),
+        })
+        self.assertFatal(self.run_verify(head), "CLAIM_UNBACKED")
+
+    def test_relabelling_implementation_as_configuration_is_refused(self) -> None:
+        """A changed executable cannot borrow a deterministic claim."""
+        raw = b"export const x = 1;\n"
+        head = self._add_public_file("src/rt/relabelled.ts", raw, {
+            "path": "src/rt/relabelled.ts",
+            "classification": "reviewed_configuration",
+            "evidence": {"source": "configuration review"},
+            "sha256": _sha(raw),
+        })
+        self.assertFatal(self.run_verify(head), "CLAIM_UNBACKED")
+
+    def test_a_genuinely_recorded_new_path_passes(self) -> None:
+        """The gate must not merely reject everything.
+
+        A new implementation path needs both factors: a record that covers it
+        and an approval naming the exact bytes.
+        """
+        raw = b"int recorded(void) { return 6; }\n"
+        document = json.loads(json.dumps(AUTHORITY_RECORDS))
+        document["records"].append({
+            "id": "recorded-path", "paths": ["src/rt/recorded.c"],
+            "classification": "project-authored-independent", "upstream": None,
+            "evidence_tier": "S",
+        })
+        self.approve_blob("src/rt/recorded.c", raw, record_id="recorded-path",
+                          classification="project-authored-independent", document=document)
+        head = self._add_public_file("src/rt/recorded.c", raw, {
+            "path": "src/rt/recorded.c",
+            "classification": "project_authored_attested",
+            "evidence": {
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "recorded-path", "evidence_tier": "S",
+                "authorship": "independent implementation record",
+                "upstream_attribution": None,
+            },
+            "sha256": _sha(raw),
+        })
+        self.assertPasses(self.run_verify(head))
+
+
+class ClaimRatchetTests(GateCase):
+    """Restating an existing path's provenance requires trusted agreement."""
+
+    def _restate(self, path: str, classification: str, evidence: dict) -> str:
+        self.repo.branch("attack", self.base)
+        entries = []
+        for entry in self.current_entries(self.base):
+            if entry["path"] == path:
+                entry = dict(entry, classification=classification, evidence=evidence)
+            entries.append(entry)
+        self.write_ledger(entries)
+        return self.repo.commit("restate")
+
+    def test_upgrading_derived_to_independent_is_refused(self) -> None:
+        head = self._restate("src/rt/core.c", "project_authored_attested", {
+            "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+            "record_id": "core-runtime", "evidence_tier": "H",
+            "authorship": "independent implementation record",
+        })
+        self.assertFatal(self.run_verify(head), "CLAIM_UNBACKED")
+
+    def test_repointing_a_path_at_another_record_is_refused(self) -> None:
+        head = self._restate("src/rt/core.c", "upstream_derived", {
+            "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+            "record_id": "blanket-tools", "evidence_tier": "S",
+            "upstream": "upstream-project",
+        })
+        verdict = self.run_verify(head)
+        self.assertFatal(verdict, "TRUSTED_RECORD_UNRESOLVED")
+        self.assertIn("CLAIM_UNBACKED", self.codes(verdict))
+
+    def test_laundering_a_grandfathered_over_claim_is_refused(self) -> None:
+        """Debt may be paid down, never re-minted under a new anchor."""
+        head = self._restate("tools/legacy.py", "project_authored_attested", {
+            "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+            "record_id": "blanket-tools", "evidence_tier": "S",
+            "authorship": "independent implementation record",
+        })
+        self.assertFatal(self.run_verify(head), "CLAIM_UNBACKED")
+
+class AttestationInheritanceTests(GateCase):
+    """Changed bytes must not inherit an attestation made about other bytes.
+
+    Grandfathering survives only while *both* halves of the reviewed state are
+    frozen: the claim as the trusted base ledger recorded it, and the bytes as
+    the trusted base tree recorded them.  These cases walk the full matrix.
+    """
+
+    LEGACY = "tools/legacy.py"          # claim disagrees with authority (blanket backing)
+    ATTESTED = "src/rt/widget.c"        # claim agrees with authority (exact record)
+    RECORDLESS_TEST = "tools/test_recordless.py"
+
+    def _edit(self, path: str, raw: bytes, *, update_hash: bool = True,
+              entry_mutator=None, branch: str = "attack") -> str:
+        self.repo.branch(branch, self.base)
+        self.repo.write(path, raw)
+        entries = []
+        for entry in self.current_entries(self.base):
+            if entry["path"] == path:
+                entry = dict(entry)
+                if update_hash:
+                    entry["sha256"] = _sha(raw)
+                if entry_mutator is not None:
+                    entry = entry_mutator(entry)
+            entries.append(entry)
+        self.write_ledger(entries)
+        return self.repo.commit(f"edit {path}")
+
+    # -- A ------------------------------------------------------------------
+    def test_A_grandfathered_path_with_unchanged_bytes_is_allowed(self) -> None:
+        """Frozen debt is reported, never fatal -- otherwise nothing can merge.
+
+        The debt set is asserted exactly. A path that agrees with authority must
+        not drift into it: ``font/README.md`` in particular is derived through
+        _class_for's special case, which yields no record id even though a
+        record names the path, and reading the id from the raw record map
+        instead would silently add it here.
+        """
+        verdict = self.run_verify(self.base)
+        self.assertPasses(verdict)
+        debt = {item["path"]: item for item in verdict["grandfathered_debt"]}
+        self.assertEqual(sorted(debt), ["README.md", self.LEGACY])
+        self.assertEqual(debt[self.LEGACY]["backing"], verifier.BACKING_BLANKET)
+        self.assertEqual(verdict["changed_unattested_paths"], [])
+
+    def test_unchanged_recordless_test_helper_keeps_deterministic_status(self) -> None:
+        verdict = self.run_verify(self.base)
+        self.assertPasses(verdict)
+        self.assertNotIn(self.RECORDLESS_TEST, verdict["changed_unattested_paths"])
+
+    def test_changed_recordless_test_helper_requires_an_exact_record(self) -> None:
+        changed = b"def test_recordless():\n    return 1\n"
+        head = self._edit(self.RECORDLESS_TEST, changed, branch="recordless-test-edit")
+        verdict = self.run_verify(head)
+        self.assertFatal(verdict, "TRUSTED_PATH_MISSING")
+        self.assertNotIn("CONTENT_MISMATCH", self.codes(verdict))
+
+    # -- B ------------------------------------------------------------------
+    def test_B_same_claim_changed_bytes_updated_hash_is_refused(self) -> None:
+        """The headline attack: coherent hash, inherited claim, new content."""
+        head = self._edit(self.LEGACY, b"print('replaced wholesale')\n")
+        verdict = self.run_verify(head)
+        self.assertFatal(verdict, "CONTENT_UNATTESTED")
+        self.assertNotIn("CONTENT_MISMATCH", self.codes(verdict))
+        self.assertEqual(
+            [item["path"] for item in verdict["changed_unattested_paths"]], [self.LEGACY],
+        )
+
+    def test_B2_a_one_byte_change_is_enough(self) -> None:
+        """No size threshold: content identity is exact or it is nothing."""
+        head = self._edit(self.LEGACY, b"print('legacy')\n\n")
+        self.assertFatal(self.run_verify(head), "CONTENT_UNATTESTED")
+
+    def test_B3_a_same_length_change_is_still_a_change(self) -> None:
+        """Comparing sizes rather than bytes would let this through.
+
+        The replacement is exactly as long as the reviewed content, so any
+        length-based shortcut in the content half of the predicate reports the
+        path as frozen when it is not.
+        """
+        original = self.FILES[self.LEGACY]
+        replacement = b"print('LEGACY')\n"
+        self.assertEqual(len(replacement), len(original))
+        self.assertNotEqual(replacement, original)
+        head = self._edit(self.LEGACY, replacement)
+        self.assertFatal(self.run_verify(head), "CONTENT_UNATTESTED")
+
+    def test_B4_a_path_absent_from_the_base_tree_is_not_frozen(self) -> None:
+        """A claim inherited from a base entry with no base file is not review.
+
+        The base ledger here carries an entry for a file the base tree does not
+        contain, so the claim half of the predicate is satisfied while nothing
+        was ever reviewed. Treating "absent from the base" as frozen would let
+        the candidate introduce the bytes under a pre-planted claim.
+        """
+        ghost, raw = "tools/ghost.py", b"print('ghost')\n"
+        claim = {
+            "path": ghost, "classification": "project_authored_attested",
+            "evidence": {"source": "public provenance census",
+                         "authorship": "independent project implementation"},
+            "sha256": _sha(raw),
+        }
+        self.repo.branch("oddbase", self.base)
+        self.write_ledger(self.current_entries(self.base) + [claim])
+        odd_base = self.repo.commit("base ledger entry with no base file")
+
+        self.repo.branch("attack", odd_base)
+        self.repo.write(ghost, raw)
+        self.write_policy(list(self.FILES) + [ghost])
+        self.write_ledger(self.current_entries(odd_base))
+        head = self.repo.commit("introduce the pre-planted path")
+        self.assertFatal(self.run_verify(head, base=odd_base), "CONTENT_UNATTESTED")
+
+    # -- C ------------------------------------------------------------------
+    def test_C_changed_bytes_with_a_forged_candidate_authority_is_refused(self) -> None:
+        """Committing a detailed ledger that blesses the new bytes changes nothing."""
+        self.repo.branch("attack", self.base)
+        raw = b"print('replaced, with my own authority')\n"
+        self.repo.write(self.LEGACY, raw)
+        forged = json.loads(json.dumps(AUTHORITY_RECORDS))
+        forged["records"].append({
+            "id": "legacy-blessed", "paths": [self.LEGACY],
+            "classification": "project-authored-independent", "upstream": None,
+            "evidence_tier": "S",
+        })
+        self.repo.write("docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                        json.dumps(forged, indent=2) + "\n")
+        entries = [
+            dict(entry, sha256=_sha(raw)) if entry["path"] == self.LEGACY else entry
+            for entry in self.current_entries(self.base)
+        ]
+        self.write_ledger(entries)
+        self.write_policy(list(self.FILES) + ["docs/provenance/IMPLEMENTATION_PROVENANCE.json"])
+        entries = self.current_entries(self.base) + [{
+            "path": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+            "classification": "reviewed_documentation",
+            "evidence": {"source": "public documentation review"},
+            "sha256": _sha((self.repo.root / "docs/provenance/IMPLEMENTATION_PROVENANCE.json").read_bytes()),
+        }]
+        entries = [dict(e, sha256=_sha(raw)) if e["path"] == self.LEGACY else e for e in entries]
+        self.write_ledger(entries)
+        head = self.repo.commit("bless my own bytes")
+        self.assertFatal(self.run_verify(head), "CONTENT_UNATTESTED")
+
+    # -- D ------------------------------------------------------------------
+    def test_D_changed_bytes_pointed_at_an_unrelated_trusted_record_is_refused(self) -> None:
+        """Reaching for a real record that says nothing about this path."""
+        head = self._edit(
+            self.LEGACY, b"print('replaced and repointed')\n",
+            entry_mutator=lambda entry: dict(entry, evidence={
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "core-runtime", "evidence_tier": "H",
+                "authorship": "independent implementation record",
+            }),
+        )
+        verdict = self.run_verify(head)
+        self.assertFatal(verdict, "TRUSTED_RECORD_UNRESOLVED")
+        self.assertIn("CLAIM_UNBACKED", self.codes(verdict))
+
+    def test_D2_changed_bytes_under_a_blanket_record_is_still_refused(self) -> None:
+        """A wildcard is inert for content just as it is for classification.
+
+        ``blanket-tools`` covers ``tools/*`` and so passes anchor integrity.
+        It is still not an attestation about these particular new bytes.
+        """
+        head = self._edit(
+            self.LEGACY, b"print('replaced under the blanket')\n",
+            entry_mutator=lambda entry: dict(entry, evidence={
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "blanket-tools", "evidence_tier": "S",
+                "authorship": "independent implementation record",
+            }),
+        )
+        verdict = self.run_verify(head)
+        self.assertNotIn("TRUSTED_RECORD_UNRESOLVED", self.codes(verdict))
+        self.assertFatal(verdict, "CLAIM_UNBACKED")
+
+    # -- E ------------------------------------------------------------------
+    def test_E_renaming_a_path_to_inherit_another_record_is_refused(self) -> None:
+        """A record names paths.  A new path is a new path, however similar."""
+        self.repo.branch("attack", self.base)
+        raw = self.FILES[self.ATTESTED]
+        self.repo.remove(self.ATTESTED)
+        self.repo.write("src/rt/widget_v2.c", raw)
+        entries = [e for e in self.current_entries(self.base) if e["path"] != self.ATTESTED]
+        entries.append({
+            "path": "src/rt/widget_v2.c",
+            "classification": "project_authored_attested",
+            "evidence": {
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "widget-independent", "evidence_tier": "S",
+                "authorship": "independent implementation record",
+            },
+            "sha256": _sha(raw),
+        })
+        self.write_ledger(entries)
+        self.write_policy(
+            [p for p in self.FILES if p != self.ATTESTED] + ["src/rt/widget_v2.c"]
+        )
+        head = self.repo.commit("rename to inherit")
+        verdict = self.run_verify(head)
+        self.assertFatal(verdict, "TRUSTED_RECORD_UNRESOLVED")
+        self.assertIn("CLAIM_UNBACKED", self.codes(verdict))
+
+    def test_E2_copying_an_attested_path_does_not_extend_its_record(self) -> None:
+        """Identical bytes are not identical provenance; the record names paths."""
+        self.repo.branch("attack", self.base)
+        raw = self.FILES[self.ATTESTED]
+        self.repo.write("src/rt/widget_copy.c", raw)
+        entries = self.current_entries(self.base) + [{
+            "path": "src/rt/widget_copy.c",
+            "classification": "project_authored_attested",
+            "evidence": {
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "widget-independent", "evidence_tier": "S",
+                "authorship": "independent implementation record",
+            },
+            "sha256": _sha(raw),
+        }]
+        self.write_ledger(entries)
+        self.write_policy(list(self.FILES) + ["src/rt/widget_copy.c"])
+        head = self.repo.commit("copy to inherit")
+        self.assertFatal(self.run_verify(head), "TRUSTED_RECORD_UNRESOLVED")
+
+    # -- F ------------------------------------------------------------------
+    def test_F_authority_updated_for_the_new_bytes_passes(self) -> None:
+        """The intended path out of debt: authority first, then the ledger.
+
+        Authority must supply both halves -- a record covering the path and an
+        approval naming the exact new bytes.
+        """
+        replacement = b"print('replaced, and now attested')\n"
+        document = json.loads(json.dumps(AUTHORITY_RECORDS))
+        document["records"].append({
+            "id": "legacy-attested", "paths": [self.LEGACY],
+            "classification": "project-authored-independent", "upstream": None,
+            "evidence_tier": "S",
+        })
+        self.approve_blob(self.LEGACY, replacement, record_id="legacy-attested",
+                          classification="project-authored-independent", document=document)
+        head = self._edit(
+            self.LEGACY, replacement,
+            entry_mutator=lambda entry: dict(entry, evidence={
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "legacy-attested", "evidence_tier": "S",
+                "authorship": "independent implementation record",
+                "upstream_attribution": None,
+            }),
+        )
+        verdict = self.run_verify(head)
+        self.assertPasses(verdict)
+        self.assertEqual(  # only the redaction fixture's own debt remains
+            [item["path"] for item in verdict["grandfathered_debt"]], ["README.md"],
+        )
+
+    def test_F2_an_agreeing_path_needs_no_duplicate_blob_approval(self) -> None:
+        """An exact path record authorizes ordinary future revisions."""
+        replacement = b"int widget(void) { return 4242; }\n"
+        head = self._edit(self.ATTESTED, replacement)
+        verdict = self.run_verify(head)
+        self.assertPasses(verdict)
+        self.assertNotIn("BLOB_UNAPPROVED", self.codes(verdict))
+        self.assertEqual(verdict["changed_unattested_paths"], [])
+
+        self.assertFatal(
+            self.run_verify(head, require_exact_blob_approvals=True), "BLOB_UNAPPROVED"
+        )
+        self.approve_blob(self.ATTESTED, replacement, record_id="widget-independent",
+                          classification="project-authored-independent")
+        self.assertPasses(self.run_verify(head, require_exact_blob_approvals=True))
+
+    def test_F3_a_deterministic_path_may_change_content_freely(self) -> None:
+        """Documentation with no record is classified by what it is, every run."""
+        head = self._edit("docs/notes.md", b"# fixture notes, revised\n")
+        verdict = self.run_verify(head)
+        self.assertPasses(verdict)
+        self.assertEqual(verdict["changed_unattested_paths"], [])
+
+    def test_F4_debt_with_exact_backing_still_freezes_its_content(self) -> None:
+        """Backing says which remedy applies, never whether the rule applies.
+
+        ``README.md`` has an exact trusted record deriving a different class
+        from the one the public ledger claims.  That is debt, so its bytes are
+        frozen until the public entry is corrected -- even though the authority
+        does speak about the path.
+        """
+        head = self._edit("README.md", b"# fixture, revised\n")
+        verdict = self.run_verify(head)
+        self.assertFatal(verdict, "CONTENT_UNATTESTED")
+        self.assertEqual(
+            [item["backing"] for item in verdict["changed_unattested_paths"]],
+            [verifier.BACKING_EXACT],
+        )
+
+    # -- the two halves are independently load-bearing ----------------------
+    def test_deleting_a_grandfathered_path_is_allowed(self) -> None:
+        """Paying debt down by removal must never be harder than keeping it."""
+        self.repo.branch("attack", self.base)
+        self.repo.remove(self.LEGACY)
+        entries = [e for e in self.current_entries(self.base) if e["path"] != self.LEGACY]
+        self.write_ledger(entries)
+        self.write_policy([p for p in self.FILES if p != self.LEGACY])
+        head = self.repo.commit("delete legacy")
+        self.assertPasses(self.run_verify(head))
+
+    def test_correcting_a_grandfathered_claim_to_authority_is_allowed(self) -> None:
+        """Debt is paid by agreeing with authority, and that must not be refused."""
+        document = json.loads(json.dumps(AUTHORITY_RECORDS))
+        document["records"].append({
+            "id": "legacy-attested", "paths": [self.LEGACY],
+            "classification": "derived-translated", "upstream": "upstream-project",
+            "upstream_paths": [], "upstream_revision": None,
+            "upstream_license": "GPL-2.0-or-later", "evidence_tier": "S",
+        })
+        self.write_trusted(document)
+        self.repo.branch("fix", self.base)
+        entries = []
+        for entry in self.current_entries(self.base):
+            if entry["path"] == self.LEGACY:
+                entry = dict(entry, classification="upstream_derived", evidence={
+                    "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                    "record_id": "legacy-attested", "evidence_tier": "S",
+                    "upstream": "upstream-project", "upstream_paths": [],
+                    "upstream_revision": None, "license": "GPL-2.0-or-later",
+                    "modification_status": "modified_or_translated; see record",
+                })
+            entries.append(entry)
+        self.write_ledger(entries)
+        head = self.repo.commit("pay down debt")
+        self.assertPasses(self.run_verify(head))
+
+
+class ExactBlobAuthorizationTests(GateCase):
+    """Compatibility coverage for the opt-in exact-blob policy.
+
+    Normal verification is path-authorized and does not require these entries.
+    Passing ``require_exact_blob_approvals=True`` preserves the former
+    higher-assurance behavior for callers that deliberately need it.
+    """
+
+    BACKED = "src/rt/widget.c"          # exact record, claim agrees with authority
+    RECORD = "widget-independent"
+    PRIVATE_CLASS = "project-authored-independent"
+
+    def approve(self, path: str, raw: bytes, *, record_id: str | None = None,
+                classification: str | None = None, sha256: str | None = None,
+                document: dict | None = None) -> dict:
+        """Add a reviewed-blob approval to the trusted authority."""
+        document = json.loads(json.dumps(document or AUTHORITY_RECORDS))
+        document.setdefault("reviewed_blobs", []).append({
+            "path": path,
+            "sha256": sha256 or _sha(raw),
+            "classification": classification or self.PRIVATE_CLASS,
+            "record_id": record_id or self.RECORD,
+            # Private review metadata the gate must never echo.
+            "reviewed_by": "maintainer",
+            "review_note": "PRIVATE REVIEW NOTE, MUST NOT APPEAR IN ANY OUTPUT",
+        })
+        self.write_trusted(document)
+        return document
+
+    def edit_backed(self, raw: bytes, *, path: str | None = None) -> str:
+        path = path or self.BACKED
+        self.repo.branch("attack", self.base)
+        self.repo.write(path, raw)
+        entries = [
+            dict(entry, sha256=_sha(raw)) if entry["path"] == path else entry
+            for entry in self.current_entries(self.base)
+        ]
+        self.write_ledger(entries)
+        return self.repo.commit("change authority-backed implementation bytes")
+
+    # -- A ------------------------------------------------------------------
+    def test_A_trusted_path_and_record_with_unchanged_blob_passes(self) -> None:
+        self.assertPasses(self.run_verify(self.base))
+
+    # -- B ------------------------------------------------------------------
+    def test_B_strict_mode_rejects_changed_blob_without_approval(self) -> None:
+        """The third-pass headline: the claim agrees, the bytes are new."""
+        head = self.edit_backed(b"int widget(void) { return 777; }\n")
+        verdict = self.run_verify(head, require_exact_blob_approvals=True)
+        self.assertFatal(verdict, "BLOB_UNAPPROVED")
+        # Not caught by anything else: the claim is untouched and correct.
+        self.assertNotIn("CLAIM_UNBACKED", self.codes(verdict))
+        self.assertNotIn("CONTENT_UNATTESTED", self.codes(verdict))
+        self.assertNotIn("CONTENT_MISMATCH", self.codes(verdict))
+
+    # -- C ------------------------------------------------------------------
+    def test_C_candidate_fabricated_digest_in_the_public_ledger_fails(self) -> None:
+        """A digest the candidate writes is not an approval."""
+        raw = b"int widget(void) { return 778; }\n"
+        self.repo.branch("attack", self.base)
+        self.repo.write(self.BACKED, raw)
+        entries = []
+        for entry in self.current_entries(self.base):
+            if entry["path"] == self.BACKED:
+                entry = dict(entry, sha256=_sha(raw), evidence=dict(
+                    entry["evidence"], approved_sha256=_sha(raw), reviewed_blob=True,
+                ))
+            entries.append(entry)
+        self.write_ledger(entries)
+        head = self.repo.commit("self-issued approval")
+        self.assertFatal(
+            self.run_verify(head, require_exact_blob_approvals=True), "BLOB_UNAPPROVED"
+        )
+
+    # -- D ------------------------------------------------------------------
+    def test_D_private_authority_approving_the_exact_digest_passes(self) -> None:
+        raw = b"int widget(void) { return 779; }\n"
+        self.approve(self.BACKED, raw)
+        head = self.edit_backed(raw)
+        verdict = self.run_verify(head, require_exact_blob_approvals=True)
+        self.assertPasses(verdict)
+        self.assertEqual(
+            [item["path"] for item in verdict["blobs_approved_this_candidate"]], [self.BACKED],
+        )
+
+    # -- E ------------------------------------------------------------------
+    def test_E_approval_for_the_wrong_digest_fails(self) -> None:
+        """Right path, right record, digest of some other revision."""
+        self.approve(self.BACKED, b"int widget(void) { return 111; }\n")
+        head = self.edit_backed(b"int widget(void) { return 222; }\n")
+        self.assertFatal(
+            self.run_verify(head, require_exact_blob_approvals=True), "BLOB_UNAPPROVED"
+        )
+
+    # -- F ------------------------------------------------------------------
+    def test_F_approval_bound_to_another_path_fails(self) -> None:
+        """The digest is approved, but for a different path."""
+        raw = b"int widget(void) { return 333; }\n"
+        self.approve("src/rt/core.c", raw, record_id="core-runtime",
+                     classification="derived-translated")
+        head = self.edit_backed(raw)
+        self.assertFatal(
+            self.run_verify(head, require_exact_blob_approvals=True), "BLOB_UNAPPROVED"
+        )
+
+    # -- G ------------------------------------------------------------------
+    def test_G_exact_bytes_copied_to_a_new_path_fail(self) -> None:
+        """Approving bytes at one path never authorizes them at another."""
+        raw = self.FILES[self.BACKED]
+        self.approve(self.BACKED, raw)
+        self.repo.branch("attack", self.base)
+        self.repo.write("src/rt/widget_copy.c", raw)
+        entries = self.current_entries(self.base) + [{
+            "path": "src/rt/widget_copy.c",
+            "classification": "project_authored_attested",
+            "evidence": {
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": self.RECORD, "evidence_tier": "S",
+                "authorship": "independent implementation record",
+            },
+            "sha256": _sha(raw),
+        }]
+        self.write_ledger(entries)
+        self.write_policy(list(self.FILES) + ["src/rt/widget_copy.c"])
+        head = self.repo.commit("copy approved bytes to a new path")
+        verdict = self.run_verify(head, require_exact_blob_approvals=True)
+        self.assertFatal(verdict, "BLOB_UNAPPROVED")
+        self.assertIn("TRUSTED_RECORD_UNRESOLVED", self.codes(verdict))
+
+    # -- H ------------------------------------------------------------------
+    def test_H_changing_classification_and_bytes_fails(self) -> None:
+        raw = b"int widget(void) { return 444; }\n"
+        self.repo.branch("attack", self.base)
+        self.repo.write(self.BACKED, raw)
+        entries = []
+        for entry in self.current_entries(self.base):
+            if entry["path"] == self.BACKED:
+                entry = dict(entry, sha256=_sha(raw), classification="upstream_derived",
+                             evidence={
+                                 "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                                 "record_id": self.RECORD, "evidence_tier": "S",
+                                 "upstream": "documented upstream family",
+                             })
+            entries.append(entry)
+        self.write_ledger(entries)
+        head = self.repo.commit("reclassify and replace")
+        verdict = self.run_verify(head, require_exact_blob_approvals=True)
+        self.assertFatal(verdict, "BLOB_UNAPPROVED")
+        self.assertIn("CLAIM_UNBACKED", self.codes(verdict))
+
+    def test_H2_approval_whose_classification_disagrees_fails(self) -> None:
+        """An approval cannot authorize a class its own record does not carry."""
+        raw = b"int widget(void) { return 445; }\n"
+        self.approve(self.BACKED, raw, classification="derived-translated")
+        head = self.edit_backed(raw)
+        self.assertFatal(
+            self.run_verify(head, require_exact_blob_approvals=True), "BLOB_APPROVAL_CLASS_MISMATCH"
+        )
+
+    def test_H3_approval_citing_a_record_that_does_not_cover_the_path_fails(self) -> None:
+        raw = b"int widget(void) { return 446; }\n"
+        self.approve(self.BACKED, raw, record_id="core-runtime")
+        head = self.edit_backed(raw)
+        self.assertFatal(
+            self.run_verify(head, require_exact_blob_approvals=True), "BLOB_APPROVAL_RECORD_MISMATCH"
+        )
+
+    # -- I ------------------------------------------------------------------
+    def test_I_wildcard_record_with_changed_bytes_fails(self) -> None:
+        """``tools/*`` is not authorization for replacement content.
+
+        Even with an exact-blob approval citing the blanket record, the claim
+        ratchet still has no exact record to derive from, so the path stays
+        refused. A wildcard cannot become content authority by either route.
+        """
+        raw = b"print('replaced under the blanket')\n"
+        self.approve("tools/legacy.py", raw, record_id="blanket-tools")
+        self.repo.branch("attack", self.base)
+        self.repo.write("tools/legacy.py", raw)
+        entries = [
+            dict(entry, sha256=_sha(raw)) if entry["path"] == "tools/legacy.py" else entry
+            for entry in self.current_entries(self.base)
+        ]
+        self.write_ledger(entries)
+        head = self.repo.commit("blanket-backed replacement")
+        verdict = self.run_verify(head, require_exact_blob_approvals=True)
+        self.assertEqual(verdict["verdict"], "fail")
+        self.assertTrue(
+            {"BLOB_APPROVAL_RECORD_MISMATCH", "CONTENT_UNATTESTED"} & self.codes(verdict),
+            msg=f"findings: {verdict['findings']}",
+        )
+
+    # -- J ------------------------------------------------------------------
+    def test_J_approval_for_a_previous_candidate_commit_goes_stale(self) -> None:
+        """Approve revision one, then push revision two."""
+        first = b"int widget(void) { return 555; }\n"
+        self.approve(self.BACKED, first)
+        head = self.edit_backed(first)
+        self.assertPasses(self.run_verify(head, require_exact_blob_approvals=True))
+
+        second = b"int widget(void) { return 556; }\n"
+        self.repo.write(self.BACKED, second)
+        entries = [
+            dict(entry, sha256=_sha(second)) if entry["path"] == self.BACKED else entry
+            for entry in self.current_entries(head)
+        ]
+        self.write_ledger(entries)
+        head2 = self.repo.commit("push a second revision")
+        self.assertFatal(
+            self.run_verify(head2, require_exact_blob_approvals=True), "BLOB_UNAPPROVED"
+        )
+
+    # -- K ------------------------------------------------------------------
+    def test_K_mutable_revision_selectors_are_refused_in_strict_mode(self) -> None:
+        """CI must judge the exact SHAs the event carried, not branch names."""
+        with self.assertRaises(verifier.VerifyError) as caught:
+            verifier.verify(
+                repo=self.repo.root, candidate_rev="attack", base_rev=self.base,
+                trusted_ledger=self.trusted_ledger, workdir=self.outside / "work",
+                require_immutable_revisions=True,
+            )
+        self.assertEqual(caught.exception.code, "MUTABLE_REVISION_REFUSED")
+
+    def test_K2_exact_shas_are_accepted_in_strict_mode(self) -> None:
+        verdict = verifier.verify(
+            repo=self.repo.root, candidate_rev=self.base, base_rev=self.base,
+            trusted_ledger=self.trusted_ledger, workdir=self.outside / "work",
+            require_immutable_revisions=True, authority_revision="a" * 40,
+        )
+        self.assertPasses(verdict)
+        self.assertEqual(verdict["authority_revision"], "a" * 40)
+
+    # -- L ------------------------------------------------------------------
+    def test_L_internally_perfect_candidate_still_fails_on_external_digest(self) -> None:
+        """Every public artifact agrees with every other, and it is still refused."""
+        raw = b"int widget(void) { return 666; }\n"
+        head = self.edit_backed(raw)
+        verdict = self.run_verify(head, require_exact_blob_approvals=True)
+        # Prove the internal coherence the attacker achieved.
+        self.assertNotIn("CONTENT_MISMATCH", self.codes(verdict))
+        self.assertNotIn("LEDGER_SCHEMA", self.codes(verdict))
+        self.assertNotIn("LEDGER_COVERAGE", self.codes(verdict))
+        self.assertNotIn("EXPORT_FIELD_MISMATCH", self.codes(verdict))
+        self.assertFatal(verdict, "BLOB_UNAPPROVED")
+
+    def test_the_gate_hashes_the_git_object_not_the_ledger_claim(self) -> None:
+        """The digest that selects an approval must be computed, not read.
+
+        Here the candidate ships unapproved bytes while its ledger *claims* the
+        digest of an approved revision. ``CONTENT_MISMATCH`` catches the lie on
+        its own, so a gate that looked the approval up by the claimed digest
+        would still fail the run -- and the defect would be invisible in the
+        verdict. It is visible in the findings: the blob must be reported
+        unapproved, and nothing may be recorded as approved.
+        """
+        approved = b"int widget(void) { return 1000; }\n"
+        shipped = b"int widget(void) { return 1001; }\n"
+        self.approve(self.BACKED, approved)
+        self.repo.branch("attack", self.base)
+        self.repo.write(self.BACKED, shipped)
+        entries = [
+            dict(entry, sha256=_sha(approved)) if entry["path"] == self.BACKED else entry
+            for entry in self.current_entries(self.base)
+        ]
+        self.write_ledger(entries)
+        head = self.repo.commit("claim the approved digest, ship other bytes")
+        verdict = self.run_verify(head, require_exact_blob_approvals=True)
+        self.assertFatal(verdict, "BLOB_UNAPPROVED")
+        self.assertIn("CONTENT_MISMATCH", self.codes(verdict))
+        self.assertEqual(verdict["blobs_approved_this_candidate"], [])
+        self.assertEqual(
+            [item["sha256"] for item in verdict["blobs_unapproved"]], [_sha(shipped)],
+            "the reported digest must be the one computed from the Git object",
+        )
+
+    # -- hygiene ------------------------------------------------------------
+    def test_private_review_metadata_never_reaches_the_verdict(self) -> None:
+        raw = b"int widget(void) { return 888; }\n"
+        self.approve(self.BACKED, raw)
+        head = self.edit_backed(raw)
+        blob = json.dumps(self.run_verify(head, require_exact_blob_approvals=True))
+        self.assertNotIn("PRIVATE REVIEW NOTE", blob)
+        self.assertNotIn("reviewed_by", blob)
+
+    def test_an_approval_citing_an_unknown_record_is_refused(self) -> None:
+        raw = b"int widget(void) { return 999; }\n"
+        self.approve(self.BACKED, raw, record_id="no-such-record")
+        head = self.edit_backed(raw)
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(head, require_exact_blob_approvals=True)
+        self.assertEqual(caught.exception.code, "TRUSTED_LEDGER_INVALID")
+
+    def test_a_repeated_approval_for_one_path_and_digest_is_refused(self) -> None:
+        """Explicit semantics: one approval per (path, digest).
+
+        Two copies are ambiguous authority even when they agree, so the
+        authority is refused rather than silently deduplicated.
+        """
+        raw = b"int widget(void) { return 2024; }\n"
+        document = self.approve(self.BACKED, raw)
+        document["reviewed_blobs"].append(dict(document["reviewed_blobs"][-1]))
+        self.write_trusted(document)
+        head = self.edit_backed(raw)
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(head, require_exact_blob_approvals=True)
+        self.assertEqual(caught.exception.code, "TRUSTED_LEDGER_INVALID")
+
+    def test_several_digests_for_one_path_are_legitimate(self) -> None:
+        """Approvals are a revision history; only the exact digest matches."""
+        older = b"int widget(void) { return 1; }\n"
+        newer = b"int widget(void) { return 2; }\n"
+        document = self.approve(self.BACKED, older)
+        self.approve(self.BACKED, newer, document=document)
+        self.assertPasses(
+            self.run_verify(self.edit_backed(newer), require_exact_blob_approvals=True)
+        )
+
+    def test_an_unknown_record_id_covers_nothing(self) -> None:
+        """Why the finding needs no separate existence check.
+
+        ``_record_covers`` is the single question -- does authority cover this
+        path under this id -- and an id the authority does not hold covers
+        nothing. Stating it here keeps the property tested rather than
+        duplicated in an untestable branch.
+        """
+        exact = {"a.c": {"id": "real"}}
+        patterns = {"real": ["a.c"]}
+        self.assertFalse(verifier._record_covers("a.c", "absent", exact, patterns))
+        self.assertTrue(verifier._record_covers("a.c", "real", exact, patterns))
+
+    def test_a_wildcard_approval_path_is_refused(self) -> None:
+        document = json.loads(json.dumps(AUTHORITY_RECORDS))
+        document["reviewed_blobs"] = [{
+            "path": "src/rt/*", "sha256": "0" * 64,
+            "classification": self.PRIVATE_CLASS, "record_id": self.RECORD,
+        }]
+        self.write_trusted(document)
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(self.base, require_exact_blob_approvals=True)
+        self.assertEqual(caught.exception.code, "TRUSTED_LEDGER_INVALID")
+
+    def test_normal_mode_ignores_legacy_blob_history(self) -> None:
+        document = json.loads(json.dumps(AUTHORITY_RECORDS))
+        document["reviewed_blobs"] = [{"path": "src/rt/*"}]
+        self.write_trusted(document)
+        self.assertPasses(self.run_verify(self.base))
+
+    def test_a_deterministic_path_needs_no_blob_approval(self) -> None:
+        """Pure documentation stays outside the executable content gate."""
+        head = self.edit_backed(b"# fixture notes, revised\n", path="docs/notes.md")
+        self.assertPasses(self.run_verify(head))
+
+
+class TrustedScopeTests(GateCase):
+    """The candidate's own policy must not decide what the gate looks at.
+
+    Letting it do so was a complete bypass, reproduced against the third-pass
+    verifier on the real repository: change an implementation file, drop it
+    from ``include_paths``, delete its ledger entry, regenerate the export, and
+    every downstream check simply stopped seeing the path.
+    """
+
+    BACKED = "src/rt/widget.c"
+
+    def _drop_from_scope(self, path: str, *, exclude: bool = False,
+                         change_bytes: bool = True) -> str:
+        self.repo.branch("attack", self.base)
+        if change_bytes:
+            self.repo.write(path, b"int widget(void) { return 31337; }\n")
+        document = dict(POLICY)
+        document["include_paths"] = sorted(
+            (set(self.FILES) | {TRUSTED_WORKFLOW, verifier.LEDGER_PATH, verifier.EXPORT_PATH})
+            - {path}
+        )
+        if exclude:
+            document["exclude_paths"] = sorted(set(POLICY["exclude_paths"]) | {path})
+        self.repo.write(verifier.POLICY_PATH, json.dumps(document, indent=2) + "\n")
+        self.write_ledger([e for e in self.current_entries(self.base) if e["path"] != path])
+        return self.repo.commit("drop a changed path out of scope")
+
+    def test_removing_a_changed_path_from_include_paths_is_refused(self) -> None:
+        head = self._drop_from_scope(self.BACKED)
+        verdict = self.run_verify(head)
+        self.assertFatal(verdict, "TRUSTED_SCOPE_VIOLATION")
+
+    def test_excluding_a_changed_path_is_refused(self) -> None:
+        head = self._drop_from_scope(self.BACKED, exclude=True)
+        self.assertFatal(self.run_verify(head), "TRUSTED_SCOPE_VIOLATION")
+
+    def test_dropping_an_unchanged_path_from_scope_is_still_refused(self) -> None:
+        """Scope is not allowed to narrow even when nothing else changed."""
+        head = self._drop_from_scope(self.BACKED, change_bytes=False)
+        self.assertFatal(self.run_verify(head), "TRUSTED_SCOPE_VIOLATION")
+
+    def test_genuinely_deleting_a_path_is_allowed(self) -> None:
+        """Removal from the tree is legitimate; vanishing from scope is not."""
+        self.repo.branch("work", self.base)
+        self.repo.remove(self.BACKED)
+        document = dict(POLICY)
+        document["include_paths"] = sorted(
+            (set(self.FILES) | {TRUSTED_WORKFLOW, verifier.LEDGER_PATH, verifier.EXPORT_PATH})
+            - {self.BACKED}
+        )
+        self.repo.write(verifier.POLICY_PATH, json.dumps(document, indent=2) + "\n")
+        self.write_ledger([e for e in self.current_entries(self.base) if e["path"] != self.BACKED])
+        head = self.repo.commit("delete the file outright")
+        self.assertPasses(self.run_verify(head))
+
+    def test_a_new_implementation_path_must_enter_the_universe(self) -> None:
+        """Adding source while leaving it out of the policy is refused."""
+        self.repo.branch("attack", self.base)
+        self.repo.write("src/rt/smuggled.c", b"int smuggled(void) { return 1; }\n")
+        head = self.repo.commit("add source outside the policy")
+        self.assertFatal(self.run_verify(head), "TRUSTED_SCOPE_VIOLATION")
+
+    def test_a_new_path_the_trusted_policy_excludes_is_allowed_out(self) -> None:
+        """The trusted policy's own exclusions still work; the candidate's do not."""
+        self.repo.branch("work", self.base)
+        self.repo.write("private/secret.c", b"int secret(void) { return 1; }\n")
+        head = self.repo.commit("add a file the trusted policy excludes")
+        self.assertPasses(self.run_verify(head))
+
+    def test_a_candidate_authored_exclusion_cannot_hide_a_new_path(self) -> None:
+        """The decisive case: only the TRUSTED policy may except a new path.
+
+        The candidate adds implementation and writes its own exclusion for it.
+        Honouring that exclusion would let any new file arrive unverified, so
+        the trusted policy is the only one consulted here.
+        """
+        self.repo.branch("attack", self.base)
+        self.repo.write("src/rt/smuggled.c", b"int smuggled(void) { return 1; }\n")
+        document = dict(POLICY)
+        document["include_paths"] = sorted(
+            set(self.FILES) | {TRUSTED_WORKFLOW, verifier.LEDGER_PATH, verifier.EXPORT_PATH}
+        )
+        # An exclusion the trusted policy does not have.
+        document["exclude_paths"] = sorted(set(POLICY["exclude_paths"]) | {"src/rt/smuggled.c"})
+        self.repo.write(verifier.POLICY_PATH, json.dumps(document, indent=2) + "\n")
+        head = self.repo.commit("exclude my own new source")
+        self.assertFatal(self.run_verify(head), "TRUSTED_SCOPE_VIOLATION")
+
+    def test_widening_scope_is_allowed(self) -> None:
+        """Coverage may grow; the new path just has to satisfy provenance."""
+        self.repo.branch("work", self.base)
+        raw = b"# extra documentation\n"
+        self.repo.write("docs/extra.md", raw)
+        self.write_policy(list(self.FILES) + ["docs/extra.md"])
+        self.write_ledger(self.current_entries(self.base) + [{
+            "path": "docs/extra.md", "classification": "reviewed_documentation",
+            "evidence": {"source": "public documentation review"}, "sha256": _sha(raw),
+        }])
+        head = self.repo.commit("publish one more document")
+        self.assertPasses(self.run_verify(head))
+
+
+class IncludedPathDeclarationTests(GateCase):
+    """An include_paths entry that no longer resolves is not a quiet removal.
+
+    The ledger is built from tracked files intersected with include_paths, and
+    the gate's inherited universe is the trusted base policy over the paths
+    still present in the candidate tree.  A path dropped from the tree while
+    its include_paths entry survives therefore leaves the audited universe
+    through both filters at once: no ledger entry, no inherited claim, no
+    finding.  The profile still says the path is published, so the policy
+    document and the tree disagree about what ships -- silently.
+    """
+
+    BACKED = "src/rt/widget.c"
+
+    # -- fixture helpers -----------------------------------------------------
+
+    def declared_paths(self) -> set[str]:
+        """The include_paths the trusted base policy actually carries."""
+        document = json.loads(
+            (self.repo.root / verifier.POLICY_PATH).read_text(encoding="utf-8"),
+        )
+        return set(document["include_paths"])
+
+    def _rebase_with_stale_declaration(self, path: str) -> None:
+        """Move the trusted base onto a policy that already declares a dead path.
+
+        This is the state the real repository is in: an entry that no longer
+        resolves, inherited from commits that deleted the file and left the
+        declaration behind.
+        """
+        self.repo.branch("base-amend", self.base)
+        document = dict(POLICY)
+        document["include_paths"] = sorted(self.declared_paths() | {path})
+        self.repo.write(verifier.POLICY_PATH, json.dumps(document, indent=2) + "\n")
+        self.base = self.repo.commit("base already carried a stale declaration")
+
+    def _untrack_but_keep_declared(self, path: str) -> str:
+        """Delete the file, regenerate every control, and leave the entry."""
+        self.repo.branch("drop", self.base)
+        self.repo.remove(path)
+        self.write_ledger([e for e in self.current_entries(self.base) if e["path"] != path])
+        return self.repo.commit("stop tracking a path the profile still publishes")
+
+    # -- cases ---------------------------------------------------------------
+
+    def test_untracking_a_published_path_is_fatal(self) -> None:
+        head = self._untrack_but_keep_declared(self.BACKED)
+        verdict = self.run_verify(head)
+        self.assertEqual(
+            verdict["verdict"], "fail",
+            msg="an untracked path the profile still publishes dropped out of the "
+                "audited universe without any finding",
+        )
+        self.assertIn("INCLUDED_PATH_UNTRACKED", self.codes(verdict), msg=f"findings: {verdict['findings']}")
+
+    def test_declaring_a_path_that_never_existed_is_fatal(self) -> None:
+        """The other half of the same hole: inventing coverage, not losing it."""
+        self.repo.branch("invent", self.base)
+        self.write_policy(list(self.FILES) + ["src/rt/never_existed.c"])
+        head = self.repo.commit("publish a path that does not exist")
+        self.assertFatal(self.run_verify(head), "INCLUDED_PATH_UNTRACKED")
+
+    def test_debt_already_in_the_base_is_reported_but_not_fatal(self) -> None:
+        """A stale entry the base already carried is news, not this change's fault.
+
+        It stays visible in every report instead of failing each change until
+        somebody removes the entry from the profile.
+        """
+        self._rebase_with_stale_declaration("docs/removed_long_ago.md")
+        self.repo.branch("inherited", self.base)
+        raw = b"# extra documentation\n"
+        self.repo.write("docs/extra.md", raw)
+        self.write_policy(sorted(self.declared_paths() | {"docs/extra.md"}))
+        self.write_ledger(self.current_entries(self.base) + [{
+            "path": "docs/extra.md", "classification": "reviewed_documentation",
+            "evidence": {"source": "public documentation review"}, "sha256": _sha(raw),
+        }])
+        head = self.repo.commit("widen scope while the stale declaration is carried forward")
+        verdict = self.run_verify(head)
+        self.assertPasses(verdict)
+        self.assertEqual(
+            [(item["path"], item["fatal"]) for item in verdict["findings"]
+             if item["code"] == "INCLUDED_PATH_UNTRACKED"],
+            [("docs/removed_long_ago.md", False)],
+        )
+
+    def test_removing_the_declaration_with_the_file_is_allowed(self) -> None:
+        """The sanctioned route: the entry goes when the file goes."""
+        self.repo.branch("work", self.base)
+        self.repo.remove(self.BACKED)
+        self.write_policy([p for p in self.declared_paths() if p != self.BACKED])
+        self.write_ledger([e for e in self.current_entries(self.base) if e["path"] != self.BACKED])
+        head = self.repo.commit("delete the file and its declaration together")
+        self.assertPasses(self.run_verify(head))
+
+
+class ClassificationFloorTests(GateCase):
+    """An implementation file may not be relabelled out of content gating."""
+
+    BACKED = "src/rt/widget.c"
+
+    def _relabel(self, classification: str, evidence: dict) -> str:
+        self.repo.branch("attack", self.base)
+        self.repo.write(self.BACKED, b"int widget(void) { return 4711; }\n")
+        raw = (self.repo.root / self.BACKED).read_bytes()
+        entries = []
+        for entry in self.current_entries(self.base):
+            if entry["path"] == self.BACKED:
+                entry = dict(entry, classification=classification,
+                             evidence=evidence, sha256=_sha(raw))
+            entries.append(entry)
+        self.write_ledger(entries)
+        return self.repo.commit(f"relabel as {classification}")
+
+    def test_relabelling_implementation_as_documentation_is_refused(self) -> None:
+        head = self._relabel("reviewed_documentation", {"source": "public documentation review"})
+        self.assertFatal(self.run_verify(head), "CLASSIFICATION_DOWNGRADE")
+
+    def test_relabelling_implementation_as_a_fixture_is_refused(self) -> None:
+        head = self._relabel("synthetic_fixture", {"source": "path-reviewed fixture/test census"})
+        self.assertFatal(self.run_verify(head), "CLASSIFICATION_DOWNGRADE")
+
+    def test_relabelling_implementation_as_configuration_is_refused(self) -> None:
+        head = self._relabel("reviewed_configuration", {"source": "configuration review"})
+        self.assertFatal(self.run_verify(head), "CLASSIFICATION_DOWNGRADE")
+
+    def test_moving_source_under_a_test_looking_name_does_not_exempt_it(self) -> None:
+        """``tools/test_*`` derives a fixture class, but the move is still new.
+
+        The copy needs its own exact path authority; inheriting the old path's
+        treatment by renaming into a fixture-shaped name must not work.
+        """
+        self.repo.branch("attack", self.base)
+        raw = self.FILES[self.BACKED]
+        self.repo.write("tools/test_widget_smuggled.py", raw)
+        self.write_policy(list(self.FILES) + ["tools/test_widget_smuggled.py"])
+        self.write_ledger(self.current_entries(self.base) + [{
+            "path": "tools/test_widget_smuggled.py", "classification": "synthetic_fixture",
+            "evidence": {"source": "path-reviewed fixture/test census"}, "sha256": _sha(raw),
+        }])
+        head = self.repo.commit("smuggle source under a fixture name")
+        verdict = self.run_verify(head)
+        self.assertFatal(verdict, "TRUSTED_PATH_MISSING")
+        self.assertEqual(
+            self.run_verify(self.base)["blobs_unapproved"], [],
+            "the original attested path is untouched and still governed",
+        )
+
+    def test_correcting_a_genuine_over_claim_is_still_allowed(self) -> None:
+        """The floor is trusted derivation, not the base claim.
+
+        ``tools/legacy.py`` is classified as implementation in the base ledger
+        while authority derives nothing for it, so moving the ledger onto the
+        derived class is a correction rather than a downgrade -- and the 113
+        normalization entries depend on that distinction.
+        """
+        self.repo.branch("work", self.base)
+        entries = []
+        for entry in self.current_entries(self.base):
+            if entry["path"] == "tools/legacy.py":
+                entry = dict(entry, classification="synthetic_fixture",
+                             evidence={"source": "path-reviewed fixture/test census"})
+            entries.append(entry)
+        self.write_ledger(entries)
+        head = self.repo.commit("correct an over-claim")
+        self.assertNotIn("CLASSIFICATION_DOWNGRADE", self.codes(self.run_verify(head)))
+
+
+class CanonicalExportTests(GateCase):
+    """Every security-relevant export field is recomputed, not accepted."""
+
+    def _forge(self, **fields) -> dict:
+        self.repo.branch("attack", self.base)
+        self.repo.before_commit = lambda: self.regenerate_export(**fields)
+        return self.run_verify(self.repo.commit("forge export fields"))
+
+    def test_forged_policy_digest_is_refused(self) -> None:
+        self.assertFatal(self._forge(policy_sha256="0" * 64), "EXPORT_FIELD_MISMATCH")
+
+    def test_forged_included_content_digest_is_refused(self) -> None:
+        self.assertFatal(self._forge(included_content_sha256="0" * 64), "EXPORT_FIELD_MISMATCH")
+
+    def test_forged_counts_are_refused(self) -> None:
+        self.assertFatal(self._forge(included_file_count=1), "EXPORT_FIELD_MISMATCH")
+        self.assertFatal(self._forge(tracked_file_count=99), "EXPORT_FIELD_MISMATCH")
+        self.assertFatal(self._forge(excluded_file_count=99), "EXPORT_FIELD_MISMATCH")
+
+    def test_forged_exclusion_lists_are_refused(self) -> None:
+        self.assertFatal(self._forge(excluded_paths=[]), "EXPORT_FIELD_MISMATCH")
+        self.assertFatal(self._forge(excluded_globs=[]), "EXPORT_FIELD_MISMATCH")
+        self.assertFatal(self._forge(excluded_present_paths=["nope"]), "EXPORT_FIELD_MISMATCH")
+
+    def test_forged_schema_and_profile_fields_are_refused(self) -> None:
+        self.assertFatal(self._forge(export_schema_version=99), "EXPORT_FIELD_MISMATCH")
+        self.assertFatal(self._forge(profile="something-else"), "EXPORT_FIELD_MISMATCH")
+        self.assertFatal(self._forge(policy_version="9.9.9"), "EXPORT_FIELD_MISMATCH")
+
+    def test_an_extra_invented_field_is_refused(self) -> None:
+        self.assertFatal(self._forge(attacker_field="hello"), "EXPORT_FIELD_MISMATCH")
+
+    def test_a_correct_ledger_digest_does_not_buy_silence(self) -> None:
+        """The third-pass check verified this one field and nothing else."""
+        verdict = self._forge(included_content_sha256="0" * 64)
+        self.assertFatal(verdict, "EXPORT_FIELD_MISMATCH")
+        detail = " ".join(f["detail"] for f in verdict["findings"])
+        self.assertIn("included_content_sha256", detail)
+
+
+class StrictParserTests(GateCase):
+    """Duplicate JSON keys are refused before any semantics run."""
+
+    def _with_duplicate_key(self, path: str, safe: str, malicious: str) -> str:
+        self.repo.branch("attack", self.base)
+        raw = (self.repo.root / path).read_bytes().decode("utf-8")
+        # Insert a second copy of an object key: json.loads keeps the last.
+        injected = raw.replace("{\n", "{\n  " + json.dumps(safe) + ": "
+                               + json.dumps(malicious) + ",\n", 1)
+        self.repo.write(path, injected)
+        self.repo.before_commit = None
+        return self.repo.commit("duplicate key")
+
+    def test_duplicate_key_in_the_public_ledger_is_refused(self) -> None:
+        self.repo.branch("attack", self.base)
+        raw = (self.repo.root / verifier.LEDGER_PATH).read_text(encoding="utf-8")
+        self.repo.write(verifier.LEDGER_PATH,
+                        raw.replace('"schema_version": 1,', '"schema_version": 1,\n  "schema_version": 2,', 1))
+        self.repo.before_commit = None
+        head = self.repo.commit("duplicate key in the ledger")
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(head)
+        self.assertEqual(caught.exception.code, "CANDIDATE_LEDGER_INVALID")
+
+    def test_duplicate_key_in_the_policy_is_refused(self) -> None:
+        self.repo.branch("attack", self.base)
+        raw = (self.repo.root / verifier.POLICY_PATH).read_text(encoding="utf-8")
+        self.repo.write(verifier.POLICY_PATH,
+                        raw.replace('"name":', '"name": "decoy",\n  "name":', 1))
+        self.repo.before_commit = None
+        head = self.repo.commit("duplicate key in the policy")
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(head)
+        self.assertIn("POLICY", caught.exception.code)
+
+    def test_duplicate_key_in_the_export_is_refused(self) -> None:
+        self.repo.branch("attack", self.base)
+        raw = (self.repo.root / verifier.EXPORT_PATH).read_text(encoding="utf-8")
+        self.repo.write(verifier.EXPORT_PATH,
+                        raw.replace('"profile":', '"profile": "decoy",\n  "profile":', 1))
+        self.repo.before_commit = None
+        head = self.repo.commit("duplicate key in the export")
+        self.assertFatal(self.run_verify(head), "EXPORT_UNREADABLE")
+
+    def test_duplicate_key_in_the_trusted_authority_is_refused(self) -> None:
+        raw = self.trusted_ledger.read_text(encoding="utf-8")
+        self.trusted_ledger.write_text(
+            raw.replace('"schema_version": 1,', '"schema_version": 1,\n  "schema_version": 2,', 1),
+            encoding="utf-8", newline="\n")
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(self.base)
+        self.assertEqual(caught.exception.code, "TRUSTED_LEDGER_INVALID")
+
+
+class PathCanonicalizationTests(GateCase):
+    """One file, one spelling. Ambiguity fails closed rather than normalizing."""
+
+    def _stage_path(self, raw_path: bytes) -> str:
+        blob = run_git(
+            ["hash-object", "-w", "--stdin"], cwd=self.repo.root,
+            input=b"int x(void) { return 1; }\n", capture_output=True, check=True,
+        ).stdout.decode("ascii").strip()
+        # `git mktree` builds a single level, so it cannot express a nested
+        # path. `update-index --index-info` takes the raw bytes and any depth.
+        run_git(["read-tree", self.base], cwd=self.repo.root, check=True,
+                capture_output=True)
+        run_git(
+            ["update-index", "-z", "--index-info"], cwd=self.repo.root,
+            input=b"100644 " + blob.encode("ascii") + b" 0\t" + raw_path + b"\0",
+            capture_output=True, check=True,
+        )
+        tree = run_git(
+            ["write-tree"], cwd=self.repo.root, capture_output=True, check=True,
+        ).stdout.decode("ascii").strip()
+        return cast(str, run_git(
+            ["commit-tree", tree, "-p", self.base, "-m", "odd path"],
+            cwd=self.repo.root, capture_output=True, check=True,
+        ).stdout.decode("ascii").strip())
+
+    def _assert_refused(self, raw_path: bytes) -> None:
+        head = self._stage_path(raw_path)
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(head)
+        self.assertEqual(caught.exception.code, "TREE_INVALID")
+
+    def test_an_nfd_spelling_is_refused(self) -> None:
+        """NFC and NFD are different Git paths that name one file elsewhere."""
+        nfd = unicodedata.normalize("NFD", "src/rt/café.c")
+        self.assertNotEqual(nfd, unicodedata.normalize("NFC", nfd))
+        self._assert_refused(nfd.encode("utf-8"))
+
+    def test_backslash_and_control_forms_are_refused_by_the_parser(self) -> None:
+        """Git will not index these on this host, so the rule is tested directly.
+
+        NFD is different: Git stores it happily, which is why it gets a
+        tree-level case above. These two are still enforced because the same
+        canonicalizer validates ledger, policy and approval path strings, and
+        nothing normalizes those.
+        """
+        for candidate in ("src\\rt\\windows.c", "src/rt/we\x01ird.c",
+                          "src/rt/nl\nname.c", "src/rt/cr\rname.c", "src/rt/del\x7f.c"):
+            with self.subTest(path=repr(candidate)):
+                with self.assertRaises(verifier.VerifyError):
+                    verifier.canonical_path(candidate, code="X", label="probe")
+
+    def test_dot_and_separator_forms_are_refused_by_the_parser(self) -> None:
+        """Git normalizes these away when building a tree, so test the rule.
+
+        ``git update-index`` collapses ``a//b`` and rejects ``.``/``..``
+        components outright, which means no tree can carry them to the
+        verifier. The canonicalizer must still refuse them: the same function
+        validates ledger, policy and approval paths, which are plain JSON
+        strings that nothing normalizes.
+        """
+        for candidate in ("src/./rt/dotted.c", "src/rt/../rt/parent.c",
+                          "src//rt/double.c", "src/rt/trailing/", "/src/rt/abs.c",
+                          "src/rt/", ".", ".."):
+            with self.subTest(path=candidate):
+                with self.assertRaises(verifier.VerifyError):
+                    verifier.canonical_path(candidate, code="X", label="probe")
+
+    def test_length_and_depth_ceilings_are_enforced_by_the_parser(self) -> None:
+        deep = "/".join("d" * 2 for _ in range(verifier.MAX_PATH_DEPTH + 1)) + "/f.c"
+        long_component = "a" * (verifier.MAX_COMPONENT_BYTES + 1) + ".c"
+        long_path = "/".join("dir" for _ in range(4)) + "/" + "b" * verifier.MAX_PATH_BYTES
+        for candidate in (deep, long_component, long_path):
+            with self.subTest(path=candidate[:40]):
+                with self.assertRaises(verifier.VerifyError):
+                    verifier.canonical_path(candidate, code="X", label="probe")
+
+    def test_a_canonical_nfc_path_is_accepted(self) -> None:
+        """The rule must not reject legitimate non-ASCII names."""
+        nfc = unicodedata.normalize("NFC", "docs/café.md")
+        head = self._stage_path(nfc.encode("utf-8"))
+        # The point is that the canonicalizer lets it through: the tree is read
+        # to completion and the run reaches ordinary semantic findings instead
+        # of raising TREE_INVALID.
+        verdict = self.run_verify(head)
+        self.assertNotIn("TREE_INVALID", self.codes(verdict, fatal_only=False))
+        self.assertEqual(verifier.canonical_path(nfc, code="X", label="probe"), nfc)
+
+
+class MergeIdentityTests(GateCase):
+    """The attested head tree must be the tree that would actually land."""
+
+    def test_a_head_behind_its_base_is_refused(self) -> None:
+        """Merge/squash/rebase all preserve the head tree only when up to date.
+
+        With the base already an ancestor of the head there is nothing to
+        reconcile, so every allowed merge method yields exactly the tree this
+        run attested. When the head is behind, the merge result is a tree the
+        run never saw.
+        """
+        self.repo.branch("newer-base", self.base)
+        self.repo.write("docs/notes.md", b"# base moved on\n")
+        entries = [
+            dict(e, sha256=_sha(b"# base moved on\n")) if e["path"] == "docs/notes.md" else e
+            for e in self.current_entries(self.base)
+        ]
+        self.write_ledger(entries)
+        moved_base = self.repo.commit("base advances")
+
+        verdict = self.run_verify(self.base, base=moved_base)
+        self.assertFatal(verdict, "MERGE_BASE_STALE")
+
+    def test_an_up_to_date_head_is_accepted(self) -> None:
+        self.assertNotIn("MERGE_BASE_STALE", self.codes(self.run_verify(self.base)))
+
+
+class PrivateRecordOracleTests(GateCase):
+    """The gate must not reveal which private record ids exist."""
+
+    def _claim_record(self, record_id: str) -> dict:
+        self.repo.branch(f"attack-{abs(hash(record_id))}", self.base)
+        entries = []
+        for entry in self.current_entries(self.base):
+            if entry["path"] == "src/rt/widget.c":
+                entry = dict(entry, evidence={
+                    "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                    "record_id": record_id, "evidence_tier": "S",
+                    "authorship": "independent implementation record",
+                })
+            entries.append(entry)
+        self.write_ledger(entries)
+        return self.run_verify(self.repo.commit(f"claim {record_id}"))
+
+    def test_existing_and_nonexistent_record_guesses_are_indistinguishable(self) -> None:
+        """A wrong guess at a real id must look exactly like a made-up one."""
+        existing = self._claim_record("core-runtime")        # real, wrong path
+        invented = self._claim_record("no-such-record-here")  # not in the authority
+
+        def signature(verdict: dict) -> list[tuple[str, str, str]]:
+            return sorted(
+                (f["code"], f["path"], f["detail"]) for f in verdict["findings"]
+                if f["code"] == "TRUSTED_RECORD_UNRESOLVED"
+            )
+
+        self.assertTrue(signature(existing), "the probe must produce a finding")
+        self.assertEqual(signature(existing), signature(invented))
+        for verdict in (existing, invented):
+            blob = json.dumps(verdict)
+            self.assertNotIn("core-runtime", blob)
+            self.assertNotIn("no-such-record-here", blob)
+
+
+class GrandfatheringScopeTests(GateCase):
+    """Cases that used to pass under the claim-only predicate."""
+
+    def test_editing_a_grandfathered_file_is_no_longer_allowed(self) -> None:
+        """This is the first-pass behaviour, inverted deliberately.
+
+        Until the content half of the predicate existed, this candidate passed:
+        same claim, changed bytes, coherently updated hash.  It is exactly the
+        attestation-inheritance hole, so it must now fail.
+        """
+        self.repo.branch("work", self.base)
+        raw = b"print('legacy, edited')\n"
+        self.repo.write("tools/legacy.py", raw)
+        entries = [
+            dict(entry, sha256=_sha(raw)) if entry["path"] == "tools/legacy.py" else entry
+            for entry in self.current_entries(self.base)
+        ]
+        self.write_ledger(entries)
+        head = self.repo.commit("edit legacy")
+        self.assertFatal(self.run_verify(head), "CONTENT_UNATTESTED")
+
+
+class ContentBindingTests(GateCase):
+    """The verdict must be about the bytes actually under review."""
+
+    def test_stale_hash_is_refused(self) -> None:
+        self.repo.branch("attack", self.base)
+        self.repo.write("src/rt/widget.c", b"int widget(void) { return 99; }\n")
+        head = self.repo.commit("change content, keep hash")
+        self.assertFatal(self.run_verify(head), "CONTENT_MISMATCH")
+
+    def test_public_file_without_a_ledger_entry_is_refused(self) -> None:
+        self.repo.branch("attack", self.base)
+        self.repo.write("src/rt/ghost.c", b"int ghost(void) { return 7; }\n")
+        self.write_policy(list(self.FILES) + [TRUSTED_WORKFLOW, verifier.LEDGER_PATH, "src/rt/ghost.c"])
+        head = self.repo.commit("public file, no entry")
+        self.assertFatal(self.run_verify(head), "LEDGER_COVERAGE")
+
+    def test_entry_without_a_file_is_refused(self) -> None:
+        self.repo.branch("attack", self.base)
+        self.repo.remove("src/rt/widget.c")
+        head = self.repo.commit("entry outlives its file")
+        self.assertFatal(self.run_verify(head), "LEDGER_COVERAGE")
+
+    def test_ledger_edited_without_regenerating_the_export_is_refused(self) -> None:
+        """publish_audit states this too, but from a candidate-defined workflow."""
+        self.repo.branch("attack", self.base)
+        stale = _sha(b"whatever the export was generated against")
+        self.write_ledger(self.current_entries(self.base), export_ledger_sha=stale)
+        head = self.repo.commit("edit ledger, keep export")
+        self.assertFatal(self.run_verify(head), "EXPORT_FIELD_MISMATCH")
+
+    def test_a_symlink_in_the_public_tree_is_refused(self) -> None:
+        """Hashing a symlink would attest its target string, not any content."""
+        self.repo.branch("attack", self.base)
+        # Stage a real mode-120000 entry without needing symlink support on the
+        # host filesystem, which Windows CI runners do not reliably grant.
+        blob = run_git(
+            ["hash-object", "-w", "--stdin"], cwd=self.repo.root,
+            input=b"src/rt/core.c", capture_output=True, check=True,
+        ).stdout.decode("ascii").strip()
+        self.repo._git("update-index", "--add", "--cacheinfo", f"120000,{blob},src/rt/link.c")
+        self.repo._git("commit", "--quiet", "-m", "symlink")
+        head = self.repo._git("rev-parse", "HEAD")
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(head)
+        self.assertEqual(caught.exception.code, "TREE_INVALID")
+
+    def test_an_oversized_tree_is_refused(self) -> None:
+        """The ceilings are a real control, not a comment.
+
+        Committing 50,000 paths in a unit test is not practical, so the ceiling
+        is lowered for the duration. What is under test is that a tree over the
+        limit is refused, not the particular number.
+        """
+        self.repo.branch("attack", self.base)
+        for index in range(4):
+            self.repo.write(f"docs/bulk_{index}.md", b"# bulk\n")
+        head = self.repo.commit("many paths")
+        original = verifier.MAX_TREE_PATHS
+        verifier.MAX_TREE_PATHS = 3
+        self.addCleanup(setattr, verifier, "MAX_TREE_PATHS", original)
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(head)
+        self.assertEqual(caught.exception.code, "TREE_TOO_LARGE")
+
+    def test_an_oversized_single_blob_is_refused(self) -> None:
+        """The per-blob ceiling is separate from the aggregate one.
+
+        It is checked from the cat-file header before the blob is read, so an
+        oversized object is refused rather than held first.
+        """
+        self.repo.branch("attack", self.base)
+        self.repo.write("docs/big.md", b"# " + b"x" * 8192 + b"\n")
+        head = self.repo.commit("one large blob")
+        original = verifier.MAX_BLOB_BYTES
+        verifier.MAX_BLOB_BYTES = 4096
+        self.addCleanup(setattr, verifier, "MAX_BLOB_BYTES", original)
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(head)
+        self.assertEqual(caught.exception.code, "TREE_TOO_LARGE")
+
+    def test_oversized_aggregate_path_text_is_refused(self) -> None:
+        """Path text has its own ceiling, enforced while ls-tree streams."""
+        self.repo.branch("attack", self.base)
+        for index in range(6):
+            self.repo.write(f"docs/padding_{'n' * 40}_{index}.md", b"# pad\n")
+        head = self.repo.commit("many long path names")
+        original = verifier.MAX_TREE_PATH_BYTES
+        verifier.MAX_TREE_PATH_BYTES = 256
+        self.addCleanup(setattr, verifier, "MAX_TREE_PATH_BYTES", original)
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(head)
+        self.assertEqual(caught.exception.code, "TREE_TOO_LARGE")
+
+    def test_an_oversized_tree_by_bytes_is_refused(self) -> None:
+        self.repo.branch("attack", self.base)
+        self.repo.write("docs/bulk.md", b"# " + b"x" * 4096 + b"\n")
+        head = self.repo.commit("large blob")
+        original = verifier.MAX_TREE_BYTES
+        verifier.MAX_TREE_BYTES = 1024
+        self.addCleanup(setattr, verifier, "MAX_TREE_BYTES", original)
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(head)
+        self.assertEqual(caught.exception.code, "TREE_TOO_LARGE")
+
+    def test_unresolved_classification_is_refused(self) -> None:
+        self.repo.branch("attack", self.base)
+        entries = [
+            dict(entry, classification="unresolved", evidence={"source": "none"})
+            if entry["path"] == "src/rt/widget.c" else entry
+            for entry in self.current_entries(self.base)
+        ]
+        self.write_ledger(entries)
+        head = self.repo.commit("unresolved")
+        self.assertFatal(self.run_verify(head), "LEDGER_SCHEMA")
+
+
+class TrustBoundaryTests(GateCase):
+    """The candidate tree is data.  It can never become an authority."""
+
+    def test_a_detailed_ledger_committed_by_the_candidate_is_ignored(self) -> None:
+        """Substituting authority into the tree must not authorize anything."""
+        self.repo.branch("attack", self.base)
+        raw = b"int forged(void) { return 8; }\n"
+        self.repo.write("src/rt/forged.c", raw)
+        forged_authority = json.loads(json.dumps(AUTHORITY_RECORDS))
+        forged_authority["records"].append({
+            "id": "forged-authority", "paths": ["src/rt/forged.c"],
+            "classification": "project-authored-independent", "upstream": None,
+            "evidence_tier": "S",
+        })
+        self.repo.write(
+            "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+            json.dumps(forged_authority, indent=2) + "\n",
+        )
+        entries = self.current_entries(self.base) + [{
+            "path": "src/rt/forged.c",
+            "classification": "project_authored_attested",
+            "evidence": {
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "forged-authority", "evidence_tier": "S",
+                "authorship": "independent implementation record",
+            },
+            "sha256": _sha(raw),
+        }]
+        self.write_ledger(entries)
+        self.write_policy(list(self.FILES) + [
+            TRUSTED_WORKFLOW, verifier.LEDGER_PATH, "src/rt/forged.c",
+            "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+        ])
+        head = self.repo.commit("commit a forged authority")
+        self.assertFatal(self.run_verify(head), "TRUSTED_RECORD_UNRESOLVED")
+
+    def test_candidate_copy_of_the_verifier_is_never_consulted(self) -> None:
+        """Replacing the in-tree verifier with a rubber stamp changes nothing."""
+        self.repo.branch("attack", self.base)
+        self.repo.write(
+            "tools/provenance_attest_verify.py",
+            b"import sys\nprint('pass')\nsys.exit(0)\n",
+        )
+        self.write_policy(list(self.FILES) + [
+            TRUSTED_WORKFLOW, verifier.LEDGER_PATH, "tools/provenance_attest_verify.py",
+        ])
+        entries = self.current_entries(self.base) + [{
+            "path": "tools/provenance_attest_verify.py",
+            "classification": "project_authored_attested",
+            "evidence": {
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "blanket-tools", "evidence_tier": "S",
+                "authorship": "independent implementation record",
+            },
+            "sha256": _sha(b"import sys\nprint('pass')\nsys.exit(0)\n"),
+        }]
+        self.write_ledger(entries)
+        head = self.repo.commit("rubber-stamp the verifier")
+        self.assertFatal(self.run_verify(head), "CLAIM_UNBACKED")
+
+    def test_trusted_ledger_inside_the_repository_is_refused(self) -> None:
+        inside = self.repo.root / "trusted.json"
+        inside.write_text(json.dumps(AUTHORITY_RECORDS), encoding="utf-8", newline="\n")
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(self.base, trusted_ledger=inside)
+        self.assertEqual(caught.exception.code, "TRUSTED_INPUT_CANDIDATE_CONTROLLED")
+
+    def test_missing_trusted_ledger_fails_closed(self) -> None:
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_verify(self.base, trusted_ledger=self.outside / "absent.json")
+        self.assertEqual(caught.exception.code, "TRUSTED_INPUT_MISSING")
+
+    def test_policy_and_prior_ledger_come_from_the_base_not_the_candidate(self) -> None:
+        """A candidate that rewrites its own base-ledger history gains nothing.
+
+        The claim ratchet compares against the *base* ledger.  Here the
+        candidate restates ``core.c`` as independent and also back-dates that
+        same claim into its own tree; the base commit is unchanged, so the
+        restatement is still new and still unbacked.
+        """
+        self.repo.branch("attack", self.base)
+        entries = []
+        for entry in self.current_entries(self.base):
+            if entry["path"] == "src/rt/core.c":
+                entry = dict(entry, classification="project_authored_attested", evidence={
+                    "source": "public provenance census",
+                    "authorship": "independent project implementation",
+                })
+            entries.append(entry)
+        self.write_ledger(entries)
+        head = self.repo.commit("rewrite the claim in place")
+        self.assertFatal(self.run_verify(head), "CLAIM_UNBACKED")
+
+
+class PolicyTamperTests(GateCase):
+    """Publication scope may tighten in a pull request; it may not loosen."""
+
+    def _rewrite_policy(self, **changes) -> str:
+        self.repo.branch("attack", self.base)
+        document = dict(POLICY)
+        document["include_paths"] = sorted(
+            list(self.FILES) + [TRUSTED_WORKFLOW, verifier.LEDGER_PATH, verifier.EXPORT_PATH]
+        )
+        document.update(changes)
+        self.repo.write(verifier.POLICY_PATH, json.dumps(document, indent=2) + "\n")
+        return self.repo.commit("rewrite policy")
+
+    def test_dropping_an_exclusion_is_refused(self) -> None:
+        self.assertFatal(self.run_verify(self._rewrite_policy(exclude_paths=[])), "POLICY_SUBSTITUTION")
+
+    def test_dropping_an_exclude_prefix_is_refused(self) -> None:
+        self.assertFatal(self.run_verify(self._rewrite_policy(exclude_prefixes=[])), "POLICY_SUBSTITUTION")
+
+    def test_dropping_an_exclude_glob_is_refused(self) -> None:
+        self.assertFatal(self.run_verify(self._rewrite_policy(exclude_globs=[])), "POLICY_SUBSTITUTION")
+
+    def test_tightening_the_policy_is_allowed(self) -> None:
+        head = self._rewrite_policy(exclude_paths=["secret.txt", "another-secret.txt"])
+        self.assertPasses(self.run_verify(head))
+
+
+class MergePathTamperTests(GateCase):
+    """The gate's own merge-path wiring is part of what it verifies."""
+
+    def _authorized_workflow_entry(self, raw: bytes) -> dict:
+        authority = json.loads(json.dumps(AUTHORITY_RECORDS))
+        authority["records"] = [
+            record for record in authority["records"]
+            if record["id"] != "workflow-independent"
+        ]
+        authority["records"].append({
+            "id": "workflow-independent",
+            "paths": [TRUSTED_WORKFLOW],
+            "classification": "project-authored-independent",
+            "upstream": None,
+            "evidence_tier": "H",
+        })
+        self.write_trusted(authority)
+        return {
+            "path": TRUSTED_WORKFLOW,
+            "classification": "project_authored_attested",
+            "evidence": {
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "workflow-independent",
+                "evidence_tier": "H",
+                "authorship": "independent implementation record",
+                "upstream_attribution": None,
+            },
+            "sha256": _sha(raw),
+        }
+
+    def _commit_workflow(self, path: str, raw: bytes) -> str:
+        self.repo.branch("attack", self.base)
+        self.repo.write(path, raw)
+        if path != TRUSTED_WORKFLOW:
+            entries = self.current_entries(self.base) + [{
+                "path": path, "classification": "reviewed_configuration",
+                "evidence": {"source": "configuration review"}, "sha256": _sha(raw),
+            }]
+            self.write_ledger(entries)
+            self.write_policy(list(self.FILES) + [TRUSTED_WORKFLOW, verifier.LEDGER_PATH, path])
+        else:
+            entries = [
+                self._authorized_workflow_entry(raw) if entry["path"] == path else entry
+                for entry in self.current_entries(self.base)
+            ]
+            self.write_ledger(entries)
+        return self.repo.commit("workflow change")
+
+    def test_a_second_job_under_the_required_context_is_refused(self) -> None:
+        """Required checks match by name, so the name is a merge-path secret."""
+        raw = (
+            b"on: [pull_request]\njobs:\n  spoof:\n    name: "
+            + RESERVED_CONTEXT.encode("utf-8") + b"\n    steps:\n      - run: exit 0\n"
+        )
+        head = self._commit_workflow(".github/workflows/spoof.yml", raw)
+        self.assertFatal(self.run_verify(head), "CI_CONTEXT_COLLISION")
+
+    def test_deleting_the_trusted_workflow_is_refused(self) -> None:
+        self.repo.branch("attack", self.base)
+        self.repo.remove(TRUSTED_WORKFLOW)
+        entries = [
+            entry for entry in self.current_entries(self.base)
+            if entry["path"] != TRUSTED_WORKFLOW
+        ]
+        self.write_ledger(entries)
+        self.write_policy(list(self.FILES) + [verifier.LEDGER_PATH])
+        head = self.repo.commit("delete the gate")
+        self.assertFatal(self.run_verify(head), "TRUSTED_WORKFLOW_WEAKENED")
+
+    def test_downgrading_the_trigger_to_pull_request_is_refused(self) -> None:
+        """`pull_request` would hand the workflow definition to the candidate."""
+        head = self._commit_workflow(TRUSTED_WORKFLOW, self.workflow_bytes(trigger=b"pull_request"))
+        self.assertFatal(self.run_verify(head), "TRUSTED_WORKFLOW_WEAKENED")
+
+    def test_renaming_the_required_job_is_refused(self) -> None:
+        head = self._commit_workflow(
+            TRUSTED_WORKFLOW, self.workflow_bytes(context="Something Else"),
+        )
+        self.assertFatal(self.run_verify(head), "TRUSTED_WORKFLOW_WEAKENED")
+
+    def test_introducing_the_gate_workflow_is_not_reported_as_tampering(self) -> None:
+        """A base without the workflow is the change that adds the gate."""
+        # The predecessor has to be a real ancestor of the candidate, not a
+        # sibling: build the gate-less commit first, then re-introduce the
+        # workflow on top of it.
+        self.repo.branch("nogate", self.base)
+        self.repo.remove(TRUSTED_WORKFLOW)
+        self.write_ledger([e for e in self.current_entries(self.base) if e["path"] != TRUSTED_WORKFLOW])
+        self.write_policy(list(self.FILES))
+        older = self.repo.commit("a base predating the gate")
+
+        workflow = self.workflow_bytes()
+        self.repo.write(TRUSTED_WORKFLOW, workflow)
+        self.write_policy(list(self.FILES) + [TRUSTED_WORKFLOW])
+        self.write_ledger(self.current_entries(older) + [
+            self._authorized_workflow_entry(workflow),
+        ])
+        head = self.repo.commit("introduce the gate workflow")
+        verdict = self.run_verify(head, base=older)
+        self.assertPasses(verdict)
+        self.assertNotIn("TRUSTED_WORKFLOW_MODIFIED", self.codes(verdict, fatal_only=False))
+
+    def test_a_benign_workflow_edit_is_reported_but_not_fatal(self) -> None:
+        raw = self.workflow_bytes() + b"    timeout-minutes: 12\n"
+        head = self._commit_workflow(TRUSTED_WORKFLOW, raw)
+        verdict = self.run_verify(head)
+        self.assertPasses(verdict)
+        self.assertIn("TRUSTED_WORKFLOW_MODIFIED", self.codes(verdict, fatal_only=False))
+
+
+class LiveRepositoryTests(unittest.TestCase):
+    """Guard the real repository's own invariants that need no private input."""
+
+    def test_the_reserved_context_appears_in_exactly_one_workflow(self) -> None:
+        workflows = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+        self.assertTrue(workflows, "no workflows found")
+        naming = [
+            path for path in workflows
+            if RESERVED_CONTEXT.encode("utf-8") in path.read_bytes()
+        ]
+        self.assertEqual(
+            [path.name for path in naming], [Path(TRUSTED_WORKFLOW).name],
+            "the required-check context must be declared only by the trusted gate workflow",
+        )
+
+    def test_both_attestation_workflows_look_up_v3_deltas_the_same_way(self) -> None:
+        """The pull-request and merge-group gates fetch the V3 authority by the derived name first (#1673)."""
+        blocks = {}
+        for name in ("provenance-attestation.yml", "provenance-attestation-merge-group.yml"):
+            raw = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+            begin, end = "# v3-policy-delta-lookup:begin", "# v3-policy-delta-lookup:end"
+            self.assertEqual((raw.count(begin), raw.count(end)), (1, 1), name)
+            block = raw[raw.index(begin):raw.index(end)]
+            self.assertIn("--policy-delta-key", block)
+            self.assertIn("docs/provenance/policy-deltas-v3/${v3_name}.json", block)
+            # The derived name is checked before it is used, and a V3 hit passes no blessed policy.
+            self.assertLess(block.index("[ \"${#v3_name}\" -eq 64 ]"), block.index("gh api"))
+            v3_hit = block[:block.index("else")]
+            self.assertNotIn("trusted_candidate_policy=", v3_hit)
+            # Only a confirmed absence falls back to the legacy layouts; any other error stops the step.
+            fallback = block[block.index("else"):]
+            self.assertLess(fallback.index('grep -q "HTTP 404"'), fallback.index("nested_policy_dir="))
+            self.assertIn("exit 1", fallback[:fallback.index("nested_policy_dir=")])
+            self.assertIn('--policy-delta-authority "${POLICY_DELTA_AUTHORITY}"', raw)
+            self.assertNotIn("policy delta authority outputs must be paired", raw)
+            blocks[name] = block
+        self.assertEqual(len(set(blocks.values())), 1, "the two lookups must not drift apart")
+
+    def test_both_attestation_workflows_look_up_v4_deltas_first(self) -> None:
+        """A V4 (claims-bound) authority is fetched by its selector; only a confirmed 404 falls back to V3."""
+        blocks = {}
+        for name in ("provenance-attestation.yml", "provenance-attestation-merge-group.yml"):
+            raw = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+            begin, end = "# v4-policy-delta-lookup:begin", "# v4-policy-delta-lookup:end"
+            self.assertEqual((raw.count(begin), raw.count(end)), (1, 1), name)
+            block = raw[raw.index(begin):raw.index(end)]
+            self.assertIn("--policy-delta-key-v4", block)
+            self.assertIn("docs/provenance/policy-deltas-v4/${v4_name}.json", block)
+            self.assertLess(block.index("[ \"${#v4_name}\" -eq 64 ]"), block.index("gh api"))
+            v4_hit, fallback = block[:block.index("else")], block[block.index("else"):]
+            self.assertNotIn("trusted_candidate_policy=", v4_hit)
+            # The V3 lookup runs only inside the V4 miss, after a confirmed absence.
+            self.assertLess(fallback.index('grep -q "HTTP 404"'), fallback.index("# v3-policy-delta-lookup:begin"))
+            self.assertIn("exit 1", fallback[:fallback.index("# v3-policy-delta-lookup:begin")])
+            self.assertIn("# v3-policy-delta-lookup:end", block)
+            self.assertLess(raw.index(begin), raw.index("# v3-policy-delta-lookup:begin"))
+            blocks[name] = block
+        self.assertEqual(len(set(blocks.values())), 1, "the two lookups must not drift apart")
+
+    def test_the_trusted_workflow_is_target_triggered(self) -> None:
+        raw = (ROOT / TRUSTED_WORKFLOW).read_bytes()
+        self.assertIn(b"pull_request_target", raw)
+        self.assertNotIn(b"\non:\n  pull_request:\n", raw)
+
+    def test_the_trusted_workflow_never_checks_out_a_candidate_chosen_base(self) -> None:
+        """A pull request picks its own base, so base.ref is attacker input.
+
+        Checking it out would run the author's own tools/ code in the job that
+        holds the authority token. The checkout must pin the default branch,
+        and the job must decline any other base.
+        """
+        raw = (ROOT / TRUSTED_WORKFLOW).read_text(encoding="utf-8")
+        checkout_refs = re.findall(r"^\s+ref: (.+)$", raw, re.MULTILINE)
+        self.assertEqual(
+            checkout_refs, ["${{ github.event.repository.default_branch }}"],
+            "the trusted checkout must pin the default branch",
+        )
+        self.assertIn(
+            "github.event.pull_request.base.ref == github.event.repository.default_branch", raw,
+        )
+
+    def test_candidate_binary_job_is_main_only_and_sha_bound(self) -> None:
+        raw = (ROOT / TRUSTED_WORKFLOW).read_text(encoding="utf-8")
+        self.assertIn("candidate_binary_l2:", raw)
+        self.assertIn(
+            "github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'", raw,
+        )
+        self.assertIn("$env:CANDIDATE_SHA -ne $env:GITHUB_SHA", raw)
+        self.assertIn("$checkedOutSha -ne $env:GITHUB_SHA", raw)
+        self.assertNotIn("ref: ${{ github.sha }}", raw)
+        # The showcase PRX job the candidate job needs is held to the same limits.
+        prx_job = raw[raw.index("  showcase_prx:"):raw.index("  candidate_binary_l2:")]
+        self.assertIn(
+            "github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'",
+            prx_job,
+        )
+        self.assertIn('"$CANDIDATE_SHA" != "$GITHUB_SHA"', prx_job)
+        self.assertIn('"$checked_out" != "$GITHUB_SHA"', prx_job)
+        self.assertNotIn("id-token", prx_job)
+        self.assertNotIn("attestations:", prx_job)
+        self.assertIn("needs: [showcase_prx]", raw[raw.index("  candidate_binary_l2:"):])
+
+    def test_the_trusted_workflow_never_interpolates_untrusted_event_text(self) -> None:
+        """Titles, bodies and branch names must not reach the job at all."""
+        raw = (ROOT / TRUSTED_WORKFLOW).read_text(encoding="utf-8")
+        for expression in re.findall(r"\$\{\{(.+?)\}\}", raw):
+            self.assertNotRegex(
+                expression, r"\.(title|body|head\.ref|head\.label|head\.repo)",
+                msg=f"attacker-authored text interpolated: {expression.strip()}",
+            )
+
+    def test_the_trusted_workflow_judges_immutable_revisions(self) -> None:
+        """Branch names are moving targets; the verdict must name exact SHAs."""
+        raw = (ROOT / TRUSTED_WORKFLOW).read_text(encoding="utf-8")
+        self.assertIn("--require-immutable-revisions", raw)
+        self.assertIn("--candidate \"${HEAD_SHA}\"", raw)
+        self.assertIn("--base \"${BASE_SHA}\"", raw)
+        self.assertNotIn("--base HEAD", raw)
+        # The base the ratchet is measured against must be on the trusted branch.
+        self.assertIn('merge-base --is-ancestor "${BASE_SHA}" HEAD', raw)
+
+    def test_the_authority_revision_is_resolved_once(self) -> None:
+        """Read the ledger AT the resolved SHA, not at a branch name twice.
+
+        Asking "what is main" and separately "give me main's ledger" leaves a
+        window in which the two answers describe different content.
+        """
+        raw = (ROOT / TRUSTED_WORKFLOW).read_text(encoding="utf-8")
+        resolve = raw.index('authority_sha="$(gh api "repos/${TRUSTED_REPO}/commits/')
+        fetch = raw.index("contents/${TRUSTED_LEDGER_PATH}")
+        self.assertLess(resolve, fetch, "the revision must be resolved before the ledger is read")
+        self.assertIn("contents/${TRUSTED_LEDGER_PATH}?ref=${authority_sha}", raw)
+        self.assertNotIn("contents/${TRUSTED_LEDGER_PATH}?ref=${TRUSTED_REF}", raw)
+        self.assertIn('--authority-revision "${AUTHORITY_SHA}"', raw)
+
+    def test_the_gate_is_documented_as_observation_mode(self) -> None:
+        """Enforcement stays off while context-name spoofing is unresolved."""
+        self.assertIn("OBSERVATION MODE", (ROOT / TRUSTED_WORKFLOW).read_text(encoding="utf-8"))
+        doc = (ROOT / "docs" / "PROVENANCE_MERGE_GATE.md").read_text(encoding="utf-8")
+        self.assertIn("DO NOT ADD IT YET", doc)
+
+    def test_every_third_party_action_is_pinned_to_a_commit_sha(self) -> None:
+        raw = (ROOT / TRUSTED_WORKFLOW).read_text(encoding="utf-8")
+        uses = re.findall(r"^\s+uses: (.+)$", raw, re.MULTILINE)
+        self.assertTrue(uses)
+        for entry in uses:
+            reference = entry.split("#", 1)[0].strip().split("@", 1)[-1]
+            self.assertRegex(reference, r"^[0-9a-f]{40}$", msg=f"unpinned action: {entry}")
+
+
+class EphemeralGenerationTests(unittest.TestCase):
+    """The integration-time path never trusts branch-carried controls."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.repo = Repository(root / "repo")
+        self.outside = root / "outside"
+        self.outside.mkdir()
+        self.trusted_ledger = self.outside / "IMPLEMENTATION_PROVENANCE.json"
+        self.repo.before_commit = self.regenerate_export
+        self.write_trusted(AUTHORITY_RECORDS)
+
+        entries = []
+        for path, raw in GateCase.FILES.items():
+            entries.append(self.entry(path, raw))
+            self.repo.write(path, raw)
+        workflow = self.workflow_bytes()
+        self.repo.write(TRUSTED_WORKFLOW, workflow)
+        entries.append(self.entry(
+            TRUSTED_WORKFLOW,
+            workflow,
+            classification="reviewed_configuration",
+            evidence={"source": "configuration review"},
+        ))
+        self.write_policy(list(GateCase.FILES) + [TRUSTED_WORKFLOW, verifier.LEDGER_PATH])
+        entries.extend([
+            {"path": verifier.LEDGER_PATH, "classification": "reviewed_configuration",
+             "evidence": {"source": "configuration review"}},
+            {"path": verifier.EXPORT_PATH, "classification": "reviewed_configuration",
+             "evidence": {"source": "configuration review"}},
+        ])
+        self.write_ledger(entries)
+        self.base = self.repo.commit("base")
+
+    def workflow_bytes(self) -> bytes:
+        return (
+            b"on:\n  pull_request_target:\njobs:\n  attest:\n    name: "
+            + cast(str, verifier.TRUSTED_CONTEXT).encode("utf-8") + b"\n"
+        )
+
+    def write_trusted(self, document: dict) -> None:
+        self.trusted_ledger.write_text(
+            json.dumps(document, indent=2) + "\n", encoding="utf-8", newline="\n"
+        )
+
+    def write_policy(self, include_paths: list[str]) -> None:
+        policy = dict(POLICY)
+        policy["include_paths"] = sorted(set(include_paths) | {verifier.EXPORT_PATH})
+        self.repo.write(verifier.POLICY_PATH, json.dumps(policy, indent=2) + "\n")
+
+    def write_ledger(self, entries: list[dict]) -> None:
+        document = {
+            "schema_version": 1,
+            "generated_by": "tools/provenance_ledger.py",
+            "policy_profile": POLICY["name"],
+            "classification_vocabulary": sorted(verifier.ALLOWED_CLASSES),
+            "entries": sorted(entries, key=lambda item: item["path"]),
+        }
+        self.repo.write(verifier.LEDGER_PATH, json.dumps(document, indent=2) + "\n")
+        self.regenerate_export()
+
+    def entry(self, path: str, raw: bytes, *, classification: str | None = None,
+              evidence: dict | None = None) -> dict:
+        defaults = {
+            "src/rt/core.c": ("upstream_derived", {
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "core-runtime", "evidence_tier": "H",
+                "upstream": "upstream-project",
+            }),
+            "src/rt/widget.c": ("project_authored_attested", {
+                "source": "docs/provenance/IMPLEMENTATION_PROVENANCE.json",
+                "record_id": "widget-independent", "evidence_tier": "S",
+            }),
+            "tools/legacy.py": ("project_authored_attested", {
+                "source": "public provenance census",
+            }),
+            "tools/test_recordless.py": ("synthetic_fixture", {
+                "source": "path-reviewed fixture/test census",
+            }),
+        }
+        classification, evidence = defaults.get(
+            path,
+            (classification or "reviewed_configuration", evidence or {"source": "configuration review"}),
+        )
+        result = {"path": path, "classification": classification, "evidence": evidence}
+        if path not in verifier.UNHASHED_PATHS:
+            result["sha256"] = _sha(raw)
+        return result
+
+    def regenerate_export(self) -> None:
+        policy_path = self.repo.root / verifier.POLICY_PATH
+        ledger_path = self.repo.root / verifier.LEDGER_PATH
+        if not policy_path.is_file() or not ledger_path.is_file():
+            return
+        self.repo.write(verifier.EXPORT_PATH, b"{}")
+        policy = load_policy(policy_path)
+        document = public_export.build_document(
+            policy,
+            self.repo.tracked_files(),
+            provenance_ledger=ledger_path.read_bytes(),
+        )
+        self.repo.write(verifier.EXPORT_PATH, _canonical(document))
+
+    def _write_control_export(self) -> None:
+        """Commit the export in its control form, as the real producers do: no tree-wide fields."""
+        self.regenerate_export()
+        export_path = self.repo.root / verifier.EXPORT_PATH
+        if export_path.is_file():
+            full = json.loads(export_path.read_text(encoding="utf-8"))
+            self.repo.write(verifier.EXPORT_PATH, _canonical(public_export.build_control_document(full)))
+
+    def baseline(self, commit: str | None = None) -> Path:
+        commit = commit or self.base
+        raw = run_git(
+            ["show", f"{commit}:{verifier.LEDGER_PATH}"],
+            cwd=self.repo.root, check=True, capture_output=True,
+        ).stdout
+        path = self.outside / "trusted-baseline.json"
+        path.write_bytes(raw)
+        return path
+
+    def back_legacy_path(self) -> None:
+        """Give the fixture's grandfathered tools/legacy.py a trusted record.
+
+        An authority-generated baseline has no grandfathered category: every
+        published path needs a qualifying record, as on the real main branch.
+        """
+        authority = json.loads(json.dumps(AUTHORITY_RECORDS))
+        authority["records"].append({
+            "id": "legacy-tool-independent",
+            "paths": ["tools/legacy.py"],
+            "classification": "project-authored-independent",
+            "upstream": None,
+            "evidence_tier": "S",
+        })
+        self.write_trusted(authority)
+
+    def authority_baseline(self, commit: str | None = None) -> Path:
+        path = self.outside / "authority-baseline.json"
+        path.write_bytes(verifier.generate_authority_baseline(
+            repo=self.repo.root,
+            base_rev=commit or self.base,
+            trusted_ledger=self.trusted_ledger,
+            workdir=self.outside / "authority-baseline-scratch",
+        ))
+        return path
+
+    def run_ephemeral(self, candidate: str, *, base: str | None = None,
+                      trusted_candidate_policy: Path | None = None,
+                      policy_delta_authority: Path | None = None,
+                      require_exact_blob_approvals: bool = False,
+                      authority_baseline: bool = False) -> dict:
+        return cast(dict[str, Any], verifier.verify_ephemeral(
+            repo=self.repo.root,
+            candidate_rev=candidate,
+            base_rev=base or self.base,
+            trusted_ledger=self.trusted_ledger,
+            trusted_baseline=(self.authority_baseline(base) if authority_baseline
+                              else self.baseline(base)),
+            output_dir=self.outside / "generated",
+            trusted_candidate_policy=trusted_candidate_policy,
+            policy_delta_authority=policy_delta_authority,
+            require_exact_blob_approvals=require_exact_blob_approvals,
+        ))
+
+
+def _canonical(document: dict) -> bytes:
+    return (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+class AuthorityBaselineTests(EphemeralGenerationTests):
+    """The trusted baseline comes from the authority, never from the base's committed ledger."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.back_legacy_path()
+
+    def emit(self, base: str | None = None) -> bytes:
+        return cast(bytes, verifier.generate_authority_baseline(
+            repo=self.repo.root,
+            base_rev=base or self.base,
+            trusted_ledger=self.trusted_ledger,
+            workdir=self.outside / "baseline-scratch",
+        ))
+
+    def validate(self, raw: bytes, base: str | None = None) -> dict[str, dict]:
+        commit = verifier._rev_commit(self.repo.root, base or self.base)
+        tree = verifier._rev_tree(self.repo.root, commit)
+        blobs = verifier.read_tree(self.repo.root, tree)
+        policy = verifier._load_policy_bytes(
+            blobs[verifier.POLICY_PATH], self.outside / "policy-scratch", "policy.json",
+            code="TRUSTED_POLICY_INVALID",
+        )
+        _document, entries = verifier._validate_public_baseline(
+            raw, base_commit=commit, base_tree=tree, base_blobs=blobs, trusted_policy=policy,
+        )
+        return cast(dict[str, dict[str, Any]], entries)
+
+    def test_envelope_is_bound_to_the_exact_base_and_validates(self) -> None:
+        raw = self.emit()
+        envelope = json.loads(raw)
+        self.assertEqual(envelope["kind"], verifier.BASELINE_KIND)
+        self.assertEqual(envelope["binding"]["base_commit"],
+                         verifier._rev_commit(self.repo.root, self.base))
+        self.assertEqual(envelope["binding"]["base_tree"], verifier._rev_tree(self.repo.root, self.base))
+        entries = self.validate(raw)
+        self.assertEqual(entries["src/rt/widget.c"]["classification"], "project_authored_attested")
+        # The publication audit checks an upstream file's SPDX header against
+        # this public identifier, so the safe claim must keep it.
+        self.assertEqual(entries["src/rt/core.c"]["evidence"]["license"], "GPL-2.0-or-later")
+
+    def test_envelope_for_one_base_is_refused_for_another(self) -> None:
+        raw = self.emit()
+        self.repo.write("docs/notes.md", "# a later base\n")
+        later = self.repo.commit("later base")
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.validate(raw, later)
+        self.assertEqual(caught.exception.code, "TRUSTED_BASELINE_BINDING")
+
+    def test_committed_base_ledger_is_not_an_input(self) -> None:
+        first = json.loads(self.emit())["ledger"]
+        ledger = json.loads((self.repo.root / verifier.LEDGER_PATH).read_text(encoding="utf-8"))
+        for entry in ledger["entries"]:
+            if entry["path"] == "src/rt/widget.c":
+                entry["evidence"]["record_id"] = "forged-record"
+        self.repo.write(verifier.LEDGER_PATH, _canonical(ledger))
+        edited = self.repo.commit("base carrying an edited committed ledger")
+        self.assertEqual(json.loads(self.emit(edited))["ledger"], first)
+
+    def test_published_path_without_a_record_fails_closed(self) -> None:
+        self.repo.write("src/rt/unrecorded.c", "int unrecorded(void) { return 0; }\n")
+        self.write_policy(list(GateCase.FILES) + [TRUSTED_WORKFLOW, verifier.LEDGER_PATH,
+                                                  "src/rt/unrecorded.c"])
+        base = self.repo.commit("base publishing an unrecorded implementation path")
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.validate(self.emit(base), base)
+        self.assertEqual(caught.exception.code, "TRUSTED_BASELINE_INVALID")
+
+    def test_cli_writes_outside_the_repository_only(self) -> None:
+        out = self.outside / "emitted" / "baseline.json"
+        argv = ["--repo", str(self.repo.root), "--base", self.base,
+                "--trusted-ledger", str(self.trusted_ledger)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(verifier.main(argv + ["--emit-authority-baseline", str(out)]), 0)
+        self.assertEqual(out.read_bytes(), self.emit())
+        inside = self.repo.root / "baseline.json"
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(verifier.main(argv + ["--emit-authority-baseline", str(inside)]), 2)
+        self.assertFalse(inside.exists())
+
+
+class EphemeralGenerationBehaviorTests(EphemeralGenerationTests):
+    def test_local_ledger_generation_matches_ephemeral_with_refresh_baseline(self) -> None:
+        self.back_legacy_path()
+        baseline = json.loads(self.baseline().read_text(encoding="utf-8"))
+        for entry in baseline["entries"]:
+            if entry["path"] == "docs/notes.md":
+                entry["classification"] = "reviewed_documentation"
+                entry["evidence"] = {"source": "public documentation review"}
+        baseline["refresh"] = {
+            "workflow": "refresh-reviewed",
+            "trusted_tree": "1" * 40,
+            "candidate_tree": "2" * 40,
+            "refreshed_paths": ["docs/notes.md"],
+        }
+        self.repo.write(verifier.LEDGER_PATH, _canonical(baseline))
+        self.base = self.repo.commit("base with refresh metadata")
+        self.repo.branch("local-refresh-parity", self.base)
+        self.repo.write("docs/notes.md", "# changed synthetic notes\n")
+        candidate = self.repo.commit("candidate with documentation edit")
+        candidate_tree = verifier._rev_tree(self.repo.root, candidate)
+
+        local = provenance_refresh.generate_controls(
+            repo=self.repo.root,
+            base_rev=self.base,
+            candidate_tree=candidate_tree,
+            trusted_ledger=self.trusted_ledger,
+            workdir=self.outside / "local-generation",
+        )
+        # A refresh commits the per-path claims ledger (#1673), never the single-slot
+        # ``refresh`` audit block.  Carrying it made every landing rewrite the same lines
+        # and left a block that can no longer reconcile against a later base; the base
+        # here still has one, and the committed result must not.
+        committed = json.loads(local.committed_ledger_bytes)
+        self.assertNotIn("refresh", committed)
+        self.assertTrue(provenance_ledger.is_claims_ledger(committed))
+        self.assertNotIn("candidate_tree", local.generated_export)
+        self.repo.write(verifier.LEDGER_PATH, local.committed_ledger_bytes)
+        self.repo.write(verifier.EXPORT_PATH, local.generated_export_bytes)
+        refreshed_head = self.repo.commit("local refresh controls")
+
+        hosted = self.run_ephemeral(refreshed_head, authority_baseline=True)
+        hosted_ledger = Path(hosted["generated_outputs"]["ledger_path"]).read_bytes()
+        hosted_export = Path(hosted["generated_outputs"]["export_path"]).read_bytes()
+        self.assertNotIn("refresh", json.loads(hosted_ledger))
+        self.assertEqual(local.committed_ledger_bytes, hosted_ledger)
+        self.assertEqual(local.generated_export_bytes, hosted_export)
+        self.assertEqual(hosted["verdict"], "pass", hosted["findings"])
+
+        fixed_point = provenance_refresh.generate_controls(
+            repo=self.repo.root,
+            base_rev=self.base,
+            candidate_tree=verifier._rev_tree(self.repo.root, refreshed_head),
+            trusted_ledger=self.trusted_ledger,
+            workdir=self.outside / "fixed-point-generation",
+        )
+        self.assertEqual(fixed_point.committed_ledger_bytes, local.committed_ledger_bytes)
+        self.assertEqual(fixed_point.generated_export_bytes, local.generated_export_bytes)
+
+    def _changed_recordless_test_head(self, branch: str) -> str:
+        self.repo.branch(branch, self.base)
+        self.repo.write(
+            "tools/test_recordless.py",
+            b"def test_recordless():\n    return 1\n",
+        )
+        document = json.loads(
+            (self.repo.root / verifier.LEDGER_PATH).read_text(encoding="utf-8")
+        )
+        for entry in document["entries"]:
+            if entry["path"] == "tools/test_recordless.py":
+                entry["sha256"] = _sha(b"def test_recordless():\n    return 1\n")
+        self.write_ledger(document["entries"])
+        return self.repo.commit("change recordless test helper")
+
+    def test_ephemeral_attestation_preserves_unchanged_recordless_test_helpers(self) -> None:
+        verdict = self.run_ephemeral(self.base)
+        self.assertEqual(verdict["verdict"], "pass", verdict["findings"])
+
+    def test_ephemeral_attestation_rejects_changed_recordless_test_helper(self) -> None:
+        head = self._changed_recordless_test_head("ephemeral-recordless-test-edit")
+        verdict = self.run_ephemeral(head)
+        self.assertEqual(verdict["verdict"], "fail", verdict["findings"])
+        self.assertIn("TRUSTED_PATH_MISSING", {
+            finding["code"] for finding in verdict["findings"]
+        })
+
+    def test_new_test_helper_without_exact_record_fails_closed(self) -> None:
+        self.repo.branch("new-recordless-test-helper", self.base)
+        path = "tools/test_new_recordless.py"
+        raw = b"def test_new_recordless():\n    return 0\n"
+        self.repo.write(path, raw)
+        self.write_policy(list(GateCase.FILES) + [TRUSTED_WORKFLOW, path])
+        document = json.loads(
+            (self.repo.root / verifier.LEDGER_PATH).read_text(encoding="utf-8")
+        )
+        document["entries"].append({
+            "path": path,
+            "classification": "synthetic_fixture",
+            "evidence": {"source": "path-reviewed fixture/test census"},
+            "sha256": _sha(raw),
+        })
+        self.write_ledger(document["entries"])
+        head = self.repo.commit("new recordless test helper")
+
+        verdict = self.run_ephemeral(head)
+
+        self.assertEqual(verdict["verdict"], "fail", verdict["findings"])
+        self.assertIn("TRUSTED_PATH_MISSING", {
+            finding["code"] for finding in verdict["findings"]
+        })
+
+    def test_local_refresh_rejects_changed_recordless_test_helper_before_outputs(self) -> None:
+        self.back_legacy_path()
+        head = self._changed_recordless_test_head("local-recordless-test-edit")
+        ledger_before = (self.repo.root / verifier.LEDGER_PATH).read_bytes()
+        export_before = (self.repo.root / verifier.EXPORT_PATH).read_bytes()
+        with self.assertRaises(verifier.VerifyError) as caught:
+            provenance_refresh.generate_controls(
+                repo=self.repo.root,
+                base_rev=self.base,
+                candidate_tree=verifier._rev_tree(self.repo.root, head),
+                trusted_ledger=self.trusted_ledger,
+                workdir=self.outside / "recordless-test-generation",
+            )
+        self.assertEqual(caught.exception.code, "TRUSTED_PATH_MISSING")
+        self.assertEqual(ledger_before, (self.repo.root / verifier.LEDGER_PATH).read_bytes())
+        self.assertEqual(export_before, (self.repo.root / verifier.EXPORT_PATH).read_bytes())
+
+    def test_local_refresh_reports_missing_trusted_authority(self) -> None:
+        with self.assertRaises(verifier.VerifyError) as ctx:
+            provenance_refresh.generate_controls(
+                repo=self.repo.root,
+                base_rev=self.base,
+                candidate_tree=verifier._rev_tree(self.repo.root, self.base),
+                trusted_ledger=self.outside / "missing-authority.json",
+                workdir=self.outside / "missing-authority-generation",
+            )
+        self.assertEqual(ctx.exception.code, "TRUSTED_INPUT_MISSING")
+
+    def test_local_refresh_requires_authority_for_a_publication_policy_delta(self) -> None:
+        self.back_legacy_path()
+        policy_path = self.repo.root / verifier.POLICY_PATH
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        policy["exclude_paths"] = sorted(set(policy["exclude_paths"]) | {"new-exclusion.txt"})
+        self.repo.write(verifier.POLICY_PATH, _canonical(policy))
+        candidate = self.repo.commit("candidate with synthetic policy delta")
+        with self.assertRaises(verifier.VerifyError) as ctx:
+            provenance_refresh.generate_controls(
+                repo=self.repo.root,
+                base_rev=self.base,
+                candidate_tree=verifier._rev_tree(self.repo.root, candidate),
+                trusted_ledger=self.trusted_ledger,
+                workdir=self.outside / "policy-delta-generation",
+            )
+        self.assertEqual(ctx.exception.code, "POLICY_DELTA_AUTHORITY_REQUIRED")
+
+    def _commit_canonical_document_refresh(self) -> str:
+        entries = json.loads(self.baseline().read_text(encoding="utf-8"))["entries"]
+        for entry in entries:
+            if entry["path"] == "docs/notes.md":
+                entry["classification"] = "reviewed_documentation"
+                entry["evidence"] = {"source": "public documentation review"}
+        self.write_ledger(entries)
+        self.base = self.repo.commit("base with reviewed documentation")
+        self.repo.branch("reviewed-document-refresh", self.base)
+        self.repo.write("docs/notes.md", "# revised fixture notes\n")
+        pre_refresh = self.repo.commit("edit reviewed documentation")
+
+        refreshed = provenance_ledger._refresh_document(
+            trusted_document=json.loads(self.baseline().read_text(encoding="utf-8")),
+            candidate=provenance_ledger._resolve_tree_selector(
+                pre_refresh, default_repo=self.repo.root, role="candidate"
+            ),
+            trusted=provenance_ledger._resolve_tree_selector(
+                self.base, default_repo=self.repo.root, role="trusted"
+            ),
+            policy=load_policy(self.repo.root / verifier.POLICY_PATH),
+            refreshed_paths=["docs/notes.md"],
+            detailed_records=None,
+        )
+        self.repo.write(verifier.LEDGER_PATH, provenance_ledger._canonical_json_bytes(refreshed))
+        return self.repo.commit("commit canonical refreshed controls")
+
+    def test_canonical_refresh_round_trip_passes_ephemeral_attestation(self) -> None:
+        head = self._commit_canonical_document_refresh()
+        verdict = self.run_ephemeral(head)
+        self.assertEqual(verdict["verdict"], "pass", verdict["findings"])
+
+    def test_refresh_audit_cannot_hide_unreviewed_metadata_or_claims(self) -> None:
+        head = self._commit_canonical_document_refresh()
+        ledger_path = self.repo.root / verifier.LEDGER_PATH
+        canonical = json.loads(ledger_path.read_text(encoding="utf-8"))
+        cases = {
+            "wrong trusted tree": lambda doc: doc["refresh"].update({"trusted_tree": "0" * 40}),
+            "undeclared changed path": lambda doc: doc["refresh"].update({"refreshed_paths": []}),
+            "extra audit field": lambda doc: doc["refresh"].update({"approved": True}),
+            "altered provenance claim": lambda doc: doc["entries"][0].update({"evidence": {"source": "candidate"}}),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                self.repo.branch("forged-refresh", head)
+                forged = json.loads(json.dumps(canonical))
+                mutate(forged)
+                self.repo.write(verifier.LEDGER_PATH, provenance_ledger._canonical_json_bytes(forged))
+                forged_head = self.repo.commit(name)
+                verdict = self.run_ephemeral(forged_head)
+                self.assertIn("LEGACY_CONTROL_MISMATCH", {
+                    finding["code"] for finding in verdict["findings"] if finding["fatal"]
+                })
+
+    def test_controls_are_generated_outside_the_candidate_tree(self) -> None:
+        self.repo.branch("without-legacy-controls", self.base)
+        self.repo.remove(verifier.LEDGER_PATH)
+        self.repo.remove(verifier.EXPORT_PATH)
+        head = self.repo.commit("remove legacy controls")
+
+        verdict = self.run_ephemeral(head)
+
+        self.assertEqual(verdict["verdict"], "pass", verdict["findings"])
+        self.assertFalse((self.repo.root / verifier.LEDGER_PATH).exists())
+        self.assertFalse((self.repo.root / verifier.EXPORT_PATH).exists())
+        generated_ledger = json.loads(
+            (self.outside / "generated" / "public_provenance_ledger.json").read_text(encoding="utf-8")
+        )
+        generated_export = json.loads(
+            (self.outside / "generated" / "PUBLIC_EXPORT.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn(verifier.LEDGER_PATH, {e["path"] for e in generated_ledger["entries"]})
+        self.assertNotIn(verifier.EXPORT_PATH, {e["path"] for e in generated_ledger["entries"]})
+        self.assertEqual(
+            generated_export["digest_excludes"],
+            sorted(verifier.CONTROL_PATHS),
+        )
+        self.assertFalse(verdict["legacy_controls_present"]["ledger"])
+        self.assertFalse(verdict["legacy_controls_present"]["export"])
+
+    def test_ephemeral_untracked_declared_path_fails_closed(self) -> None:
+        """The hosted mode must not let a declared path leave the tree silently."""
+        self.repo.branch("ephemeral-untracked-declaration", self.base)
+        self.repo.remove("src/rt/widget.c")
+        entries = json.loads(self.baseline().read_text(encoding="utf-8"))["entries"]
+        self.write_ledger([entry for entry in entries if entry["path"] != "src/rt/widget.c"])
+        head = self.repo.commit("drop a published path but keep its declaration")
+
+        verdict = self.run_ephemeral(head)
+
+        self.assertEqual(verdict["verdict"], "fail", verdict["findings"])
+        self.assertIn(
+            ("INCLUDED_PATH_UNTRACKED", "src/rt/widget.c"),
+            {
+                (finding["code"], finding["path"])
+                for finding in verdict["findings"]
+                if finding["fatal"]
+            },
+        )
+
+    def _claims_ledger_for(self, head: str) -> dict:
+        """The claims-only form (#1673) of the ledger generated for ``head``."""
+        self.repo.before_commit = self._write_control_export
+        self.run_ephemeral(head)
+        generated = json.loads(
+            (self.outside / "generated" / "public_provenance_ledger.json").read_text(encoding="utf-8")
+        )
+        return cast(dict[str, Any], provenance_ledger.claims_ledger(generated))
+
+    def _fatal_codes(self, verdict: dict) -> set[str]:
+        return {finding["code"] for finding in verdict["findings"] if finding["fatal"]}
+
+    def test_claims_ledger_survives_an_unrelated_source_edit(self) -> None:
+        """The point of #1673: editing a file leaves a claims-only ledger untouched."""
+        claims = self._claims_ledger_for(self.base)
+        self.assertEqual(claims["schema_version"], provenance_ledger.CLAIMS_LEDGER_SCHEMA_VERSION)
+        self.assertFalse(any("sha256" in entry for entry in claims["entries"]))
+        self.repo.branch("claims-ledger", self.base)
+        self.repo.write(verifier.LEDGER_PATH, provenance_ledger._canonical_json_bytes(claims))
+        self.repo.commit("commit the claims-only ledger")
+        self.repo.write("src/rt/core.c", b"int core(void) { return 41; }\n")
+        head = self.repo.commit("edit a source file, ledger untouched")
+
+        verdict = self.run_ephemeral(head)
+
+        self.assertEqual(verdict["verdict"], "pass", verdict["findings"])
+        generated = json.loads(
+            (self.outside / "generated" / verifier.HASHED_LEDGER_OUTPUT_NAME).read_text(encoding="utf-8")
+        )
+        entry = next(item for item in generated["entries"] if item["path"] == "src/rt/core.c")
+        self.assertEqual(entry["sha256"], _sha(b"int core(void) { return 41; }\n"),
+                         "the hosted output still binds the edited bytes")
+
+    def test_claims_ledger_cannot_change_a_claim(self) -> None:
+        claims = self._claims_ledger_for(self.base)
+        claims["entries"][0]["evidence"] = {"source": "candidate"}
+        self.repo.branch("forged-claims", self.base)
+        self.repo.write(verifier.LEDGER_PATH, provenance_ledger._canonical_json_bytes(claims))
+        head = self.repo.commit("forge a claim in the claims-only ledger")
+
+        self.assertIn("LEGACY_CONTROL_MISMATCH", self._fatal_codes(self.run_ephemeral(head)))
+
+    def test_claims_ledger_must_carry_no_hash(self) -> None:
+        """A half-converted ledger is refused, not read as either form."""
+        claims = self._claims_ledger_for(self.base)
+        claims["entries"][0]["sha256"] = "0" * 64
+        self.repo.branch("mixed-claims", self.base)
+        self.repo.write(verifier.LEDGER_PATH, provenance_ledger._canonical_json_bytes(claims))
+        head = self.repo.commit("claims-only ledger that keeps one hash")
+
+        codes = self._fatal_codes(self.run_ephemeral(head))
+        self.assertIn("LEDGER_SCHEMA", codes)
+        self.assertIn("LEGACY_CONTROL_MISMATCH", codes)
+
+    def test_claims_ledger_must_cover_every_protected_path(self) -> None:
+        claims = self._claims_ledger_for(self.base)
+        dropped = claims["entries"].pop(0)["path"]
+        self.repo.branch("short-claims", self.base)
+        self.repo.write(verifier.LEDGER_PATH, provenance_ledger._canonical_json_bytes(claims))
+        head = self.repo.commit("claims-only ledger missing an entry")
+
+        verdict = self.run_ephemeral(head)
+        self.assertIn("LEGACY_CONTROL_MISMATCH", self._fatal_codes(verdict))
+        self.assertIn(("LEDGER_COVERAGE", dropped),
+                      {(finding["code"], finding["path"]) for finding in verdict["findings"]})
+
+    def _commit_claims_base(self) -> str:
+        """Commit the claims-only ledger the producers write (#1673) on top of the base."""
+        claims = self._claims_ledger_for(self.base)
+        self.repo.branch("claims-base", self.base)
+        self.repo.write(verifier.LEDGER_PATH, provenance_ledger._canonical_json_bytes(claims))
+        return self.repo.commit("convert the committed ledger to the claims form")
+
+    def test_outputs_are_the_committed_claims_and_the_hashed_generation(self) -> None:
+        verdict = self.run_ephemeral(self.base)
+        out = self.outside / "generated"
+        committed = (out / verifier.LEDGER_OUTPUT_NAME).read_bytes()
+        hashed = (out / verifier.HASHED_LEDGER_OUTPUT_NAME).read_bytes()
+        self.assertEqual(committed, provenance_ledger.claims_ledger_bytes(json.loads(hashed)))
+        self.assertTrue(provenance_ledger.is_claims_ledger(json.loads(committed)))
+        self.assertEqual(
+            [entry["path"] for entry in json.loads(hashed)["entries"]
+             if entry["path"] not in verifier.UNHASHED_PATHS and "sha256" not in entry],
+            [], "the hashed generation is the release's content anchor",
+        )
+        outputs = verdict["generated_outputs"]
+        self.assertEqual(outputs["ledger_sha256"], _sha(committed), "ci_controls.sh checks this digest")
+        self.assertEqual(outputs["hashed_ledger_sha256"], _sha(hashed))
+
+    def test_adopting_the_committed_output_round_trips(self) -> None:
+        """ci_controls.sh --adopt: a stale schema-1 head fails, its adopted outputs pass unchanged."""
+        self.repo.before_commit = self._write_control_export
+        self.repo.branch("adopt", self.base)
+        self.repo.write("src/rt/core.c", b"int core(void) { return 7; }\n")
+        stale = self.repo.commit("edit a source file, hashed ledger left stale")
+        first = self.run_ephemeral(stale)
+        self.assertIn("LEGACY_CONTROL_MISMATCH", self._fatal_codes(first))
+        out = self.outside / "generated"
+        committed = (out / verifier.LEDGER_OUTPUT_NAME).read_bytes()
+        export = (out / verifier.EXPORT_PATH).read_bytes()
+        self.repo.before_commit = None
+        self.repo.write(verifier.LEDGER_PATH, committed)
+        self.repo.write(verifier.EXPORT_PATH, export)
+        adopted = self.repo.commit("adopt the generated controls")
+
+        second = self.run_ephemeral(adopted)
+
+        self.assertEqual(second["verdict"], "pass", second["findings"])
+        self.assertEqual((out / verifier.LEDGER_OUTPUT_NAME).read_bytes(), committed)
+        self.assertEqual((out / verifier.EXPORT_PATH).read_bytes(), export)
+
+    def test_a_hashed_candidate_still_passes_on_a_claims_base(self) -> None:
+        """The switch: a branch that still carries the schema-1 ledger is accepted on a claims base."""
+        self.back_legacy_path()
+        claims_base = self._commit_claims_base()
+        self.repo.write("src/rt/core.c", b"int core(void) { return 8; }\n")
+        unrefreshed = self.repo.commit("edit a source file")
+        self.run_ephemeral(unrefreshed, base=claims_base, authority_baseline=True)
+        hashed = (self.outside / "generated" / verifier.HASHED_LEDGER_OUTPUT_NAME).read_bytes()
+        self.repo.write(verifier.LEDGER_PATH, hashed)
+        head = self.repo.commit("carry the hashed schema-1 generation, as an old branch does")
+
+        verdict = self.run_ephemeral(head, base=claims_base, authority_baseline=True)
+
+        self.assertEqual(verdict["verdict"], "pass", verdict["findings"])
+
+    def test_a_claims_ledger_is_not_a_plain_baseline(self) -> None:
+        claims_base = self._commit_claims_base()
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_ephemeral(claims_base, base=claims_base)
+        self.assertEqual(caught.exception.code, "TRUSTED_BASELINE_UNHASHED")
+
+    def test_the_export_is_recomputed_over_the_ledger_bytes_the_tree_carries(self) -> None:
+        self.back_legacy_path()
+        self.repo.before_commit = self._write_control_export
+        claims_base = self._commit_claims_base()
+        digests = {}
+        for candidate, form in ((claims_base, "claims"), (self.base, "hashed")):
+            with self.subTest(form=form):
+                controls = verifier.generate_ephemeral_controls(
+                    repo=self.repo.root,
+                    candidate_tree=candidate,
+                    base_rev=candidate,
+                    trusted_ledger=self.trusted_ledger,
+                    trusted_baseline=self.authority_baseline(candidate),
+                    workdir=self.outside / f"export-{form}",
+                )
+                # A claims candidate is expected to carry the committed form, a schema-1
+                # candidate the hashed generation; the export digests the bytes it will carry.
+                expected = controls.committed_ledger_bytes if form == "claims" else controls.generated_ledger_bytes
+                digests[form] = controls.generated_export["provenance_ledger_sha256"]
+                self.assertEqual(digests[form], _sha(expected))
+        self.assertNotEqual(digests["claims"], digests["hashed"])
+
+    def test_a_trusted_input_at_the_hashed_output_path_is_refused(self) -> None:
+        output_dir = self.outside / "collision-hashed"
+        output_dir.mkdir()
+        trusted = output_dir / verifier.HASHED_LEDGER_OUTPUT_NAME
+        trusted.write_bytes(self.trusted_ledger.read_bytes())
+        with self.assertRaises(verifier.VerifyError) as caught:
+            verifier.verify_ephemeral(
+                repo=self.repo.root,
+                candidate_rev=self.base,
+                base_rev=self.base,
+                trusted_ledger=trusted,
+                trusted_baseline=self.baseline(),
+                output_dir=output_dir,
+            )
+        self.assertEqual(caught.exception.code, "OUTPUT_TRUSTED_INPUT_COLLISION")
+        self.assertEqual(trusted.read_bytes(), self.trusted_ledger.read_bytes())
+
+    def test_stale_legacy_controls_cannot_hide_the_fresh_hash(self) -> None:
+        self.repo.branch("stale-legacy", self.base)
+        changed = b"int core(void) { return 99; }\n"
+        self.repo.write("src/rt/core.c", changed)
+        # ``before_commit`` regenerates only the legacy export; the ledger keeps
+        # its old hash, reproducing the reported PR failure without editing the
+        # maintainer-owned metadata in the real repository.
+        head = self.repo.commit("change source without legacy refresh")
+
+        verdict = self.run_ephemeral(head)
+
+        codes = {finding["code"] for finding in verdict["findings"]}
+        self.assertIn("CONTENT_MISMATCH", codes)
+        self.assertIn("LEGACY_CONTROL_MISMATCH", codes)
+        generated = json.loads(
+            (self.outside / "generated" / verifier.HASHED_LEDGER_OUTPUT_NAME).read_text(encoding="utf-8")
+        )
+        entry = next(item for item in generated["entries"] if item["path"] == "src/rt/core.c")
+        self.assertEqual(entry["sha256"], _sha(changed))
+
+    def test_unbacked_frozen_ephemeral_debt_renders_fail_without_traceback(self) -> None:
+        authority = json.loads(json.dumps(AUTHORITY_RECORDS))
+        core_record = next(record for record in authority["records"] if record["id"] == "core-runtime")
+        core_record["paths"] = ["src/rt/other.c"]
+        self.write_trusted(authority)
+        verdict_path = self.outside / "verdict.json"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = verifier.main([
+                "--repo", str(self.repo.root),
+                "--candidate", self.base,
+                "--base", self.base,
+                "--trusted-ledger", str(self.trusted_ledger),
+                "--trusted-baseline", str(self.baseline()),
+                "--ephemeral",
+                "--output-dir", str(self.outside / "cli-output"),
+                "--json", str(verdict_path),
+                "--show-debt",
+            ])
+
+        report = stdout.getvalue()
+        self.assertEqual(status, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertIn("FAIL  TRUSTED_RECORD_UNRESOLVED: src/rt/core.c:", report)
+        self.assertIn("[none] src/rt/core.c: public claim differs; private record details withheld", report)
+        self.assertIn("verdict: FAIL (1 fatal finding(s))", report)
+        self.assertNotIn("Traceback", report)
+        self.assertNotIn("Private/Upstream/Path.cpp", report)
+        verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+        self.assertEqual(verdict["verdict"], "fail")
+        core_debt = next(item for item in verdict["grandfathered_debt"] if item["path"] == "src/rt/core.c")
+        self.assertEqual(core_debt["backing"], "none")
+        self.assertNotIn("Private/Upstream/Path.cpp", verdict_path.read_text(encoding="utf-8"))
+
+    def test_plain_baseline_must_be_the_exact_trusted_base_blob(self) -> None:
+        wrong = self.outside / "wrong-baseline.json"
+        wrong.write_bytes(self.baseline().read_bytes() + b" ")
+        with self.assertRaises(verifier.VerifyError) as caught:
+            verifier.verify_ephemeral(
+                repo=self.repo.root,
+                candidate_rev=self.base,
+                base_rev=self.base,
+                trusted_ledger=self.trusted_ledger,
+                trusted_baseline=wrong,
+                output_dir=self.outside / "wrong-output",
+            )
+        self.assertEqual(caught.exception.code, "TRUSTED_BASELINE_BINDING")
+
+    def test_candidate_policy_change_needs_an_external_delta_authority(self) -> None:
+        self.repo.branch("policy-change", self.base)
+        policy_path = self.repo.root / verifier.POLICY_PATH
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        policy["include_paths"] = sorted(set(policy["include_paths"]) | {"docs/new.md"})
+        self.repo.write(verifier.POLICY_PATH, _canonical(policy))
+        head = self.repo.commit("candidate policy change")
+
+        verdict = self.run_ephemeral(head)
+
+        self.assertIn(
+            "POLICY_SUBSTITUTION",
+            {finding["code"] for finding in verdict["findings"]},
+        )
+
+    def test_blessed_candidate_policy_can_remove_exact_obsolete_exclusion(self) -> None:
+        self.repo.branch("authorized-exclusion-removal", self.base)
+        policy_path = self.repo.root / verifier.POLICY_PATH
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        policy["exclude_paths"] = []
+        candidate_policy_raw = _canonical(policy)
+        self.repo.write(verifier.POLICY_PATH, candidate_policy_raw)
+        head = self.repo.commit("authorized obsolete exclusion removal")
+
+        baseline_raw = run_git(
+            ["show", f"{self.base}:{verifier.POLICY_PATH}"],
+            cwd=self.repo.root, check=True, capture_output=True,
+        ).stdout
+        blessed_policy = self.outside / "blessed-exclusion-removal-policy.json"
+        blessed_policy.write_bytes(candidate_policy_raw)
+        authority = self.outside / "exclusion-removal-policy-delta-authority.json"
+        authority.write_bytes(_canonical({
+            "schema_version": 1,
+            "kind": "policy-delta-authority",
+            "baseline_policy_sha256": _sha(baseline_raw),
+            "candidate_policy_sha256": _sha(candidate_policy_raw),
+            "allowed_delta": {
+                "include_added": [],
+                "include_removed": [],
+                "exclude_added": [],
+                "exclude_removed": ["secret.txt"],
+                "rule_changes": [],
+            },
+        }))
+
+        verdict = self.run_ephemeral(
+            head,
+            trusted_candidate_policy=blessed_policy,
+            policy_delta_authority=authority,
+        )
+
+        self.assertEqual(verdict["verdict"], "pass", verdict["findings"])
+        self.assertEqual(verdict["policy_delta"]["exclude_removed"], ["secret.txt"])
+        self.assertNotIn(
+            "POLICY_SUBSTITUTION",
+            {finding["code"] for finding in verdict["findings"]},
+        )
+
+    def test_a_legacy_delta_cannot_admit_a_path_and_its_v3_delta_can(self) -> None:
+        self.repo.branch("authorized-policy-change", self.base)
+        # The declaration has to resolve to a file the tree carries, so this
+        # case publishes the document it declares and the legacy controls stay
+        # coherent; what is under test is authorizing the policy change.
+        raw = b"# new documentation\n"
+        self.repo.write("docs/new.md", raw)
+        policy_path = self.repo.root / verifier.POLICY_PATH
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        policy["include_paths"] = sorted(set(policy["include_paths"]) | {"docs/new.md"})
+        candidate_policy_raw = _canonical(policy)
+        self.repo.write(verifier.POLICY_PATH, candidate_policy_raw)
+        base_entries = json.loads(run_git(
+            ["show", f"{self.base}:{verifier.LEDGER_PATH}"], cwd=self.repo.root,
+            check=True, capture_output=True,
+        ).stdout.decode("utf-8"))["entries"]
+        classification, evidence = provenance_ledger._class_for("docs/new.md", None)
+        self.write_ledger(base_entries + [{
+            "path": "docs/new.md", "classification": classification,
+            "evidence": evidence, "sha256": _sha(raw),
+        }])
+        head = self.repo.commit("authorized candidate policy change")
+
+        baseline_raw = run_git(
+            ["show", f"{self.base}:{verifier.POLICY_PATH}"],
+            cwd=self.repo.root, check=True, capture_output=True,
+        ).stdout
+        blessed_policy = self.outside / "blessed-candidate-policy.json"
+        blessed_policy.write_bytes(candidate_policy_raw)
+        authority = self.outside / "policy-delta-authority.json"
+        authority.write_bytes(_canonical({
+            "schema_version": 1,
+            "kind": "policy-delta-authority",
+            "baseline_policy_sha256": _sha(baseline_raw),
+            "candidate_policy_sha256": _sha(candidate_policy_raw),
+            "allowed_delta": {
+                "include_added": ["docs/new.md"],
+                "include_removed": [],
+                "exclude_added": [],
+                "exclude_removed": [],
+                "rule_changes": [],
+            },
+        }))
+
+        # A V1/V2 record binds no file bytes, so since V3 (#1673) it cannot admit a new path:
+        # an edited new file would miss its V3 delta and pass on the old record.
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_ephemeral(
+                head,
+                trusted_candidate_policy=blessed_policy,
+                policy_delta_authority=authority,
+            )
+        self.assertEqual(caught.exception.code, "POLICY_DELTA_LEGACY_ADDS_PATHS")
+
+        # The same change under its V3 delta (what a --rekey writes) is authorized.
+        v3 = self.outside / "policy-delta-v3.json"
+        v3.write_bytes(provenance_ledger.policy_delta_v3_bytes(provenance_ledger.derive_policy_delta_v3(
+            json.loads(baseline_raw), json.loads(candidate_policy_raw), {"docs/new.md": _sha(raw)}.get,
+        )))
+        verdict = self.run_ephemeral(head, policy_delta_authority=v3)
+
+        self.assertEqual(verdict["verdict"], "pass", verdict["findings"])
+        self.assertEqual(verdict["policy_delta"]["include_added"], ["docs/new.md"])
+        self.assertIsNone(
+            next((item for item in verdict["findings"] if item["code"] == "POLICY_SUBSTITUTION"), None),
+        )
+
+    def _rule_change_head(self) -> tuple[str, bytes, bytes, dict, dict]:
+        """A head whose only profile change is a rule field: one exclude_rationale entry is dropped."""
+        self.repo.branch("rule-change", self.base)
+        policy_path = self.repo.root / verifier.POLICY_PATH
+        baseline_raw = policy_path.read_bytes()
+        baseline = json.loads(baseline_raw.decode("utf-8"))
+        candidate = json.loads(baseline_raw.decode("utf-8"))
+        rationale = dict(candidate.get("exclude_rationale", {}))
+        rationale["docs/retired-note.md"] = "Synthetic orphan rationale."
+        candidate["exclude_rationale"] = rationale
+        candidate_raw = _canonical(candidate)
+        self.repo.write(verifier.POLICY_PATH, candidate_raw)
+        head = self.repo.commit("rule change: one rationale entry")
+        return head, baseline_raw, candidate_raw, baseline, candidate
+
+    def _rule_authority(self, baseline_raw: bytes, candidate_raw: bytes, rule_changes: list) -> tuple[Path, Path]:
+        blessed_policy = self.outside / "blessed-candidate-policy.json"
+        blessed_policy.write_bytes(candidate_raw)
+        authority = self.outside / "policy-delta-authority.json"
+        authority.write_bytes(_canonical({
+            "schema_version": 2,
+            "kind": "policy-delta-authority",
+            "baseline_policy_sha256": _sha(baseline_raw),
+            "candidate_policy_sha256": _sha(candidate_raw),
+            "allowed_delta": {
+                "include_added": [], "include_removed": [], "exclude_added": [], "exclude_removed": [],
+                "rule_changes": rule_changes,
+            },
+        }))
+        return blessed_policy, authority
+
+    def test_a_v2_delta_authorizes_a_rule_change_bound_to_its_values(self) -> None:
+        head, baseline_raw, candidate_raw, baseline, candidate = self._rule_change_head()
+        bound = {
+            "key": "exclude_rationale",
+            "baseline_sha256": provenance_ledger.policy_rule_value_sha256(baseline, "exclude_rationale"),
+            "candidate_sha256": provenance_ledger.policy_rule_value_sha256(candidate, "exclude_rationale"),
+        }
+        blessed_policy, authority = self._rule_authority(baseline_raw, candidate_raw, [bound])
+
+        verdict = self.run_ephemeral(head, trusted_candidate_policy=blessed_policy, policy_delta_authority=authority)
+
+        self.assertEqual(verdict["verdict"], "pass", verdict["findings"])
+        self.assertEqual(verdict["policy_delta"]["rule_changes"], ["exclude_rationale"])
+
+    def test_a_v2_delta_refuses_a_rule_change_bound_to_another_value(self) -> None:
+        head, baseline_raw, candidate_raw, baseline, _candidate = self._rule_change_head()
+        other = dict(baseline, exclude_rationale={"docs/other.md": "Not what was reviewed."})
+        bound = {
+            "key": "exclude_rationale",
+            "baseline_sha256": provenance_ledger.policy_rule_value_sha256(baseline, "exclude_rationale"),
+            "candidate_sha256": provenance_ledger.policy_rule_value_sha256(other, "exclude_rationale"),
+        }
+        blessed_policy, authority = self._rule_authority(baseline_raw, candidate_raw, [bound])
+
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_ephemeral(head, trusted_candidate_policy=blessed_policy, policy_delta_authority=authority)
+        self.assertEqual(caught.exception.code, "POLICY_DELTA_RULE_VALUE_MISMATCH")
+
+    def test_external_policy_delta_inputs_cannot_share_generated_output_paths(self) -> None:
+        self.repo.branch("output-collision-policy-change", self.base)
+        policy_path = self.repo.root / verifier.POLICY_PATH
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        policy["include_paths"] = sorted(set(policy["include_paths"]) | {"docs/new.md"})
+        candidate_policy_raw = _canonical(policy)
+        self.repo.write(verifier.POLICY_PATH, candidate_policy_raw)
+        head = self.repo.commit("policy change for output collision test")
+
+        baseline_raw = run_git(
+            ["show", f"{self.base}:{verifier.POLICY_PATH}"],
+            cwd=self.repo.root, check=True, capture_output=True,
+        ).stdout
+        authority_document = _canonical({
+            "schema_version": 1,
+            "kind": "policy-delta-authority",
+            "baseline_policy_sha256": _sha(baseline_raw),
+            "candidate_policy_sha256": _sha(candidate_policy_raw),
+            "allowed_delta": {
+                "include_added": ["docs/new.md"],
+                "include_removed": [],
+                "exclude_added": [],
+                "exclude_removed": [],
+                "rule_changes": [],
+            },
+        })
+
+        for output_name in ("public_provenance_ledger.json", "PUBLIC_EXPORT.json"):
+            with self.subTest(output_name=output_name):
+                output_dir = self.outside / f"collision-{output_name}"
+                output_dir.mkdir()
+                blessed_policy = self.outside / f"blessed-{output_name}.json"
+                blessed_policy.write_bytes(candidate_policy_raw)
+                authority = self.outside / f"authority-{output_name}.json"
+                authority.write_bytes(authority_document)
+                if output_name == "public_provenance_ledger.json":
+                    blessed_policy = output_dir / output_name
+                    blessed_policy.write_bytes(candidate_policy_raw)
+                else:
+                    authority = output_dir / output_name
+                    authority.write_bytes(authority_document)
+
+                with self.assertRaises(verifier.VerifyError) as caught:
+                    verifier.verify_ephemeral(
+                        repo=self.repo.root,
+                        candidate_rev=head,
+                        base_rev=self.base,
+                        trusted_ledger=self.trusted_ledger,
+                        trusted_baseline=self.baseline(),
+                        output_dir=output_dir,
+                        trusted_candidate_policy=blessed_policy,
+                        policy_delta_authority=authority,
+                    )
+                self.assertEqual(caught.exception.code, "OUTPUT_TRUSTED_INPUT_COLLISION")
+                self.assertTrue(blessed_policy.is_file())
+                self.assertTrue(authority.is_file())
+
+    def test_blessed_candidate_policy_must_match_candidate_bytes(self) -> None:
+        self.repo.branch("mismatched-policy-change", self.base)
+        policy_path = self.repo.root / verifier.POLICY_PATH
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        policy["include_paths"] = sorted(set(policy["include_paths"]) | {"docs/new.md"})
+        candidate_policy_raw = _canonical(policy)
+        self.repo.write(verifier.POLICY_PATH, candidate_policy_raw)
+        head = self.repo.commit("mismatched candidate policy")
+
+        baseline_raw = run_git(
+            ["show", f"{self.base}:{verifier.POLICY_PATH}"],
+            cwd=self.repo.root, check=True, capture_output=True,
+        ).stdout
+        blessed_policy = self.outside / "wrong-blessed-candidate-policy.json"
+        blessed_policy.write_bytes(candidate_policy_raw + b" ")
+        authority = self.outside / "wrong-policy-delta-authority.json"
+        authority.write_bytes(_canonical({
+            "schema_version": 1,
+            "kind": "policy-delta-authority",
+            "baseline_policy_sha256": _sha(baseline_raw),
+            "candidate_policy_sha256": _sha(blessed_policy.read_bytes()),
+            "allowed_delta": {
+                "include_added": ["docs/new.md"],
+                "include_removed": [],
+                "exclude_added": [],
+                "exclude_removed": [],
+                "rule_changes": [],
+            },
+        }))
+
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self.run_ephemeral(
+                head,
+                trusted_candidate_policy=blessed_policy,
+                policy_delta_authority=authority,
+            )
+        self.assertEqual(caught.exception.code, "CANDIDATE_POLICY_MISMATCH")
+
+    def test_new_source_without_external_path_authority_stays_fail_closed(self) -> None:
+        self.repo.branch("new-source", self.base)
+        raw = b"int new_source(void) { return 1; }\n"
+        self.repo.write("src/rt/new_source.c", raw)
+        self.write_policy(list(GateCase.FILES) + [TRUSTED_WORKFLOW, verifier.LEDGER_PATH,
+                                                   verifier.EXPORT_PATH, "src/rt/new_source.c"])
+        forged = json.loads(
+            (self.repo.root / verifier.LEDGER_PATH).read_text(encoding="utf-8")
+        )
+        forged["entries"].append({
+            "path": "src/rt/new_source.c",
+            "classification": "project_authored_attested",
+            "evidence": {
+                "source": "candidate supplied claim",
+                "record_id": "invented-record",
+            },
+            "sha256": _sha(raw),
+        })
+        self.repo.write(verifier.LEDGER_PATH, _canonical(forged))
+        head = self.repo.commit("new source without trusted admission")
+
+        verdict = self.run_ephemeral(head)
+
+        codes = {finding["code"] for finding in verdict["findings"]}
+        self.assertIn("TRUSTED_PATH_MISSING", codes)
+        self.assertIn("CLAIM_UNBACKED", codes)
+
+    def test_new_build_file_cannot_escape_through_documentation_class(self) -> None:
+        self.repo.branch("new-build-file", self.base)
+        self.repo.write("CMakeLists.txt", b"project(synthetic)\n")
+        self.write_policy(list(GateCase.FILES) + [TRUSTED_WORKFLOW, verifier.LEDGER_PATH,
+                                                   verifier.EXPORT_PATH, "CMakeLists.txt"])
+        head = self.repo.commit("new build file")
+
+        verdict = self.run_ephemeral(head)
+
+        codes = {finding["code"] for finding in verdict["findings"]}
+        self.assertIn("TRUSTED_PATH_MISSING", codes)
+
+    def test_candidate_policy_cannot_hide_a_new_build_file(self) -> None:
+        self.repo.branch("hidden-build-file", self.base)
+        self.repo.write("CMakeLists.txt", b"project(hidden)\n")
+        head = self.repo.commit("unlisted build file")
+
+        verdict = self.run_ephemeral(head)
+
+        self.assertIn(
+            "TRUSTED_SCOPE_VIOLATION",
+            {finding["code"] for finding in verdict["findings"]},
+        )
+
+
+class _PolicyDeltaFixture(EphemeralGenerationTests):
+    """Profile changes on branches, the authority documents an admission writes, and landing."""
+
+    NEW_A = "docs/new-a.md"
+    NEW_B = "docs/new-b.md"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.back_legacy_path()
+        self.repo.before_commit = self._write_control_export
+
+    def _profile(self, rev: str) -> dict:
+        return cast(dict[str, Any], json.loads(run_git(
+            ["show", f"{rev}:{verifier.POLICY_PATH}"], cwd=self.repo.root,
+            check=True, capture_output=True, text=True,
+        ).stdout))
+
+    def _change(self, branch: str, start: str, files: dict[str, bytes], *, include=(), mutate=None) -> str:
+        """Commit ``files`` on a new branch from ``start``, with ``include`` added to the canonical profile."""
+        self.repo.branch(branch, start)
+        policy = self._profile(start)
+        policy["include_paths"] = sorted(set(policy["include_paths"]) | set(include))
+        if mutate is not None:
+            mutate(policy)
+        for path, raw in files.items():
+            self.repo.write(path, raw)
+        self.repo.write(verifier.POLICY_PATH, provenance_ledger.canonical_profile_bytes(policy))
+        return self.repo.commit(f"profile change on {branch}")
+
+    def _v3(self, base: str, head: str, label: str = "v3") -> Path:
+        """Write the V3 authority an admission of ``head``'s change against ``base`` records."""
+        blobs = verifier.read_tree(self.repo.root, verifier._rev_tree(self.repo.root, head))
+        document = provenance_ledger.derive_policy_delta_v3(
+            self._profile(base), self._profile(head),
+            lambda path: _sha(blobs[path]) if path in blobs else None,
+        )
+        raw = provenance_ledger.policy_delta_v3_bytes(document)
+        name = provenance_ledger.policy_delta_v3_name(raw)
+        self.assertEqual(name, verifier.policy_delta_key(repo=self.repo.root, base_rev=base, candidate_rev=head),
+                         "the workflow's lookup name is the stored document's digest")
+        path = self.outside / f"{label}-{name}.json"
+        path.write_bytes(raw)
+        return path
+
+    def _attest(self, head: str, base: str, authority: Path | None, **kwargs) -> dict:
+        return self.run_ephemeral(head, base=base, policy_delta_authority=authority, authority_baseline=True, **kwargs)
+
+    def _land(self, head: str, base: str, authority: Path) -> str:
+        """Adopt the generated controls on ``head``, as the desk's --adopt does, and require a pass."""
+        self.repo.branch(f"landing-{head[:12]}", head)
+        self._attest(head, base, authority)
+        out = self.outside / "generated"
+        hook, self.repo.before_commit = self.repo.before_commit, None
+        self.repo.write(verifier.LEDGER_PATH, (out / verifier.LEDGER_OUTPUT_NAME).read_bytes())
+        self.repo.write(verifier.EXPORT_PATH, (out / verifier.EXPORT_PATH).read_bytes())
+        landed = self.repo.commit("adopt the generated controls")
+        self.repo.before_commit = hook
+        verdict = self._attest(landed, base, authority)
+        self.assertEqual(verdict["verdict"], "pass", verdict["findings"])
+        return landed
+
+    def _refused(self, code: str, head: str, base: str, authority: Path, **kwargs) -> None:
+        with self.assertRaises(verifier.VerifyError) as caught:
+            self._attest(head, base, authority, **kwargs)
+        self.assertEqual(caught.exception.code, code, str(caught.exception))
+
+    def _commit_index_only(self, message: str, files: dict[str, bytes]) -> str:
+        """Commit ``files`` through the index alone: case variants cannot share a Windows checkout."""
+        for path, raw in files.items():
+            blob = run_git(["hash-object", "-w", "--stdin"], cwd=self.repo.root, input=raw,
+                           check=True, capture_output=True).stdout.decode("ascii").strip()
+            run_git(["update-index", "--add", "--cacheinfo", f"100644,{blob},{path}"], cwd=self.repo.root,
+                    check=True, capture_output=True)
+        run_git(["commit", "--quiet", "-m", message], cwd=self.repo.root, check=True, capture_output=True)
+        return self.repo.head()
+
+
+
+class PolicyDeltaV3Tests(_PolicyDeltaFixture):
+    """V3 policy-delta authority (#1673): the approved path change, not the base profile's bytes.
+
+    Each case builds the document the admission writes (derived from the base profile, the
+    candidate profile and the candidate's blobs) and hands it to the verifier directly, the
+    way the attestation workflow does after its lookup.
+    """
+
+    # -- must pass ------------------------------------------------------------
+
+    def test_a_v3_authority_admits_a_new_path_on_its_own_base(self) -> None:
+        head = self._change("pr-a", self.base, {self.NEW_A: b"# a\n"}, include=[self.NEW_A])
+        landed = self._land(head, self.base, self._v3(self.base, head))
+        verdict = self._attest(landed, self.base, self._v3(self.base, landed, "landed"))
+        self.assertEqual(verdict["policy_delta"]["include_added"], [self.NEW_A])
+
+    def test_two_admissions_land_in_either_order_without_a_rekey(self) -> None:
+        """Both admitted against the same base; the second still verifies after the first lands."""
+        for first, second in ((self.NEW_A, self.NEW_B), (self.NEW_B, self.NEW_A)):
+            with self.subTest(first=first):
+                tag = first.rsplit("/", 1)[-1]
+                head_1 = self._change(f"first-{tag}", self.base, {first: b"# first\n"}, include=[first])
+                head_2 = self._change(f"second-{tag}", self.base, {second: b"# second\n"}, include=[second])
+                authority_1 = self._v3(self.base, head_1, f"first-{tag}")
+                authority_2 = self._v3(self.base, head_2, f"second-{tag}")
+                main_1 = self._land(head_1, self.base, authority_1)
+
+                # The second pull request after merging the new main: the union profile.
+                rebased = self._change(f"second-{tag}-on-main", main_1, {second: b"# second\n"}, include=[second])
+                landed = self._land(rebased, main_1, authority_2)
+                self.assertEqual(self._attest(landed, main_1, authority_2)["policy_delta"]["include_added"],
+                                 [second])
+
+                # Failing before #1673: a V1 delta bound to the old base profile needs a re-key here.
+                blessed = self.outside / f"blessed-{tag}.json"
+                blessed.write_bytes(provenance_ledger.canonical_profile_bytes(self._profile(head_2)))
+                v1 = self.outside / f"v1-{tag}.json"
+                v1.write_bytes(_canonical({
+                    "schema_version": 1, "kind": "policy-delta-authority",
+                    "baseline_policy_sha256": _sha(provenance_ledger.canonical_profile_bytes(self._profile(self.base))),
+                    "candidate_policy_sha256": _sha(blessed.read_bytes()),
+                    "allowed_delta": {"include_added": [second], "include_removed": [], "exclude_added": [],
+                                      "exclude_removed": [], "rule_changes": []},
+                }))
+                with self.assertRaises(verifier.VerifyError) as caught:
+                    self._attest(landed, main_1, v1, trusted_candidate_policy=blessed)
+                self.assertEqual(caught.exception.code, "CANDIDATE_POLICY_MISMATCH")
+
+    # -- canaries: each must fail closed ----------------------------------------
+
+    def test_new_file_bytes_must_match_the_admitted_digest(self) -> None:
+        head = self._change("pr-a", self.base, {self.NEW_A: b"# admitted\n"}, include=[self.NEW_A])
+        authority = self._v3(self.base, head)
+        self.repo.write(self.NEW_A, b"# edited after admission\n")
+        edited = self.repo.commit("edit the new file after its admission")
+        self._refused("POLICY_DELTA_ADDED_BYTES_MISMATCH", edited, self.base, authority)
+
+    def test_an_edited_file_cannot_fall_back_to_its_legacy_record(self) -> None:
+        """Cross-review 1: a pre-V3 admission keeps its byte-free V1 record next to the V3 one."""
+        head = self._change("pr-legacy", self.base, {self.NEW_A: b"# admitted\n"}, include=[self.NEW_A])
+        authority = self._v3(self.base, head)
+        blessed = self.outside / "blessed-legacy.json"
+        blessed.write_bytes(provenance_ledger.canonical_profile_bytes(self._profile(head)))
+        legacy = self.outside / "v1-legacy.json"
+        legacy.write_bytes(_canonical({
+            "schema_version": 1, "kind": "policy-delta-authority",
+            "baseline_policy_sha256": _sha(provenance_ledger.canonical_profile_bytes(self._profile(self.base))),
+            "candidate_policy_sha256": _sha(blessed.read_bytes()),
+            "allowed_delta": {"include_added": [self.NEW_A], "include_removed": [], "exclude_added": [],
+                              "exclude_removed": [], "rule_changes": []},
+        }))
+        self.repo.write(self.NEW_A, b"# edited after admission\n")
+        edited = self.repo.commit("edit the new file; the profile is unchanged")
+        # The V3 name the workflow derives for the edit no longer matches; the legacy record it
+        # would fall back to is refused for any path addition.
+        self.assertNotEqual(verifier.policy_delta_key(repo=self.repo.root, base_rev=self.base, candidate_rev=edited),
+                            authority.stem.split("-", 1)[1])
+        self._refused("POLICY_DELTA_LEGACY_ADDS_PATHS", edited, self.base, legacy, trusted_candidate_policy=blessed)
+        self._refused("POLICY_DELTA_ADDED_BYTES_MISMATCH", edited, self.base, authority)
+
+    def test_an_added_path_the_base_already_publishes_is_refused(self) -> None:
+        head_a = self._change("pr-a", self.base, {self.NEW_A: b"# a\n"}, include=[self.NEW_A])
+        authority_a = self._v3(self.base, head_a)
+        main_1 = self._land(head_a, self.base, authority_a)
+        head_c = self._change("pr-c", main_1, {self.NEW_B: b"# c\n"}, include=[self.NEW_B])
+        self._refused("POLICY_DELTA_PATH_EXISTS", head_c, main_1, authority_a)
+
+    def test_an_added_path_that_exists_unpublished_in_the_base_is_refused(self) -> None:
+        draft = "docs/draft.md"
+        base_2 = self._change("draft-base", self.base, {draft: b"# draft\n"},
+                              mutate=lambda policy: policy.update(exclude_paths=sorted({*policy["exclude_paths"], draft})))
+        head = self._change("publish-draft", base_2, {}, include=[draft],
+                            mutate=lambda policy: policy.update(exclude_paths=[p for p in policy["exclude_paths"] if p != draft]))
+        self._refused("POLICY_DELTA_PATH_EXISTS", head, base_2, self._v3(base_2, head))
+
+    def test_a_rule_whose_earlier_value_moved_is_refused(self) -> None:
+        head = self._change("pr-rule", self.base, {}, mutate=lambda policy: policy.update(notes="approved note"))
+        authority = self._v3(self.base, head)
+        base_2 = self._change("other-rule", self.base, {}, mutate=lambda policy: policy.update(notes="landed first"))
+        rebased = self._change("pr-rule-on-main", base_2, {}, mutate=lambda policy: policy.update(notes="approved note"))
+        self._refused("POLICY_DELTA_RULE_VALUE_MISMATCH", rebased, base_2, authority)
+
+    def test_a_profile_edit_outside_the_delta_is_refused(self) -> None:
+        head = self._change("pr-a", self.base, {self.NEW_A: b"# a\n"}, include=[self.NEW_A])
+        authority = self._v3(self.base, head)
+        more = self._change("pr-a-more", head, {self.NEW_B: b"# unapproved\n"}, include=[self.NEW_B])
+        self._refused("POLICY_DELTA_UNAUTHORIZED", more, self.base, authority)
+
+    def test_a_non_canonical_candidate_profile_is_refused(self) -> None:
+        head = self._change("pr-a", self.base, {self.NEW_A: b"# a\n"}, include=[self.NEW_A])
+        authority = self._v3(self.base, head)
+        self.repo.write(verifier.POLICY_PATH, json.dumps(self._profile(head), indent=4) + "\n")
+        reformatted = self.repo.commit("same profile, another layout")
+        self._refused("CANDIDATE_POLICY_NOT_CANONICAL", reformatted, self.base, authority)
+
+    def test_a_v3_authority_comes_alone_and_v1_needs_its_blessed_policy(self) -> None:
+        head = self._change("pr-a", self.base, {self.NEW_A: b"# a\n"}, include=[self.NEW_A])
+        authority = self._v3(self.base, head)
+        blessed = self.outside / "blessed.json"
+        blessed.write_bytes(provenance_ledger.canonical_profile_bytes(self._profile(head)))
+        self._refused("POLICY_DELTA_ARGUMENT_REQUIRED", head, self.base, authority, trusted_candidate_policy=blessed)
+        v1 = self.outside / "v1.json"
+        v1.write_bytes(_canonical({
+            "schema_version": 1, "kind": "policy-delta-authority",
+            "baseline_policy_sha256": _sha(provenance_ledger.canonical_profile_bytes(self._profile(self.base))),
+            "candidate_policy_sha256": _sha(blessed.read_bytes()),
+            "allowed_delta": {"include_added": [self.NEW_A], "include_removed": [], "exclude_added": [],
+                              "exclude_removed": [], "rule_changes": []},
+        }))
+        self._refused("POLICY_DELTA_ARGUMENT_REQUIRED", head, self.base, v1)
+
+    def test_a_case_colliding_new_path_is_refused(self) -> None:
+        self.repo.branch("pr-case", self.base)
+        policy = self._profile(self.base)
+        policy["include_paths"] = sorted({*policy["include_paths"], "docs/NOTES.md"})
+        head = self._commit_index_only("publish a case variant of docs/notes.md", {
+            "docs/NOTES.md": b"# shadow\n",
+            verifier.POLICY_PATH: provenance_ledger.canonical_profile_bytes(policy),
+        })
+        self._refused("POLICY_DELTA_PATH_COLLISION", head, self.base, self._v3(self.base, head))
+
+    def test_a_case_colliding_new_path_is_a_finding_even_unpublished(self) -> None:
+        self.repo.branch("pr-case-unpublished", self.base)
+        head = self._commit_index_only("an unpublished case variant", {"docs/Notes.md": b"# shadow\n"})
+        verdict = self._attest(head, self.base, None)
+        self.assertIn(("PATH_CASE_COLLISION", "docs/Notes.md"),
+                      {(item["code"], item["path"]) for item in verdict["findings"] if item["fatal"]})
+
+    def test_dropping_an_exclusion_cannot_leave_a_new_implementation_path_unclassified(self) -> None:
+        """Failing before #1673 step 2: the scope check skipped any path the base policy excluded."""
+        hidden = "tools/hidden_helper.py"
+        base_2 = self._change("exclude-hidden", self.base, {},
+                              mutate=lambda policy: policy.update(exclude_paths=sorted({*policy["exclude_paths"], hidden})))
+        head = self._change("drop-exclusion", base_2, {hidden: b"print('hidden')\n"},
+                            mutate=lambda policy: policy.update(exclude_paths=[p for p in policy["exclude_paths"] if p != hidden]))
+        self._refused("POLICY_DELTA_UNCLASSIFIED_PATH", head, base_2, self._v3(base_2, head))
+        # The same change under a V1 authority that approves exactly that exclusion removal.
+        blessed = self.outside / "blessed-exclusion.json"
+        blessed.write_bytes(provenance_ledger.canonical_profile_bytes(self._profile(head)))
+        v1 = self.outside / "v1-exclusion.json"
+        v1.write_bytes(_canonical({
+            "schema_version": 1, "kind": "policy-delta-authority",
+            "baseline_policy_sha256": _sha(provenance_ledger.canonical_profile_bytes(self._profile(base_2))),
+            "candidate_policy_sha256": _sha(blessed.read_bytes()),
+            "allowed_delta": {"include_added": [], "include_removed": [], "exclude_added": [],
+                              "exclude_removed": [hidden], "rule_changes": []},
+        }))
+        verdict = self._attest(head, base_2, v1, trusted_candidate_policy=blessed)
+        self.assertIn(("TRUSTED_SCOPE_VIOLATION", hidden),
+                      {(item["code"], item["path"]) for item in verdict["findings"] if item["fatal"]})
+
+    def test_policy_delta_key_needs_no_trusted_input_and_fails_on_no_change(self) -> None:
+        head = self._change("pr-a", self.base, {self.NEW_A: b"# a\n"}, include=[self.NEW_A])
+        expected = self._v3(self.base, head).stem.split("-", 1)[1]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = verifier.main(["--repo", str(self.repo.root), "--base", self.base, "--candidate", head,
+                                "--policy-delta-key"])
+        self.assertEqual((rc, out.getvalue().strip()), (0, expected))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = verifier.main(["--repo", str(self.repo.root), "--base", self.base, "--candidate", self.base,
+                                "--policy-delta-key"])
+        self.assertEqual((rc, out.getvalue()), (2, ""))
+        self.assertIn("POLICY_DELTA_EMPTY", err.getvalue())
+
+
+class PolicyDeltaV4Tests(_PolicyDeltaFixture):
+    """V4 policy-delta authority: an admission binds each added path to its origin claim.
+
+    The claim is what the trusted record says (class, record id, record classification,
+    upstream, revision, licence). Bytes stay bound only for a byte-identical import. Each case
+    builds the document ``admit_paths.py`` writes and hands it to the verifier, as the workflow
+    does after looking it up under ``--policy-delta-key-v4``.
+    """
+
+    TOOL = "tools/new_tool.py"
+    LIB = "third_party/lib/lib.h"
+    MANIFEST = "third_party/lib/PROVENANCE.md"
+    LIB_BYTES = b"/* synthetic upstream header */\nint lib(void);\n"
+    TOOL_RECORD = {
+        "id": "new-tool-authored", "paths": [TOOL], "classification": "project-authored-independent",
+        "upstream": None, "upstream_revision": None, "upstream_license": None, "evidence_tier": "S",
+    }
+    LIB_RECORD = {
+        "id": "synthetic-lib-import", "paths": [LIB, MANIFEST], "classification": "upstream-third-party",
+        "upstream": "synthetic-lib", "upstream_revision": "commit 0123456789abcdef0123456789abcdef01234567",
+        "upstream_license": "MIT", "evidence_tier": "H",
+    }
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._records([self.TOOL_RECORD, self.LIB_RECORD])
+
+    def _records(self, extra: list[dict]) -> None:
+        authority = json.loads(self.trusted_ledger.read_text(encoding="utf-8"))
+        ids = {record["id"] for record in extra}
+        authority["records"] = [r for r in authority["records"] if r["id"] not in ids] + extra
+        self.write_trusted(authority)
+
+    def _manifest(self, kind: str = "imported byte-identical", lib: bytes | None = None) -> bytes:
+        data = self.LIB_BYTES if lib is None else lib
+        blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+        return (
+            "# PROVENANCE.md - `third_party/lib/`\n\n"
+            "| File | Kind | Upstream blob SHA | SHA-256 |\n| --- | --- | --- | --- |\n"
+            f"| `lib.h` | {kind} | `{blob}` | `{_sha(data)}` |\n"
+            "| `PROVENANCE.md` | project-authored manifest | n/a | n/a |\n"
+        ).encode("utf-8")
+
+    def _v4(self, base: str, head: str, label: str = "v4", bindings: dict[str, str] | None = None) -> Path:
+        """Write the V4 authority an admission of ``head``'s change against ``base`` records."""
+        blobs = verifier.read_tree(self.repo.root, verifier._rev_tree(self.repo.root, head))
+        exact, _patterns, _ids = verifier.load_trusted_records(self.trusted_ledger.read_bytes())
+        document = provenance_ledger.derive_policy_delta_v4(
+            self._profile(base), self._profile(head),
+            digest_of=lambda path: _sha(blobs[path]) if path in blobs else None,
+            claim_of=lambda path: provenance_ledger.admission_claim(path, exact.get(path)),
+            binding_of=lambda path: (bindings or {}).get(path, "claim"),
+        )
+        name = verifier.policy_delta_key_v4(repo=self.repo.root, base_rev=base, candidate_rev=head)
+        self.assertEqual(name, provenance_ledger.policy_delta_v4_key(self._profile(base), self._profile(head)))
+        path = self.outside / f"{label}-{name}.json"
+        path.write_bytes(provenance_ledger.policy_delta_v3_bytes(document))
+        return path
+
+    def _edit(self, files: dict[str, bytes], message: str) -> str:
+        for path, raw in files.items():
+            self.repo.write(path, raw)
+        return self.repo.commit(message)
+
+    def _vendored_pr(self, branch: str = "pr-lib") -> str:
+        return self._change(branch, self.base, {self.LIB: self.LIB_BYTES, self.MANIFEST: self._manifest()},
+                            include=[self.LIB, self.MANIFEST])
+
+    # -- must pass ------------------------------------------------------------
+
+    def test_an_authored_file_edited_after_admission_attests_without_readmission(self) -> None:
+        """Tonight's two re-admissions: a trimmed final blank line and one added annotation."""
+        head = self._change("pr-tool", self.base, {
+            self.TOOL: b"def run(value):\n    return value\n\n\n", self.NEW_A: b"# a\n\n\n",
+        }, include=[self.TOOL, self.NEW_A])
+        v4 = self._v4(self.base, head)
+        v3 = self._v3(self.base, head)
+        edited = self._edit({
+            self.TOOL: b"def run(value: int) -> int:\n    return value\n", self.NEW_A: b"# a\n",
+        }, "end-of-file-fixer and one type annotation, after the admission")
+
+        # The selector depends on the profiles alone: the workflow fetches the same decision.
+        self.assertEqual(verifier.policy_delta_key_v4(repo=self.repo.root, base_rev=self.base, candidate_rev=edited),
+                         v4.stem.split("-", 1)[1])
+        landed = self._land(edited, self.base, v4)
+        self.assertEqual(self._attest(landed, self.base, v4)["policy_delta"]["include_added"],
+                         sorted([self.TOOL, self.NEW_A]))
+        # Before V4 the same edit needed a whole new admission: the V3 pin refuses it.
+        self._refused("POLICY_DELTA_ADDED_BYTES_MISMATCH", edited, self.base, v3)
+
+    def test_an_unedited_byte_identical_import_lands(self) -> None:
+        head = self._vendored_pr()
+        v4 = self._v4(self.base, head, bindings={self.LIB: "bytes"})
+        (entry,) = [item for item in json.loads(v4.read_text(encoding="utf-8"))["include_added"]
+                    if item["path"] == self.LIB]
+        self.assertEqual((entry["binding"], entry["sha256"]), ("bytes", _sha(self.LIB_BYTES)))
+        self._land(head, self.base, v4)
+
+    def test_two_v4_admissions_land_in_either_order(self) -> None:
+        head_1 = self._change("first", self.base, {self.NEW_A: b"# first\n"}, include=[self.NEW_A])
+        head_2 = self._change("second", self.base, {self.TOOL: b"x = 1\n"}, include=[self.TOOL])
+        v4_1, v4_2 = self._v4(self.base, head_1, "first"), self._v4(self.base, head_2, "second")
+        main_1 = self._land(head_1, self.base, v4_1)
+        rebased = self._change("second-on-main", main_1, {self.TOOL: b"x: int = 1\n"}, include=[self.TOOL])
+        self._land(rebased, main_1, v4_2)
+
+    # -- canaries: each must fail closed ----------------------------------------
+
+    def test_a_byte_identical_import_edited_after_admission_fails(self) -> None:
+        head = self._vendored_pr()
+        v4 = self._v4(self.base, head, bindings={self.LIB: "bytes"})
+        edited = self._edit({self.LIB: self.LIB_BYTES.rstrip(b"\n")}, "a formatter drops the final newline")
+        self._refused("POLICY_DELTA_ADDED_BYTES_MISMATCH", edited, self.base, v4)
+
+    def test_an_origin_claim_change_fails(self) -> None:
+        """The trusted record changes after the admission: a new upstream licence or record class."""
+        head = self._vendored_pr()
+        v4 = self._v4(self.base, head, bindings={self.LIB: "bytes"})
+        for field, value in (("upstream_license", "GPL-2.0-or-later"), ("classification", "derived-translated"),
+                             ("upstream_revision", "commit fedcba9876543210fedcba9876543210fedcba98"),
+                             ("upstream", "another-upstream")):
+            with self.subTest(field=field):
+                self._records([{**self.LIB_RECORD, field: value}])
+                self._refused("POLICY_DELTA_CLAIM_MISMATCH", head, self.base, v4)
+        # A path the record stops covering loses its claim's record: a document falls back to its
+        # path rule (a different claim), an implementation path to no claim at all.
+        self._records([{**self.LIB_RECORD, "paths": [self.LIB]}])
+        self._refused("POLICY_DELTA_CLAIM_MISMATCH", head, self.base, v4)
+        self._records([{**self.LIB_RECORD, "paths": [self.MANIFEST]}])
+        self._refused("POLICY_DELTA_CLAIM_UNRESOLVED", head, self.base, v4)
+        self._records([self.LIB_RECORD])
+        self._land(head, self.base, v4)
+
+    def test_an_unadmitted_added_path_still_fails(self) -> None:
+        head = self._change("pr-a", self.base, {self.NEW_A: b"# a\n"}, include=[self.NEW_A])
+        v4 = self._v4(self.base, head)
+        widened = self._change("pr-a-widened", head, {self.TOOL: b"x = 1\n"}, include=[self.NEW_A, self.TOOL])
+        # The workflow derives another name, so the admitted decision is not even fetched ...
+        self.assertNotEqual(
+            verifier.policy_delta_key_v4(repo=self.repo.root, base_rev=self.base, candidate_rev=widened),
+            v4.stem.split("-", 1)[1])
+        # ... and supplied anyway it approves only the admitted path.
+        self._refused("POLICY_DELTA_UNAUTHORIZED", widened, self.base, v4)
+        # With no authority at all the profile change itself fails the verdict.
+        verdict = self._attest(widened, self.base, None)
+        self.assertEqual(verdict["verdict"], "fail")
+        self.assertIn("POLICY_SUBSTITUTION", {finding["code"] for finding in verdict["findings"]})
+
+    def test_an_added_path_whose_file_is_missing_fails(self) -> None:
+        head = self._change("pr-a", self.base, {self.NEW_A: b"# a\n"}, include=[self.NEW_A])
+        v4 = self._v4(self.base, head)
+        self.repo.remove(self.NEW_A)
+        removed = self.repo.commit("drop the admitted file, keep its profile entry")
+        self._refused("POLICY_DELTA_ADDED_PATH_MISSING", removed, self.base, v4)
+
+    def test_malformed_v4_documents_are_refused(self) -> None:
+        head = self._vendored_pr()
+        good = json.loads(self._v4(self.base, head, bindings={self.LIB: "bytes"}).read_text(encoding="utf-8"))
+
+        def tamper(name: str, change) -> Path:
+            document = json.loads(json.dumps(good))
+            change(next(item for item in document["include_added"] if item["path"] == self.LIB))
+            path = self.outside / f"tampered-{name}.json"
+            path.write_bytes(provenance_ledger.policy_delta_v3_bytes(document))
+            return path
+
+        cases = {
+            "claim-binding-with-digest": lambda item: item.update(binding="claim"),
+            "bytes-binding-without-digest": lambda item: item.pop("sha256"),
+            "unknown-binding": lambda item: item.update(binding="trust-me"),
+            "extra-claim-field": lambda item: item["claim"].update(note="x"),
+            "unresolved-claim": lambda item: item["claim"].update(classification="unresolved"),
+        }
+        for name, change in cases.items():
+            with self.subTest(case=name):
+                self._refused("POLICY_DELTA_AUTHORITY_INVALID", head, self.base, tamper(name, change))
+        # Dropping the byte binding is a different decision, so it must not match this one by accident.
+        unbound = tamper("unbound", lambda item: (item.update(binding="claim"), item.pop("sha256")))
+        self._land(head, self.base, unbound)
+
+    def test_a_v4_authority_comes_alone(self) -> None:
+        head = self._change("pr-a", self.base, {self.NEW_A: b"# a\n"}, include=[self.NEW_A])
+        blessed = self.outside / "blessed.json"
+        blessed.write_bytes(provenance_ledger.canonical_profile_bytes(self._profile(head)))
+        self._refused("POLICY_DELTA_ARGUMENT_REQUIRED", head, self.base, self._v4(self.base, head),
+                      trusted_candidate_policy=blessed)
+
+    def test_policy_delta_key_v4_reads_the_profiles_only(self) -> None:
+        head = self._change("pr-a", self.base, {self.NEW_A: b"# a\n"}, include=[self.NEW_A])
+        expected = self._v4(self.base, head).stem.split("-", 1)[1]
+        edited = self._edit({self.NEW_A: b"# a, edited\n"}, "edit the admitted file")
+        for candidate in (head, edited):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = verifier.main(["--repo", str(self.repo.root), "--base", self.base, "--candidate", candidate,
+                                    "--policy-delta-key-v4"])
+            self.assertEqual((rc, out.getvalue().strip()), (0, expected))
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = verifier.main(["--repo", str(self.repo.root), "--base", self.base, "--candidate", self.base,
+                                "--policy-delta-key-v4"])
+        self.assertEqual(rc, 2)
+        self.assertIn("POLICY_DELTA_EMPTY", err.getvalue())
+
+    # -- byte-identical imports after landing -----------------------------------
+
+    def test_a_landed_byte_identical_import_cannot_drift(self) -> None:
+        head = self._vendored_pr()
+        landed = self._land(head, self.base, self._v4(self.base, head, bindings={self.LIB: "bytes"}))
+        drifted_bytes = self.LIB_BYTES + b"\n"
+
+        self.repo.branch("drift", landed)
+        drifted = self._edit({self.LIB: drifted_bytes}, "a hook adds a blank line to the import")
+        verdict = self._attest(drifted, landed, None)
+        self.assertEqual(verdict["verdict"], "fail")
+        self.assertIn("VENDORED_BYTES_DRIFT", {finding["code"] for finding in verdict["findings"]})
+
+        # Dropping the manifest row, or re-wording it as anything but a LOCAL DELTA, is not a way out.
+        for code, manifest in (
+            ("VENDORED_ROW_REMOVED", b"# PROVENANCE.md - `third_party/lib/`\n"),
+            ("VENDORED_ROW_RECLASSIFIED", self._manifest("vendored, lightly tidied", drifted_bytes)),
+        ):
+            with self.subTest(code=code):
+                self.repo.branch(f"hide-{code.lower()}", drifted)
+                hidden = self._edit({self.MANIFEST: manifest}, "hide the change")
+                self.assertIn(code, {f["code"] for f in self._attest(hidden, landed, None)["findings"]})
+
+        # Re-pinning the row to the new bytes cannot approve itself (#1889 review).
+        self.repo.branch("repin", drifted)
+        repinned = self._edit({self.MANIFEST: self._manifest("imported byte-identical", drifted_bytes)},
+                              "pin the manifest row to the edited bytes")
+        verdict = self._attest(repinned, landed, None)
+        self.assertEqual(verdict["verdict"], "fail")
+        self.assertEqual([(f["code"], f["maintainer_action"]) for f in verdict["findings"]],
+                         [("VENDORED_ROW_REPINNED", True)])
+
+        # Recording it as a LOCAL DELTA is the explicit way to change an import, and it changes
+        # the import's claim, so it waits for the maintainer.
+        self.repo.branch("local-delta", drifted)
+        recorded = self._edit({self.MANIFEST: self._manifest("imported + LOCAL DELTA", drifted_bytes)},
+                              "record the change as a LOCAL DELTA")
+        verdict = self._attest(recorded, landed, None)
+        self.assertEqual([(f["code"], f["maintainer_action"]) for f in verdict["findings"]],
+                         [("VENDORED_ROW_LOCAL_DELTA", True)])
+
+        # The maintainer approves the exact new bytes in the trusted ledger, citing the path's record.
+        authority = json.loads(self.trusted_ledger.read_text(encoding="utf-8"))
+        authority["reviewed_blobs"] = [{
+            "path": self.LIB, "sha256": _sha(drifted_bytes), "classification": "upstream-third-party",
+            "record_id": self.LIB_RECORD["id"],
+        }]
+        self.write_trusted(authority)
+        verdict = self._attest(recorded, landed, None)
+        self.assertEqual(verdict["verdict"], "pass", verdict["findings"])
+        verdict = self._attest(repinned, landed, None)
+        self.assertEqual(verdict["verdict"], "pass", verdict["findings"])
+
+
+class VendoredManifestTests(unittest.TestCase):
+    """``_vendored_manifest_findings``: an "imported byte-identical" row keeps its bytes bound."""
+
+    DATA = b"int upstream(void);\n"
+
+    @classmethod
+    def row(cls, kind: str, data: bytes | None = None, *, blob: bool = True, sha: bool = True) -> str:
+        data = cls.DATA if data is None else data
+        blob_id = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() if blob else "n/a"
+        return f"| `up.h` | {kind} | `{blob_id}` | `{_sha(data) if sha else 'n/a'}` |\n"
+
+    @staticmethod
+    def manifest(*rows: str) -> bytes:
+        return ("| File | Kind | Upstream blob SHA | SHA-256 |\n| --- | --- | --- | --- |\n"
+                + "".join(rows)).encode("utf-8")
+
+    def codes(self, candidate: dict[str, bytes], base: dict[str, bytes] | None = None, approved=None) -> list[str]:
+        return [
+            finding.code
+            for finding in verifier._vendored_manifest_findings(candidate, base or {}, change_approved=approved)
+        ]
+
+    def test_matching_rows_pass_and_drift_fails(self) -> None:
+        good = {"lib/PROVENANCE.md": self.manifest(self.row("imported byte-identical")), "lib/up.h": self.DATA}
+        self.assertEqual(self.codes(good), [])
+        drifted = {**good, "lib/up.h": self.DATA + b"\n"}
+        self.assertEqual(self.codes(drifted), ["VENDORED_BYTES_DRIFT", "VENDORED_BYTES_DRIFT"])
+        for blob, sha in ((True, False), (False, True)):
+            with self.subTest(blob=blob, sha=sha):
+                one_hash = {"lib/PROVENANCE.md": self.manifest(self.row("imported byte-identical", blob=blob, sha=sha)),
+                            "lib/up.h": self.DATA + b"\n"}
+                self.assertEqual(self.codes(one_hash), ["VENDORED_BYTES_DRIFT"])
+
+    def test_rows_that_cannot_be_checked_fail_closed(self) -> None:
+        unhashed = {"lib/PROVENANCE.md": self.manifest(self.row("imported byte-identical", blob=False, sha=False)),
+                    "lib/up.h": self.DATA}
+        self.assertEqual(self.codes(unhashed), ["VENDORED_ROW_UNVERIFIABLE"])
+        self.assertEqual(self.codes({"lib/PROVENANCE.md": self.manifest(self.row("imported byte-identical"))}),
+                         ["VENDORED_FILE_MISSING"])
+        escaping = {"lib/PROVENANCE.md": self.manifest(self.row("imported byte-identical").replace("up.h", "../../x.h"))}
+        self.assertEqual(self.codes(escaping), ["VENDORED_FILE_MISSING"])
+        self.assertEqual(self.codes({"lib/PROVENANCE.md": b"\xff\xfe"}), ["VENDORED_MANIFEST_UNREADABLE"])
+
+    def test_leaving_byte_identical_is_explicit(self) -> None:
+        base = {"lib/PROVENANCE.md": self.manifest(self.row("imported byte-identical")), "lib/up.h": self.DATA}
+        edited = self.DATA + b"/* local fix */\n"
+        local_delta = {"lib/PROVENANCE.md": self.manifest(self.row("imported + LOCAL DELTA", edited)),
+                       "lib/up.h": edited}
+        # The relabel changes the import's claim, so it needs the maintainer's approval of the bytes.
+        self.assertEqual(self.codes(local_delta, base), ["VENDORED_ROW_LOCAL_DELTA"])
+        self.assertEqual(self.codes(local_delta, base, approved=lambda path, data: data == edited), [])
+        removed_row = {"lib/PROVENANCE.md": self.manifest(), "lib/up.h": edited}
+        self.assertEqual(self.codes(removed_row, base), ["VENDORED_ROW_REMOVED"])
+        relabelled = {"lib/PROVENANCE.md": self.manifest(self.row("project-authored", edited)), "lib/up.h": edited}
+        self.assertEqual(self.codes(relabelled, base), ["VENDORED_ROW_RECLASSIFIED"])
+        self.assertEqual(self.codes({"lib/up.h": edited}, base), ["VENDORED_ROW_REMOVED"])
+        # Removing the import itself needs no manifest row.
+        self.assertEqual(self.codes({"lib/PROVENANCE.md": self.manifest()}, base), [])
+
+    def test_a_landed_import_cannot_approve_its_own_new_hash(self) -> None:
+        """Rewrite a landed byte-identical import and its pinned hashes together (#1889 review)."""
+        base = {"lib/PROVENANCE.md": self.manifest(self.row("imported byte-identical")), "lib/up.h": self.DATA}
+        edited = self.DATA + b"int injected(void);\n"
+        rehashed = {"lib/PROVENANCE.md": self.manifest(self.row("imported byte-identical", edited)), "lib/up.h": edited}
+        self.assertEqual(self.codes(rehashed), [], "the candidate manifest alone is self-consistent")
+        (finding,) = verifier._vendored_manifest_findings(rehashed, base)
+        self.assertEqual(finding.code, "VENDORED_ROW_REPINNED")
+        self.assertTrue(finding.maintainer_action)
+        self.assertTrue(finding.fatal)
+        # A new upstream revision in the header, even with the same bytes, is a new pin too.
+        relabelled_header = {
+            **base, "lib/PROVENANCE.md": base["lib/PROVENANCE.md"].replace(b"Upstream blob SHA", b"Upstream v9 blob SHA"),
+        }
+        self.assertEqual(self.codes(relabelled_header, base), ["VENDORED_ROW_REPINNED"])
+        self.assertEqual(self.codes(base, base), [])
+        # Only an approval of the candidate's exact bytes clears it.
+        self.assertEqual(self.codes(rehashed, base, approved=lambda path, data: data == edited), [])
+        self.assertEqual(self.codes(rehashed, base, approved=lambda path, data: data == self.DATA),
+                         ["VENDORED_ROW_REPINNED"])
+
+    def test_the_approval_is_a_trusted_exact_blob_entry_citing_the_path_record(self) -> None:
+        edited = self.DATA + b"/* new upstream */\n"
+        trusted = json.dumps({"records": [], "reviewed_blobs": [{
+            "path": "lib/up.h", "sha256": _sha(edited), "classification": "upstream-third-party",
+            "record_id": "lib-import",
+        }]}).encode("utf-8")
+        approved = verifier._vendored_change_approver(trusted, {"lib/up.h": {"id": "lib-import"}})
+        self.assertTrue(approved("lib/up.h", edited))
+        self.assertFalse(approved("lib/up.h", self.DATA), "another digest")
+        self.assertFalse(approved("lib/other.h", edited), "another path")
+        cites_another = verifier._vendored_change_approver(trusted, {"lib/up.h": {"id": "other-record"}})
+        self.assertFalse(cites_another("lib/up.h", edited), "an approval citing a record that does not cover the path")
+        self.assertFalse(verifier._vendored_change_approver(trusted, {})("lib/up.h", edited), "no exact record")
+        untouched = verifier._vendored_change_approver(b"not json", {})
+        self.assertEqual(self.codes({"lib/up.h": self.DATA}, {}, approved=untouched), [],
+                         "the approvals are read only when a change needs one")
+
+    def test_tables_without_a_kind_column_declare_nothing(self) -> None:
+        assets = b"| File | Archive path | SHA-256 |\n| --- | --- | --- |\n| `up.h` | x | `" + b"0" * 64 + b"` |\n"
+        self.assertEqual(self.codes({"lib/PROVENANCE.md": assets, "lib/up.h": self.DATA}), [])
+
+    def test_every_tracked_manifest_matches_its_files(self) -> None:
+        """The real tree: every byte-identical row of every PROVENANCE.md still holds."""
+        blobs = verifier.read_tree(ROOT, verifier._rev_tree(ROOT, "HEAD"))
+        rows = sum(
+            1 for path, raw in blobs.items() if path.endswith("/" + verifier.VENDOR_MANIFEST_NAME)
+            for row in verifier._manifest_rows(raw) or [] if verifier._is_byte_identical_kind(row.get("kind", ""))
+        )
+        self.assertGreater(rows, 0, "the tree carries byte-identical imports")
+        self.assertEqual([finding.as_dict() for finding in verifier._vendored_manifest_findings(blobs, blobs)], [])
+
+
+class IndependentRefreshMergeTests(EphemeralGenerationTests):
+    """Two reviewed refreshes of different paths must land without a resync.
+
+    A refresh used to write a single-slot ``refresh`` audit block into the
+    committed ledger, holding the trusted base tree, the candidate tree and the
+    refreshed path list.  Every landing rewrote those same lines, so two
+    independent refreshes conflicted, and a block written against one base can
+    never reconcile against a later one -- so landing one reviewed change made
+    every other open change's committed controls disagree with the trusted
+    generation and forced a full control resync on it.
+
+    The committed controls are per-path again, so an unrelated landing is a
+    clean merge whose controls already equal a fresh generation of the merged
+    tree: no resync, no second regeneration, no private authority.
+    """
+
+    #: Two documentation paths far apart in the ledger's sort order, so a
+    #: passing merge cannot be an accident of adjacent lines, and neither needs
+    #: implementation-grade authority to be edited.
+    PATH_A = "docs/notes.md"
+    PATH_B = "README.md"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.back_legacy_path()
+        # Put the base into the same committed control form a real main branch
+        # carries, so the two branches below only differ in the paths they edit.
+        self.repo.before_commit = None
+        controls = provenance_refresh.generate_controls(
+            repo=self.repo.root,
+            base_rev=self.base,
+            candidate_tree=verifier._rev_tree(self.repo.root, self.base),
+            trusted_ledger=self.trusted_ledger,
+            workdir=self.outside / "base-controls",
+        )
+        self.repo.write(verifier.LEDGER_PATH, controls.committed_ledger_bytes)
+        self.repo.write(verifier.EXPORT_PATH, controls.generated_export_bytes)
+        self.base = self.repo.commit("base in committed control form")
+
+    def _reviewed_branch(self, name: str, path: str, raw: bytes) -> str:
+        """One reviewed change: edit a path, then regenerate its controls."""
+        self.repo.branch(name, self.base)
+        self.repo.write(path, raw)
+        self.repo.commit(f"edit {path}")
+        controls = provenance_refresh.generate_controls(
+            repo=self.repo.root,
+            base_rev=self.base,
+            candidate_tree=verifier._rev_tree(self.repo.root, self.repo.head()),
+            trusted_ledger=self.trusted_ledger,
+            workdir=self.outside / f"controls-{name}",
+        )
+        self.repo.write(verifier.LEDGER_PATH, controls.committed_ledger_bytes)
+        self.repo.write(verifier.EXPORT_PATH, controls.generated_export_bytes)
+        return self.repo.commit(f"provenance: refresh controls for {path}")
+
+    def test_two_independent_refreshes_merge_and_the_merged_controls_still_verify(self) -> None:
+        landed = self._reviewed_branch("change-a", self.PATH_A, b"# fixture notes, edited by A\n")
+        self._reviewed_branch("change-b", self.PATH_B, b"# fixture\n\nedited by B\n")
+
+        merge = run_git(
+            ["merge", "--no-edit", "change-a"],
+            cwd=self.repo.root, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(
+            merge.returncode, 0,
+            "two independent refreshes must merge without a control conflict:\n"
+            f"{merge.stdout}\n{merge.stderr}",
+        )
+        for path in (verifier.LEDGER_PATH, verifier.EXPORT_PATH):
+            self.assertNotIn(b"<<<<<<<", (self.repo.root / path).read_bytes())
+
+        # ``landed`` is what main becomes, so it is the base the hosted gate
+        # will name.  Verifying against it is the whole point: the merge needs
+        # no regeneration, because what the branch already carries is the
+        # trusted generation of the merged tree against the moved base.
+        head = self.repo.head()
+        verdict = self.run_ephemeral(head, base=landed, authority_baseline=True)
+        self.assertEqual(verdict["verdict"], "pass", verdict["findings"])
+        self.assertEqual(verdict["fatal_count"], 0, verdict["findings"])
+        self.assertEqual(
+            (self.repo.root / verifier.LEDGER_PATH).read_bytes(),
+            Path(verdict["generated_outputs"]["ledger_path"]).read_bytes(),
+        )
+        self.assertEqual(
+            (self.repo.root / verifier.EXPORT_PATH).read_bytes(),
+            Path(verdict["generated_outputs"]["export_path"]).read_bytes(),
+        )
+
+    def test_a_refresh_commits_no_single_slot_audit_block(self) -> None:
+        base_ledger = (self.repo.root / verifier.LEDGER_PATH).read_bytes()
+        self._reviewed_branch("change-a", self.PATH_A, b"# fixture notes, edited by A\n")
+
+        committed = json.loads(
+            (self.repo.root / verifier.LEDGER_PATH).read_text(encoding="utf-8")
+        )
+        self.assertNotIn("refresh", committed)
+        # The committed entries carry claims only (#1673): an edit changes no claim, so the
+        # refresh leaves the ledger's bytes exactly as the base had them.
+        entry = next(
+            item for item in committed["entries"] if item["path"] == self.PATH_A
+        )
+        self.assertNotIn("sha256", entry)
+        self.assertEqual((self.repo.root / verifier.LEDGER_PATH).read_bytes(), base_ledger)
+
+    def test_two_edits_to_one_file_merge_without_a_control_conflict(self) -> None:
+        """Conflict source 1 of #1673: different hunks of one file used to collide on its hash line."""
+        lines = [f"line {index}\n".encode() for index in range(12)]
+        self.repo.branch("shared-file", self.base)
+        self.repo.write(self.PATH_A, b"".join(lines))
+        self.repo.commit("a longer shared file")
+        controls = provenance_refresh.generate_controls(
+            repo=self.repo.root,
+            base_rev=self.base,
+            candidate_tree=verifier._rev_tree(self.repo.root, self.repo.head()),
+            trusted_ledger=self.trusted_ledger,
+            workdir=self.outside / "controls-shared",
+        )
+        self.repo.write(verifier.LEDGER_PATH, controls.committed_ledger_bytes)
+        self.repo.write(verifier.EXPORT_PATH, controls.generated_export_bytes)
+        self.base = self.repo.commit("refresh the shared file's controls")
+        top = b"".join([b"top edit by A\n", *lines[1:]])
+        bottom = b"".join([*lines[:-1], b"bottom edit by B\n"])
+        landed = self._reviewed_branch("hunk-a", self.PATH_A, top)
+        self._reviewed_branch("hunk-b", self.PATH_A, bottom)
+
+        merge = run_git(
+            ["merge", "--no-edit", "hunk-a"],
+            cwd=self.repo.root, capture_output=True, text=True, check=False,
+        )
+
+        self.assertEqual(merge.returncode, 0, f"{merge.stdout}\n{merge.stderr}")
+        merged = (self.repo.root / self.PATH_A).read_bytes()
+        self.assertTrue(merged.startswith(b"top edit by A\n") and merged.endswith(b"bottom edit by B\n"))
+        verdict = self.run_ephemeral(self.repo.head(), base=landed, authority_baseline=True)
+        self.assertEqual(verdict["verdict"], "pass", verdict["findings"])
+        hashed = json.loads(Path(verdict["generated_outputs"]["hashed_ledger_path"]).read_text(encoding="utf-8"))
+        entry = next(item for item in hashed["entries"] if item["path"] == self.PATH_A)
+        self.assertEqual(entry["sha256"], hashlib.sha256(merged).hexdigest(),
+                         "the hosted generation binds the merged bytes")
+
+
+class RealHistoryParityTests(unittest.TestCase):
+    """Historical parity may gain only the explicit changed-test boundary."""
+
+    BASE = "24e25d9e761a700a97e21a090ac7bb19ac82bdda"
+    CANDIDATE = "70a4aec365bd5ffceda504c7c003e4b38db432c2"
+    PRIVATE_CLASS = {
+        "project_authored_attested": "project-authored-independent",
+        "upstream_derived": "derived-translated",
+        "generated_from_public_source": "derived-data",
+    }
+
+    @staticmethod
+    def _git_blob(revision: str, path: str) -> bytes:
+        return subprocess.run(
+            ["git", "show", f"{revision}:{path}"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout
+
+    def _require_history(self) -> None:
+        for revision in (self.BASE, self.CANDIDATE):
+            present = subprocess.run(
+                ["git", "cat-file", "-e", f"{revision}^{{commit}}"],
+                cwd=ROOT,
+                capture_output=True,
+            )
+            if present.returncode != 0:
+                self.skipTest(f"real-history commit unavailable in this checkout: {revision}")
+
+    def _test_authority(self, candidate_ledger: dict, base_ledger: dict) -> dict:
+        """Build a disclosure-safe test authority for already-public claims."""
+
+        records: dict[str, dict] = {}
+        for entry in candidate_ledger["entries"]:
+            classification = entry.get("classification")
+            private_class = self.PRIVATE_CLASS.get(classification)
+            record_id = entry.get("evidence", {}).get("record_id")
+            if private_class is None or not record_id:
+                continue
+            record = records.setdefault(record_id, {
+                "id": record_id,
+                "paths": [],
+                "classification": private_class,
+                "evidence_tier": entry.get("evidence", {}).get("evidence_tier") or "S",
+                "upstream": "documented public source" if private_class != "project-authored-independent" else None,
+                "upstream_paths": [],
+                "upstream_revision": None,
+                "upstream_license": "see NOTICE.md",
+            })
+            self.assertEqual(record["classification"], private_class)
+            record["paths"].append(entry["path"])
+
+        base_entries = {entry["path"]: entry for entry in base_ledger["entries"]}
+        approvals = []
+        for entry in candidate_ledger["entries"]:
+            private_class = self.PRIVATE_CLASS.get(entry.get("classification"))
+            record_id = entry.get("evidence", {}).get("record_id")
+            digest = entry.get("sha256")
+            if private_class is None or not record_id or not digest:
+                continue
+            if base_entries.get(entry["path"], {}).get("sha256") == digest:
+                continue
+            approvals.append({
+                "path": entry["path"],
+                "sha256": digest,
+                "classification": private_class,
+                "record_id": record_id,
+            })
+
+        for record in records.values():
+            record["paths"].sort()
+        return {
+            "schema_version": 1,
+            "records": sorted(records.values(), key=lambda record: record["id"]),
+            "reviewed_blobs": sorted(approvals, key=lambda approval: approval["path"]),
+        }
+
+    def test_real_history_modes_agree_on_recordless_changed_test_fatal(self) -> None:
+        self._require_history()
+        base_ledger_raw = self._git_blob(self.BASE, verifier.LEDGER_PATH)
+        candidate_ledger = json.loads(
+            self._git_blob(self.CANDIDATE, verifier.LEDGER_PATH).decode("utf-8")
+        )
+        base_ledger = json.loads(base_ledger_raw.decode("utf-8"))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            outside = Path(temporary)
+            authority = outside / "test-authority.json"
+            baseline = outside / "trusted-baseline.json"
+            authority.write_bytes(_canonical(self._test_authority(candidate_ledger, base_ledger)))
+            baseline.write_bytes(base_ledger_raw)
+
+            committed = verifier.verify(
+                repo=ROOT,
+                candidate_rev=self.CANDIDATE,
+                base_rev=self.BASE,
+                trusted_ledger=authority,
+                workdir=outside / "committed",
+            )
+            ephemeral = verifier.verify_ephemeral(
+                repo=ROOT,
+                candidate_rev=self.CANDIDATE,
+                base_rev=self.BASE,
+                trusted_ledger=authority,
+                trusted_baseline=baseline,
+                output_dir=outside / "ephemeral",
+            )
+
+        committed_fatal = {
+            (finding["code"], finding["path"])
+            for finding in committed["findings"] if finding["fatal"]
+        }
+        ephemeral_fatal = {
+            (finding["code"], finding["path"])
+            for finding in ephemeral["findings"] if finding["fatal"]
+        }
+        # The property under test is that the two modes agree. The specific
+        # fatal set additionally depends on whether the repository's *committed*
+        # controls have been regenerated since the generator last changed; an
+        # EXPORT_FIELD_MISMATCH against PUBLIC_EXPORT.json is that pending
+        # regeneration, not a disagreement between the modes, and it disappears
+        # once a maintainer refreshes the control.
+        self.assertIn(
+            ("TRUSTED_PATH_MISSING", "tools/test_discovery_contract.py"),
+            committed_fatal,
+            committed["findings"],
+        )
+        self.assertEqual(ephemeral_fatal, committed_fatal, ephemeral["findings"])
+        self.assertTrue(
+            committed_fatal <= {
+                ("TRUSTED_PATH_MISSING", "tools/test_discovery_contract.py"),
+                ("EXPORT_FIELD_MISMATCH", verifier.EXPORT_PATH),
+            },
+            f"unexpected fatal findings on the real history: {sorted(committed_fatal)}",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

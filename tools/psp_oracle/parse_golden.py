@@ -1,0 +1,4516 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+"""Host-side parsers for the PSP hardware golden streams.
+
+Consolidated from the six per-probe modules ``parse_audio_query.py``,
+``parse_cache_alias.py``, ``parse_ctrl_clock.py``, ``parse_fpu_vector.py``,
+``parse_io_matrix.py`` and ``parse_phaseb.py``.  This is a relocation, not a
+rewrite.  Every parser keeps its strict and non-strict semantics, its error
+messages, its exception type, its field names, its field ordering and its
+constants unchanged; each section below is the former module verbatim apart from
+the per-probe constant prefixes described next.
+
+The mailbox delete/wait parser is a new strict record contract for the
+source-owned PSP kernel-object probe.  It validates stream completeness and
+exact field sets without asserting any measured PSP return code.
+
+Two constant names were defined by several of those modules with *different*
+values, so each keeps its own value under a distinct per-probe name rather than
+being merged: ``EXPECTED_TEST_ID`` and ``EXPECTED_TERMINAL_COUNT`` (audio, cache,
+fpu, io, phaseb) and the audio/cache/io trio's ``SEMANTIC_CASES``,
+``TERMINAL_CASE``, ``HOST0_LOG``, ``SPEC`` and ``EXPECTED_CASES``.  The only code
+shared across probes here is the sequence-observable reader, which was
+byte-identical in the three modules that used it.
+
+A parser asserts the *stream*, never the PSP.  These inputs come from a
+hardware-gated probe, so anything unparseable must stay a named failure rather
+than a lenient pass.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+import re
+from typing import cast
+
+from .protocol import ProtocolError, SequenceReport, StreamSpec, TestResult, parse_output, parse_sequence
+
+
+def _observable(report: SequenceReport, case: str, field: str) -> int | None:
+    record = report.results.get(case)
+    if record is None:
+        return None
+    value = dict(record.values).get(field)
+    if value is None:
+        return None
+    return int(value, 0)
+
+
+def _int_field(values: Mapping[str, int | str], field: str) -> int:
+    """Read a numeric field after the parser has validated and converted it."""
+    return cast(int, values[field])
+
+
+# ---------------------------------------------------------------------------
+# PSP-AUDIO-001 audio reservation/query probe
+#
+# The record contract is derived from ``fixtures/psp_oracle/probe.c``
+# ``run_audio_query`` at the frozen source commit: four self-contained
+# reserve/release cells emitted in order by ``emit_record_extended``, then the
+# ``audio-done`` completion sentinel whose ``out0`` is the literal ``4u`` the
+# probe emits.  Nothing here is inherited from an earlier manifest.
+#
+# The audio probe emits per record rather than deferring, because no audio
+# observable spans a cell boundary and ``host0:`` I/O cannot alter ``sceAudio``
+# channel reservation state.  That is a property of this probe, not a licence to
+# log inside any other probe's measured window.
+# ---------------------------------------------------------------------------
+
+AUDIO_EXPECTED_TEST_ID = "PSP-AUDIO-001"
+
+AUDIO_SEMANTIC_CASES = (
+    "audio-ch-reserve",
+    "audio-ch-query-before",
+    "audio-ch-output-blocking-0",
+    "audio-ch-output-blocking-1",
+    "audio-ch-query-after",
+    "audio-ch-release",
+    "audio-ch-query-released",
+    "audio-out2-reserve",
+    "audio-out2-query-before",
+    "audio-out2-output-blocking",
+    "audio-out2-query-after",
+    "audio-out2-release",
+    "audio-src-reserve",
+)
+AUDIO_TERMINAL_CASE = "audio-done"
+AUDIO_HOST0_LOG = "host0:/audio_query_log.txt"
+
+AUDIO_SPEC = StreamSpec(
+    test_id=AUDIO_EXPECTED_TEST_ID,
+    semantic_cases=AUDIO_SEMANTIC_CASES,
+    terminal_case=AUDIO_TERMINAL_CASE,
+)
+AUDIO_EXPECTED_CASES = AUDIO_SPEC.ordered_cases
+AUDIO_EXPECTED_TERMINAL_COUNT = AUDIO_SPEC.terminal_count
+AUDIO_OUT_COUNTS = {
+    "audio-ch-reserve": 3,
+    "audio-ch-query-before": 2,
+    "audio-ch-output-blocking-0": 7,
+    "audio-ch-output-blocking-1": 7,
+    "audio-ch-query-after": 2,
+    "audio-ch-release": 1,
+    "audio-ch-query-released": 2,
+    "audio-out2-reserve": 2,
+    "audio-out2-query-before": 1,
+    "audio-out2-output-blocking": 4,
+    "audio-out2-query-after": 1,
+    "audio-out2-release": 1,
+    "audio-src-reserve": 2,
+    "audio-done": 1,
+}
+
+
+def _validate_scalar_shape(sequence: SequenceReport,
+                           out_counts: dict[str, int]) -> None:
+    for case_id, record in sequence.results.items():
+        values = dict(record.values)
+        expected = {"result", *(f"out{i}" for i in range(out_counts[case_id]))}
+        if set(values) != expected:
+            raise ProtocolError(
+                f"{sequence.spec.test_id}: {case_id} fields must be "
+                f"{sorted(expected)}, got {sorted(values)}"
+            )
+        for field, value in values.items():
+            try:
+                int(value, 0)
+            except ValueError as exc:
+                raise ProtocolError(
+                    f"{sequence.spec.test_id}: {case_id} {field} is not an integer"
+                ) from exc
+
+
+@dataclass(frozen=True)
+class AudioQueryReport:
+    sequence: SequenceReport
+    channel_reserve_rc: int | None
+    channel_rest_len: int | None
+
+    @property
+    def complete(self) -> bool:
+        return self.sequence.complete
+
+    @property
+    def terminal_present(self) -> bool:
+        return self.sequence.terminal_present
+
+    @property
+    def all_passed(self) -> bool:
+        return self.sequence.all_passed
+
+    @property
+    def record_count(self) -> int:
+        return self.sequence.record_count
+
+    @property
+    def results(self):
+        return self.sequence.results
+
+
+def parse_audio_query_output(
+    text: str, *, require_complete: bool = True
+) -> AudioQueryReport:
+    """Parse a captured PSP-AUDIO-001 stream from one channel.
+
+    ``require_complete=True`` is complete-or-error.  ``require_complete=False``
+    diagnoses an ordered prefix and can never report ``all_passed``.
+    """
+
+    sequence = parse_sequence(text, AUDIO_SPEC, require_complete=require_complete)
+    _validate_scalar_shape(sequence, AUDIO_OUT_COUNTS)
+    return AudioQueryReport(
+        sequence=sequence,
+        channel_reserve_rc=_observable(sequence, "audio-ch-reserve", "out0"),
+        channel_rest_len=_observable(sequence, "audio-ch-query-before", "out0"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# PSP-GE-001 raw non-finite input probe
+# ---------------------------------------------------------------------------
+
+GE_NAN_WORDS = {
+    "qnan": 0x7FC00000,
+    "pinf": 0x7F800000,
+    "ninf": 0xFF800000,
+    "nzero": 0x80000000,
+    "denorm": 0x00000001,
+}
+GE_NAN_MODES = ("screen2d", "clip3d", "litnormal")
+GE_NAN_SEMANTIC_CASES = tuple(
+    case_id
+    for name in GE_NAN_WORDS
+    for case_id in (
+        f"ge-nan-vfpu-{name}",
+        *(f"ge-nan-{mode}-{name}" for mode in GE_NAN_MODES),
+    )
+)
+GE_NAN_SPEC = StreamSpec(
+    test_id="PSP-GE-001",
+    semantic_cases=GE_NAN_SEMANTIC_CASES,
+    terminal_case="ge-nan-done",
+)
+GE_NAN_OUT_COUNTS = {
+    **{f"ge-nan-vfpu-{name}": 3 for name in GE_NAN_WORDS},
+    **{
+        f"ge-nan-{mode}-{name}": 4
+        for name in GE_NAN_WORDS
+        for mode in GE_NAN_MODES
+    },
+    "ge-nan-done": 1,
+}
+
+
+def parse_ge_nan_output(text: str, *, require_complete: bool = True) -> SequenceReport:
+    sequence = parse_sequence(text, GE_NAN_SPEC, require_complete=require_complete)
+    _validate_scalar_shape(sequence, GE_NAN_OUT_COUNTS)
+    for case_id, record in sequence.results.items():
+        if case_id == GE_NAN_SPEC.terminal_case:
+            continue
+        sample = case_id.rsplit("-", 1)[1]
+        actual = int(dict(record.values)["out0"], 0)
+        if actual != GE_NAN_WORDS[sample]:
+            raise ProtocolError(
+                f"PSP-GE-001: {case_id} input bits {actual:#010x} do not match "
+                f"the named raw input {GE_NAN_WORDS[sample]:#010x}"
+            )
+    return sequence
+
+
+# ---------------------------------------------------------------------------
+# PSP-VRAM-MIRROR-001 raw EDRAM mirror and depth-buffer observations
+# ---------------------------------------------------------------------------
+
+VRAM_MIRROR_BASES = (
+    0x04000000, 0x04200000, 0x04400000, 0x04600000,
+    0x44000000, 0x44200000, 0x44400000, 0x44600000,
+)
+VRAM_MIRROR_WRITE_BASES = (
+    0x04200000, 0x04400000, 0x04600000,
+    0x44200000, 0x44400000, 0x44600000,
+)
+VRAM_MIRROR_CACHED_ALIAS_COUNT = len(VRAM_MIRROR_BASES) // 2
+VRAM_MIRROR_BYTES = 0x00200000
+VRAM_MIRROR_ROW_BYTES = 0x400
+VRAM_MIRROR_ROW_WORDS = VRAM_MIRROR_ROW_BYTES // 4
+VRAM_MIRROR_DENSE_OFFSET = 0x00088000
+VRAM_MIRROR_DENSE_ROWS = 8
+VRAM_MIRROR_PAIR_BASES = (0x00000000, 0x00044000, 0x00100000, 0x001FF800)
+VRAM_MIRROR_PAIR_ROWS = 2
+VRAM_MIRROR_SWEEP_FIRST_BIT = 2
+VRAM_MIRROR_SWEEP_LAST_BIT = 20
+VRAM_MIRROR_SAMPLE_CHUNK_WORDS = 8
+VRAM_MIRROR_CPU_SAMPLE_WORD_COUNT = (
+    VRAM_MIRROR_DENSE_ROWS * VRAM_MIRROR_ROW_WORDS
+    + len(VRAM_MIRROR_PAIR_BASES) * VRAM_MIRROR_PAIR_ROWS * VRAM_MIRROR_ROW_WORDS
+    + 2 * (VRAM_MIRROR_SWEEP_LAST_BIT - VRAM_MIRROR_SWEEP_FIRST_BIT + 1)
+)
+VRAM_MIRROR_CPU_SAMPLE_CHUNK_COUNT = (
+    (VRAM_MIRROR_CPU_SAMPLE_WORD_COUNT + VRAM_MIRROR_SAMPLE_CHUNK_WORDS - 1)
+    // VRAM_MIRROR_SAMPLE_CHUNK_WORDS
+)
+VRAM_MIRROR_WRITE_OFFSETS = (0x000100, 0x044100, 0x088100)
+VRAM_MIRROR_MARKER_PREFIX = 0xB6000000
+VRAM_MIRROR_PATTERN_PREFIX = 0xA5000000
+VRAM_MIRROR_FRAME_BYTES = 512 * 272 * 2
+VRAM_MIRROR_DEPTH_STRIDE = 512
+VRAM_MIRROR_DEPTH_ROWS = (0, 7, 8, 9, 15, 16, 100, 101, 108, 109)
+VRAM_MIRROR_DEPTH_ROW_COUNT = len(VRAM_MIRROR_DEPTH_ROWS)
+VRAM_MIRROR_DEPTH_ALIASES = (VRAM_MIRROR_BASES[4], VRAM_MIRROR_BASES[5])
+VRAM_MIRROR_DEPTH_CHUNK_PIXELS = 32
+VRAM_MIRROR_DEPTH_ROW_CHUNK_COUNT = (
+    VRAM_MIRROR_DEPTH_STRIDE // VRAM_MIRROR_DEPTH_CHUNK_PIXELS
+)
+VRAM_MIRROR_COLOR_ROWS = (0, 8, 100)
+VRAM_MIRROR_COLOR_CHUNK_PIXELS = 64
+VRAM_MIRROR_COLOR_ROW_CHUNK_COUNT = (
+    VRAM_MIRROR_DEPTH_STRIDE // VRAM_MIRROR_COLOR_CHUNK_PIXELS
+)
+VRAM_MIRROR_COLOR_ALIAS = VRAM_MIRROR_BASES[4]
+VRAM_MIRROR_CLEAR_DEPTH = 0x5A5A
+VRAM_MIRROR_DEPTH_FUNCTION_ALWAYS = 1
+VRAM_MIRROR_DEPTH_MASK_WRITE_ENABLE = 0
+VRAM_MIRROR_DEPTH_RANGE_NEAR = 0xFFFF
+VRAM_MIRROR_DEPTH_RANGE_FAR = 0
+VRAM_MIRROR_GU_SPRITES = 6
+VRAM_MIRROR_GU_VERTEX_TYPE = (7 << 2) | (2 << 7) | (1 << 23)
+VRAM_MIRROR_GE_SYNC_CASES = (
+    ("vram-ge-clear-sync", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    ("vram-ge-sprite-a-sync", 1, 0, 0, 0x1111, 32, 16, 0x1111,
+     0xFFFF0000, 2, VRAM_MIRROR_GU_SPRITES, VRAM_MIRROR_GU_VERTEX_TYPE),
+    ("vram-ge-sprite-b-sync", 2, 64, 8, 0x2222, 96, 12, 0x2222,
+     0xFF00FF00, 2, VRAM_MIRROR_GU_SPRITES, VRAM_MIRROR_GU_VERTEX_TYPE),
+    ("vram-ge-sprite-c-sync", 3, 200, 100, 0x3333, 208, 101, 0x3333,
+     0xFF0000FF, 2, VRAM_MIRROR_GU_SPRITES, VRAM_MIRROR_GU_VERTEX_TYPE),
+)
+VRAM_MIRROR_GE_SYNC_OUT_COUNT = 27
+VRAM_MIRROR_INFO_FIELDS = (
+    "cached_base", "uncached_base", "display_offset", "display_bytes",
+    "display_stride", "display_format", "color_offset", "color_frame_bytes",
+    "depth_offset", "depth_frame_bytes", "vram_bytes", "cpu_sample_word_count",
+    "cpu_dense_offset", "cpu_dense_rows", "cpu_row_bytes", "cpu_pair_region_count",
+    "cpu_pair_rows", "cpu_sweep_first_bit", "cpu_sweep_last_bit",
+    "write_alias_count", "write_sample_count", "write_offset_0", "write_offset_1",
+    "write_offset_2", "write_scan_bytes", "depth_stride", "depth_row_count",
+    *(f"depth_row_y{row}" for row in range(VRAM_MIRROR_DEPTH_ROW_COUNT)),
+    "depth_alias_count", "depth_chunk_pixels", "color_row_count",
+    *(f"color_row_y{row}" for row in range(len(VRAM_MIRROR_COLOR_ROWS))),
+    "color_chunk_pixels",
+    "depth_test_enabled", "depth_function", "depth_mask", "depth_range_near",
+    "depth_range_far", "clear_depth", "pattern_prefix", "marker_prefix",
+    "cached_alias_count",
+)
+VRAM_MIRROR_INFO_OUT_COUNT = len(VRAM_MIRROR_INFO_FIELDS)
+VRAM_MIRROR_SEMANTIC_CASES = (
+    ("vram-mirror-info",)
+    + tuple(
+        f"vram-cpu-pattern-{chunk:03d}"
+        for chunk in range(VRAM_MIRROR_CPU_SAMPLE_CHUNK_COUNT)
+    )
+    + tuple(
+        f"vram-cpu-write-mirror-{alias:02d}-{sample:02d}"
+        for alias in range(len(VRAM_MIRROR_WRITE_BASES))
+        for sample in range(len(VRAM_MIRROR_WRITE_OFFSETS))
+    )
+    + tuple(
+        sync_case[0] for sync_case in VRAM_MIRROR_GE_SYNC_CASES
+    )
+    + tuple(
+        f"vram-ge-depth-row{row}-{chunk:02d}"
+        for row in range(len(VRAM_MIRROR_DEPTH_ROWS))
+        for chunk in range(VRAM_MIRROR_DEPTH_ROW_CHUNK_COUNT)
+    )
+    + tuple(
+        f"vram-ge-color-row{row}-{chunk:02d}"
+        for row in range(len(VRAM_MIRROR_COLOR_ROWS))
+        for chunk in range(VRAM_MIRROR_COLOR_ROW_CHUNK_COUNT)
+    )
+    + ("vram-restore",)
+)
+VRAM_MIRROR_SPEC = StreamSpec(
+    test_id="PSP-VRAM-MIRROR-001",
+    semantic_cases=VRAM_MIRROR_SEMANTIC_CASES,
+    terminal_case="vram-mirror-done",
+)
+VRAM_MIRROR_OUT_COUNTS = {
+    "vram-mirror-info": VRAM_MIRROR_INFO_OUT_COUNT,
+    **{
+        f"vram-cpu-pattern-{chunk:03d}":
+            min(
+                VRAM_MIRROR_SAMPLE_CHUNK_WORDS,
+                VRAM_MIRROR_CPU_SAMPLE_WORD_COUNT
+                - chunk * VRAM_MIRROR_SAMPLE_CHUNK_WORDS,
+            ) * len(VRAM_MIRROR_BASES) * 2
+        for chunk in range(VRAM_MIRROR_CPU_SAMPLE_CHUNK_COUNT)
+    },
+    **{
+        f"vram-cpu-write-mirror-{alias:02d}-{sample:02d}": 4
+        for alias in range(len(VRAM_MIRROR_WRITE_BASES))
+        for sample in range(len(VRAM_MIRROR_WRITE_OFFSETS))
+    },
+    **{
+        sync_case[0]: VRAM_MIRROR_GE_SYNC_OUT_COUNT
+        for sync_case in VRAM_MIRROR_GE_SYNC_CASES
+    },
+    **{
+        f"vram-ge-depth-row{row}-{chunk:02d}":
+            VRAM_MIRROR_DEPTH_CHUNK_PIXELS * len(VRAM_MIRROR_DEPTH_ALIASES) * 2
+        for row in range(len(VRAM_MIRROR_DEPTH_ROWS))
+        for chunk in range(VRAM_MIRROR_DEPTH_ROW_CHUNK_COUNT)
+    },
+    **{
+        f"vram-ge-color-row{row}-{chunk:02d}":
+            VRAM_MIRROR_COLOR_CHUNK_PIXELS * 2
+        for row in range(len(VRAM_MIRROR_COLOR_ROWS))
+        for chunk in range(VRAM_MIRROR_COLOR_ROW_CHUNK_COUNT)
+    },
+    "vram-restore": 5,
+    "vram-mirror-done": 1,
+}
+
+
+def _vram_mirror_integer(record: TestResult, field: str) -> int:
+    try:
+        value = int(dict(record.values)[field], 0)
+    except (KeyError, ValueError) as exc:
+        raise ProtocolError(
+            f"PSP-VRAM-MIRROR-001: {record.case_id} {field} is not an integer"
+        ) from exc
+    if not 0 <= value <= 0xFFFFFFFF:
+        raise ProtocolError(
+            f"PSP-VRAM-MIRROR-001: {record.case_id} {field} is outside a raw word"
+        )
+    return value
+
+
+def _validate_vram_mirror_shapes(sequence: SequenceReport) -> None:
+    for case_id, record in sequence.results.items():
+        values = dict(record.values)
+        if record.status == "SKIP":
+            expected = {"result"}
+            if case_id == VRAM_MIRROR_SPEC.terminal_case:
+                expected.add("out0")
+        else:
+            expected = {
+                "result",
+                *(f"out{index}" for index in range(VRAM_MIRROR_OUT_COUNTS[case_id])),
+            }
+        if set(values) != expected:
+            raise ProtocolError(
+                f"PSP-VRAM-MIRROR-001: {case_id} fields must be "
+                f"{sorted(expected)}, got {sorted(values)}"
+            )
+        for field in values:
+            _vram_mirror_integer(record, field)
+
+
+def _vram_mirror_sample_offsets() -> tuple[int, ...]:
+    offsets = [
+        VRAM_MIRROR_DENSE_OFFSET + word * 4
+        for word in range(VRAM_MIRROR_DENSE_ROWS * VRAM_MIRROR_ROW_WORDS)
+    ]
+    for base in VRAM_MIRROR_PAIR_BASES:
+        for row in range(VRAM_MIRROR_PAIR_ROWS):
+            offsets.extend(
+                base + row * VRAM_MIRROR_ROW_BYTES + word * 4
+                for word in range(VRAM_MIRROR_ROW_WORDS)
+            )
+    for bit in range(VRAM_MIRROR_SWEEP_FIRST_BIT, VRAM_MIRROR_SWEEP_LAST_BIT + 1):
+        power = 1 << bit
+        offsets.extend((VRAM_MIRROR_DENSE_OFFSET ^ power, power))
+    if len(offsets) != VRAM_MIRROR_CPU_SAMPLE_WORD_COUNT:
+        raise ProtocolError("PSP-VRAM-MIRROR-001: sample plan count is inconsistent")
+    return tuple(offsets)
+
+
+def _vram_mirror_validate_address_pairs(
+    record: TestResult, expected_addresses: tuple[int, ...], *, value_max: int = 0xFFFFFFFF
+) -> None:
+    for index, expected_address in enumerate(expected_addresses):
+        address = _vram_mirror_integer(record, f"out{index * 2}")
+        sample = _vram_mirror_integer(record, f"out{index * 2 + 1}")
+        if address != expected_address:
+            raise ProtocolError(
+                f"PSP-VRAM-MIRROR-001: {record.case_id} out{index * 2} "
+                f"must name address {expected_address:#010x}, got {address:#010x}"
+            )
+        if sample > value_max:
+            raise ProtocolError(
+                f"PSP-VRAM-MIRROR-001: {record.case_id} raw sample "
+                f"{sample:#010x} exceeds {value_max:#x}"
+            )
+
+
+def parse_vram_mirror_output(
+    text: str, *, require_complete: bool = True
+) -> SequenceReport:
+    """Parse raw VRAM mirror observations without asserting hardware values."""
+
+    sequence = parse_sequence(text, VRAM_MIRROR_SPEC, require_complete=require_complete)
+    _validate_vram_mirror_shapes(sequence)
+    info_record = sequence.results.get("vram-mirror-info")
+    if info_record is None:
+        return sequence
+    if info_record.status == "SKIP":
+        if any(
+            record.status != "SKIP"
+            for case_id, record in sequence.results.items()
+            if case_id != "vram-mirror-info"
+        ):
+            raise ProtocolError("PSP-VRAM-MIRROR-001: skipped setup has measured records")
+        return sequence
+    if info_record.status != "PASS":
+        raise ProtocolError("PSP-VRAM-MIRROR-001: setup must PASS or SKIP")
+
+    info_words = tuple(
+        _vram_mirror_integer(info_record, f"out{index}")
+        for index in range(VRAM_MIRROR_INFO_OUT_COUNT)
+    )
+    info = dict(zip(VRAM_MIRROR_INFO_FIELDS, info_words, strict=True))
+    cached_base = info["cached_base"]
+    uncached_base = info["uncached_base"]
+    display_offset = info["display_offset"]
+    display_bytes = info["display_bytes"]
+    display_stride = info["display_stride"]
+    display_format = info["display_format"]
+    color_offset = info["color_offset"]
+    depth_offset = info["depth_offset"]
+    frame_bytes = info["color_frame_bytes"]
+    if cached_base != VRAM_MIRROR_BASES[0] or uncached_base != VRAM_MIRROR_BASES[4]:
+        raise ProtocolError("PSP-VRAM-MIRROR-001: base address fields are not PSP VRAM aliases")
+    if (
+        display_bytes == 0
+        or display_stride == 0
+        or display_format > 3
+        or display_offset + display_bytes > VRAM_MIRROR_BYTES
+    ):
+        raise ProtocolError("PSP-VRAM-MIRROR-001: display span is outside 2 MiB VRAM")
+    display_bytes_per_pixel = 4 if display_format == 3 else 2
+    if display_bytes != display_stride * 272 * display_bytes_per_pixel:
+        raise ProtocolError("PSP-VRAM-MIRROR-001: display span does not match its format")
+    if (
+        color_offset % VRAM_MIRROR_ROW_BYTES != 0
+        or color_offset < display_offset + display_bytes
+        or frame_bytes != VRAM_MIRROR_FRAME_BYTES
+        or info["depth_frame_bytes"] != VRAM_MIRROR_FRAME_BYTES
+        or depth_offset != color_offset + frame_bytes
+        or depth_offset + info["depth_frame_bytes"] > VRAM_MIRROR_BYTES
+    ):
+        raise ProtocolError("PSP-VRAM-MIRROR-001: scratch color/depth spans are invalid")
+    expected_info = {
+        "vram_bytes": VRAM_MIRROR_BYTES,
+        "cpu_sample_word_count": VRAM_MIRROR_CPU_SAMPLE_WORD_COUNT,
+        "cpu_dense_offset": VRAM_MIRROR_DENSE_OFFSET,
+        "cpu_dense_rows": VRAM_MIRROR_DENSE_ROWS,
+        "cpu_row_bytes": VRAM_MIRROR_ROW_BYTES,
+        "cpu_pair_region_count": len(VRAM_MIRROR_PAIR_BASES),
+        "cpu_pair_rows": VRAM_MIRROR_PAIR_ROWS,
+        "cpu_sweep_first_bit": VRAM_MIRROR_SWEEP_FIRST_BIT,
+        "cpu_sweep_last_bit": VRAM_MIRROR_SWEEP_LAST_BIT,
+        "write_alias_count": len(VRAM_MIRROR_WRITE_BASES),
+        "write_sample_count": len(VRAM_MIRROR_WRITE_OFFSETS),
+        "write_offset_0": VRAM_MIRROR_WRITE_OFFSETS[0],
+        "write_offset_1": VRAM_MIRROR_WRITE_OFFSETS[1],
+        "write_offset_2": VRAM_MIRROR_WRITE_OFFSETS[2],
+        "write_scan_bytes": VRAM_MIRROR_BYTES,
+        "depth_stride": VRAM_MIRROR_DEPTH_STRIDE,
+        "depth_row_count": len(VRAM_MIRROR_DEPTH_ROWS),
+        **{
+            f"depth_row_y{row}": y
+            for row, y in enumerate(VRAM_MIRROR_DEPTH_ROWS)
+        },
+        "depth_alias_count": len(VRAM_MIRROR_DEPTH_ALIASES),
+        "depth_chunk_pixels": VRAM_MIRROR_DEPTH_CHUNK_PIXELS,
+        "color_row_count": len(VRAM_MIRROR_COLOR_ROWS),
+        **{
+            f"color_row_y{row}": y
+            for row, y in enumerate(VRAM_MIRROR_COLOR_ROWS)
+        },
+        "color_chunk_pixels": VRAM_MIRROR_COLOR_CHUNK_PIXELS,
+        "depth_test_enabled": 1,
+        "depth_function": VRAM_MIRROR_DEPTH_FUNCTION_ALWAYS,
+        "depth_mask": VRAM_MIRROR_DEPTH_MASK_WRITE_ENABLE,
+        "depth_range_near": VRAM_MIRROR_DEPTH_RANGE_NEAR,
+        "depth_range_far": VRAM_MIRROR_DEPTH_RANGE_FAR,
+        "clear_depth": VRAM_MIRROR_CLEAR_DEPTH,
+        "pattern_prefix": VRAM_MIRROR_PATTERN_PREFIX,
+        "marker_prefix": VRAM_MIRROR_MARKER_PREFIX,
+        "cached_alias_count": VRAM_MIRROR_CACHED_ALIAS_COUNT,
+    }
+    if any(info[field] != expected for field, expected in expected_info.items()):
+        raise ProtocolError("PSP-VRAM-MIRROR-001: probe plan metadata does not match the contract")
+    write_offsets = tuple(info[f"write_offset_{index}"]
+                          for index in range(len(VRAM_MIRROR_WRITE_OFFSETS)))
+    if (
+        len(set(write_offsets)) != len(write_offsets)
+        or any(offset & 3 or offset >= 0x00100000 for offset in write_offsets)
+    ):
+        raise ProtocolError("PSP-VRAM-MIRROR-001: write scan offsets are invalid")
+
+    sample_offsets = _vram_mirror_sample_offsets()
+    for chunk in range(VRAM_MIRROR_CPU_SAMPLE_CHUNK_COUNT):
+        first = chunk * VRAM_MIRROR_SAMPLE_CHUNK_WORDS
+        offsets = sample_offsets[first:first + VRAM_MIRROR_SAMPLE_CHUNK_WORDS]
+        record = sequence.results[f"vram-cpu-pattern-{chunk:03d}"]
+        addresses = tuple(
+            alias + offset for offset in offsets for alias in VRAM_MIRROR_BASES
+        )
+        _vram_mirror_validate_address_pairs(record, addresses)
+
+    write_offsets = tuple(info[f"write_offset_{index}"]
+                          for index in range(len(VRAM_MIRROR_WRITE_OFFSETS)))
+    for alias_index, write_base in enumerate(VRAM_MIRROR_WRITE_BASES):
+        for sample_index, offset in enumerate(write_offsets):
+            record = sequence.results[
+                f"vram-cpu-write-mirror-{alias_index:02d}-{sample_index:02d}"
+            ]
+            values = tuple(
+                _vram_mirror_integer(record, f"out{index}") for index in range(4)
+            )
+            expected_address = write_base + offset
+            expected_marker = (
+                VRAM_MIRROR_MARKER_PREFIX | (alias_index << 20) | offset
+            )
+            if values[0:2] != (expected_address, expected_marker):
+                raise ProtocolError(
+                    f"PSP-VRAM-MIRROR-001: {record.case_id} write address/marker "
+                    "does not match the named mirror write"
+                )
+            found_offset, found_count = values[2:4]
+            if found_count > VRAM_MIRROR_BYTES // 4:
+                raise ProtocolError(
+                    f"PSP-VRAM-MIRROR-001: {record.case_id} match count exceeds VRAM"
+                )
+            if found_count == 0:
+                if found_offset != 0xFFFFFFFF:
+                    raise ProtocolError(
+                        f"PSP-VRAM-MIRROR-001: {record.case_id} no-match sentinel is invalid"
+                    )
+            elif found_offset == 0xFFFFFFFF or found_offset & 3 or found_offset >= VRAM_MIRROR_BYTES:
+                raise ProtocolError(
+                    f"PSP-VRAM-MIRROR-001: {record.case_id} first match offset is invalid"
+                )
+
+    for sync_case in VRAM_MIRROR_GE_SYNC_CASES:
+        case_id = sync_case[0]
+        record = sequence.results[case_id]
+        if record.status == "SKIP":
+            continue
+        values = tuple(
+            _vram_mirror_integer(record, f"out{index}")
+            for index in range(VRAM_MIRROR_GE_SYNC_OUT_COUNT)
+        )
+        if values[7:16] != (
+            VRAM_MIRROR_CACHED_ALIAS_COUNT,
+            depth_offset,
+            VRAM_MIRROR_DEPTH_STRIDE,
+            info["depth_range_near"],
+            info["depth_range_far"],
+            info["depth_function"],
+            info["depth_mask"],
+            info["depth_test_enabled"],
+            info["clear_depth"],
+        ):
+            raise ProtocolError(
+                f"PSP-VRAM-MIRROR-001: {case_id} GE state metadata disagrees with setup"
+            )
+        if values[16:] != sync_case[1:]:
+            raise ProtocolError(
+                f"PSP-VRAM-MIRROR-001: {case_id} operation/vertex metadata is invalid"
+            )
+        if values[4] > 1 or values[6] > 1:
+            raise ProtocolError(
+                f"PSP-VRAM-MIRROR-001: {case_id} idle fields are not booleans"
+            )
+
+    depth_rows_y = tuple(info[f"depth_row_y{row}"]
+                         for row in range(VRAM_MIRROR_DEPTH_ROW_COUNT))
+    for row, y in enumerate(depth_rows_y):
+        for chunk in range(VRAM_MIRROR_DEPTH_ROW_CHUNK_COUNT):
+            record = sequence.results[f"vram-ge-depth-row{row}-{chunk:02d}"]
+            if record.status == "SKIP":
+                continue
+            offsets = tuple(
+                depth_offset + (y * VRAM_MIRROR_DEPTH_STRIDE
+                                + chunk * VRAM_MIRROR_DEPTH_CHUNK_PIXELS + pixel) * 2
+                for pixel in range(VRAM_MIRROR_DEPTH_CHUNK_PIXELS)
+            )
+            addresses = tuple(
+                alias + offset
+                for offset in offsets
+                for alias in VRAM_MIRROR_DEPTH_ALIASES
+            )
+            _vram_mirror_validate_address_pairs(record, addresses, value_max=0xFFFF)
+
+    for row, y in enumerate(VRAM_MIRROR_COLOR_ROWS):
+        for chunk in range(VRAM_MIRROR_COLOR_ROW_CHUNK_COUNT):
+            record = sequence.results[f"vram-ge-color-row{row}-{chunk:02d}"]
+            if record.status == "SKIP":
+                continue
+            offsets = tuple(
+                color_offset + (
+                    y * VRAM_MIRROR_DEPTH_STRIDE
+                    + chunk * VRAM_MIRROR_COLOR_CHUNK_PIXELS + pixel
+                ) * 2
+                for pixel in range(VRAM_MIRROR_COLOR_CHUNK_PIXELS)
+            )
+            addresses = tuple(VRAM_MIRROR_COLOR_ALIAS + offset for offset in offsets)
+            _vram_mirror_validate_address_pairs(record, addresses, value_max=0xFFFF)
+
+    restore = sequence.results["vram-restore"]
+    if restore.status != "SKIP":
+        restore_values = tuple(
+            _vram_mirror_integer(restore, f"out{index}") for index in range(5)
+        )
+        if restore_values[0:2] != (VRAM_MIRROR_BASES[4], VRAM_MIRROR_BYTES):
+            raise ProtocolError("PSP-VRAM-MIRROR-001: restore record does not cover all VRAM")
+        if restore_values[2] != 2 * VRAM_MIRROR_CACHED_ALIAS_COUNT:
+            raise ProtocolError(
+                "PSP-VRAM-MIRROR-001: restore record must maintain every cached VRAM alias"
+            )
+        if restore_values[4] > 1:
+            raise ProtocolError("PSP-VRAM-MIRROR-001: restore GE idle field is not boolean")
+        if restore.status == "PASS" and restore_values[3] != 0:
+            raise ProtocolError("PSP-VRAM-MIRROR-001: passing restore has byte mismatches")
+        done = sequence.results[VRAM_MIRROR_SPEC.terminal_case]
+        if restore.status != "PASS" and done.status == "PASS":
+            raise ProtocolError("PSP-VRAM-MIRROR-001: terminal PASS contradicts failed restore")
+    done = sequence.results[VRAM_MIRROR_SPEC.terminal_case]
+    if done.status != "SKIP" and _vram_mirror_integer(done, "out0") != len(
+        VRAM_MIRROR_SEMANTIC_CASES
+    ):
+        raise ProtocolError("PSP-VRAM-MIRROR-001: terminal record count is invalid")
+    return sequence
+
+
+@dataclass(frozen=True)
+class VramMirrorAddressTransform:
+    """Affine VRAM byte-offset mapping learned from position-encoded CPU reads.
+
+    ``column_map[b]`` is the output bit mask contributed by input bit ``b``.
+    The probe samples word-aligned offsets, so columns 0 and 1 are deliberately
+    ``None`` rather than guessed from the unmeasured sub-word bits.
+    """
+
+    alias_base: int
+    constant: int
+    column_map: tuple[int | None, ...]
+    sample_count: int
+
+    def apply(self, offset: int) -> int:
+        if offset < 0 or offset >= VRAM_MIRROR_BYTES or offset & 3:
+            raise ProtocolError(
+                f"PSP-VRAM-MIRROR-001: alias {self.alias_base:#010x} "
+                f"cannot map unmeasured/non-VRAM offset {offset:#x}"
+            )
+        physical = self.constant
+        for bit in range(2, VRAM_MIRROR_BYTES.bit_length() - 1):
+            if offset & (1 << bit):
+                column = self.column_map[bit]
+                if column is None:
+                    raise ProtocolError(
+                        f"PSP-VRAM-MIRROR-001: alias {self.alias_base:#010x} "
+                        f"has no measured column for bit {bit}"
+                    )
+                physical ^= column
+        if physical < 0 or physical >= VRAM_MIRROR_BYTES:
+            raise ProtocolError(
+                f"PSP-VRAM-MIRROR-001: alias {self.alias_base:#010x} "
+                f"mapped outside VRAM to {physical:#x}"
+            )
+        return physical
+
+
+@dataclass(frozen=True)
+class VramMirrorWriteLanding:
+    case_id: str
+    alias_base: int
+    requested_offset: int
+    predicted_offset: int
+    marker: int
+    first_found_offset: int | None
+    found_count: int
+
+    @property
+    def unique_match_agrees_with_read_transform(self) -> bool | None:
+        if self.found_count != 1:
+            return None
+        return self.first_found_offset == self.predicted_offset
+
+
+@dataclass(frozen=True)
+class VramMirrorDepthStorage:
+    relative_xor_candidates: tuple[int, ...]
+    absolute_xor_candidates: tuple[int, ...]
+    observed_sprite_pixels: int
+    alias_crosschecked_words: int
+
+    @staticmethod
+    def _common_bits(candidates: tuple[int, ...]) -> int:
+        if not candidates:
+            return 0
+        common = candidates[0]
+        for candidate in candidates[1:]:
+            common &= candidate
+        return common
+
+    @property
+    def relative_xor_common_bits(self) -> int:
+        return self._common_bits(self.relative_xor_candidates)
+
+    @property
+    def absolute_xor_common_bits(self) -> int:
+        return self._common_bits(self.absolute_xor_candidates)
+
+    @property
+    def absolute_vs_relative_scope_ambiguous(self) -> bool:
+        return self.relative_xor_candidates == self.absolute_xor_candidates
+
+
+@dataclass(frozen=True)
+class VramMirrorAnalysis:
+    address_transforms: tuple[VramMirrorAddressTransform, ...]
+    write_landings: tuple[VramMirrorWriteLanding, ...]
+    depth_storage: VramMirrorDepthStorage
+
+
+def _vram_mirror_affine_transforms(
+    sequence: SequenceReport,
+) -> tuple[VramMirrorAddressTransform, ...]:
+    info_record = sequence.results["vram-mirror-info"]
+    info = {
+        name: _vram_mirror_integer(info_record, f"out{index}")
+        for index, name in enumerate(VRAM_MIRROR_INFO_FIELDS)
+    }
+    pattern_prefix = info["pattern_prefix"]
+    offset_mask = VRAM_MIRROR_BYTES - 1
+    prefix_mask = 0xFFFFFFFF ^ offset_mask
+    observations: list[dict[int, int]] = [dict() for _ in VRAM_MIRROR_BASES]
+
+    sample_offsets = _vram_mirror_sample_offsets()
+    for chunk in range(VRAM_MIRROR_CPU_SAMPLE_CHUNK_COUNT):
+        first = chunk * VRAM_MIRROR_SAMPLE_CHUNK_WORDS
+        offsets = sample_offsets[first:first + VRAM_MIRROR_SAMPLE_CHUNK_WORDS]
+        record = sequence.results[f"vram-cpu-pattern-{chunk:03d}"]
+        if record.status != "PASS":
+            raise ProtocolError(
+                f"PSP-VRAM-MIRROR-001: cannot analyze {record.case_id} with "
+                f"status {record.status}"
+            )
+        for word_index, offset in enumerate(offsets):
+            for alias_index, alias_base in enumerate(VRAM_MIRROR_BASES):
+                output_index = (word_index * len(VRAM_MIRROR_BASES) + alias_index) * 2
+                address = _vram_mirror_integer(record, f"out{output_index}")
+                value = _vram_mirror_integer(record, f"out{output_index + 1}")
+                if address != alias_base + offset:
+                    raise ProtocolError(
+                        f"PSP-VRAM-MIRROR-001: {record.case_id} address changed "
+                        f"while analyzing alias {alias_base:#010x}"
+                    )
+                physical = value & offset_mask
+                if value != (pattern_prefix | physical) or value & prefix_mask != pattern_prefix:
+                    raise ProtocolError(
+                        f"PSP-VRAM-MIRROR-001: {record.case_id} value does not carry "
+                        f"the position pattern for alias {alias_base:#010x}"
+                    )
+                previous = observations[alias_index].setdefault(offset, physical)
+                if previous != physical:
+                    raise ProtocolError(
+                        f"PSP-VRAM-MIRROR-001: alias {alias_base:#010x} maps "
+                        f"offset {offset:#x} inconsistently"
+                    )
+
+    basis_offsets = (0,) + tuple(
+        1 << bit for bit in range(2, VRAM_MIRROR_BYTES.bit_length() - 1)
+    )
+    transforms: list[VramMirrorAddressTransform] = []
+    for alias_index, alias_base in enumerate(VRAM_MIRROR_BASES):
+        mapping = observations[alias_index]
+        missing = tuple(offset for offset in basis_offsets if offset not in mapping)
+        if missing:
+            raise ProtocolError(
+                f"PSP-VRAM-MIRROR-001: alias {alias_base:#010x} lacks affine "
+                f"basis samples {tuple(hex(offset) for offset in missing)}"
+            )
+        constant = mapping[0]
+        columns: list[int | None] = [None, None]
+        columns.extend(mapping[1 << bit] ^ constant for bit in range(2, 21))
+        for offset, physical in mapping.items():
+            predicted = constant
+            for bit in range(2, 21):
+                if offset & (1 << bit):
+                    column = columns[bit]
+                    if column is None:
+                        raise ProtocolError(
+                            "PSP-VRAM-MIRROR-001: affine column map is incomplete"
+                        )
+                    predicted ^= column
+            if predicted != physical:
+                raise ProtocolError(
+                    f"PSP-VRAM-MIRROR-001: alias {alias_base:#010x} is not affine "
+                    f"over GF(2) at offset {offset:#x}"
+                )
+        transforms.append(VramMirrorAddressTransform(
+            alias_base=alias_base,
+            constant=constant,
+            column_map=tuple(columns),
+            sample_count=len(mapping),
+        ))
+    return tuple(transforms)
+
+
+def _vram_mirror_depth_storage(
+    sequence: SequenceReport,
+    info: dict[str, int],
+    transforms: dict[int, VramMirrorAddressTransform],
+) -> VramMirrorDepthStorage:
+    depth_offset = info["depth_offset"]
+    row_bytes = VRAM_MIRROR_DEPTH_STRIDE * 2
+    depth_rows = tuple(
+        info[f"depth_row_y{row}"] for row in range(VRAM_MIRROR_DEPTH_ROW_COUNT)
+    )
+    samples: dict[int, dict[tuple[int, int], int]] = {
+        alias: {} for alias in VRAM_MIRROR_DEPTH_ALIASES
+    }
+    for row_index, y in enumerate(depth_rows):
+        for chunk in range(VRAM_MIRROR_DEPTH_ROW_CHUNK_COUNT):
+            record = sequence.results[f"vram-ge-depth-row{row_index}-{chunk:02d}"]
+            if record.status != "PASS":
+                raise ProtocolError(
+                    f"PSP-VRAM-MIRROR-001: cannot analyze {record.case_id} with "
+                    f"status {record.status}"
+                )
+            for pixel in range(VRAM_MIRROR_DEPTH_CHUNK_PIXELS):
+                x = chunk * VRAM_MIRROR_DEPTH_CHUNK_PIXELS + pixel
+                logical_offset = depth_offset + y * row_bytes + 2 * x
+                for alias_index, alias_base in enumerate(VRAM_MIRROR_DEPTH_ALIASES):
+                    output_index = (pixel * len(VRAM_MIRROR_DEPTH_ALIASES) + alias_index) * 2
+                    address = _vram_mirror_integer(record, f"out{output_index}")
+                    value = _vram_mirror_integer(record, f"out{output_index + 1}")
+                    if address != alias_base + logical_offset:
+                        raise ProtocolError(
+                            f"PSP-VRAM-MIRROR-001: {record.case_id} has a wrong depth address"
+                        )
+                    samples[alias_base][(y, x)] = value
+
+    sprite_sources: dict[int, tuple[int, ...]] = {}
+    for sync_case in VRAM_MIRROR_GE_SYNC_CASES:
+        operation = sync_case[1]
+        if operation == 0:
+            continue
+        x0, y0, z0, x1, y1, z1 = sync_case[2:8]
+        if z0 != z1 or x0 >= x1 or y0 >= y1:
+            raise ProtocolError(
+                f"PSP-VRAM-MIRROR-001: {sync_case[0]} does not describe a flat-Z sprite"
+            )
+        if z0 in sprite_sources:
+            raise ProtocolError(
+                "PSP-VRAM-MIRROR-001: sprite Z values must distinguish the probe sprites"
+            )
+        sprite_sources[z0] = tuple(
+            row * row_bytes + 2 * x
+            for row in range(y0, y1)
+            for x in range(x0, x1)
+        )
+    sprite_z_values = frozenset(sprite_sources)
+    base_samples = samples[VRAM_MIRROR_BASES[4]]
+    observed_hits = {
+        (y, x, value)
+        for (y, x), value in base_samples.items()
+        if value in sprite_z_values
+    }
+    observed_z_values = frozenset(value for _y, _x, value in observed_hits)
+    if observed_z_values != sprite_z_values:
+        raise ProtocolError(
+            "PSP-VRAM-MIRROR-001: sampled base rows do not contain every raw-Z sprite"
+        )
+
+    relative_candidates: set[int] | None = None
+    absolute_candidates: set[int] | None = None
+    for y, x, z_value in observed_hits:
+        observed_linear = y * row_bytes + 2 * x
+        source_offsets = sprite_sources[z_value]
+        relative_for_hit = {observed_linear ^ source for source in source_offsets}
+        absolute_for_hit = {
+            (depth_offset + observed_linear) ^ (depth_offset + source)
+            for source in source_offsets
+        }
+        relative_candidates = (
+            relative_for_hit if relative_candidates is None
+            else relative_candidates & relative_for_hit
+        )
+        absolute_candidates = (
+            absolute_for_hit if absolute_candidates is None
+            else absolute_candidates & absolute_for_hit
+        )
+
+    if not relative_candidates or not absolute_candidates:
+        raise ProtocolError(
+            "PSP-VRAM-MIRROR-001: raw-Z sprites do not share one depth-storage XOR"
+        )
+
+    def matches_sampled_depth(candidate: int, *, absolute: bool) -> tuple[bool, dict[int, int]]:
+        expected_by_physical: dict[int, int] = {}
+        for z_value, source_offsets in sprite_sources.items():
+            for source in source_offsets:
+                physical = (
+                    (depth_offset + source) ^ candidate
+                    if absolute else depth_offset + (source ^ candidate)
+                )
+                if physical < depth_offset or physical >= depth_offset + info["depth_frame_bytes"]:
+                    return False, {}
+                previous = expected_by_physical.setdefault(physical, z_value)
+                if previous != z_value:
+                    return False, {}
+        predicted_hits: set[tuple[int, int, int]] = set()
+        sampled_rows = set(depth_rows)
+        for physical, z_value in expected_by_physical.items():
+            linear = physical - depth_offset
+            if linear & 1:
+                return False, {}
+            y, row_byte_offset = divmod(linear, row_bytes)
+            x, pixel_remainder = divmod(row_byte_offset, 2)
+            if pixel_remainder or x >= VRAM_MIRROR_DEPTH_STRIDE:
+                return False, {}
+            if y in sampled_rows:
+                predicted_hits.add((y, x, z_value))
+        if predicted_hits != observed_hits:
+            return False, {}
+        for (y, x), value in base_samples.items():
+            physical = depth_offset + y * row_bytes + 2 * x
+            expected = expected_by_physical.get(physical)
+            if expected is not None and value != expected:
+                return False, {}
+            if value in sprite_z_values and expected != value:
+                return False, {}
+
+        mirror_transform = transforms[VRAM_MIRROR_DEPTH_ALIASES[1]]
+        mirror_samples = samples[VRAM_MIRROR_DEPTH_ALIASES[1]]
+        for (y, x), value in mirror_samples.items():
+            virtual = depth_offset + y * row_bytes + 2 * x
+            if virtual & 3:
+                continue
+            physical = mirror_transform.apply(virtual)
+            expected = expected_by_physical.get(physical)
+            if expected is not None and value != expected:
+                return False, {}
+            if value in sprite_z_values and expected != value:
+                return False, {}
+        return True, expected_by_physical
+
+    relative_matches: list[int] = []
+    absolute_matches: list[int] = []
+    for candidate in sorted(relative_candidates):
+        if matches_sampled_depth(candidate, absolute=False)[0]:
+            relative_matches.append(candidate)
+    for candidate in sorted(absolute_candidates):
+        if matches_sampled_depth(candidate, absolute=True)[0]:
+            absolute_matches.append(candidate)
+    if not relative_matches or not absolute_matches:
+        raise ProtocolError(
+            "PSP-VRAM-MIRROR-001: depth-storage XOR candidates do not explain "
+            "the sampled raw-Z rows"
+        )
+
+    alias_crosschecked_words = 0
+    base_by_physical = {
+        depth_offset + y * row_bytes + 2 * x: value
+        for (y, x), value in base_samples.items()
+    }
+    mirror_transform = transforms[VRAM_MIRROR_DEPTH_ALIASES[1]]
+    mirror_samples = samples[VRAM_MIRROR_DEPTH_ALIASES[1]]
+    for (y, x), value in mirror_samples.items():
+        virtual = depth_offset + y * row_bytes + 2 * x
+        if virtual & 3:
+            continue
+        physical = mirror_transform.apply(virtual)
+        base_value = base_by_physical.get(physical)
+        if base_value is not None:
+            if value != base_value:
+                raise ProtocolError(
+                    "PSP-VRAM-MIRROR-001: 0x44200000 depth sample disagrees with "
+                    "the decoded base alias"
+                )
+            alias_crosschecked_words += 1
+
+    return VramMirrorDepthStorage(
+        relative_xor_candidates=tuple(relative_matches),
+        absolute_xor_candidates=tuple(absolute_matches),
+        observed_sprite_pixels=len(observed_hits),
+        alias_crosschecked_words=alias_crosschecked_words,
+    )
+
+
+def analyze_vram_mirror_run(sequence: SequenceReport) -> VramMirrorAnalysis:
+    """Derive alias maps, write landings, and the GE depth XOR from one parsed run.
+
+    This analysis consumes only the position pattern and raw probe outputs. It
+    does not compare them with a pinned hardware result; measured expectations
+    belong in source-owned tests, while this function reports what each run says.
+    """
+
+    if sequence.spec.test_id != VRAM_MIRROR_SPEC.test_id:
+        raise ProtocolError(
+            f"expected {VRAM_MIRROR_SPEC.test_id}, got {sequence.spec.test_id}"
+        )
+    if not sequence.complete or not sequence.all_passed:
+        raise ProtocolError(
+            "PSP-VRAM-MIRROR-001: analysis requires a complete all-PASS run"
+        )
+    info_record = sequence.results.get("vram-mirror-info")
+    if info_record is None or info_record.status != "PASS":
+        raise ProtocolError("PSP-VRAM-MIRROR-001: analysis requires PASS setup metadata")
+    info = {
+        name: _vram_mirror_integer(info_record, f"out{index}")
+        for index, name in enumerate(VRAM_MIRROR_INFO_FIELDS)
+    }
+    transforms = _vram_mirror_affine_transforms(sequence)
+    transforms_by_base = {item.alias_base: item for item in transforms}
+
+    write_landings: list[VramMirrorWriteLanding] = []
+    write_offsets = tuple(
+        info[f"write_offset_{index}"] for index in range(len(VRAM_MIRROR_WRITE_OFFSETS))
+    )
+    for alias_index, alias_base in enumerate(VRAM_MIRROR_WRITE_BASES):
+        transform = transforms_by_base[alias_base]
+        for sample_index, requested_offset in enumerate(write_offsets):
+            case_id = f"vram-cpu-write-mirror-{alias_index:02d}-{sample_index:02d}"
+            record = sequence.results[case_id]
+            write_address = _vram_mirror_integer(record, "out0")
+            marker = _vram_mirror_integer(record, "out1")
+            first = _vram_mirror_integer(record, "out2")
+            count = _vram_mirror_integer(record, "out3")
+            predicted = transform.apply(requested_offset)
+            write_landings.append(VramMirrorWriteLanding(
+                case_id=case_id,
+                alias_base=alias_base,
+                requested_offset=write_address - alias_base,
+                predicted_offset=predicted,
+                marker=marker,
+                first_found_offset=None if count == 0 else first,
+                found_count=count,
+            ))
+
+    depth_storage = _vram_mirror_depth_storage(sequence, info, transforms_by_base)
+    return VramMirrorAnalysis(
+        address_transforms=transforms,
+        write_landings=tuple(write_landings),
+        depth_storage=depth_storage,
+    )
+
+
+# ---------------------------------------------------------------------------
+# PSP-DMAC-001 safe alignment/overlap cells and isolated invalid-tail launches
+# ---------------------------------------------------------------------------
+
+DMAC_CELL_OFFSETS = (1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15)
+DMAC_OVERLAP_OFFSETS = (1, 2, 3, 7, 15)
+DMAC_CELL_SEMANTIC_CASES = tuple(
+    [
+        f"align-{api}-{side}-{offset:02x}"
+        for api in ("memcpy", "try")
+        for offset in DMAC_CELL_OFFSETS
+        for side in ("src", "dst", "both")
+    ]
+    + [
+        f"overlap-{api}-{direction}-{delta:02x}"
+        for api in ("memcpy", "try")
+        for delta in DMAC_OVERLAP_OFFSETS
+        for direction in ("forward", "backward")
+    ]
+)
+DMAC_CELL_SPEC = StreamSpec(
+    test_id="PSP-DMAC-001",
+    semantic_cases=DMAC_CELL_SEMANTIC_CASES,
+    terminal_case="dmac-cells-done",
+)
+DMAC_CELL_OUT_COUNTS = {
+    **{case_id: 10 for case_id in DMAC_CELL_SEMANTIC_CASES},
+    "dmac-cells-done": 1,
+}
+DMAC_INVALID_K = 0xC000
+DMAC_INVALID_DELTAS = (1, 4, 0x1000, 0x2000)
+DMAC_INVALID_POST_GUARD_BYTES = 0x1000
+DMAC_INVALID_OVERFLOW_BAND_BYTES = 0x2000
+
+
+@dataclass(frozen=True)
+class DmacInvalidLaunch:
+    tier: str
+    case_ids: tuple[str, ...]
+    api: str | None = None
+    endpoint: str | None = None
+    cell: str | None = None
+
+
+_DMAC_INVALID_S0_SHAPES = (("a", "dst"), ("b", "src"), ("c", "both"), ("d", "dst"))
+# None means the endpoint must be non-null; it does not establish ownership.
+# The ownership proof remains the producer's setup_mask and its source-owned
+# allocation/module buffer contract.
+_DMAC_INVALID_S0_POINTER_SHAPES = {
+    "a": (None, 0),
+    "b": (0, None),
+    "c": (None, None),
+    "d": (None, 0xFFFFFFFF),
+}
+_DMAC_INVALID_B_LAUNCHES = (
+    ("dma-invalid-tail-memcpy-dst", "b1", "memcpy", "dst"),
+    ("dma-invalid-tail-memcpy-src", "b2", "memcpy", "src"),
+    ("dma-invalid-tail-try-dst", "b3", "try", "dst"),
+    ("dma-invalid-tail-try-src", "b4", "try", "src"),
+)
+DMAC_INVALID_CASES = {
+    "dma-invalid-tail-s0": DmacInvalidLaunch(
+        tier="S",
+        case_ids=tuple(
+            f"invalid-tail-s0-{shape}-{api}"
+            for api in ("memcpy", "try")
+            for shape, _endpoint in _DMAC_INVALID_S0_SHAPES
+        ),
+    ),
+    **{
+        campaign_case: DmacInvalidLaunch(
+            tier="B",
+            case_ids=tuple(
+                f"invalid-tail-{cell}-delta-{delta:04x}"
+                for delta in DMAC_INVALID_DELTAS
+            ),
+            api=api,
+            endpoint=endpoint,
+            cell=cell,
+        )
+        for campaign_case, cell, api, endpoint in _DMAC_INVALID_B_LAUNCHES
+    },
+}
+
+# Block allocated, page geometry, refused page at the block's end: the one boundary a cell
+# can cross (bits 0-2; the begin-side refusal of the 2026-11-02 design is gone).
+DMAC_INVALID_SETUP_MASK = 0x7
+
+DMAC_INVALID_FIELDS = frozenset({
+    "result", "rc", "P", "matches", "guards_outside", "post_guard",
+    "overflow_band", "source_intact", "setup_mask", "K", "delta", "api",
+    "endpoint", "cache_discipline", "tier", "executed", "payload_mutations",
+    "source_addr", "destination_addr",
+})
+
+
+def _parse_dmac_invalid_values(record: TestResult, campaign_case: str) -> dict[str, int | str]:
+    values: dict[str, int | str] = dict(record.values)
+    if set(values) != DMAC_INVALID_FIELDS:
+        raise ProtocolError(f"{campaign_case}: Tier {record.case_id} fields are incomplete or unexpected")
+    numeric_fields = DMAC_INVALID_FIELDS - {"api", "endpoint", "tier"}
+    for field in numeric_fields:
+        value = values[field]
+        if not isinstance(value, str) or not value.startswith("0x"):
+            raise ProtocolError(f"{campaign_case}: {record.case_id} {field} is not hexadecimal")
+        try:
+            values[field] = int(value, 16)
+        except ValueError as exc:
+            raise ProtocolError(f"{campaign_case}: {record.case_id} {field} is not hexadecimal") from exc
+    if values["result"] != values["rc"]:
+        raise ProtocolError(f"{campaign_case}: {record.case_id} result does not match rc")
+    if values["K"] != DMAC_INVALID_K:
+        raise ProtocolError(f"{campaign_case}: {record.case_id} changed the disputed K boundary")
+    if values["source_intact"] not in {0, 1} or values["cache_discipline"] not in {0, 1}:
+        raise ProtocolError(f"{campaign_case}: {record.case_id} boolean field is outside 0/1")
+    if values["executed"] not in {0, 1}:
+        raise ProtocolError(f"{campaign_case}: {record.case_id} executed is outside 0/1")
+    if any(not 0 <= _int_field(values, field) <= 0xFFFFFFFF for field in (
+        "source_addr", "destination_addr",
+    )):
+        raise ProtocolError(
+            f"{campaign_case}: {record.case_id} diagnostic address is not a PSP address"
+        )
+    return values
+
+
+def parse_dmac_cells_output(text: str, *, require_complete: bool = True) -> SequenceReport:
+    sequence = parse_sequence(text, DMAC_CELL_SPEC, require_complete=require_complete)
+    _validate_scalar_shape(sequence, DMAC_CELL_OUT_COUNTS)
+    for case_id, record in sequence.results.items():
+        if case_id == DMAC_CELL_SPEC.terminal_case:
+            continue
+        values = {key: int(value, 0) for key, value in record.values}
+        if case_id.startswith("align-"):
+            _, api_name, side, offset_text = case_id.split("-")
+            offset = int(offset_text, 16)
+            expected_api = 0 if api_name == "memcpy" else 1
+            src_offset = offset if side in {"src", "both"} else 0
+            dst_offset = offset if side in {"dst", "both"} else 0
+            wanted = {
+                "out0": expected_api,
+                "out1": src_offset,
+                "out2": dst_offset,
+                "out3": 64,
+            }
+            source_address, destination_address = values["out8"], values["out9"]
+            if source_address % 16 != src_offset or destination_address % 16 != dst_offset:
+                raise ProtocolError(f"PSP-DMAC-001: {case_id} address alignment is false")
+            safe = values["out6"] == 0 and values["out7"] == 1
+        else:
+            _, api_name, direction, delta_text = case_id.split("-")
+            delta = int(delta_text, 16)
+            expected_api = 0 if api_name == "memcpy" else 1
+            expected_direction = 0 if direction == "forward" else 1
+            wanted = {
+                "out0": expected_api,
+                "out1": expected_direction,
+                "out2": delta,
+                "out3": 64,
+            }
+            source_address, destination_address = values["out8"], values["out9"]
+            address_delta = (destination_address - source_address) & 0xFFFFFFFF
+            wanted_delta = delta if expected_direction == 0 else (0x100000000 - delta)
+            if address_delta != wanted_delta:
+                raise ProtocolError(f"PSP-DMAC-001: {case_id} overlap direction is false")
+            safe = values["out6"] == 0
+        for field, expected in wanted.items():
+            if values[field] != expected:
+                raise ProtocolError(
+                    f"PSP-DMAC-001: {case_id} {field}={values[field]:#x}, "
+                    f"expected {expected:#x}"
+                )
+        if record.status == "PASS" and not safe:
+            raise ProtocolError(f"PSP-DMAC-001: {case_id} PASS has a changed guard/source")
+    return sequence
+
+
+def parse_dmac_invalid_tail_output(text: str, campaign_case: str):
+    launch = DMAC_INVALID_CASES.get(campaign_case)
+    if launch is None:
+        raise ProtocolError(f"unknown isolated DMAC invalid-tail case {campaign_case!r}")
+    parsed = parse_output(text)
+    if len(parsed.results) != len(launch.case_ids):
+        raise ProtocolError(f"{campaign_case}: stream does not contain its complete cell set")
+    observed_ids = tuple(record.case_id for record in parsed.results)
+    if observed_ids != launch.case_ids:
+        raise ProtocolError(f"{campaign_case}: cell ids or order differ from the launch contract")
+    if any(record.test_id != "PSP-DMAC-001" for record in parsed.results):
+        raise ProtocolError(f"{campaign_case}: stream contains a foreign test id")
+    statuses = {record.status for record in parsed.results}
+    if len(statuses) != 1 or not statuses <= {"PASS", "SKIP"}:
+        raise ProtocolError(f"{campaign_case}: stream has a mixed or failing cell status")
+
+    for record in parsed.results:
+        values = _parse_dmac_invalid_values(record, campaign_case)
+        if values["tier"] != launch.tier:
+            raise ProtocolError(f"{campaign_case}: {record.case_id} has the wrong tier")
+        if launch.tier == "S":
+            shape, api = record.case_id.removeprefix("invalid-tail-s0-").rsplit("-", 1)
+            endpoint = dict(_DMAC_INVALID_S0_SHAPES).get(shape)
+            if endpoint is None or values["api"] != api or values["endpoint"] != endpoint:
+                raise ProtocolError(f"{campaign_case}: {record.case_id} pointer cell is mislabeled")
+            if values["delta"] != 0:
+                raise ProtocolError(f"{campaign_case}: {record.case_id} size-zero cell has a delta")
+        else:
+            if values["api"] != launch.api or values["endpoint"] != launch.endpoint:
+                raise ProtocolError(f"{campaign_case}: {record.case_id} API or endpoint is mislabeled")
+            delta = int(record.case_id.rsplit("-", 1)[1], 16)
+            if values["delta"] != delta or delta not in DMAC_INVALID_DELTAS:
+                raise ProtocolError(f"{campaign_case}: {record.case_id} delta is outside the cell matrix")
+        if record.status == "SKIP":
+            if values["executed"] != 0 or values["setup_mask"] == DMAC_INVALID_SETUP_MASK:
+                raise ProtocolError(f"{campaign_case}: {record.case_id} SKIP did not fail a setup gate")
+            if values["cache_discipline"] != 0:
+                raise ProtocolError(f"{campaign_case}: {record.case_id} SKIP claims a transfer cache bracket")
+            if values["source_intact"] != 0:
+                raise ProtocolError(
+                    f"{campaign_case}: {record.case_id} SKIP cannot claim source integrity"
+                )
+            if any(values[field] != 0 for field in (
+                "P", "matches", "guards_outside", "post_guard", "overflow_band",
+                "payload_mutations",
+            )):
+                raise ProtocolError(f"{campaign_case}: {record.case_id} SKIP contains transfer mutations")
+            continue
+
+        if values["executed"] != 1 or values["setup_mask"] != DMAC_INVALID_SETUP_MASK:
+            raise ProtocolError(f"{campaign_case}: {record.case_id} PASS lacks ownership proof")
+        if values["cache_discipline"] != 1 or values["source_intact"] != 1:
+            raise ProtocolError(f"{campaign_case}: {record.case_id} PASS lacks cache/source integrity")
+        if values["guards_outside"] != 0:
+            raise ProtocolError(f"{campaign_case}: {record.case_id} changed an outside guard")
+
+        if launch.tier == "S":
+            if values["P"] != 0 or values["matches"] != 0:
+                raise ProtocolError(f"{campaign_case}: {record.case_id} size-zero cell moved bytes")
+            if any(values[field] != 0 for field in (
+                "post_guard", "overflow_band", "payload_mutations",
+            )):
+                raise ProtocolError(f"{campaign_case}: {record.case_id} size-zero cell mutated scratch")
+            expected_source, expected_destination = _DMAC_INVALID_S0_POINTER_SHAPES[shape]
+            for field, expected in (
+                ("source_addr", expected_source),
+                ("destination_addr", expected_destination),
+            ):
+                matches_shape = (
+                    values[field] != 0 if expected is None else values[field] == expected
+                )
+                if not matches_shape:
+                    raise ProtocolError(
+                        f"{campaign_case}: {record.case_id} {field} does not match its S0 pointer shape"
+                    )
+            continue
+
+        delta_text = record.case_id.rsplit("-", 1)[1]
+        delta = int(delta_text, 16)
+        requested = DMAC_INVALID_K + delta
+        copied = _int_field(values, "P")
+        matches = _int_field(values, "matches")
+        if copied > requested or matches > requested or copied > matches:
+            raise ProtocolError(f"{campaign_case}: {record.case_id} copy counts exceed the request")
+        if launch.endpoint == "dst":
+            if values["payload_mutations"] != 0:
+                raise ProtocolError(
+                    f"{campaign_case}: {record.case_id} destination cell claims source payload mutations"
+                )
+            post_guard = _int_field(values, "post_guard")
+            overflow_band = _int_field(values, "overflow_band")
+            if post_guard > DMAC_INVALID_POST_GUARD_BYTES or \
+                    overflow_band > DMAC_INVALID_OVERFLOW_BAND_BYTES:
+                raise ProtocolError(f"{campaign_case}: {record.case_id} mutation count exceeds its region")
+            expected_overrun = max(copied - DMAC_INVALID_K, 0)
+            expected_post = min(expected_overrun, DMAC_INVALID_POST_GUARD_BYTES)
+            expected_band = max(expected_overrun - DMAC_INVALID_POST_GUARD_BYTES, 0)
+            if post_guard != expected_post or overflow_band != expected_band:
+                raise ProtocolError(f"{campaign_case}: {record.case_id} overrun classification is incomplete")
+        elif any(_int_field(values, field) != 0 for field in (
+            "post_guard", "overflow_band", "payload_mutations",
+        )):
+            raise ProtocolError(f"{campaign_case}: {record.case_id} source cell mutated its scratch block")
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# PSP-KERNEL-002 zero-duration delay/yield/callback probe
+# ---------------------------------------------------------------------------
+
+DELAY_ZERO_SEMANTIC_CASES = ("delay-threadcb-zero", "delay-thread-zero")
+DELAY_ZERO_SPEC = StreamSpec(
+    test_id="PSP-KERNEL-002",
+    semantic_cases=DELAY_ZERO_SEMANTIC_CASES,
+    terminal_case="delay-zero-done",
+)
+DELAY_ZERO_OUT_COUNTS = {case_id: 10 for case_id in DELAY_ZERO_SEMANTIC_CASES}
+DELAY_ZERO_OUT_COUNTS["delay-zero-done"] = 1
+
+
+def parse_delay_zero_output(text: str, *, require_complete: bool = True) -> SequenceReport:
+    sequence = parse_sequence(text, DELAY_ZERO_SPEC, require_complete=require_complete)
+    _validate_scalar_shape(sequence, DELAY_ZERO_OUT_COUNTS)
+    for case_id, record in sequence.results.items():
+        if case_id == DELAY_ZERO_SPEC.terminal_case or record.status != "PASS":
+            continue
+        values = {key: int(value, 0) for key, value in record.values}
+        if values["out0"] != 0 or values["out2"] != 0 or \
+                values["out3"] != 0 or values["out6"] != values["out7"] or \
+                values["out8"] != 2:
+            raise ProtocolError(
+                f"PSP-KERNEL-002: {case_id} PASS did not start with an equal-priority "
+                "ready thread and pending callback"
+            )
+    return sequence
+
+
+# ---------------------------------------------------------------------------
+# Campaign cases whose measurements are intentionally still NOT_RUN.
+# ---------------------------------------------------------------------------
+
+CAMPAIGN_PROBE_CASES: dict[str, tuple[StreamSpec, dict[str, int]]] = {}
+
+
+def _register_campaign_probe(
+    campaign_case: str,
+    test_id: str,
+    semantic_cases: tuple[str, ...],
+    out_counts: dict[str, int],
+    *,
+    terminal_case: str | None = None,
+) -> None:
+    spec = StreamSpec(
+        test_id,
+        semantic_cases,
+        terminal_case or f"{campaign_case}-done",
+    )
+    counts = dict(out_counts)
+    counts[spec.terminal_case] = 1
+    CAMPAIGN_PROBE_CASES[campaign_case] = (spec, counts)
+
+
+_register_campaign_probe(
+    "kernel-alarm", "PSP-ALARM-001",
+    ("alarm-null-handler", "alarm-zero-clock", "alarm-table-exhaustion",
+     "alarm-cancel-fired-once", "alarm-cancel-cancelled", "alarm-cancel-unknown",
+     "alarm-rearm-base", "alarm-blocking-in-handler"),
+    {"alarm-null-handler": 2, "alarm-zero-clock": 3, "alarm-table-exhaustion": 3,
+     "alarm-cancel-fired-once": 3, "alarm-cancel-cancelled": 3,
+     "alarm-cancel-unknown": 1, "alarm-rearm-base": 5,
+     "alarm-blocking-in-handler": 5},
+)
+_register_campaign_probe(
+    "thread-scheduler", "PSP-THREAD-003",
+    ("thread-suspend-idle", "thread-suspend-self", "thread-resume-idle",
+     "thread-rotate-range", "thread-ready-order-after-rotate",
+     "thread-suspend-wait-timeout"),
+    {"thread-suspend-idle": 4, "thread-suspend-self": 4,
+     "thread-resume-idle": 1, "thread-rotate-range": 1,
+     "thread-ready-order-after-rotate": 7, "thread-suspend-wait-timeout": 5},
+)
+_register_campaign_probe(
+    "wait-outcomes", "PSP-WAIT-001",
+    ("sema-signal-before-deadline-late-dispatch",
+     "event-signal-before-deadline-late-dispatch",
+     "sema-cancel-before-deadline-late-dispatch",
+     "event-cancel-before-deadline-late-dispatch"),
+    {case_id: 5 for case_id in (
+        "sema-signal-before-deadline-late-dispatch",
+        "event-signal-before-deadline-late-dispatch",
+        "sema-cancel-before-deadline-late-dispatch",
+        "event-cancel-before-deadline-late-dispatch",
+    )},
+)
+_register_campaign_probe(
+    "refer-status-size", "PSP-KERNEL-STATUS-001",
+    tuple(f"{kind}-size-{size}" for kind in ("sema", "event", "mbx")
+          for size in ("zero", "8", "40", "full")),
+    {f"{kind}-size-{size}": 5
+     for kind in ("sema", "event", "mbx")
+     for size in ("zero", "8", "40", "full")},
+)
+_register_campaign_probe(
+    "ge-break-continue", "PSP-GE-CONTROL-001",
+    ("ge-break-no-active-list", "ge-continue-no-paused-list",
+     "ge-break-invalid-mode", "ge-list-sync-paused", "ge-draw-sync-paused",
+     "ge-continue-drain", "ge-quiesce-after-continue",
+     "ge-break-reset-no-dequeue", "ge-list-sync-cancelled",
+     "ge-draw-sync-cancelled", "ge-quiesce-after-cancel",
+     "ge-list-dequeue-stalled", "ge-quiesce-after-dequeue"),
+    {"ge-break-no-active-list": 2, "ge-continue-no-paused-list": 1,
+     "ge-break-invalid-mode": 2, "ge-list-sync-paused": 3,
+     "ge-draw-sync-paused": 3, "ge-continue-drain": 5,
+     "ge-quiesce-after-continue": 4, "ge-break-reset-no-dequeue": 2,
+     "ge-list-sync-cancelled": 3, "ge-draw-sync-cancelled": 3,
+     "ge-quiesce-after-cancel": 4, "ge-list-dequeue-stalled": 4,
+     "ge-quiesce-after-dequeue": 4},
+)
+# ge-sync-ids (78, probe.c, #1374): GE sync results for a queue id no enqueue returned, the id
+# of a completed list (before and after later lists, and after a sceGeDrawSync(0)) and a list
+# a reset removed, in the poll form and in the bounded blocking form, and sync types other
+# than 0 and 1 on an idle GE. A blocking record is qid, returned (0: no return within the
+# 200 ms bound), result, wait result, delete result and elapsed us.
+GE_SYNC_IDS_CASES = (
+    "ge-list-sync-unknown-poll", "ge-list-dequeue-unknown", "ge-list-sync-completed-poll",
+    "ge-sync-invalid-mode", "ge-list-sync-after-reenqueue", "ge-list-sync-stale-1",
+    "ge-list-sync-stale-2", "ge-list-sync-stale-3", "ge-draw-sync-idle-wait",
+    "ge-list-sync-after-draw-wait", "ge-list-sync-cancelled-poll",
+    "ge-draw-sync-after-reset-wait", "ge-list-sync-completed-wait",
+    "ge-list-sync-cancelled-wait", "ge-list-sync-unknown-wait", "ge-list-sync-stale-wait",
+    "ge-sync-quiesce",
+)
+GE_SYNC_IDS_OUT_COUNTS = {
+    "ge-list-sync-unknown-poll": 4, "ge-list-dequeue-unknown": 2,
+    "ge-list-sync-completed-poll": 7, "ge-sync-invalid-mode": 4,
+    "ge-list-sync-after-reenqueue": 7, "ge-list-sync-stale-1": 7, "ge-list-sync-stale-2": 7,
+    "ge-list-sync-stale-3": 7, "ge-draw-sync-idle-wait": 6, "ge-list-sync-after-draw-wait": 4,
+    "ge-list-sync-cancelled-poll": 4, "ge-draw-sync-after-reset-wait": 6,
+    "ge-list-sync-completed-wait": 6, "ge-list-sync-cancelled-wait": 6,
+    "ge-list-sync-unknown-wait": 6, "ge-list-sync-stale-wait": 6, "ge-sync-quiesce": 4,
+}
+_register_campaign_probe(
+    "ge-sync-ids", "PSP-GE-SYNC-001", GE_SYNC_IDS_CASES, GE_SYNC_IDS_OUT_COUNTS,
+)
+_register_campaign_probe(
+    "kernel-misc", "PSP-KERNEL-MISC-001",
+    ("sysclock-wide", "ctrl-sampling-mode", "thread-profiler",
+     "global-profiler", "vtimer-basic", "display-basic", "impose-basic"),
+    {"sysclock-wide": 4, "ctrl-sampling-mode": 2, "thread-profiler": 2,
+     "global-profiler": 2, "vtimer-basic": 13, "display-basic": 4,
+     "impose-basic": 5},
+)
+# vfpu-compare: 15 operand pairs for each of vscmp.s, vsge.s and vslt.s, emitted
+# op-major (every vscmp.s cell, then vsge.s, then vslt.s), each with three
+# words: the model word, then the two operands. PASS means the compare wrote its
+# destination; agreement with the model is the result word against out0, which a
+# report reads (the status does not judge it). The parser checks shape.
+_VFPU_COMPARE_PAIRS = (
+    "lt", "eq", "gt", "zero-pos-neg", "zero-neg-pos", "nan-left-quiet",
+    "nan-right-quiet", "nan-left-signal", "nan-right-signal", "nan-left-negative",
+    "inf-pos-neg", "inf-neg-pos", "inf-pos-pos", "inf-neg-neg", "inf-pos-finite",
+)
+_register_campaign_probe(
+    "vfpu-compare", "PSP-VFPU-CMP-001",
+    tuple(f"{op}-{pair}" for op in ("vscmp", "vsge", "vslt") for pair in _VFPU_COMPARE_PAIRS),
+    {f"{op}-{pair}": 3 for op in ("vscmp", "vsge", "vslt") for pair in _VFPU_COMPARE_PAIRS},
+)
+
+
+# HLE measurement families (probe_hle_measure.c; H-oracle-hle-measure-1009).
+# Every cell is emitted, as PASS, FAIL or SKIP, so each stream has a fixed shape
+# and order. The contracts check shape and order only: no PSP return value is
+# asserted, because these probes exist to measure what the console returns. The
+# exceptions are validate_hle_edram_restore, which checks the GE probe's own restore
+# of the state it changed, and validate_hle_savedata_getsize_absent, which checks the
+# precondition that probe measures under; neither is a console semantic.
+_register_campaign_probe(
+    "hle-kernel-status", "PSP-HLE-KERNEL-STATUS-001",
+    ("sys-status-size-0x1c", "sys-status-size-0x20", "sys-status-size-0x08",
+     "sys-status-size-0x00", "fpl-create", "fpl-refer-full-all-free",
+     "fpl-try-alloc-a", "fpl-try-alloc-b", "fpl-try-alloc-exhausted",
+     "fpl-refer-full-two-held", "fpl-refer-size-0x08-two-held",
+     "fpl-refer-size-0x00-two-held", "fpl-free-a", "fpl-refer-full-one-free",
+     "fpl-free-b", "fpl-delete", "fpl-refer-full-after-delete"),
+    {"sys-status-size-0x1c": 8, "sys-status-size-0x20": 8,
+     "sys-status-size-0x08": 8, "sys-status-size-0x00": 8,
+     "fpl-create": 1, "fpl-refer-full-all-free": 14,
+     "fpl-try-alloc-a": 1, "fpl-try-alloc-b": 1, "fpl-try-alloc-exhausted": 1,
+     "fpl-refer-full-two-held": 14, "fpl-refer-size-0x08-two-held": 14,
+     "fpl-refer-size-0x00-two-held": 14, "fpl-free-a": 1,
+     "fpl-refer-full-one-free": 14, "fpl-free-b": 1, "fpl-delete": 1,
+     "fpl-refer-full-after-delete": 14},
+)
+_register_campaign_probe(
+    "hle-vtimer", "PSP-HLE-VTIMER-001",
+    ("vtimer-create", "vtimer-refer-created", "vtimer-stop-not-started",
+     "vtimer-start", "vtimer-time-running-early", "vtimer-refer-running-early",
+     "vtimer-delay-20ms", "vtimer-time-running-20ms", "vtimer-stop",
+     "vtimer-time-stopped", "vtimer-refer-stopped", "vtimer-delay-20ms-stopped",
+     "vtimer-time-stopped-later", "vtimer-start-restart", "vtimer-refer-size-0x08",
+     "vtimer-delete-running", "vtimer-refer-after-delete", "vtimer-delete-again"),
+    {"vtimer-create": 1, "vtimer-refer-created": 18, "vtimer-stop-not-started": 1,
+     "vtimer-start": 1, "vtimer-time-running-early": 2,
+     "vtimer-refer-running-early": 18, "vtimer-delay-20ms": 1,
+     "vtimer-time-running-20ms": 2, "vtimer-stop": 1, "vtimer-time-stopped": 2,
+     "vtimer-refer-stopped": 18, "vtimer-delay-20ms-stopped": 1,
+     "vtimer-time-stopped-later": 2, "vtimer-start-restart": 1,
+     "vtimer-refer-size-0x08": 18, "vtimer-delete-running": 1,
+     "vtimer-refer-after-delete": 18, "vtimer-delete-again": 1},
+)
+# hle-power-clock: the scePower getters return the clock, so for the Int and bare
+# getters the record's result IS the value (the frequency) and out0 repeats it. For
+# the Float getters result is the IEEE-754 bit pattern and out0 the truncated integer
+# part (all ones when out of range or NaN). The contract checks field shape only, so
+# result is never read here as a return code.
+_register_campaign_probe(
+    "hle-power-clock", "PSP-HLE-POWER-001",
+    ("pll-clock-int", "pll-clock-float", "cpu-clock-int", "cpu-clock-float",
+     "cpu-clock-alias", "bus-clock-int", "bus-clock-float", "bus-clock-alias",
+     "cpu-clock-int-repeat"),
+    {case_id: 1 for case_id in (
+        "pll-clock-int", "pll-clock-float", "cpu-clock-int", "cpu-clock-float",
+        "cpu-clock-alias", "bus-clock-int", "bus-clock-float", "bus-clock-alias",
+        "cpu-clock-int-repeat",
+    )},
+)
+_register_campaign_probe(
+    "hle-hprm", "PSP-HLE-HPRM-001",
+    ("hprm-remote-first", "hprm-headphone-first", "hprm-microphone-first",
+     "hprm-remote-second", "hprm-headphone-second", "hprm-microphone-second"),
+    {case_id: 1 for case_id in (
+        "hprm-remote-first", "hprm-headphone-first", "hprm-microphone-first",
+        "hprm-remote-second", "hprm-headphone-second", "hprm-microphone-second",
+    )},
+)
+_register_campaign_probe(
+    "hle-ctrl-latch", "PSP-HLE-CTRL-LATCH-001",
+    ("latch-read-initial", "latch-peek-initial", "latch-poll-window",
+     "latch-read-after-poll", "latch-peek-after-poll",
+     "latch-read-clears-peek-keeps"),
+    {"latch-read-initial": 4, "latch-peek-initial": 4, "latch-poll-window": 6,
+     "latch-read-after-poll": 4, "latch-peek-after-poll": 4,
+     "latch-read-clears-peek-keeps": 5},
+)
+_register_campaign_probe(
+    "hle-sysparam", "PSP-HLE-SYSPARAM-001",
+    ("int-id-2", "int-id-3", "int-id-4", "int-id-5", "int-id-6", "int-id-7",
+     "int-id-8", "int-id-9", "int-unknown-0", "int-unknown-10", "int-unknown-64",
+     "string-id-1-len-0x80", "string-id-1-len-0x04"),
+    {**{f"int-id-{i}": 1 for i in range(2, 10)},
+     "int-unknown-0": 1, "int-unknown-10": 1, "int-unknown-64": 1,
+     "string-id-1-len-0x80": 3, "string-id-1-len-0x04": 3},
+)
+_register_campaign_probe(
+    "hle-ge-edram", "PSP-HLE-GE-EDRAM-001",
+    ("edram-size", "edram-addr", "edram-width-query-initial",
+     "edram-width-set-512", "edram-width-set-1024", "edram-width-set-2048",
+     "edram-width-set-4096", "edram-width-restore", "edram-width-query-final"),
+    {case_id: 1 for case_id in (
+        "edram-size", "edram-addr", "edram-width-query-initial",
+        "edram-width-set-512", "edram-width-set-1024", "edram-width-set-2048",
+        "edram-width-set-4096", "edram-width-restore", "edram-width-query-final",
+    )},
+)
+
+# Single-launch HLE cases (probe_hle_measure.c, one launch each). Shape only: a cell
+# is PASS when its calls completed, SKIP when the object it needs was not obtained,
+# and every out word is an observation. Nothing here compares a value with a PSP
+# expectation. The fixed-pool delete cells of hle-kernel-pool-bounds are PASS with
+# out0 0 when their create was refused (validate_hle_pool_bounds_deletes).
+_register_campaign_probe(
+    "hle-vtimer-unit", "PSP-HLE-VTIMER-002",
+    ("vtimer-unit-create", "vtimer-unit-start", "vtimer-unit-time-a",
+     "vtimer-unit-systime-a", "vtimer-unit-delay", "vtimer-unit-time-b",
+     "vtimer-unit-systime-b", "vtimer-unit-base-running",
+     "vtimer-unit-refer-running", "vtimer-unit-stop", "vtimer-unit-base-stopped",
+     "vtimer-unit-refer-stopped", "vtimer-unit-delete"),
+    {"vtimer-unit-create": 1, "vtimer-unit-start": 1, "vtimer-unit-time-a": 2,
+     "vtimer-unit-systime-a": 2, "vtimer-unit-delay": 1, "vtimer-unit-time-b": 2,
+     "vtimer-unit-systime-b": 2, "vtimer-unit-base-running": 2,
+     "vtimer-unit-refer-running": 2, "vtimer-unit-stop": 1,
+     "vtimer-unit-base-stopped": 2, "vtimer-unit-refer-stopped": 2,
+     "vtimer-unit-delete": 1},
+)
+_register_campaign_probe(
+    "hle-vtimer-errors", "PSP-HLE-VTIMER-003",
+    ("vtimer-err-create-stale", "vtimer-err-delete-stale",
+     "vtimer-err-start-deleted", "vtimer-err-stop-deleted",
+     "vtimer-err-time-deleted", "vtimer-err-cleanup-stale",
+     "vtimer-err-create-live", "vtimer-err-delete-live",
+     "vtimer-err-noslot-create", "vtimer-err-noslot-cleanup"),
+    {"vtimer-err-create-stale": 1, "vtimer-err-delete-stale": 1,
+     "vtimer-err-start-deleted": 1, "vtimer-err-stop-deleted": 1,
+     "vtimer-err-time-deleted": 2, "vtimer-err-cleanup-stale": 0,
+     "vtimer-err-create-live": 1, "vtimer-err-delete-live": 1,
+     "vtimer-err-noslot-create": 2, "vtimer-err-noslot-cleanup": 2},
+)
+_register_campaign_probe(
+    "hle-kernel-pool-bounds", "PSP-HLE-KERNEL-STATUS-002",
+    ("fpl-create-size-0x00", "fpl-delete-size-0x00",
+     "fpl-create-size-0x7fffffff", "fpl-delete-size-0x7fffffff", "vpl-create",
+     "vpl-try-alloc-refusal", "vpl-free-all", "vpl-delete"),
+    {"fpl-create-size-0x00": 1, "fpl-delete-size-0x00": 1,
+     "fpl-create-size-0x7fffffff": 1, "fpl-delete-size-0x7fffffff": 1,
+     "vpl-create": 1, "vpl-try-alloc-refusal": 2, "vpl-free-all": 2,
+     "vpl-delete": 1},
+)
+_register_campaign_probe(
+    "hle-null-out-pointers", "PSP-HLE-NULL-OUT-001",
+    ("null-vtimer-create", "null-sys-status", "null-vtimer-time", "null-vtimer-base",
+     "null-vtimer-refer", "null-vtimer-delete"),
+    {"null-vtimer-create": 0, "null-sys-status": 0, "null-vtimer-time": 0,
+     "null-vtimer-base": 0, "null-vtimer-refer": 0, "null-vtimer-delete": 0},
+)
+_register_campaign_probe(
+    "hle-power-float-v0", "PSP-HLE-POWER-002",
+    ("pll-clock-float-v0", "cpu-clock-float-v0", "bus-clock-float-v0"),
+    {"pll-clock-float-v0": 1, "cpu-clock-float-v0": 1, "bus-clock-float-v0": 1},
+)
+_HLE_AUDIO_SRC_INVALID_CASES = (
+    "src-reserve-invalid-samples-zero", "src-reserve-invalid-samples-65",
+    "src-reserve-invalid-samples-4096", "src-reserve-invalid-frequency",
+    "src-reserve-invalid-channels-1", "src-reserve-invalid-channels-4",
+)
+_HLE_AUDIO_SRC_CASES = (
+    "src-release-unreserved", "src-output-unreserved", "src-reserve-valid",
+    "src-reserve-already-held", "src-output-blocking-0", "src-release-after-output",
+    "src-release-again", *_HLE_AUDIO_SRC_INVALID_CASES, "out2-then-src-reserve",
+    "src-then-out2-reserve", "src-final-cleanup", "out2-final-cleanup",
+)
+_register_campaign_probe(
+    "hle-audio-src", "PSP-HLE-AUDIO-SRC-001", _HLE_AUDIO_SRC_CASES,
+    {
+        "src-release-unreserved": 0, "src-output-unreserved": 2,
+        "src-reserve-valid": 3, "src-reserve-already-held": 3,
+        "src-output-blocking-0": 2, "src-release-after-output": 0,
+        "src-release-again": 0,
+        **{case_id: 4 for case_id in _HLE_AUDIO_SRC_INVALID_CASES},
+        "out2-then-src-reserve": 3, "src-then-out2-reserve": 3,
+        "src-final-cleanup": 0, "out2-final-cleanup": 0,
+    },
+)
+# hle-savedata-getsize (#308): each dialog cell carries InitStart's return as its result and 24
+# words (eight driver words, the bind word and the 15 sizeInfo words); each save-absent cell
+# carries sceIoGetstat's return and st_mode; volatile-lock-before carries TryLock's return, the
+# Unlock return and the size. Every word is an observation, except that each save-absent
+# result must say the save is absent (validate_hle_savedata_getsize_absent).
+_HLE_SAVEDATA_GETSIZE_DIALOG_CASES = (
+    "getsize-missing-secure", "getsize-missing-empty", "getsize-missing-shortfall",
+    "getsize-missing-null",
+)
+_HLE_SAVEDATA_GETSIZE_ABSENT_CASES = (
+    "save-absent-before", "save-absent-after-secure", "save-absent-after-empty",
+    "save-absent-after-shortfall", "save-absent-after-null",
+)
+_register_campaign_probe(
+    "hle-savedata-getsize", "PSP-HLE-SAVEDATA-GETSIZE-001",
+    ("save-absent-before", "volatile-lock-before", "getsize-missing-secure",
+     "save-absent-after-secure", "getsize-missing-empty", "save-absent-after-empty",
+     "getsize-missing-shortfall", "save-absent-after-shortfall",
+     "getsize-missing-null", "save-absent-after-null"),
+    {
+        **{case_id: 24 for case_id in _HLE_SAVEDATA_GETSIZE_DIALOG_CASES},
+        **{case_id: 1 for case_id in _HLE_SAVEDATA_GETSIZE_ABSENT_CASES},
+        "volatile-lock-before": 2,
+    },
+)
+_HLE_TIMER_ORDER_CASES = (
+    "alarm-same-delay-set", "alarm-same-delay-a", "alarm-same-delay-b",
+    "alarm-long-then-short-set", "alarm-long-event", "alarm-short-event",
+    "timer-order-vtimer-create", "timer-order-vtimer-handler",
+    "timer-order-vtimer-alarm-set", "timer-order-vtimer-event",
+    "timer-order-vtimer-alarm-event", "alarm-zero-set", "alarm-zero-event",
+    "alarm-same-delay-cleanup", "alarm-long-short-cleanup",
+    "timer-order-vtimer-cleanup", "alarm-zero-cleanup",
+)
+_register_campaign_probe(
+    "hle-timer-order", "PSP-HLE-TIMER-ORDER-001", _HLE_TIMER_ORDER_CASES,
+    {
+        "alarm-same-delay-set": 1, "alarm-same-delay-a": 2,
+        "alarm-same-delay-b": 2, "alarm-long-then-short-set": 1,
+        "alarm-long-event": 2, "alarm-short-event": 2,
+        "timer-order-vtimer-create": 1, "timer-order-vtimer-handler": 1,
+        "timer-order-vtimer-alarm-set": 1, "timer-order-vtimer-event": 2,
+        "timer-order-vtimer-alarm-event": 2, "alarm-zero-set": 1,
+        "alarm-zero-event": 2, "alarm-same-delay-cleanup": 2,
+        "alarm-long-short-cleanup": 2, "timer-order-vtimer-cleanup": 3,
+        "alarm-zero-cleanup": 1,
+    },
+)
+
+# hle-issues-batch (106, probe_hle_issues.c): the #356 model getters, then two passes of the
+# #326 vscmp cells and the vrndi.s carry grids. Every row is emitted on every run, so the
+# stream is fixed-shape; the row names are those of the 2026-10-24 measured build.
+HLE_ISSUES_MODEL_CASES = (
+    "model-ku-get-model", "model-sce-get-model", "model-ku-get-model-again",
+    "model-sce-get-model-again", "model-kernel-get-model-07c586a1",
+    "model-kernel-get-model-6373995d",
+)
+HLE_ISSUES_VSCMP_SETS = ("qnan-inf", "nan-kinds", "inf-inf", "zero-nan", "denorm-finite",
+                         "nan-mixed")
+HLE_ISSUES_VSCMP_FORMS = ("vscmp.s", "vscmp.p", "vscmp.t", "vscmp.q", "vscmp.q-same")
+#: Carry-grid dimensions: 8 C2 words x 8 C3 words x 7 carry words, per stem and pass.
+HLE_ISSUES_CARRY_GRID = (8, 8, 7)
+HLE_ISSUES_CARRY_STEMS = ("rcar", "rcbig")
+HLE_ISSUES_PASSES = 2
+
+
+def _hle_issues_pass_cases(pass_index: int) -> tuple[str, ...]:
+    vscmp = tuple(f"vscmp-p{pass_index}-{name}-{form}"
+                  for name in HLE_ISSUES_VSCMP_SETS for form in HLE_ISSUES_VSCMP_FORMS)
+    c2s, c3s, carries = HLE_ISSUES_CARRY_GRID
+    carry = tuple(f"{stem}-p{pass_index}-{i}-{j}-{k}"
+                  for stem in HLE_ISSUES_CARRY_STEMS
+                  for i in range(c2s) for j in range(c3s) for k in range(carries))
+    return vscmp + carry
+
+
+HLE_ISSUES_BATCH_CASES = HLE_ISSUES_MODEL_CASES + tuple(
+    case for pass_index in range(HLE_ISSUES_PASSES)
+    for case in _hle_issues_pass_cases(pass_index))
+_register_campaign_probe(
+    "hle-issues-batch", "PSP-HLE-ISSUES-001", HLE_ISSUES_BATCH_CASES,
+    {
+        **{case: 3 for case in HLE_ISSUES_MODEL_CASES},
+        **{case: (16 if case.startswith("vscmp-") else 17)
+           for case in HLE_ISSUES_BATCH_CASES if case not in HLE_ISSUES_MODEL_CASES},
+    },
+)
+
+# vfpu-forms (108, probe_hle_issues.c): the #326 VFPU form words, two passes. Every row is
+# emitted on every run, so the stream is fixed-shape: vh2f.s over 12 half pairs and vh2f.p
+# over 6 (each under no S prefix and the two TN_PFX forms) plus the in-place vh2f.p, vuc2i.s
+# over 10 byte words, vsocp.s over 22 operands and vsocp.p over 11 pairs, vwbn.s over 28
+# operands at eight exponents and once more at 0x7f under P1, and 17 vrndf1.s/vrndf2.s draws.
+VFPU_FORMS_PREFIXES = ("none", "p1", "p2")
+VFPU_FORMS_WBN_FORMS = ("00", "01", "7e", "7f", "80", "96", "fe", "ff", "7f-p1")
+VFPU_FORMS_GRID = {"h2f-s": 12, "h2f-p": 6, "uc2i": 10, "socp-s": 22, "socp-p": 11,
+                   "wbn": 28, "rndf": 17}
+VFPU_FORMS_PASSES = 2
+
+
+def _vfpu_forms_pass_cases(p: int) -> tuple[str, ...]:
+    g, pf = VFPU_FORMS_GRID, VFPU_FORMS_PREFIXES
+    h2f = tuple(f"h2f-p{p}-s-{i}-{x}" for i in range(g["h2f-s"]) for x in pf)
+    h2f += tuple(case for i in range(g["h2f-p"])
+                 for case in (*(f"h2f-p{p}-p-{i}-{x}" for x in pf), f"h2f-p{p}-alias-{i}"))
+    uc2i = tuple(f"uc2i-p{p}-{i}-{x}" for i in range(g["uc2i"]) for x in pf)
+    socp = tuple(f"socp-p{p}-s-{i}-{x}" for i in range(g["socp-s"]) for x in pf)
+    socp += tuple(f"socp-p{p}-p-{i}-{x}" for i in range(g["socp-p"]) for x in pf)
+    wbn = tuple(f"wbn-p{p}-{form}-{i}" for form in VFPU_FORMS_WBN_FORMS for i in range(g["wbn"]))
+    rndf = tuple(f"rndf{n}-p{p}-{k}" for n in (1, 2) for k in range(g["rndf"]))
+    return h2f + uc2i + socp + wbn + rndf
+
+
+VFPU_FORMS_CASES = tuple(case for p in range(VFPU_FORMS_PASSES)
+                         for case in _vfpu_forms_pass_cases(p))
+_register_campaign_probe(
+    "vfpu-forms", "PSP-VFPU-FORMS-001", VFPU_FORMS_CASES,
+    {case: (17 if case.startswith("rndf") else 13) for case in VFPU_FORMS_CASES},
+)
+
+# vfpu-funnel (118, probe_hle_issues.c): the #326 funnel add and average words, two passes.
+# Every row is emitted on every run, so the stream is fixed-shape: per pass, vfad then vavg,
+# each at .p, .t and .q (one step per form and size), over 26 operand sets, each under no S
+# prefix and the two TN_PFX forms. Rows are <form>-p<pass>-<size>-<i>-<prefix>, 13 words each.
+VFPU_FUNNEL_FORMS = ("fad", "avg")
+VFPU_FUNNEL_SIZES = ("p", "t", "q")
+VFPU_FUNNEL_PREFIXES = ("none", "p1", "p2")
+VFPU_FUNNEL_OPERAND_SETS = 26
+VFPU_FUNNEL_PASSES = 2
+VFPU_FUNNEL_CASES = tuple(
+    f"{form}-p{p}-{size}-{i}-{pfx}"
+    for p in range(VFPU_FUNNEL_PASSES)
+    for form in VFPU_FUNNEL_FORMS
+    for size in VFPU_FUNNEL_SIZES
+    for i in range(VFPU_FUNNEL_OPERAND_SETS)
+    for pfx in VFPU_FUNNEL_PREFIXES
+)
+_register_campaign_probe(
+    "vfpu-funnel", "PSP-VFPU-FUNNEL-001", VFPU_FUNNEL_CASES,
+    {case: 13 for case in VFPU_FUNNEL_CASES},
+)
+
+# vfpu-sort (120, probe_hle_issues.c): the #326 vsrt1.q to vsrt4.q words, two passes. Every
+# row is emitted on every run, so the stream is fixed-shape: per pass, the four forms (one
+# step each) over 24 operand sets, each under no S prefix and the two TN_PFX forms. Rows are
+# <form>-p<pass>-<i>-<prefix>, 13 words each.
+VFPU_SORT_FORMS = ("srt1", "srt2", "srt3", "srt4")
+VFPU_SORT_PREFIXES = ("none", "p1", "p2")
+VFPU_SORT_OPERAND_SETS = 24
+VFPU_SORT_PASSES = 2
+VFPU_SORT_CASES = tuple(
+    f"{form}-p{p}-{i}-{pfx}"
+    for p in range(VFPU_SORT_PASSES)
+    for form in VFPU_SORT_FORMS
+    for i in range(VFPU_SORT_OPERAND_SETS)
+    for pfx in VFPU_SORT_PREFIXES
+)
+_register_campaign_probe(
+    "vfpu-sort", "PSP-VFPU-SORT-001", VFPU_SORT_CASES,
+    {case: 13 for case in VFPU_SORT_CASES},
+)
+
+# kernel-semantics (127, probe_kernel_semantics.c): the v0.0.2 kernel cells (#1287, #1390, #1383,
+# #1380, #1382). Every row is emitted on every run with a fixed word count; a word that does
+# not apply is 0xA5A5A5A5, and the io rows are SKIP when the probe-owned Memory Stick
+# directory already existed. The parser checks the stream's shape, never a PSP value.
+KERNEL_SEM_ROWS = {
+    "subintr-register": 8, "subintr-order": 24, "subintr-times": 24, "subintr-release": 8,
+    "ctrl-empty-read": 6, "ctrl-short-read-peek": 8, "ctrl-short-read": 3,
+    "ctrl-short-read-next": 3, "ctrl-peek-count": 3, "ctrl-mode-digital": 9,
+    "ctrl-mode-analog": 9, "ctrl-mode-digital-again": 9, "ctrl-cycle-5555": 13, "ctrl-cycle-wait": 3,
+    "vmem-trylock-type-1": 4, "vmem-trylock-type-2": 4, "vmem-trylock-type-m1": 4,
+    "vmem-lock-type-1": 4, "vmem-alloc-free": 6, "vmem-alloc-held": 6, "vmem-unlock": 1,
+    "io-missing-parent": 4, "io-mkdir": 1, "io-excl-new": 3, "io-excl-existing": 5,
+    "io-seek64": 16, "io-seek64-rdwr": 4, "io-cleanup": 3, "wlan-state": 2,
+}
+_register_campaign_probe(
+    "kernel-semantics", "PSP-KERNEL-SEM-001", tuple(KERNEL_SEM_ROWS), dict(KERNEL_SEM_ROWS),
+)
+
+# io-seek-eof (136, probe_kernel_semantics.c): #1380 in the probe-owned ms0:/NKKSEM01: opens
+# of a missing file without PSP_O_CREAT, negative seeks on read-write and read-only
+# descriptors, a write after a seek past the end (size, gap bytes, tail) and a read past it.
+# Every row is emitted on every run with a fixed word count (SKIP rows keep the shape).
+IO_SEEK_EOF_ROWS = (
+    ("io-eof-mkdir", 1), ("io-eof-missing", 5), ("io-eof-create", 3),
+    ("io-eof-seek-negative", 16), ("io-eof-seek-negative-rdonly", 5),
+    ("io-eof-write-past", 8), ("io-eof-gap", 8), ("io-eof-read-past", 5),
+    ("io-eof-cleanup", 3),
+)
+_register_campaign_probe(
+    "io-seek-eof", "PSP-IO-EOF-001", tuple(row for row, _ in IO_SEEK_EOF_ROWS),
+    dict(IO_SEEK_EOF_ROWS),
+)
+
+# memory-edge (138, probe_memory_edge.c, fixture mem_edge.h): the #303 invalid-tail and
+# boundary cells and #1380's sceIoRead into a boundary buffer. Three measurement rows, then for
+# each of three placements (the last bytes of user RAM, the first bytes of user RAM, the last
+# bytes of VRAM) a placement row and 21 call cells (three APIs by four deltas on the reading
+# side, three APIs by three deltas on the writing side), then three always-SKIP rows. Every row
+# is emitted on every run with a fixed word count: a cell that is not run is a SKIP record.
+MEMORY_EDGE_PLACES = ("ramtail", "ramhead", "vramtail")
+MEMORY_EDGE_APIS = ("io", "memcpy", "try")
+MEMORY_EDGE_SRC_DELTAS = (0, 1, 4, 0x1000)
+MEMORY_EDGE_DST_DELTAS = (0, 1, 4)
+MEMORY_EDGE_CELL_WORDS = 12
+
+
+def _memory_edge_rows() -> tuple[tuple[str, int], ...]:
+    rows: list[tuple[str, int]] = [("edge-ram-hi", 8), ("edge-ram-lo", 8), ("edge-data", 3)]
+    for place in MEMORY_EDGE_PLACES:
+        if place == "vramtail":
+            rows.append(("edge-vram", 4))
+        rows.append((f"edge-place-{place}", 8))
+        for side, deltas in (("src", MEMORY_EDGE_SRC_DELTAS), ("dst", MEMORY_EDGE_DST_DELTAS)):
+            for api in MEMORY_EDGE_APIS:
+                for delta in deltas:
+                    rows.append((f"me-{place}-{api}-{side}-{delta:04x}", MEMORY_EDGE_CELL_WORDS))
+    for name in ("me-cpu-store-edge", "me-cpu-load-edge", "me-scratch-io", "me-scratch-cross"):
+        rows.append((name, MEMORY_EDGE_CELL_WORDS))
+    return tuple(rows)
+
+
+MEMORY_EDGE_ROWS = _memory_edge_rows()
+_register_campaign_probe(
+    "memory-edge", "PSP-MEMEDGE-001", tuple(row for row, _ in MEMORY_EDGE_ROWS),
+    dict(MEMORY_EDGE_ROWS),
+)
+
+# vfpu-forms2 (121, probe_hle_issues.c): the second #326 batch of VFPU forms, two passes. Every
+# row is emitted on every run, so the stream is fixed-shape. Per pass: vrnds.s over 24 seed
+# words from two RCX states (rnds-p<pass>-<i>-<a|b>, 25 words), vrndi, vrndf1 and vrndf2 at
+# .p, .t and .q from eight RCX states (<wrndi|wrndf1|wrndf2>-p<pass>-<p|t|q>-<k>, 20 words),
+# vf2h.p and vf2h.q over 28 operand quads and vc2i.s over 10 byte words, each under no S
+# prefix and the two TN_PFX forms (f2h-p<pass>-<p|q>-<i>-<pfx> and c2i-p<pass>-<i>-<pfx>, 13
+# words).
+VFPU_FORMS2_SEEDS = 24
+VFPU_FORMS2_SEED_STATES = ("a", "b")
+VFPU_FORMS2_DRAW_STEMS = ("wrndi", "wrndf1", "wrndf2")
+VFPU_FORMS2_DRAW_SIZES = ("p", "t", "q")
+VFPU_FORMS2_DRAW_STATES = 8
+VFPU_FORMS2_F2H_SIZES = ("p", "q")
+VFPU_FORMS2_F2H_QUADS = 28
+VFPU_FORMS2_C2I_OPERANDS = 10
+VFPU_FORMS2_PREFIXES = ("none", "p1", "p2")
+VFPU_FORMS2_PASSES = 2
+VFPU_FORMS2_SEED_WORDS = 25
+VFPU_FORMS2_DRAW_WORDS = 20
+VFPU_FORMS2_CELL_WORDS = 13
+
+
+def _vfpu_forms2_pass_cases(p: int) -> tuple[str, ...]:
+    rnds = tuple(f"rnds-p{p}-{i}-{s}" for i in range(VFPU_FORMS2_SEEDS)
+                 for s in VFPU_FORMS2_SEED_STATES)
+    draws = tuple(f"{stem}-p{p}-{size}-{k}" for stem in VFPU_FORMS2_DRAW_STEMS
+                  for size in VFPU_FORMS2_DRAW_SIZES for k in range(VFPU_FORMS2_DRAW_STATES))
+    f2h = tuple(f"f2h-p{p}-{size}-{i}-{x}" for size in VFPU_FORMS2_F2H_SIZES
+                for i in range(VFPU_FORMS2_F2H_QUADS) for x in VFPU_FORMS2_PREFIXES)
+    c2i = tuple(f"c2i-p{p}-{i}-{x}" for i in range(VFPU_FORMS2_C2I_OPERANDS)
+                for x in VFPU_FORMS2_PREFIXES)
+    return rnds + draws + f2h + c2i
+
+
+VFPU_FORMS2_CASES = tuple(case for p in range(VFPU_FORMS2_PASSES)
+                          for case in _vfpu_forms2_pass_cases(p))
+_register_campaign_probe(
+    "vfpu-forms2", "PSP-VFPU-FORMS2-001", VFPU_FORMS2_CASES,
+    {case: (VFPU_FORMS2_SEED_WORDS if case.startswith("rnds-")
+            else VFPU_FORMS2_DRAW_WORDS if case.startswith("wrnd")
+            else VFPU_FORMS2_CELL_WORDS) for case in VFPU_FORMS2_CASES},
+)
+
+# ge-sample (109, probe_ge_sample.c): the #282 GE texture sample-point cells. Every draw is
+# emitted on every run, so the stream is fixed-shape: per mapping, primitive (triangle pair
+# or sprite), filter and texture, one `-draw` record (the GE wait outcome, 7 words) and one
+# record per read-back row y 3..18 (16 raw 8888 pixels, x 3..18).
+GE_SAMPLE_MAPS = ("1to1", "half", "mag2", "min20", "s16", "s16min")
+GE_SAMPLE_PRIMS = ("tri", "spr")
+GE_SAMPLE_FILTERS = ("near", "lin")
+GE_SAMPLE_TEXTURES = ("u", "v")
+GE_SAMPLE_ROWS = tuple(range(3, 19))
+GE_SAMPLE_DRAWS = tuple(f"{prim}-{filt}-{m}-{tex}" for m in GE_SAMPLE_MAPS
+                        for prim in GE_SAMPLE_PRIMS for filt in GE_SAMPLE_FILTERS
+                        for tex in GE_SAMPLE_TEXTURES)
+GE_SAMPLE_CASES = tuple(case for draw in GE_SAMPLE_DRAWS
+                        for case in (f"{draw}-draw", *(f"{draw}-r{y:02d}" for y in GE_SAMPLE_ROWS)))
+_register_campaign_probe(
+    "ge-sample", "PSP-GE-SAMPLE-001", GE_SAMPLE_CASES,
+    {case: (7 if case.endswith("-draw") else 16) for case in GE_SAMPLE_CASES},
+)
+
+# dma-timing (118, probe_dmac_timing.c): the #303 DMAC transfer-time and busy-channel cells.
+# Every cell is emitted on every run, so the stream is fixed-shape: t-<pair>-<api>-<size>
+# for the four main-RAM/VRAM pairs, both APIs and nine sizes (13 words), a-<src offset>-
+# <dst offset>-<size> for eleven alignments at two sizes (13 words), then b1 (11), the five
+# b2 cells (12), the two b3 cells (17), the six b4 cells (15), then c1-try-<size> and
+# c2-memcpy-<size> for thirteen sizes (13), the five b5 cells (16), c3-try-<size> for eleven
+# sizes between 0x100 and 0x200 (13), t2-<pair>-m-<size> for six more sizes (13), sixteen
+# c4-<size>-<src offset>-<dst offset> byte-level Try cells (16) and six more alignment pairs
+# (13).
+DMA_TIMING_PAIRS = ("rr", "rv", "vr", "vv")
+DMA_TIMING_APIS = ("m", "t")
+DMA_TIMING_SIZES = (0x10, 0x40, 0x100, 0x400, 0x1000, 0x4000, 0x10000, 0x40000, 0x100000)
+DMA_TIMING_ALIGN = ((0, 0), (1, 0), (0, 1), (1, 1), (2, 2), (4, 4), (8, 8), (16, 16),
+                    (4, 0), (0, 4), (32, 0))
+DMA_TIMING_ALIGN_SIZES = (0x1000, 0x10000)
+DMA_TIMING_B2_CELLS = ("b2-try-null", "b2-try-zero", "b2-memcpy-null", "b2-memcpy-zero",
+                       "b2-try-valid")
+DMA_TIMING_B3_CELLS = ("b3-second-higher", "b3-second-lower")
+DMA_TIMING_B4_CELLS = tuple(f"b4-{pair}-{size:06x}" for pair in ("vv", "rr")
+                            for size in (0x10000, 0x40000, 0x100000))
+DMA_TIMING_T_CASES = tuple(f"t-{pair}-{api}-{size:06x}" for pair in DMA_TIMING_PAIRS
+                           for api in DMA_TIMING_APIS for size in DMA_TIMING_SIZES)
+DMA_TIMING_A_CASES = tuple(f"a-{src:02x}-{dst:02x}-{size:06x}" for src, dst in DMA_TIMING_ALIGN
+                           for size in DMA_TIMING_ALIGN_SIZES)
+DMA_TIMING_C_SIZES = (0x10, 0x20, 0x40, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000,
+                      0x4000, 0x8000, 0x10000)
+DMA_TIMING_C1_CASES = tuple(f"c1-try-{size:06x}" for size in DMA_TIMING_C_SIZES)
+DMA_TIMING_C2_CASES = tuple(f"c2-memcpy-{size:06x}" for size in DMA_TIMING_C_SIZES)
+DMA_TIMING_B5_CELLS = ("b5-vv-010000", "b5-vv-040000", "b5-vv-100000", "b5-rr-040000",
+                       "b5-rr-0c0000")
+DMA_TIMING_C3_SIZES = (0x101, 0x104, 0x108, 0x110, 0x120, 0x140, 0x180, 0x1C0, 0x1F0, 0x1FC,
+                       0x1FF)
+DMA_TIMING_C3_CASES = tuple(f"c3-try-{size:06x}" for size in DMA_TIMING_C3_SIZES)
+DMA_TIMING_T2_SIZES = (0x200, 0x800, 0x2000, 0x8000, 0x20000, 0x80000)
+DMA_TIMING_T2_CASES = tuple(f"t2-{pair}-m-{size:06x}" for pair in DMA_TIMING_PAIRS
+                            for size in DMA_TIMING_T2_SIZES)
+DMA_TIMING_C4 = ((0x109, 0, 0), (0x10C, 0, 0), (0x10F, 0, 0), (0x1F1, 0, 0), (0x1F4, 0, 0),
+                 (0x1F8, 0, 0), (0x1FC, 0, 0), (0x1FF, 0, 0), (0x201, 0, 0), (0x20C, 0, 0),
+                 (0x10004, 0, 0), (0x200, 1, 0), (0x200, 0, 1), (0x200, 4, 4), (0x1FC, 4, 4),
+                 (0x108, 0, 1))
+DMA_TIMING_C4_CASES = tuple(f"c4-{size:06x}-{src:02x}-{dst:02x}" for size, src, dst in DMA_TIMING_C4)
+DMA_TIMING_ALIGN2 = ((2, 0), (0, 2), (3, 0), (8, 0), (0, 8), (12, 0))
+DMA_TIMING_A2_CASES = tuple(f"a-{src:02x}-{dst:02x}-{size:06x}" for src, dst in DMA_TIMING_ALIGN2
+                            for size in DMA_TIMING_ALIGN_SIZES)
+DMA_TIMING_CASES = (DMA_TIMING_T_CASES + DMA_TIMING_A_CASES + ("b1-try-dest",)
+                    + DMA_TIMING_B2_CELLS + DMA_TIMING_B3_CELLS + DMA_TIMING_B4_CELLS
+                    + DMA_TIMING_C1_CASES + DMA_TIMING_C2_CASES + DMA_TIMING_B5_CELLS
+                    + DMA_TIMING_C3_CASES + DMA_TIMING_T2_CASES + DMA_TIMING_C4_CASES
+                    + DMA_TIMING_A2_CASES)
+_register_campaign_probe(
+    "dma-timing", "PSP-DMAC-002", DMA_TIMING_CASES,
+    {
+        **{case: 13 for case in DMA_TIMING_T_CASES + DMA_TIMING_A_CASES},
+        "b1-try-dest": 11,
+        **{case: 12 for case in DMA_TIMING_B2_CELLS},
+        **{case: 17 for case in DMA_TIMING_B3_CELLS},
+        **{case: 15 for case in DMA_TIMING_B4_CELLS},
+        **{case: 13 for case in DMA_TIMING_C1_CASES + DMA_TIMING_C2_CASES + DMA_TIMING_A2_CASES
+           + DMA_TIMING_C3_CASES + DMA_TIMING_T2_CASES},
+        **{case: 16 for case in DMA_TIMING_B5_CELLS + DMA_TIMING_C4_CASES},
+    },
+)
+
+# insn-trace (119, probe_insn_trace.c): the #312 real-PSP instruction trace. Per fixture of
+# fixtures/psp_oracle/insn_trace_fixtures.h, an `<id>-init` record (44 words), one
+# `<id>-sNNNN` record per executed instruction (44 words: pc, op, r1..r25, r29..r31, hi,
+# lo, selected f0..f3/fcr31, v0..v3/v32, and the store's address and value) and an `<id>-end`
+# record (4 words). The step counts are those of the
+# fixtures' architectural execution, which Nakagawa's trace of the same words reproduces
+# (tools/test_insn_trace.py checks both against this table).
+INSN_TRACE_STEPS = (
+    ("alu-branch-ls", 105), ("delay-slots", 27), ("fpu-state", 4), ("vfpu-state", 5),
+)
+INSN_TRACE_CASES = tuple(
+    case for fixture, steps in INSN_TRACE_STEPS
+    for case in (f"{fixture}-init", *(f"{fixture}-s{step:04d}" for step in range(steps)),
+                 f"{fixture}-end"))
+_register_campaign_probe(
+    "insn-trace", "PSP-TRACE-001", INSN_TRACE_CASES,
+    {case: (44 if case.endswith("-init") else 4 if case.endswith("-end") else 44)
+     for case in INSN_TRACE_CASES},
+)
+_register_campaign_probe(
+    "insn-trace-exception", "PSP-TRACE-EXCEPTION-001", (),
+    {"exception-armed": 1}, terminal_case="exception-armed",
+)
+
+# intr-cause (120, probe_hle_issues.c): the #325 COP0 interrupt state. Every row is emitted
+# on every run, so the stream is fixed-shape: four snapshots with interrupts enabled, then per
+# pass 25 snapshots 1 ms apart inside a sceKernelCpuSuspendIntr window, one snapshot 200 us
+# after the resume and the window summary. A snapshot row is Cause plus six words (Status,
+# Count, interrupt-enable word, time offset, vcount, kuKernelCall return); the summary has four.
+INTR_CAUSE_ENABLED = 4
+INTR_CAUSE_SNAPS = 25
+INTR_CAUSE_PASSES = 2
+INTR_CAUSE_CASES = tuple(f"cause-enabled-{i}" for i in range(INTR_CAUSE_ENABLED)) + tuple(
+    case for p in range(INTR_CAUSE_PASSES)
+    for case in (*(f"cause-masked-p{p}-t{k:02d}" for k in range(INTR_CAUSE_SNAPS)),
+                 f"cause-resumed-p{p}", f"cause-window-p{p}"))
+_register_campaign_probe(
+    "intr-cause", "PSP-INTR-CAUSE-001", INTR_CAUSE_CASES,
+    {case: (4 if case.startswith("cause-window-") else 6) for case in INTR_CAUSE_CASES},
+)
+
+# #1375 PSP-NULLCODE-001. One launch first records exact entry snapshots ($ra, $sp,
+# $gp, $a0-$a3, $t0-$t3), then records all four NULL registration results. These are
+# observations, so the parser validates only their shape.
+_register_campaign_probe(
+    "null-code-registration", "PSP-NULLCODE-001",
+    ("thread-entry", "thread-entry-setup", "callback-entry", "callback-entry-setup",
+     "alarm-entry", "alarm-entry-setup", "vtimer-entry", "vtimer-entry-setup",
+     "vblank-subintr-entry", "vblank-subintr-setup", "create-thread-null",
+     "create-callback-null", "register-subintr-null", "register-subintr-null-not-invoked",
+     "ge-drawsync-idle", "ge-set-callback-null", "ge-set-callback-null-not-invoked"),
+    {case: 11 for case in (
+        "thread-entry", "callback-entry", "alarm-entry", "vtimer-entry", "vblank-subintr-entry",
+    )} | {
+        "thread-entry-setup": 6, "callback-entry-setup": 4,
+        "alarm-entry-setup": 2, "vtimer-entry-setup": 5, "vblank-subintr-setup": 6,
+        "create-thread-null": 3, "create-callback-null": 3,
+        "register-subintr-null": 3, "register-subintr-null-not-invoked": 1,
+        "ge-drawsync-idle": 6, "ge-set-callback-null": 2,
+        "ge-set-callback-null-not-invoked": 1,
+    },
+)
+_register_campaign_probe(
+    "null-thread-invocation", "PSP-NULLCODE-001",
+    ("null-thread-armed", "null-thread-started"),
+    {"null-thread-armed": 2, "null-thread-started": 7},
+)
+_register_campaign_probe(
+    "null-callback-invocation", "PSP-NULLCODE-001",
+    ("null-callback-armed", "null-callback-checked"),
+    {"null-callback-armed": 2, "null-callback-checked": 7},
+)
+
+# The fetch itself ends the PRX. The one SKIP record names the target armed for the
+# fault; the runner's retained `exprint` reply is the source of exception fields.
+for _fetch_case in (
+    "exception-a3-fetch-zero", "exception-a3-fetch-08000000", "exception-a3-fetch-40000000",
+):
+    _register_campaign_probe(
+        _fetch_case, "PSP-EXCEPTION-FETCH-001", (), {"fetch-armed": 1},
+        terminal_case="fetch-armed",
+    )
+
+# ge-raster (123, probe_ge_sample.c): the #343 GE raster corpus. The cells are the gr_cells
+# table of the block probe_ge_sample.c shares with tests/native/hle_thread_selftest.c, in order. Per
+# cell, one `-draw` record (9 words: the GE wait outcome, the list length and the window's
+# FNV-1a 64 digest, low word first) and one record per window row y 0..3 (16 pixels, x 16..31).
+GE_RASTER_CELLS = (
+    "b-sa-isa", "b-fix", "b-fix-ff", "b-dc-sc", "b-idc-isc", "b-da-ida", "b-2sa-2isa",
+    "b-2isa-2sa", "b-2da-2ida", "b-sub-sa-fix", "b-rsub-sa-isa", "b-min", "b-max", "b-abs",
+    "b-eq6", "b-eq7", "b-fac11-15", "b565-sa-isa", "b5551-sa-isa", "b4444-sa-isa",
+    "b565-da-ida", "b-2sa-fix0", "b-2isa-fix0", "b-2da-fix0", "b-ffix-2isa", "b-ffix-2ida",
+    "b5551-da-ida", "b4444-da-ida", "at-f0", "at-f1", "at-f2", "at-f3", "at-f4", "at-f5",
+    "at-f6", "at-f7", "at-mask", "at-gt0", "ct-never", "ct-always", "ct-eq", "ct-ne",
+    "ct-eq-mix", "st-f0", "st-f1", "st-f2", "st-f3", "st-f4", "st-f5", "st-f6", "st-f7",
+    "st-op0", "st-op1", "st-op2", "st-op3", "st-op4", "st-op5", "st-op6", "st-op7", "st-mask",
+    "st4444-incr", "st4444-decr", "st4444-repl", "st4444-lt", "st5551-incr", "st5551-decr",
+    "st5551-repl7f", "st5551-inv", "st565-repl", "st565-eq0", "z-f0", "z-f1", "z-f2", "z-f3",
+    "z-f4", "z-f5", "z-f6", "z-f7", "z-lt-st", "z-gt-st", "tf-mod-rgb", "tf-mod-rgb-x2",
+    "tf-mod-rgba", "tf-mod-rgba-x2", "tf-dec-rgb", "tf-dec-rgb-x2", "tf-dec-rgba",
+    "tf-dec-rgba-x2", "tf-bld-rgb", "tf-bld-rgb-x2", "tf-bld-rgba", "tf-bld-rgba-x2",
+    "tf-rep-rgb", "tf-rep-rgb-x2", "tf-rep-rgba", "tf-rep-rgba-x2", "tf-add-rgb",
+    "tf-add-rgb-x2", "tf-add-rgba", "tf-add-rgba-x2", "tf-mod-rgba-w", "tf-mod-rgba-1",
+    "tfa-mod-rgba", "tfa-dec-rgba", "tfa-bld-rgba", "tfa-rep-rgba", "tfa-add-rgba",
+    "tfa-mod-rgb", "tx-5650", "tx-5551", "tx-4444", "tx-c8-8888", "tx-c8-sh4", "tx-c8-5551",
+    "tx-c4-4444", "tx-c4-off3", "tx-c4-bw48", "tx-c4-bw64", "tx-8888-bw20", "tx-c8-bw24",
+    "wr-c-neg", "wr-w-neg", "wr-uw-vc", "wr-c-big", "wr-w-big", "wr-w-min4", "wr-w-neg-lin",
+    "wr-c-neg-lin", "e-tri0", "e-tri1", "e-tri2", "e-tri3", "e-tri4", "e-tri5", "e-tri6",
+    "e-tri7", "e-line0", "e-line1", "e-line2", "e-line3", "e-points", "fmt-565", "fmt-5551",
+    "fmt-4444", "dth-565", "dth-5551", "dth-4444", "dth-8888", "dth-565-b", "msk-8888",
+    "msk-565", "msk-4444", "msk-8888-st", "lo-0", "lo-1", "lo-2", "lo-3", "lo-4", "lo-5",
+    "lo-6", "lo-7", "lo-8", "lo-9", "lo-10", "lo-11", "lo-12", "lo-13", "lo-14", "lo-15",
+    "lo-565-xor", "clr-c", "clr-a", "clr-ca", "clr-ca-msk", "clr-ca-dth565", "clr-ca-dth8888",
+    "clr-c-565", "clr-ca-blend", "clr-ca-atest", "clr-a-4444", "xf-tri", "xf-plain", "fog-a",
+    "fog-b", "fog-c", "fog-k0-b", "fog-k0-c", "fog-k1-b", "fog-k1-c",
+)
+GE_RASTER_ROWS = tuple(range(4))
+GE_RASTER_CASES = tuple(case for cell in GE_RASTER_CELLS
+                        for case in (f"{cell}-draw", *(f"{cell}-r{y}" for y in GE_RASTER_ROWS)))
+_register_campaign_probe(
+    "ge-raster", "PSP-GE-RASTER-001", GE_RASTER_CASES,
+    {case: (9 if case.endswith("-draw") else 16) for case in GE_RASTER_CASES},
+)
+
+# ge-mip (126, probe_ge_sample.c): the #1373 GE level-of-detail cells. The cells are the gm_cells
+# table of the block probe_ge_sample.c shares with tests/native/hle_thread_selftest.c, in order, with
+# the ge-raster record shape: one `-draw` record (9 words) and one record per window row.
+GE_MIP_CELLS = (
+    "c-b0", "c-b1", "c-b3", "c-b7", "c-b7f", "c-bm1", "c-b0f7", "c-b0f8", "c-b0f9", "c-b1f8",
+    "cl-b0f1", "cl-b0f4", "cl-b0f8", "cl-b1fc", "cl-b6ff", "cl-b7f8", "c-max2-b4", "cl-max2-b2f8",
+    "c-nomip-b3", "c-f5-b2", "c-f7-b2f8", "m3-b2", "m3-b0-4x", "a-1x", "a-2x", "a-4x", "a-8x",
+    "a-16x", "a-1x5", "a-3x", "a-half", "al-1x5", "al-3x", "al-6x", "a-u4", "a-v4", "a-u4v2",
+    "al-u3v2", "a-4x-b1", "a-4x-bm1", "al-2x-b0f8", "a-quad-w2", "a-quad-w1to4", "s-s1-w1",
+    "s-s1-w2", "s-s1-w3", "s-s1-w4", "s-s1-w8", "s-s1-wh", "s-s2-w1", "s-s2-w4", "s-sh-w8",
+    "s-s1-w2-b1", "s-s1-w2-4x", "sn-s1-w3", "s-s1-w1to8", "s-spr-s4",
+    "a-quad-v16-w1to8", "a-quad-v16-w8to1", "a-quad-v8-w1to8", "a-quad-u48-w1to4",
+    "a-quad-w4to1", "an-quad-w1to4", "a-quad-w1to4-bm1f8", "s-s1-w8to1", "s-s3-w1to8",
+)
+GE_MIP_CASES = tuple(case for cell in GE_MIP_CELLS
+                     for case in (f"{cell}-draw", *(f"{cell}-r{y}" for y in GE_RASTER_ROWS)))
+_register_campaign_probe(
+    "ge-mip", "PSP-GE-MIP-001", GE_MIP_CASES,
+    {case: (9 if case.endswith("-draw") else 16) for case in GE_MIP_CASES},
+)
+
+# ge-light (139, probe_ge_sample.c): the #1732 GE lighting cells. Per specular coefficient of the
+# gl_coefs table, in order: seventeen `-zN` and seventeen `-yN` records (the float bits of the
+# normals' z and y, 16 samples each), then for family s (specular) and family d (powered
+# diffuse) one `-draw` record (10 words: the GE wait outcome, the list length, k's float bits,
+# its 24-bit command data and the light component) and seventeen `-rN` window rows.
+GE_LIGHT_COEFS = ("k1", "k2", "k3p5", "k8", "k10", "k16", "k31", "k64", "k100", "k128")
+GE_LIGHT_FAMILIES = ("s", "d")
+GE_LIGHT_ROWS = tuple(range(17))
+GE_LIGHT_CASES = tuple(
+    case for coef in GE_LIGHT_COEFS
+    for case in (
+        *(f"{coef}-z{y}" for y in GE_LIGHT_ROWS),
+        *(f"{coef}-y{y}" for y in GE_LIGHT_ROWS),
+        *(case for family in GE_LIGHT_FAMILIES
+          for case in (f"{family}-{coef}-draw",
+                       *(f"{family}-{coef}-r{y}" for y in GE_LIGHT_ROWS))),
+    )
+)
+_register_campaign_probe(
+    "ge-light", "PSP-GE-LIGHT-001", GE_LIGHT_CASES,
+    {case: (10 if case.endswith("-draw") else 16) for case in GE_LIGHT_CASES},
+)
+
+# module-start (124, probe_module_start.c): the module_start thread cell. A fixed-shape
+# stream of raw words: module_start's own sceKernelReferThreadStatus (return code and the
+# 26-word SceKernelThreadInfo), the user-partition free sizes before and after the helper
+# thread is created, the helper's creation, the helper's later refer-status of module_start's
+# thread id, the free sizes after a 50 ms sleep, the sceKernelGetThreadmanIdList thread list
+# summary (count, stored, old thread in list, helper in list, both thread ids) and the
+# helper's own refer-status.
+MODULE_START_CASES = (
+    "ms-self", "ms-mem-pre", "ms-helper-create", "ms-mem-created",
+    "ms-refer-after", "ms-mem-after", "ms-idlist", "ms-helper-self",
+)
+MODULE_START_OUT_COUNTS = {
+    "ms-self": 27, "ms-mem-pre": 2, "ms-helper-create": 3, "ms-mem-created": 2,
+    "ms-refer-after": 27, "ms-mem-after": 2, "ms-idlist": 6, "ms-helper-self": 27,
+}
+_register_campaign_probe(
+    "module-start", "PSP-MODULE-START-001", MODULE_START_CASES, MODULE_START_OUT_COUNTS,
+)
+
+VFPU_TRANSCENDENTAL_OPS = (
+    "vsin", "vcos", "vexp2", "vlog2", "vrsq", "vrcp", "vsqrt", "vasin",
+    "vnrcp", "vnsin", "vrexp2",
+)
+VFPU_TRANSCENDENTAL_CHUNKS = 8
+VFPU_TRANSCENDENTAL_SEMANTIC_CASES = tuple(
+    f"{op}-chunk-{chunk:02d}"
+    for op in VFPU_TRANSCENDENTAL_OPS
+    for chunk in range(VFPU_TRANSCENDENTAL_CHUNKS)
+)
+_register_campaign_probe(
+    "vfpu-transcendental-corpus", "PSP-VFPU-TRANSCENDENTAL-001",
+    VFPU_TRANSCENDENTAL_SEMANTIC_CASES,
+    {
+        case_id: (7 if case_id.endswith("-chunk-07") else 8)
+        for case_id in VFPU_TRANSCENDENTAL_SEMANTIC_CASES
+    },
+)
+
+# ge-timing (probe.c, run_ge_timing; #1296): gt-setup, then one pass of the timing and
+# completion cells at 222/111 MHz (case tag b111) and one at 333/166 MHz (b166), then the
+# GE teardown and gt-done. Timing cells carry 16 words, c13 peeks 17, the other completion
+# cells 7, the teardown 5. A timing cell is named for its size parameter, a completion cell
+# for its rep. Shape and order only: the stream measures time, so no word is asserted.
+GE_TIMING_CLOCK_TAGS = ("b111", "b166")
+GE_TIMING_VERTEX_CELLS = (
+    "t7-list", "t7-strip", "t7-indexed", "t8-pos16", "t8-pos8", "t8-color", "t8-uv",
+    "t8-normal", "t8-full", "t9-lights0", "t9-lights1", "t9-lights4", "t10-weights1",
+    "t10-weights4", "t10-weights8",
+)
+GE_TIMING_ROUND2_SIZES = (8, 16, 32, 64, 128, 256)
+GE_TIMING_COMPLETION_CELLS = (
+    ("c13-peeks", 17), ("c4-signal", 7), ("c5-busyenq", 7), ("c2-drawsync", 7),
+    ("c6-listsync", 7),
+)
+
+
+def _ge_timing_pass_cells() -> tuple[tuple[str, int], ...]:
+    """(cell suffix, out count) of one clock pass, in probe order (gt_pass)."""
+    cells = ["t0-empty-0"]
+    cells += [f"t{n}-{name}-{words}" for words in (1024, 4096, 16384)
+              for n, name in ((1, "nop"), (2, "state"), (3, "matrix"))]
+    cells += [f"t4-clear-{kind}-{strips}" for kind in ("c8888", "cz8888", "c5650", "cz5650")
+              for strips in (1, 4, 16)]
+    cells += [f"t5-{form}-{size}" for size in (8, 32, 128)
+              for form in ("sprite", "sprite-perprim")]
+    cells += [f"t6-{form}-{count}" for count in (1024, 4096, 16384)
+              for form in ("tri1px", "tri1px-perprim")]
+    cells += [f"{cell}-{verts}" for verts in (1536, 6144, 18432)
+              for cell in GE_TIMING_VERTEX_CELLS]
+    cells += [f"t11-{fmt}-{size}-{filt}-{strips}"
+              for fmt in ("5650", "5650s", "8888", "8888s", "t4", "t4s", "t8", "t8s", "dxt1")
+              for size in (64, 512) for filt in ("nearest", "linear") for strips in (1, 4, 16)]
+    cells += [f"t12-{state}-{strips}"
+              for state in ("base", "blend", "alphatest", "depth", "dither", "xfbase", "fog")
+              for strips in (1, 4, 16)]
+    cells += [f"t13-clut{entries}-{loads}" for entries in (16, 256) for loads in (64, 256, 1024)]
+    cells += [f"t14-copy-{src}-{size}" for src in ("ram", "vram") for size in (64, 256, 480)]
+    cells += ["t15-twolists-32"]
+    cells += [f"s1-sprite-{w}x{h}-{(256 // w) * (256 // h)}"
+              for w in GE_TIMING_ROUND2_SIZES for h in GE_TIMING_ROUND2_SIZES]
+    cells += [f"s2-triquad-{size}-{2 * (256 // size) ** 2}" for size in GE_TIMING_ROUND2_SIZES]
+    cells += [f"s3-tex-{fmt}-{size}-{strips}" for fmt in ("8888", "8888s", "5650", "t8", "dxt1")
+              for size in (128, 256) for strips in (1, 4, 16)]
+    cells += ["s4-mix-vertex-fill-0"]
+    timed = tuple((cell, 16) for cell in cells)
+    return timed + tuple((f"{cell}-r{rep}", count) for cell, count in GE_TIMING_COMPLETION_CELLS
+                         for rep in range(8))
+
+
+GE_TIMING_OUT_COUNTS = {
+    "gt-setup": 4,
+    **{f"gt-{tag}-{cell}": count for tag in GE_TIMING_CLOCK_TAGS
+       for cell, count in _ge_timing_pass_cells()},
+    "gt-gu-teardown": 5,
+    "gt-done": 4,
+}
+_register_campaign_probe(
+    "ge-timing", "PSP-GE-TIMING-001", tuple(GE_TIMING_OUT_COUNTS), GE_TIMING_OUT_COUNTS,
+)
+
+# llsc-link: three link windows and the sc behaviours they measure (see probe.c,
+# run_llsc_link). Six words per cell: loaded, first sc result, A and B after the
+# cell, and the model words for A and B. The parser checks shape only.
+_register_campaign_probe(
+    "llsc-link", "PSP-LLSC-001",
+    ("llsc-control", "llsc-second-sc", "llsc-other-address"),
+    {"llsc-control": 6, "llsc-second-sc": 6, "llsc-other-address": 6},
+)
+
+# fpu-cc: COP1 condition-code facts (see probe.c, run_fpu_cc). One FCR31 writability
+# cell, then for each condition code 0..7 a c.eq.s cell (one word) and a bc1t/bc1f cell
+# (four words). The condition code 0 cells are controls; the parser checks shape only.
+_FPU_CC_CELLS = ("fpu-cc-fcr31-bits",) + tuple(
+    f"fpu-cc{n}-{kind}" for n in range(8) for kind in ("ceq", "branch"))
+_register_campaign_probe(
+    "fpu-cc", "PSP-FPU-CC-001", _FPU_CC_CELLS,
+    {cell: (2 if cell == "fpu-cc-fcr31-bits" else 1 if cell.endswith("-ceq") else 4)
+     for cell in _FPU_CC_CELLS},
+)
+
+# cpu-timing (probe.c, run_cpu_timing): the 65 measured/restore records are
+# followed by a stream-completion record whose out0 is the semantic record count.
+_CPU_TIMING_NORMAL_BLOCKS = (2048, 8192, 32768)
+_CPU_TIMING_NORMAL_OPS = (
+    "alu-addu", "alu-shift", "alu-logic", "multu-mflo-pair", "divu-mflo-pair",
+    "load-cache-hit", "store-cache-hit", "branch-taken-delay",
+    "branch-not-taken-delay", "branch-useful-delay", "fpu-add-s", "fpu-mul-s",
+    "fpu-div-s", "vfpu-add-s", "vfpu-mul-s",
+)
+_CPU_TIMING_SEMANTIC_CASES = (
+    "cpu-timing-clock",
+    *(f"{op}-{blocks}" for blocks in _CPU_TIMING_NORMAL_BLOCKS for op in _CPU_TIMING_NORMAL_OPS),
+    *(f"{op}-{blocks}" for blocks in (32, 128, 256)
+      for op in ("load-cache-miss", "store-cache-miss")),
+    "syscall-display-setframebuf",
+    "cpu-timing-framebuffer",
+    "syscall-display-accumulated-hcount",
+    "cpu-timing-ge-idle",
+    "syscall-ge-drawsync-done",
+    "syscall-ge-list-enqueue",
+    "syscall-ge-list-update-stall",
+    "cpu-timing-gu-teardown",
+    "syscall-vblank-start-latency",
+    "cpu-timing-sync-setup",
+    "syscall-sema-signal-wait",
+    "syscall-lwmutex-lock-unlock",
+    "cpu-timing-done",
+)
+_CPU_TIMING_OUT_COUNTS = {case_id: 4 for case_id in _CPU_TIMING_SEMANTIC_CASES}
+_CPU_TIMING_OUT_COUNTS.update({
+    "cpu-timing-framebuffer": 5,
+    "cpu-timing-ge-idle": 2,
+    "syscall-ge-list-enqueue": 7,
+    "syscall-ge-list-update-stall": 7,
+    "cpu-timing-gu-teardown": 5,
+    "cpu-timing-sync-setup": 2,
+    "cpu-timing-done": 3,
+})
+_register_campaign_probe(
+    "cpu-timing", "PSP-CPU-TIMING-001",
+    _CPU_TIMING_SEMANTIC_CASES,
+    _CPU_TIMING_OUT_COUNTS,
+    terminal_case="cpu-timing-complete",
+)
+
+
+#: Documented GE eDRAM translation widths (pspge.h: 0 = do not set, else these).
+HLE_EDRAM_WIDTHS = (512, 1024, 2048, 4096)
+
+
+HLE_SAVEDATA_GETSIZE_ABSENT_RESULT = 0x80010002
+
+
+def validate_hle_savedata_getsize_absent(text: str) -> None:
+    """Fail closed unless the save stayed absent around every hle-savedata-getsize dialog.
+
+    Every cell of that probe measures a save that does not exist, so a stick that holds
+    the probe's save directory, or a dialog that creates it, voids the run. This is the
+    precondition of the measurement, not a console semantic: sceIoGetstat's 0x80010002 is
+    the only proof the probe has that the directory is absent.
+    """
+
+    results = {record.case_id: record for record in parse_output(text).results}
+    for case_id in _HLE_SAVEDATA_GETSIZE_ABSENT_CASES:
+        if case_id not in results:
+            raise ProtocolError(f"PSP-HLE-SAVEDATA-GETSIZE-001: missing record {case_id!r}")
+        result = int(dict(results[case_id].values)["result"], 0)
+        if result != HLE_SAVEDATA_GETSIZE_ABSENT_RESULT:
+            raise ProtocolError(
+                f"PSP-HLE-SAVEDATA-GETSIZE-001: {case_id} returned {result:#010x}, so the save "
+                "directory was not absent and the run measured nothing"
+            )
+
+
+def validate_hle_edram_restore(text: str) -> None:
+    """Fail closed unless the GE translation width was restored to its original value.
+
+    The probe changes GE state only through sceGeEdramSetAddrTranslation and
+    restores the width it found. sceGeEdramSetAddrTranslation(w) sets the width to w
+    and returns the width it replaced (set-returning-previous, as captured on the
+    PSP-3000 on 2026-10-10; that run was not acceptance-eligible, so the behaviour is
+    CAPTURED, not MEASURED), so a read by Set(0) is itself a set to 0. The probe
+    therefore verifies its restore with Set(initial), which returns the width now set
+    and leaves it in place, and its final read is Set(initial) too. When the restore
+    cell ran, its out0 and the final read must both equal the initial width. When the
+    initial width was not restorable, every width cell must be SKIP and the final
+    read, a Set(0), must return the 0 that the initial read left: the probe cannot put
+    a non-documented width back, and says so by that 0.
+    """
+
+    parsed = parse_output(text)
+    results = {record.case_id: record for record in parsed.results}
+    try:
+        initial = int(dict(results["edram-width-query-initial"].values)["result"], 0)
+        final = int(dict(results["edram-width-query-final"].values)["result"], 0)
+    except KeyError as exc:
+        raise ProtocolError(f"PSP-HLE-GE-EDRAM-001: missing record {exc}") from exc
+    width_cases = [f"edram-width-set-{width}" for width in HLE_EDRAM_WIDTHS]
+    restorable = initial in HLE_EDRAM_WIDTHS
+    if not restorable:
+        if any(results[case].status != "SKIP" for case in width_cases + ["edram-width-restore"]):
+            raise ProtocolError(
+                "PSP-HLE-GE-EDRAM-001: a width cell ran although the original width "
+                f"{initial:#x} is not restorable"
+            )
+        if final != 0:
+            raise ProtocolError(
+                f"PSP-HLE-GE-EDRAM-001: final read returned {final:#x}, not 0; with no restore "
+                "cell the initial Set(0) left 0 and the final Set(0) must report that 0"
+            )
+        return
+    if any(results[case].status == "SKIP" for case in width_cases + ["edram-width-restore"]):
+        raise ProtocolError("PSP-HLE-GE-EDRAM-001: a restorable width cell was skipped")
+    # The restore record's `result` holds the pre-restore width (the value its
+    # Set(initial) returned) and its `out0` the verifying read (the value a second
+    # Set(initial) returned), exactly as the probe records them. Both the verify and
+    # the final read are Set(initial): under set-returning-previous each returns the
+    # width the restore left and keeps it, so both must equal the original width.
+    restore = dict(results["edram-width-restore"].values)
+    if int(restore["out0"], 0) != initial:
+        raise ProtocolError(
+            f"PSP-HLE-GE-EDRAM-001: restore left width {int(restore['out0'], 0):#x}, "
+            f"not the original {initial:#x}"
+        )
+    if final != initial:
+        raise ProtocolError(
+            f"PSP-HLE-GE-EDRAM-001: final read returned {final:#x}, not the restored "
+            f"{initial:#x}; sceGeEdramSetAddrTranslation sets the width and returns the width "
+            "it replaced (set-returning-previous), so the final Set(initial) must return the "
+            "width the restore left"
+        )
+
+
+#: Single-launch HLE cases whose status is machinery-only: a record is PASS when its calls
+#: completed and SKIP when the object it needs was not obtained, and never FAIL.
+HLE_MACHINERY_STATUS_CASES = frozenset({
+    "hle-vtimer-unit", "hle-vtimer-errors", "hle-kernel-pool-bounds", "hle-power-float-v0",
+    "hle-null-out-pointers", "hle-audio-src", "hle-timer-order", "hle-savedata-getsize",
+})
+VFPU_RAW_WORD_CASES = frozenset({"vfpu-transcendental-corpus"})
+#: Cases whose every cell is an unconditional observation: each record is PASS.
+HLE_OBSERVATION_CASES = frozenset({"hle-issues-batch", "vfpu-forms", "intr-cause", "vfpu-forms2",
+                                   "vfpu-funnel", "vfpu-sort"})
+
+#: hle-kernel-pool-bounds fixed-pool (create, delete) cell pairs.
+HLE_POOL_BOUNDS_FPL_PAIRS = (
+    ("fpl-create-size-0x00", "fpl-delete-size-0x00"),
+    ("fpl-create-size-0x7fffffff", "fpl-delete-size-0x7fffffff"),
+)
+
+
+def validate_hle_pool_bounds_deletes(sequence: SequenceReport) -> None:
+    """Fail closed unless each fixed-pool delete cell agrees with its own create cell.
+
+    A refused create is what these creates measure, so the delete cell after it is PASS,
+    not SKIP: its out0 is 1 when it issued a delete (the create's out0 says a pool was
+    created) and 0 when there was no pool, in which case it made no call and its result
+    is 0. This checks the probe's own bookkeeping, like validate_hle_edram_restore; it
+    compares no value with a PSP expectation. A pair with a record still missing from a
+    partial stream is not checked.
+    """
+
+    results = sequence.results
+    test_id = sequence.spec.test_id
+    for create_id, delete_id in HLE_POOL_BOUNDS_FPL_PAIRS:
+        if create_id not in results or delete_id not in results:
+            continue
+        delete = results[delete_id]
+        if delete.status != "PASS":
+            raise ProtocolError(
+                f"{test_id}: {delete_id} status {delete.status!r}; a fixed-pool delete cell is "
+                "PASS whether or not its create returned a pool"
+            )
+        created = int(dict(results[create_id].values)["out0"], 0)
+        values = dict(delete.values)
+        issued = int(values["out0"], 0)
+        if issued not in (0, 1) or issued != created:
+            raise ProtocolError(
+                f"{test_id}: {delete_id} out0 {issued:#x} must equal {create_id} out0 "
+                f"{created:#x} (1 when a pool was created and deleted, 0 when there was none)"
+            )
+        if issued == 0 and int(values["result"], 0) != 0:
+            raise ProtocolError(
+                f"{test_id}: {delete_id} recorded no pool (out0 0) but a non-zero result; "
+                "with no pool the cell makes no call"
+            )
+
+
+def parse_campaign_probe_output(
+    text: str, campaign_case: str, *, require_complete: bool = True
+) -> SequenceReport:
+    """Parse one fixed-size campaign stream without asserting PSP outcomes."""
+
+    try:
+        spec, counts = CAMPAIGN_PROBE_CASES[campaign_case]
+    except KeyError as exc:
+        raise ProtocolError(f"unknown campaign probe {campaign_case!r}") from exc
+    sequence = parse_sequence(text, spec, require_complete=require_complete)
+    _validate_scalar_shape(sequence, counts)
+    if campaign_case in HLE_MACHINERY_STATUS_CASES:
+        for record in sequence.results.values():
+            if record.status not in ("PASS", "SKIP"):
+                raise ProtocolError(
+                    f"{spec.test_id}: {record.case_id} status {record.status!r} is not "
+                    "machinery-only (a cell is PASS or SKIP, never FAIL)"
+                )
+    if campaign_case == "hle-kernel-pool-bounds":
+        validate_hle_pool_bounds_deletes(sequence)
+    if campaign_case in VFPU_RAW_WORD_CASES:
+        for record in sequence.results.values():
+            if record.status != "PASS":
+                raise ProtocolError(
+                    f"{spec.test_id}: {record.case_id} must carry a produced raw-word record"
+                )
+    if campaign_case in HLE_OBSERVATION_CASES:
+        for record in sequence.results.values():
+            if record.status != "PASS":
+                raise ProtocolError(
+                    f"{spec.test_id}: {record.case_id} status {record.status!r}; every cell "
+                    "of this case is an unconditional observation recorded PASS"
+                )
+    return sequence
+
+
+# ---------------------------------------------------------------------------
+# PSP-HLE-INTR-001 (hle-intr-cells, probe_hle_issues.c): #325 delivery cells
+# ---------------------------------------------------------------------------
+
+HLE_INTR_TEST_ID = "PSP-HLE-INTR-001"
+HLE_INTR_TERMINAL = "hle-intr-cells-done"
+#: The handler-return series, in emission order. Each is `<name>-call<i>` per stored
+#: handler call (at most HLE_INTR_TCALLS), then `<name>`, then `<name>-after-zero`; a VTimer
+#: series whose create failed is the single FAIL record `<name>` with no out words.
+HLE_INTR_SERIES = ("vtimer-ret-20ms", "vtimer-ret-1us", "vtimer-ret-mixed",
+                   "alarm-ret-20ms", "alarm-ret-1us")
+HLE_INTR_TCALLS = 8
+#: The VBLANK cells that run only when a sub-interrupt slot was registered and enabled.
+HLE_INTR_VBL_CELLS = ("vbl-free", "vbl-masked-20ms", "vbl-masked-50ms",
+                      "vbl-masked-20ms-again", "vbl-hold-25ms")
+HLE_INTR_OUT_COUNTS = {
+    "vbl-register": 17, "vbl-free": 12, "vbl-masked-20ms": 14, "vbl-masked-50ms": 14,
+    "vbl-masked-20ms-again": 14, "vbl-hold-25ms": 16, "vbl-release": 2,
+    HLE_INTR_TERMINAL: 1,
+}
+HLE_INTR_NO_SLOT = 0xFFFFFFFF
+
+
+def _hle_intr_expected_cases(ids: list[str], results: dict[str, TestResult]) -> list[str]:
+    """The record sequence the probe emits, with its run-dependent parts read from the stream.
+
+    How many handler calls each series stored, whether a VTimer was created and whether a
+    VBLANK slot was registered and enabled are run facts; everything else is fixed. For a
+    stream cut short the rest of the success path is assumed, so parse_sequence sees an
+    ordered prefix of it.
+    """
+    expected: list[str] = []
+    for name in HLE_INTR_SERIES:
+        calls = 0
+        while (calls < HLE_INTR_TCALLS and len(expected) < len(ids)
+               and ids[len(expected)] == f"{name}-call{calls}"):
+            expected.append(f"{name}-call{calls}")
+            calls += 1
+        expected.append(name)
+        record = results.get(name)
+        if not (record is not None and record.status == "FAIL" and calls == 0
+                and name.startswith("vtimer-")):
+            expected.append(f"{name}-after-zero")
+    expected.append("vbl-register")
+    register = results.get("vbl-register")
+    if register is None or register.status == "PASS":
+        expected.extend(HLE_INTR_VBL_CELLS)
+        expected.append("vbl-release")
+    elif int(dict(register.values)["result"], 0) != HLE_INTR_NO_SLOT:
+        expected.append("vbl-release")
+    return expected
+
+
+def _hle_intr_out_count(case_id: str, record: TestResult) -> int:
+    if case_id in HLE_INTR_OUT_COUNTS:
+        return HLE_INTR_OUT_COUNTS[case_id]
+    if case_id in HLE_INTR_SERIES:
+        return 0 if record.status == "FAIL" else 3
+    if case_id.endswith("-after-zero"):
+        return 1
+    return 4  # <series>-call<i>
+
+
+def parse_hle_intr_cells_output(text: str, *, require_complete: bool = True) -> SequenceReport:
+    """Parse the hle-intr-cells stream: exact order, field counts and the probe's bookkeeping.
+
+    The checks compare the probe with itself: call rows carry sequence numbers 1..n, a series
+    has as many call rows as its count says (up to the eight the probe stores), the VBLANK
+    cells are present exactly when a slot was registered and enabled, and the release is
+    present whenever a slot was registered. No returned value is compared with an expected
+    PSP value.
+    """
+
+    parsed = parse_output(text)
+    ids = [record.case_id for record in parsed.results]
+    by_id = {record.case_id: record for record in parsed.results}
+    spec = StreamSpec(HLE_INTR_TEST_ID, tuple(_hle_intr_expected_cases(ids, by_id)),
+                      HLE_INTR_TERMINAL)
+    sequence = parse_sequence(text, spec, require_complete=require_complete)
+    _validate_scalar_shape(sequence, {case_id: _hle_intr_out_count(case_id, record)
+                                      for case_id, record in sequence.results.items()})
+    results = sequence.results
+    for case_id, record in results.items():
+        values = {key: int(value, 0) for key, value in record.values}
+        if case_id in HLE_INTR_SERIES:
+            if record.status == "FAIL":
+                if not case_id.startswith("vtimer-"):
+                    raise ProtocolError(f"{HLE_INTR_TEST_ID}: {case_id} FAIL; only a VTimer "
+                                        "create can fail a series")
+                continue
+            if record.status != "PASS":
+                raise ProtocolError(f"{HLE_INTR_TEST_ID}: {case_id} status {record.status!r} "
+                                    "is not PASS")
+            calls = sum(1 for other in results if other.startswith(f"{case_id}-call"))
+            if calls != min(values["out0"], HLE_INTR_TCALLS):
+                raise ProtocolError(
+                    f"{HLE_INTR_TEST_ID}: {case_id} counts {values['out0']:#x} calls but "
+                    f"{calls} call rows were recorded (the probe stores at most "
+                    f"{HLE_INTR_TCALLS})")
+        elif case_id == "vbl-register":
+            slot, enable = values["result"], values["out0"]
+            registered = slot != HLE_INTR_NO_SLOT
+            if registered and slot >= 16:
+                raise ProtocolError(
+                    f"{HLE_INTR_TEST_ID}: vbl-register slot {slot:#x} is not 0..15")
+            enabled = registered and enable < 0x80000000
+            if record.status != ("PASS" if enabled else "FAIL"):
+                raise ProtocolError(
+                    f"{HLE_INTR_TEST_ID}: vbl-register status {record.status!r} disagrees "
+                    f"with slot {slot:#x} and enable {enable:#x}")
+        elif case_id != HLE_INTR_TERMINAL:
+            if record.status != "PASS":
+                raise ProtocolError(f"{HLE_INTR_TEST_ID}: {case_id} status {record.status!r} "
+                                    "is not PASS")
+            call = re.fullmatch(r"(.+)-call(\d+)", case_id)
+            if call is not None and values["result"] != int(call.group(2)) + 1:
+                raise ProtocolError(
+                    f"{HLE_INTR_TEST_ID}: {case_id} sequence {values['result']:#x} is not "
+                    f"{int(call.group(2)) + 1}")
+    return sequence
+
+
+REGISTRY_MODELED_KEYS = frozenset({
+    "language", "button_assign", "date_format", "time_format", "timezone",
+    "summer_time", "adhoc_channel",
+})
+REGISTRY_TEST_ID = "PSP-REGISTRY-001"
+REGISTRY_HOST0_LOG = "host0:/registry_readonly_log.txt"
+
+
+@dataclass(frozen=True)
+class RegistryReadOnlyReport:
+    parsed: object
+    complete: bool
+    categories: tuple[str, ...]
+    keys: tuple[str, ...]
+
+
+def parse_registry_readonly_output(
+    text: str, *, require_complete: bool = True
+) -> RegistryReadOnlyReport:
+    """Validate the ordered, dynamically sized, read-only registry census."""
+
+    parsed = parse_output(text)
+    records = [record for record in parsed.results if record.test_id == REGISTRY_TEST_ID]
+    if len(records) != len(parsed.results):
+        raise ProtocolError(f"{REGISTRY_TEST_ID}: foreign test_id in registry stream")
+    if not records:
+        raise ProtocolError(f"{REGISTRY_TEST_ID}: registry stream has no records")
+
+    expected_fixed = ("registry-open", "registry-errors")
+    if tuple(record.case_id for record in records[:min(len(records), 2)]) != \
+            expected_fixed[:min(len(records), 2)]:
+        raise ProtocolError(f"{REGISTRY_TEST_ID}: stream must start with {list(expected_fixed)}")
+    if len(records) > 0:
+        _validate_registry_fields(records[0], {"result", "out0", "out1"})
+    if len(records) > 1:
+        _validate_registry_fields(
+            records[1], {
+                "result", "out0", "out1", "out2", "out3", "out4", "out5", "out6"
+            }
+        )
+
+    categories: list[str] = []
+    keys: list[str] = []
+    terminal = records[-1].case_id == "registry-done"
+    body = records[2: -1 if terminal else None]
+    for index, record in enumerate(body):
+        values = dict(record.values)
+        if record.case_id == "registry-bad-handle":
+            # The forged-handle call runs last so a fault there cannot hide
+            # the census; nothing but registry-done may follow it.
+            if index != len(body) - 1:
+                raise ProtocolError(
+                    f"{REGISTRY_TEST_ID}: registry-bad-handle must follow the census"
+                )
+            _validate_registry_fields(record, {"result", "out0", "out1"})
+        elif record.case_id.startswith("registry-category-"):
+            if set(values) != {"result", "out0", "out1", "detail"}:
+                raise ProtocolError(f"{REGISTRY_TEST_ID}: {record.case_id} has invalid fields")
+            _validate_registry_name(values["detail"], category=True)
+            categories.append(values["detail"])
+        elif record.case_id.startswith("registry-key-"):
+            common = {"result", "out0", "out1", "out2", "out3", "detail"}
+            if set(values) not in (common, common | {"value_hex"}):
+                raise ProtocolError(f"{REGISTRY_TEST_ID}: {record.case_id} has invalid fields")
+            _validate_registry_name(values["detail"], category=False)
+            name = values["detail"].rsplit("/", 1)[-1]
+            has_value = int(values["out2"], 0) == 1
+            if name in REGISTRY_MODELED_KEYS:
+                if has_value != ("value_hex" in values):
+                    raise ProtocolError(
+                        f"{REGISTRY_TEST_ID}: modeled key value presence disagrees for {name}"
+                    )
+            elif "value_hex" in values or has_value:
+                raise ProtocolError(
+                    f"{REGISTRY_TEST_ID}: non-modeled key value must not be recorded"
+                )
+            if "value_hex" in values and not re.fullmatch(r"(?:[0-9a-fA-F]{2})*", values["value_hex"]):
+                raise ProtocolError(f"{REGISTRY_TEST_ID}: value_hex is not byte encoded")
+            keys.append(values["detail"])
+        else:
+            raise ProtocolError(f"{REGISTRY_TEST_ID}: unexpected record {record.case_id!r}")
+
+    if terminal:
+        if len(records) < 2 or records[-2].case_id != "registry-bad-handle":
+            raise ProtocolError(
+                f"{REGISTRY_TEST_ID}: registry-bad-handle must precede registry-done"
+            )
+        done = records[-1]
+        _validate_registry_fields(done, {"result", "out0", "out1", "out2"})
+        done_values = {key: int(value, 0) for key, value in done.values if key != "detail"}
+        if done_values["out0"] != len(categories) or done_values["out1"] != len(keys) or \
+                done_values["out2"] != len(records) - 1:
+            raise ProtocolError(f"{REGISTRY_TEST_ID}: registry completion counts disagree")
+    elif require_complete:
+        raise ProtocolError(f"{REGISTRY_TEST_ID}: registry stream is missing registry-done")
+
+    ordered = [record.case_id for record in records]
+    if ordered[0:2] != list(expected_fixed):
+        raise ProtocolError(f"{REGISTRY_TEST_ID}: registry header order is invalid")
+    if terminal and ordered[-1] != "registry-done":
+        raise ProtocolError(f"{REGISTRY_TEST_ID}: registry-done must be last")
+    if len(set(ordered)) != len(ordered):
+        raise ProtocolError(f"{REGISTRY_TEST_ID}: duplicate record case_id")
+    return RegistryReadOnlyReport(
+        parsed=parsed,
+        complete=terminal,
+        categories=tuple(categories),
+        keys=tuple(keys),
+    )
+
+
+def _validate_registry_fields(record, expected: set[str]) -> None:
+    values = dict(record.values)
+    if set(values) != expected:
+        raise ProtocolError(
+            f"{REGISTRY_TEST_ID}: {record.case_id} fields must be {sorted(expected)}, "
+            f"got {sorted(values)}"
+        )
+    for field, value in values.items():
+        if field != "detail":
+            try:
+                int(value, 0)
+            except ValueError as exc:
+                raise ProtocolError(
+                    f"{REGISTRY_TEST_ID}: {record.case_id} {field} is not an integer"
+                ) from exc
+
+
+def _validate_registry_name(value: str, *, category: bool) -> None:
+    parts = value.split("/")
+    if not value or value.startswith("/") or ".." in parts or any(
+        not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", part) for part in parts
+    ):
+        raise ProtocolError(f"{REGISTRY_TEST_ID}: unsafe registry name {value!r}")
+    if category and value != "CONFIG" and not value.startswith("CONFIG/"):
+        raise ProtocolError(f"{REGISTRY_TEST_ID}: category is outside /CONFIG: {value!r}")
+
+
+# ---------------------------------------------------------------------------
+# PSP-REGISTRY-002 read-only font-registry walk (fixtures/psp_oracle/registry_walk.h)
+#
+# The stream is font-registry-open, then font-category/font-key records in the
+# walk's enumeration order, then font-registry-done. The parser re-checks the
+# walk's safety contract on the evidence itself: a category appears only right
+# after the key record that listed it as an on-route directory with a name
+# that round-trips, the root is never opened (it is listed through the registry
+# handle, and its children are opened only when that listing showed /CONFIG as
+# a directory), values appear only inside /DATA/FONT and
+# /SYSPROFILE/RESOLUTION, and every listed key is accounted for in order. It
+# does not decide PSP values.
+# ---------------------------------------------------------------------------
+
+REGISTRY_FONT_TEST_ID = "PSP-REGISTRY-002"
+REGISTRY_FONT_HOST0_LOG = "host0:/registry_font_log.txt"
+REGISTRY_FONT_ROUTES = (("DATA", "FONT"), ("SYSPROFILE", "RESOLUTION"))
+REGISTRY_FONT_NAME_MAX = 26
+REGISTRY_FONT_KEYS_MAX = 64
+REGISTRY_FONT_DEPTH_MAX = 6
+REGISTRY_FONT_VALUE_MAX = 1024
+REGISTRY_FONT_ERROR = 0xFFFFFFFF
+REGISTRY_FONT_TYPE_DIR = 1
+REGISTRY_FONT_KEY_METADATA = 0
+REGISTRY_FONT_KEY_VALUE = 1
+REGISTRY_FONT_KEY_OPENED = 2
+REGISTRY_FONT_KEY_OFF_ROUTE = 3
+REGISTRY_FONT_KEY_NAME_REFUSED = 4
+REGISTRY_FONT_KEY_DEPTH_LIMIT = 5
+REGISTRY_FONT_KEY_OPEN_LIMIT = 6
+REGISTRY_FONT_KEY_VALUE_SIZE = 7
+REGISTRY_FONT_KEY_INFO_FAILED = 8
+REGISTRY_FONT_KEY_NAME_UNSAFE = 9
+REGISTRY_FONT_KEY_ROOT_UNVERIFIED = 10
+REGISTRY_FONT_ROOT_ANCHOR = "/CONFIG"
+_REGISTRY_FONT_REFUSALS = frozenset({
+    REGISTRY_FONT_KEY_NAME_REFUSED, REGISTRY_FONT_KEY_DEPTH_LIMIT, REGISTRY_FONT_KEY_OPEN_LIMIT,
+    REGISTRY_FONT_KEY_ROOT_UNVERIFIED,
+})
+_REGISTRY_FONT_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,26}")
+
+
+@dataclass(frozen=True)
+class RegistryFontKey:
+    path: str
+    index: int
+    type: int
+    size: int
+    disposition: int
+    value: bytes | None
+
+
+@dataclass(frozen=True)
+class RegistryFontReport:
+    parsed: object
+    complete: bool
+    registry_opened: bool
+    root_enumerated: bool
+    root_verified: bool
+    categories: tuple[str, ...]
+    opened: tuple[str, ...]
+    keys: tuple[RegistryFontKey, ...]
+
+
+def _font_components(path: str) -> list[str]:
+    if path == "/":
+        return []
+    if not path.startswith("/") or path.endswith("/"):
+        raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: malformed registry path {path!r}")
+    parts = path[1:].split("/")
+    if any(not _REGISTRY_FONT_NAME_RE.fullmatch(part) for part in parts):
+        raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: unsafe registry path {path!r}")
+    return parts
+
+
+def _font_on_route(parts: list[str]) -> bool:
+    """Whether a directory at ``parts`` may be entered: a route prefix or below a route."""
+
+    span = min(len(parts), 2)
+    return bool(parts) and any(tuple(parts[:span]) == route[:span] for route in REGISTRY_FONT_ROUTES)
+
+
+def _font_value_subtree(parent: list[str]) -> bool:
+    """Whether keys of the directory ``parent`` are inside a value subtree."""
+
+    return len(parent) >= 2 and tuple(parent[:2]) in REGISTRY_FONT_ROUTES
+
+
+def _font_reopenable(name: str) -> bool:
+    return 0 < len(name) < REGISTRY_FONT_NAME_MAX and not name.startswith("__NAKAGAWA")
+
+
+def _font_fields(record: TestResult, expected: set[str]) -> dict[str, int | str]:
+    values = dict(record.values)
+    if set(values) != expected:
+        raise ProtocolError(
+            f"{REGISTRY_FONT_TEST_ID}: {record.case_id} fields must be {sorted(expected)}, "
+            f"got {sorted(values)}"
+        )
+    out: dict[str, int | str] = {}
+    for field, value in values.items():
+        if field in {"detail", "value_hex", "name_hex"}:
+            if field != "detail" and not re.fullmatch(r"(?:[0-9a-f]{2})*", value):
+                raise ProtocolError(
+                    f"{REGISTRY_FONT_TEST_ID}: {record.case_id} {field} is not byte encoded"
+                )
+            out[field] = value
+            continue
+        try:
+            out[field] = int(value, 0)
+        except ValueError as exc:
+            raise ProtocolError(
+                f"{REGISTRY_FONT_TEST_ID}: {record.case_id} {field} is not an integer"
+            ) from exc
+    return out
+
+
+def parse_registry_font_output(
+    text: str, *, require_complete: bool = True
+) -> RegistryFontReport:
+    """Validate the read-only font-registry walk and its safety contract."""
+
+    parsed = parse_output(text)
+    records = list(parsed.results)
+    if any(record.test_id != REGISTRY_FONT_TEST_ID for record in records):
+        raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: foreign test_id in font-registry stream")
+    if records[0].case_id != "font-registry-open":
+        raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: stream must start with font-registry-open")
+    opening = _font_fields(records[0], {"result", "out0", "out1"})
+    registry_opened = _int_field(opening, "result") == 0
+    if (records[0].status == "PASS") != registry_opened:
+        raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: font-registry-open status disagrees")
+    terminal = records[-1].case_id == "font-registry-done" and len(records) > 1
+    body = records[1:-1] if terminal else records[1:]
+    if not registry_opened and body:
+        raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: records after a failed registry open")
+
+    categories: list[str] = []
+    opened: list[str] = []
+    keys: list[RegistryFontKey] = []
+    stack: list[list] = []  # [path, count, next index]
+    pending_open: str | None = None
+    root_enumerated = False
+    for record in body:
+        if record.case_id.startswith("font-category-"):
+            if record.case_id != f"font-category-{len(categories):04d}":
+                raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: {record.case_id} is out of sequence")
+            values = _font_fields(record, {"result", "out0", "out1", "out2", "out3", "detail"})
+            path = str(values["detail"])
+            parts = _font_components(path)
+            result = _int_field(values, "result")
+            out0 = _int_field(values, "out0")
+            out1 = _int_field(values, "out1")
+            out2 = _int_field(values, "out2")
+            out3 = _int_field(values, "out3")
+            usable = (result == 0 and out0 == 0
+                      and out1 <= REGISTRY_FONT_KEYS_MAX
+                      and (out1 == 0 or out2 == 0))
+            if (record.status == "PASS") != usable:
+                raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: {record.case_id} status disagrees")
+            if out3 != len(parts):
+                raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: {record.case_id} depth disagrees")
+            if not categories:
+                if path != "/" or result != 0:
+                    raise ProtocolError(
+                        f"{REGISTRY_FONT_TEST_ID}: the first category must be the root listing"
+                    )
+                root_enumerated = usable
+            else:
+                # Safety: a category exists in the evidence only because the key record just
+                # before it listed it as an on-route directory whose name round-trips.
+                if pending_open != path:
+                    raise ProtocolError(
+                        f"{REGISTRY_FONT_TEST_ID}: {path} was opened without being listed "
+                        "as an on-route directory just before"
+                    )
+                if (not _font_on_route(parts) or len(parts) > REGISTRY_FONT_DEPTH_MAX
+                        or not all(_font_reopenable(part) for part in parts)):
+                    raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: {path} must never be opened")
+                if result == 0:
+                    opened.append(path)
+            pending_open = None
+            categories.append(path)
+            if usable and out1 > 0:
+                stack.append([path, out1, 0])
+            continue
+
+        if not record.case_id.startswith("font-key-"):
+            raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: unexpected record {record.case_id!r}")
+        if pending_open is not None:
+            raise ProtocolError(
+                f"{REGISTRY_FONT_TEST_ID}: {pending_open} was listed as opened but has no category"
+            )
+        if record.case_id != f"font-key-{len(keys):04d}":
+            raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: {record.case_id} is out of sequence")
+        base = {"result", "out0", "out1", "out2", "out3", "out4", "detail"}
+        raw = dict(record.values)
+        extra = set(raw) - base
+        if extra not in (set(), {"value_hex"}, {"name_hex"}):
+            raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: {record.case_id} has invalid fields")
+        values = _font_fields(record, base | extra)
+        while stack and stack[-1][2] >= stack[-1][1]:
+            stack.pop()
+        if not stack:
+            raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: {record.case_id} has no listing parent")
+        parent_path, _count, index = stack[-1]
+        if _int_field(values, "out2") != index:
+            raise ProtocolError(
+                f"{REGISTRY_FONT_TEST_ID}: {record.case_id} breaks the enumeration order"
+            )
+        stack[-1][2] += 1
+        disposition = _int_field(values, "out3")
+        path = str(values["detail"])
+        if disposition == REGISTRY_FONT_KEY_NAME_UNSAFE:
+            # name_hex is the whole listing slot; a usable name is NUL-terminated inside it.
+            slot = bytes.fromhex(str(values.get("name_hex", "")))
+            name = slot.split(b"\0", 1)[0] if b"\0" in slot else None
+            if ("name_hex" not in values or len(slot) != REGISTRY_FONT_NAME_MAX + 1
+                    or path != parent_path
+                    or _int_field(values, "result") != REGISTRY_FONT_ERROR
+                    or record.status != "FAIL"
+                    or (name is not None
+                        and _REGISTRY_FONT_NAME_RE.fullmatch(name.decode("latin-1")))):
+                raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: {record.case_id} unsafe-name record")
+            keys.append(RegistryFontKey(parent_path, index, REGISTRY_FONT_ERROR,
+                                        REGISTRY_FONT_ERROR, disposition, None))
+            continue
+        if "name_hex" in values:
+            raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: {record.case_id} has a stray name_hex")
+        parts = _font_components(path)
+        parent_parts = _font_components(parent_path)
+        if parts[:-1] != parent_parts or not parts:
+            raise ProtocolError(
+                f"{REGISTRY_FONT_TEST_ID}: {record.case_id} is not a child of {parent_path}"
+            )
+        out0 = _int_field(values, "out0")
+        out1 = _int_field(values, "out1")
+        out4 = _int_field(values, "out4")
+        is_dir = out0 == REGISTRY_FONT_TYPE_DIR
+        in_values = _font_value_subtree(parent_parts)
+        value = None
+        if "value_hex" in values:
+            if disposition != REGISTRY_FONT_KEY_VALUE or out4 != 0 or not in_values:
+                raise ProtocolError(
+                    f"{REGISTRY_FONT_TEST_ID}: {record.case_id} carries a value it must not have"
+                )
+            value = bytes.fromhex(str(values["value_hex"]))
+            if len(value) != out1:
+                raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: {record.case_id} value size disagrees")
+        ok = _int_field(values, "result") == 0
+        if (record.status == "PASS") != ok:
+            raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: {record.case_id} status disagrees")
+        if disposition == REGISTRY_FONT_KEY_INFO_FAILED:
+            consistent = not ok
+        elif not ok:
+            consistent = False
+        elif disposition == REGISTRY_FONT_KEY_METADATA:
+            consistent = not is_dir and not in_values and out4 == REGISTRY_FONT_ERROR
+        elif disposition == REGISTRY_FONT_KEY_VALUE:
+            consistent = (not is_dir and in_values
+                          and 0 < out1 <= REGISTRY_FONT_VALUE_MAX
+                          and (out4 == 0) == (value is not None))
+        elif disposition == REGISTRY_FONT_KEY_VALUE_SIZE:
+            consistent = (not is_dir and in_values and out4 == REGISTRY_FONT_ERROR
+                          and not 0 < out1 <= REGISTRY_FONT_VALUE_MAX)
+        elif disposition == REGISTRY_FONT_KEY_OPENED:
+            consistent = (is_dir and _font_on_route(parts) and _font_reopenable(parts[-1])
+                          and len(parts) <= REGISTRY_FONT_DEPTH_MAX)
+            pending_open = path
+        elif disposition == REGISTRY_FONT_KEY_OFF_ROUTE:
+            consistent = is_dir and not _font_on_route(parts)
+        elif disposition == REGISTRY_FONT_KEY_NAME_REFUSED:
+            consistent = is_dir and _font_on_route(parts) and not _font_reopenable(parts[-1])
+        elif disposition in (REGISTRY_FONT_KEY_DEPTH_LIMIT, REGISTRY_FONT_KEY_OPEN_LIMIT):
+            consistent = is_dir and _font_on_route(parts)
+        elif disposition == REGISTRY_FONT_KEY_ROOT_UNVERIFIED:
+            consistent = is_dir and _font_on_route(parts) and len(parts) == 1
+        else:
+            consistent = False
+        if not consistent:
+            raise ProtocolError(
+                f"{REGISTRY_FONT_TEST_ID}: {record.case_id} disposition {disposition} "
+                "disagrees with its key"
+            )
+        keys.append(RegistryFontKey(path, index, out0, out1,
+                                    disposition, value))
+
+    if pending_open is not None:
+        raise ProtocolError(
+            f"{REGISTRY_FONT_TEST_ID}: {pending_open} was listed as opened but has no category"
+        )
+    anchor_listed = any(key.path == REGISTRY_FONT_ROOT_ANCHOR
+                        and key.type == REGISTRY_FONT_TYPE_DIR for key in keys)
+    root_opened = any(key.disposition == REGISTRY_FONT_KEY_OPENED
+                      and key.path.count("/") == 1 for key in keys)
+    root_refused = any(key.disposition == REGISTRY_FONT_KEY_ROOT_UNVERIFIED for key in keys)
+    if root_opened and not anchor_listed:
+        raise ProtocolError(
+            f"{REGISTRY_FONT_TEST_ID}: a root category was opened although the listing did not "
+            f"show {REGISTRY_FONT_ROOT_ANCHOR} as a directory"
+        )
+    root_verified = False
+    if terminal:
+        done = _font_fields(records[-1], {
+            "result", "out0", "out1", "out2", "out3", "out4", "out5", "out6",
+        })
+        root_verified = done["out6"] == 1
+        if (done["out6"] not in (0, 1)
+                or (root_verified and (root_refused or not anchor_listed))
+                or (not root_verified and root_opened)):
+            raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: font-registry-done root check disagrees")
+        while stack and stack[-1][2] >= stack[-1][1]:
+            stack.pop()
+        if stack:
+            raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: listed keys are missing before done")
+        refused = sum(1 for key in keys if key.disposition in _REGISTRY_FONT_REFUSALS)
+        expected = {
+            "out0": len(categories), "out1": len(keys), "out2": len(records) - 1,
+            "out3": len(opened), "out4": refused, "out5": int(root_enumerated),
+        }
+        if any(done[field] != value for field, value in expected.items()):
+            raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: font-registry-done counts disagree")
+        if not registry_opened and done["result"] != REGISTRY_FONT_ERROR:
+            raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: registry closed without being opened")
+        if registry_opened and not categories:
+            raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: the root listing record is missing")
+    elif require_complete:
+        raise ProtocolError(f"{REGISTRY_FONT_TEST_ID}: stream is missing font-registry-done")
+    return RegistryFontReport(
+        parsed=parsed,
+        complete=terminal,
+        registry_opened=registry_opened,
+        root_enumerated=root_enumerated,
+        root_verified=root_verified,
+        categories=tuple(categories),
+        opened=tuple(opened),
+        keys=tuple(keys),
+    )
+
+
+def _s32(value: int) -> int:
+    return value - (1 << 32) if value & 0x80000000 else value
+
+
+# ---------------------------------------------------------------------------
+# PSP-FONTFILES-001 read-only copy of flash0:/font (fixtures/psp_oracle/font_files.h)
+#
+# font-dir-open, then (when the listing opened) font-mkdir, font-entry-NNNN in
+# listing order, font-dir-close, one font-copy-NNNN per copy candidate, and
+# font-files-done. The parser checks the order, that only regular files with
+# safe names inside the size bound were copied, and that a copy passes only
+# when its three digests and byte counts agree. The copies and digests are
+# private evidence; this parser never decides what a console should hold.
+# ---------------------------------------------------------------------------
+
+FONT_FILES_TEST_ID = "PSP-FONTFILES-001"
+FONT_FILES_HOST0_LOG = "host0:/font_files_log.txt"
+FONT_FILES_ENTRIES_MAX = 64
+FONT_FILES_FILE_MAX = 16 * 1024 * 1024
+FONT_FILES_MATCH_ALL = 7
+_FONT_FILES_NAME_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,62}")
+_SHA256_TEXT_RE = re.compile(r"[0-9a-f]{64}")
+
+
+@dataclass(frozen=True)
+class FontFileEntry:
+    name: str | None
+    name_hex: str | None
+    mode: int
+    attr: int
+    size: int
+    disposition: int
+
+
+@dataclass(frozen=True)
+class FontFileCopy:
+    name: str
+    size: int
+    sha256: str
+    readback_sha256: str
+    reread_sha256: str
+    match: int
+    verified: bool
+
+
+@dataclass(frozen=True)
+class FontFilesReport:
+    parsed: object
+    complete: bool
+    listed: bool
+    entries: tuple[FontFileEntry, ...]
+    copies: tuple[FontFileCopy, ...]
+
+
+def _io_fields(
+    test_id: str, record: TestResult, expected: set[str], text: set[str]
+) -> dict[str, int | str]:
+    values = dict(record.values)
+    if set(values) != expected:
+        raise ProtocolError(
+            f"{test_id}: {record.case_id} fields must be {sorted(expected)}, got {sorted(values)}"
+        )
+    out: dict[str, int | str] = {}
+    for field, value in values.items():
+        if field in text:
+            out[field] = value
+            continue
+        try:
+            out[field] = int(value, 0)
+        except ValueError as exc:
+            raise ProtocolError(f"{test_id}: {record.case_id} {field} is not an integer") from exc
+    return out
+
+
+def parse_font_files_output(text: str, *, require_complete: bool = True) -> FontFilesReport:
+    """Validate the flash0:/font listing-and-copy stream."""
+
+    tid = FONT_FILES_TEST_ID
+    parsed = parse_output(text)
+    records = list(parsed.results)
+    if any(record.test_id != tid for record in records):
+        raise ProtocolError(f"{tid}: foreign test_id in font-files stream")
+    if records[0].case_id != "font-dir-open":
+        raise ProtocolError(f"{tid}: stream must start with font-dir-open")
+    opening = _io_fields(tid, records[0], {"result", "out0", "out1"}, set())
+    listed = _s32(_int_field(opening, "result")) >= 0
+    if (records[0].status == "PASS") != listed:
+        raise ProtocolError(f"{tid}: font-dir-open status disagrees")
+    terminal = len(records) > 1 and records[-1].case_id == "font-files-done"
+    body = records[1:-1] if terminal else records[1:]
+    entries: list[FontFileEntry] = []
+    copies: list[FontFileCopy] = []
+    candidates: list[FontFileEntry] = []
+    closed = False
+    if not listed and body:
+        raise ProtocolError(f"{tid}: records after a listing that did not open")
+    if body:
+        if body[0].case_id != "font-mkdir":
+            raise ProtocolError(f"{tid}: font-mkdir must follow an opened listing")
+        _io_fields(tid, body[0], {"result"}, set())
+    for record in body[1:]:
+        if record.case_id.startswith("font-entry-"):
+            if closed or record.case_id != f"font-entry-{len(entries):04d}":
+                raise ProtocolError(f"{tid}: {record.case_id} is out of sequence")
+            raw = dict(record.values)
+            name_field = {"detail"} if "detail" in raw else {"name_hex"}
+            values = _io_fields(tid, record, {"result", "out0", "out1", "out2", "out3", "out4"}
+                                | name_field, {"detail", "name_hex"})
+            name = values.get("detail")
+            name_hex = values.get("name_hex")
+            if name is not None and not _FONT_FILES_NAME_RE.fullmatch(str(name)):
+                raise ProtocolError(f"{tid}: {record.case_id} prints an unsafe name")
+            if name_hex is not None and not re.fullmatch(r"(?:[0-9a-f]{2}){1,64}", str(name_hex)):
+                raise ProtocolError(f"{tid}: {record.case_id} name_hex is not byte encoded")
+            out0 = _int_field(values, "out0")
+            out1 = _int_field(values, "out1")
+            out2 = _int_field(values, "out2")
+            out3 = _int_field(values, "out3")
+            result = _int_field(values, "result")
+            disposition = _int_field(values, "out4")
+            size = out2 | (out3 << 32)
+            if size & (1 << 63):
+                size -= 1 << 64
+            regular = (out0 & 0xF000) == 0x2000
+            consistent = {
+                0: regular and name is not None and 0 <= size <= FONT_FILES_FILE_MAX,
+                1: not regular,
+                2: regular and name is None,
+                3: regular and name is not None and not 0 <= size <= FONT_FILES_FILE_MAX,
+            }.get(disposition, False)
+            if not consistent or result <= 0 or record.status != "PASS":
+                raise ProtocolError(f"{tid}: {record.case_id} disposition {disposition} disagrees")
+            entry = FontFileEntry(None if name is None else str(name),
+                                  None if name_hex is None else str(name_hex),
+                                  out0, out1, size, disposition)
+            entries.append(entry)
+            if disposition == 0:
+                candidates.append(entry)
+        elif record.case_id == "font-dir-close":
+            if closed:
+                raise ProtocolError(f"{tid}: font-dir-close repeats")
+            values = _io_fields(tid, record, {"result", "out0", "out1"}, set())
+            out0 = _int_field(values, "out0")
+            out1 = _int_field(values, "out1")
+            result = _int_field(values, "result")
+            if out0 != len(entries):
+                raise ProtocolError(f"{tid}: font-dir-close entry count disagrees")
+            if out1 == 0xFFFFFFFF and len(entries) != FONT_FILES_ENTRIES_MAX:
+                raise ProtocolError(f"{tid}: font-dir-close end result disagrees")
+            if (record.status == "PASS") != (result == 0 and out1 == 0):
+                raise ProtocolError(f"{tid}: font-dir-close status disagrees")
+            closed = True
+        elif record.case_id.startswith("font-copy-"):
+            index = len(copies)
+            if not closed or record.case_id != f"font-copy-{index:04d}" or index >= len(candidates):
+                raise ProtocolError(f"{tid}: {record.case_id} is out of sequence")
+            values = _io_fields(
+                tid, record,
+                {"result", *(f"out{i}" for i in range(9)), "detail", "sha256",
+                 "readback_sha256", "reread_sha256"},
+                {"detail", "sha256", "readback_sha256", "reread_sha256"},
+            )
+            entry = candidates[index]
+            if values["detail"] != entry.name:
+                raise ProtocolError(f"{tid}: {record.case_id} copies a file it did not list")
+            digests = [str(values[field]) for field in ("sha256", "readback_sha256", "reread_sha256")]
+            if not all(_SHA256_TEXT_RE.fullmatch(digest) for digest in digests):
+                raise ProtocolError(f"{tid}: {record.case_id} digests are malformed")
+            match = _int_field(values, "out8")
+            expected = 0
+            out1 = _int_field(values, "out1")
+            read_a = _s32(out1)
+            if read_a >= 0 and _int_field(values, "out3") == out1 \
+                    and _int_field(values, "out5") == out1 \
+                    and digests[0] == digests[1]:
+                expected |= 1
+            if read_a >= 0 and _int_field(values, "out7") == out1 and digests[0] == digests[2]:
+                expected |= 2
+            if read_a >= 0 and read_a == entry.size:
+                expected |= 4
+            # A failed write leaves fewer bytes written than read, so the counts decide bit 0 too.
+            if match != expected:
+                raise ProtocolError(f"{tid}: {record.case_id} match bits disagree with its counts")
+            verified = match == FONT_FILES_MATCH_ALL
+            if verified != (_int_field(values, "result") == 0) or (record.status == "PASS") != verified:
+                raise ProtocolError(f"{tid}: {record.case_id} status disagrees with its checks")
+            copies.append(FontFileCopy(entry.name or "", entry.size, digests[0], digests[1],
+                                       digests[2], match, verified))
+        else:
+            raise ProtocolError(f"{tid}: unexpected record {record.case_id!r}")
+    if terminal:
+        if listed and (not closed or len(copies) != len(candidates)):
+            raise ProtocolError(f"{tid}: listing or copies incomplete before font-files-done")
+        done = _io_fields(tid, records[-1], {"result", "out0", "out1", "out2", "out3"}, set())
+        expected_done = {
+            "out0": len(entries), "out1": len(candidates),
+            "out2": sum(1 for copy in copies if copy.verified), "out3": len(records) - 1,
+        }
+        if any(done[field] != value for field, value in expected_done.items()):
+            raise ProtocolError(f"{tid}: font-files-done counts disagree")
+    elif require_complete:
+        raise ProtocolError(f"{tid}: stream is missing font-files-done")
+    return FontFilesReport(parsed, terminal, listed, tuple(entries), tuple(copies))
+
+
+# ---------------------------------------------------------------------------
+# PSP-FONTLIST-001 the system font list as the console's own font library reports
+# it (fixtures/psp_oracle/font_list.h)
+#
+# font-list-newlib, then (when the library opened) font-list-count, and when the
+# count is positive font-list-list, font-list-entry-NNNN for every requested
+# index, font-info-NNNN for the same indices, then font-list-donelib and
+# font-list-done. Entries carry the raw style bytes as raw_hex with words 0-7
+# and 40-41 as out0-out9. The parser checks the order, the field sets, each
+# record's own consistency and the counts; it never decides what fonts a console
+# should hold. Names inside the entries are console strings and stay private.
+# ---------------------------------------------------------------------------
+
+FONT_LIST_TEST_ID = "PSP-FONTLIST-001"
+FONT_LIST_HOST0_LOG = "host0:/font_list_log.txt"
+FONT_LIST_ENTRIES_MAX = 64
+FONT_LIST_STYLE_BYTES = 168
+FONT_LIST_UNTOUCHED = 0xA5A5A5A5
+_FONT_LIST_WORD_FIELDS = frozenset(f"out{i}" for i in range(10))
+_FONT_LIST_RAW_RE = re.compile(r"(?:[0-9a-f]{2}){168}")
+
+
+@dataclass(frozen=True)
+class FontListEntry:
+    index: int
+    words: tuple[int, ...]
+    raw: bytes
+    ok: bool
+    result: int
+
+
+@dataclass(frozen=True)
+class FontListReport:
+    parsed: object
+    complete: bool
+    library: int
+    library_ok: bool
+    count: int | None
+    requested: int
+    entries: tuple[FontListEntry, ...]
+    infos: tuple[FontListEntry, ...]
+    failures: int | None
+
+
+def _font_list_error_clean(error: int) -> bool:
+    """An error word the library wrote as 0, or never wrote (the probe's untouched marker)."""
+    return error in (0, FONT_LIST_UNTOUCHED)
+
+
+def _font_list_entry(tid: str, record, prefix: str, index: int) -> FontListEntry:
+    expected_id = f"{prefix}{index:04d}"
+    if record.case_id != expected_id:
+        raise ProtocolError(f"{tid}: {record.case_id} is out of sequence; expected {expected_id}")
+    values = _io_fields(tid, record, {"result", "raw_hex", *_FONT_LIST_WORD_FIELDS}, {"raw_hex"})
+    raw_hex = str(values["raw_hex"])
+    if not _FONT_LIST_RAW_RE.fullmatch(raw_hex):
+        raise ProtocolError(f"{tid}: {record.case_id} raw_hex is not {FONT_LIST_STYLE_BYTES} bytes")
+    raw = bytes.fromhex(raw_hex)
+    words = tuple(_int_field(values, f"out{i}") for i in range(10))
+    expected = tuple(int.from_bytes(raw[4 * i:4 * i + 4], "little") for i in range(8)) + (
+        int.from_bytes(raw[0xA0:0xA4], "little"), int.from_bytes(raw[0xA4:0xA8], "little"))
+    if words != expected:
+        raise ProtocolError(f"{tid}: {record.case_id} out words disagree with raw_hex")
+    return FontListEntry(index, words, raw, record.status == "PASS", _int_field(values, "result"))
+
+
+def parse_font_list_output(text: str, *, require_complete: bool = True) -> FontListReport:
+    """Validate the font-library list stream."""
+
+    tid = FONT_LIST_TEST_ID
+    parsed = parse_output(text)
+    records = list(parsed.results)
+    if not records:
+        raise ProtocolError(f"{tid}: empty font-list stream")
+    if any(record.test_id != tid for record in records):
+        raise ProtocolError(f"{tid}: foreign test_id in font-list stream")
+    if records[0].case_id != "font-list-newlib":
+        raise ProtocolError(f"{tid}: stream must start with font-list-newlib")
+    newlib = _io_fields(tid, records[0], {"result", "out0", "out1", "out2", "out3", "out4"}, set())
+    library = _int_field(newlib, "result")
+    library_ok = library != 0 and _font_list_error_clean(_int_field(newlib, "out0"))
+    if (records[0].status == "PASS") != library_ok:
+        raise ProtocolError(f"{tid}: font-list-newlib status disagrees")
+    terminal = len(records) > 1 and records[-1].case_id == "font-list-done"
+    body = records[1:-1] if terminal else records[1:]
+    failures = 0 if library_ok else 1
+    count: int | None = None
+    requested = 0
+    entries: list[FontListEntry] = []
+    infos: list[FontListEntry] = []
+    donelib_seen = False
+    position = 0
+    if library == 0:
+        if body:
+            raise ProtocolError(f"{tid}: records after a library that did not open")
+    else:
+        if position < len(body):
+            record = body[position]
+            position += 1
+            if record.case_id != "font-list-count":
+                raise ProtocolError(f"{tid}: font-list-count must follow font-list-newlib")
+            values = _io_fields(tid, record, {"result", "out0", "out1"}, set())
+            count = _s32(_int_field(values, "result"))
+            requested = _int_field(values, "out1")
+            count_ok = (
+                0 <= count <= FONT_LIST_ENTRIES_MAX
+                and _font_list_error_clean(_int_field(values, "out0"))
+            )
+            if (record.status == "PASS") != count_ok:
+                raise ProtocolError(f"{tid}: font-list-count status disagrees")
+            if requested != min(max(count, 0), FONT_LIST_ENTRIES_MAX):
+                raise ProtocolError(f"{tid}: font-list-count requested count disagrees with the count")
+            if not count_ok:
+                failures += 1
+        elif require_complete:
+            raise ProtocolError(f"{tid}: stream is missing font-list-count")
+        if requested > 0 and position < len(body):
+            record = body[position]
+            position += 1
+            if record.case_id != "font-list-list":
+                raise ProtocolError(f"{tid}: font-list-list must follow font-list-count")
+            values = _io_fields(tid, record, {"result", "out0"}, set())
+            if _int_field(values, "out0") != requested:
+                raise ProtocolError(f"{tid}: font-list-list requested count disagrees")
+            list_ok = _s32(_int_field(values, "result")) >= 0
+            if (record.status == "PASS") != list_ok:
+                raise ProtocolError(f"{tid}: font-list-list status disagrees")
+            if not list_ok:
+                failures += 1
+            for index in range(requested):
+                if position >= len(body):
+                    break
+                entry = _font_list_entry(tid, body[position], "font-list-entry-", index)
+                position += 1
+                if entry.ok != list_ok or entry.result != 0:
+                    raise ProtocolError(f"{tid}: {body[position - 1].case_id} disagrees with font-list-list")
+                entries.append(entry)
+            for index in range(requested):
+                if position >= len(body):
+                    break
+                info = _font_list_entry(tid, body[position], "font-info-", index)
+                position += 1
+                if info.ok != (info.result == 0):
+                    raise ProtocolError(f"{tid}: {body[position - 1].case_id} status disagrees")
+                if not info.ok:
+                    failures += 1
+                infos.append(info)
+        if position < len(body):
+            record = body[position]
+            position += 1
+            if record.case_id != "font-list-donelib":
+                raise ProtocolError(f"{tid}: {record.case_id} is out of sequence; expected font-list-donelib")
+            values = _io_fields(tid, record, {"result", "out0", "out1"}, set())
+            donelib_ok = _int_field(values, "result") == 0
+            if (record.status == "PASS") != donelib_ok:
+                raise ProtocolError(f"{tid}: font-list-donelib status disagrees")
+            if not donelib_ok:
+                failures += 1
+            donelib_seen = True
+        if position < len(body):
+            raise ProtocolError(f"{tid}: unexpected record {body[position].case_id}")
+    done_failures: int | None = None
+    if terminal:
+        values = _io_fields(tid, records[-1],
+                            {"result", "out0", "out1", "out2", "out3", "out4", "out5", "out6"}, set())
+        if library != 0 and not donelib_seen:
+            raise ProtocolError(f"{tid}: font-list-done before font-list-donelib")
+        if len(entries) != requested or len(infos) != requested:
+            raise ProtocolError(f"{tid}: entries or infos incomplete before font-list-done")
+        if (_int_field(values, "out0") != len(entries)
+                or _int_field(values, "out1") != sum(1 for info in infos if info.ok)):
+            raise ProtocolError(f"{tid}: font-list-done counts disagree")
+        if _int_field(values, "out6") != failures:
+            raise ProtocolError(f"{tid}: font-list-done failure count disagrees")
+        if (records[-1].status == "PASS") != (failures == 0):
+            raise ProtocolError(f"{tid}: font-list-done status disagrees")
+        done_failures = _int_field(values, "out6")
+    elif require_complete:
+        raise ProtocolError(f"{tid}: stream is missing font-list-done")
+    return FontListReport(parsed, terminal, library, library_ok, count, requested,
+                          tuple(entries), tuple(infos), done_failures)
+
+
+# ---------------------------------------------------------------------------
+# PSP-UMDIO-001 bare-device and disc open results (fixtures/psp_oracle/umd_io.h)
+#
+# umd-state-before, io-open-NNNN for each fixed open, io-dopen-NNNN for each
+# fixed dopen, umd-state-after, umdio-done. The path lists below mirror the
+# probe source (a test keeps them equal). The default parser records results;
+# its explicit measured mode compares the accepted inserted-UMD run below.
+# ---------------------------------------------------------------------------
+
+UMDIO_TEST_ID = "PSP-UMDIO-001"
+UMDIO_HOST0_LOG = "host0:/umd_io_log.txt"
+UMDIO_OPENS = (
+    ("umd0:", 0x1), ("umd1:", 0x1), ("umd:", 0x1), ("umd0:/", 0x1), ("umd1:/", 0x1),
+    ("disc0:", 0x1), ("disc0:/", 0x1), ("disc0:/PSP_GAME", 0x1),
+    ("disc0:/PSP_GAME/SYSDIR", 0x1), ("disc0:/UMD_DATA.BIN", 0x1),
+    ("umd0:", 0xF0001), ("umd1:", 0xF0001), ("msstor0p1:/", 0x1),
+)
+UMDIO_DOPENS = ("umd0:", "umd1:", "umd:", "disc0:", "disc0:/", "disc0:/PSP_GAME")
+UMDIO_MEASURED_STATE = (0x00000001, 0x00000032)
+UMDIO_MEASURED_OPEN_RESULTS = (
+    (0x00000003, 0x00000000), (0x00000003, 0x00000000),
+    (0x00000003, 0x00000000), (0x00000003, 0x00000000),
+    (0x00000003, 0x00000000), (0x80010016, 0xFFFFFFFF),
+    (0x80010002, 0xFFFFFFFF), (0x00000003, 0x00000000),
+    (0x00000003, 0x00000000), (0x00000003, 0x00000000),
+    (0x00000003, 0x00000000), (0x00000003, 0x00000000),
+    (0x00000003, 0x00000000),
+)
+UMDIO_MEASURED_DOPEN_RESULTS = (
+    (0x80020325, 0xFFFFFFFF), (0x80020325, 0xFFFFFFFF),
+    (0x80020325, 0xFFFFFFFF), (0x80010016, 0xFFFFFFFF),
+    (0x00000003, 0x00000000), (0x00000003, 0x00000000),
+)
+
+
+@dataclass(frozen=True)
+class UmdIoReport:
+    parsed: object
+    complete: bool
+    before: tuple[int, int] | None
+    after: tuple[int, int] | None
+    opens: tuple[tuple[str, int, int, int], ...]
+    dopens: tuple[tuple[str, int, int], ...]
+
+
+def parse_umd_io_output(text: str, *, require_complete: bool = True,
+                        require_measured: bool = False) -> UmdIoReport:
+    """Validate the fixed bare-device stream and optionally its measured run."""
+
+    tid = UMDIO_TEST_ID
+    parsed = parse_output(text)
+    records = list(parsed.results)
+    if any(record.test_id != tid for record in records):
+        raise ProtocolError(f"{tid}: foreign test_id in umd-io stream")
+    expected = (["umd-state-before"]
+                + [f"io-open-{i:04d}" for i in range(len(UMDIO_OPENS))]
+                + [f"io-dopen-{i:04d}" for i in range(len(UMDIO_DOPENS))]
+                + ["umd-state-after", "umdio-done"])
+    observed = [record.case_id for record in records]
+    if observed != expected[:len(observed)]:
+        raise ProtocolError(f"{tid}: records out of order: {observed}")
+    complete = len(observed) == len(expected)
+    if not complete and require_complete:
+        raise ProtocolError(f"{tid}: stream is missing umdio-done")
+    before = after = None
+    opens: list[tuple[str, int, int, int]] = []
+    dopens: list[tuple[str, int, int]] = []
+    for record in records:
+        if record.status != "PASS":
+            raise ProtocolError(f"{tid}: {record.case_id} must be PASS (results are recorded)")
+        if record.case_id.startswith("umd-state-"):
+            values = _io_fields(tid, record, {"result", "out0"}, set())
+            state = (_int_field(values, "result"), _int_field(values, "out0"))
+            if record.case_id == "umd-state-before":
+                before = state
+            else:
+                after = state
+        elif record.case_id.startswith("io-open-"):
+            values = _io_fields(tid, record, {"result", "out0", "out1", "detail"}, {"detail"})
+            path, flags = UMDIO_OPENS[len(opens)]
+            if values["detail"] != path or _int_field(values, "out0") != flags:
+                raise ProtocolError(f"{tid}: {record.case_id} is not the source's open {path}")
+            result = _int_field(values, "result")
+            out1 = _int_field(values, "out1")
+            if (_s32(result) < 0) != (out1 == 0xFFFFFFFF):
+                raise ProtocolError(f"{tid}: {record.case_id} close result disagrees")
+            opens.append((path, flags, result, out1))
+        elif record.case_id.startswith("io-dopen-"):
+            values = _io_fields(tid, record, {"result", "out0", "detail"}, {"detail"})
+            path = UMDIO_DOPENS[len(dopens)]
+            if values["detail"] != path:
+                raise ProtocolError(f"{tid}: {record.case_id} is not the source's dopen {path}")
+            result = _int_field(values, "result")
+            out0 = _int_field(values, "out0")
+            if (_s32(result) < 0) != (out0 == 0xFFFFFFFF):
+                raise ProtocolError(f"{tid}: {record.case_id} close result disagrees")
+            dopens.append((path, result, out0))
+        elif record.case_id == "umdio-done":
+            values = _io_fields(tid, record, {"result", "out0", "out1", "out2", "out3", "out4"},
+                                set())
+            counts = {
+                "out0": len(UMDIO_OPENS),
+                "out1": sum(1 for item in opens if _s32(item[2]) >= 0),
+                "out2": len(UMDIO_DOPENS),
+                "out3": sum(1 for item in dopens if _s32(item[1]) >= 0),
+                "out4": len(records) - 1,
+            }
+            if any(_int_field(values, field) != value for field, value in counts.items()):
+                raise ProtocolError(f"{tid}: umdio-done counts disagree")
+    report = UmdIoReport(parsed, complete, before, after, tuple(opens), tuple(dopens))
+    if require_measured:
+        if not complete:
+            raise ProtocolError(f"{tid}: measured validation requires a complete stream")
+        if before != UMDIO_MEASURED_STATE or after != UMDIO_MEASURED_STATE:
+            raise ProtocolError(f"{tid}: stream is not the measured inserted-UMD state")
+        if tuple((item[2], item[3]) for item in report.opens) != UMDIO_MEASURED_OPEN_RESULTS:
+            raise ProtocolError(f"{tid}: sceIoOpen results differ from the measured PSP table")
+        if tuple((item[1], item[2]) for item in report.dopens) != UMDIO_MEASURED_DOPEN_RESULTS:
+            raise ProtocolError(f"{tid}: sceIoDopen results differ from the measured PSP table")
+    return report
+
+
+# ---------------------------------------------------------------------------
+# PSP-UMDRAW-001 raw UMD read/seek observations (fixtures/psp_oracle/umd_io.h)
+#
+# The parser accepts only the probe's fixed records and scalar fields. Seek
+# results are low word then high word; sector-16 reads expose only their first
+# eight bytes and an all-zero flag. It never accepts payloads or checksums.
+# ---------------------------------------------------------------------------
+
+UMDRAW_TEST_ID = "PSP-UMDRAW-001"
+UMDRAW_HOST0_LOG = "host0:/umd_raw_read_log.txt"
+UMDRAW_RAW_FLAGS = 0x000F0001
+UMDRAW_READONLY_FLAGS = 0x00000001
+UMDRAW_IOFILEMGR_NIDS = (
+    0x109F50BC, 0x27EB27B8, 0x3251EA56, 0x42EC03AC, 0x55F4717D,
+    0x68963324, 0x6A638D83, 0x810C4BC3, 0xA0B5A7C2, 0xACE946E8,
+    0xB29DDF9C, 0xE23EEC33, 0xE3EB004C, 0xEB092469, 0xF27A9C51,
+)
+UMDRAW_READ_SIZES = (1, 512, 2047, 2048, 2049, 4096, 32768, 0)
+UMDRAW_CASES = (
+    "umd-state-before", "raw-open-extra",
+    "seek-set-0", "seek-set-16", "seek-set-32768", "seek-cur-0", "seek-end-0",
+    "seek-set-1", "seek-set-neg1", "seek32-set-0", "seek32-set-16",
+    "seek32-set-32768", "seek32-end-0", "pos-advance-seek", "pos-advance-first",
+    "pos-advance-second", "pos-advance-cur", "byte-sector16-seek", "byte-sector16-read",
+    "size-1-seek", "size-1-read", "size-512-seek", "size-512-read",
+    "size-2047-seek", "size-2047-read", "size-2048-seek", "size-2048-read",
+    "size-2049-seek", "size-2049-read", "size-4096-seek", "size-4096-read",
+    "size-32768-seek", "size-32768-read", "size-0-seek", "size-0-read",
+    "unaligned-seek", "unaligned-read", "far-seek", "far-read", "async-seek",
+    "async-read", "async-poll", "async-wait", "async-data", "getstat", "raw-close",
+    "readonly-open", "readonly-seek-0", "readonly-seek-16", "readonly-seek-32768",
+    "readonly-close", "umd-state-after", "umdraw-done",
+)
+UMDRAW_SEEK64_CASES = frozenset({
+    "seek-set-0", "seek-set-16", "seek-set-32768", "seek-cur-0", "seek-end-0",
+    "seek-set-1", "seek-set-neg1", "pos-advance-seek", "pos-advance-cur",
+    "byte-sector16-seek", "unaligned-seek", "far-seek", "async-seek",
+    "readonly-seek-0", "readonly-seek-16", "readonly-seek-32768",
+    *(f"size-{size}-seek" for size in UMDRAW_READ_SIZES),
+})
+UMDRAW_SEEK32_CASES = frozenset({
+    "seek32-set-0", "seek32-set-16", "seek32-set-32768", "seek32-end-0",
+})
+UMDRAW_HEADER_READ_SIZES = {
+    "pos-advance-first": 2048,
+    "pos-advance-second": 2048,
+    "byte-sector16-read": 2048,
+    **{f"size-{size}-read": size for size in UMDRAW_READ_SIZES},
+    "async-data": 2048,
+}
+
+
+@dataclass(frozen=True)
+class UmdRawReadReport:
+    parsed: object
+    complete: bool
+    before: tuple[int, int] | None
+    after: tuple[int, int] | None
+
+
+def parse_umd_raw_read_output(text: str, *, require_complete: bool = True) -> UmdRawReadReport:
+    """Validate the fixed read-only raw-UMD stream without asserting PSP semantics."""
+
+    tid = UMDRAW_TEST_ID
+    parsed = parse_output(text)
+    records = list(parsed.results)
+    if any(record.test_id != tid for record in records):
+        raise ProtocolError(f"{tid}: foreign test_id in umd-raw-read stream")
+    observed = [record.case_id for record in records]
+    if len(observed) > len(UMDRAW_CASES) or observed != list(UMDRAW_CASES[:len(observed)]):
+        raise ProtocolError(f"{tid}: records out of order: {observed}")
+    complete = len(observed) == len(UMDRAW_CASES)
+    if not complete and require_complete:
+        raise ProtocolError(f"{tid}: stream is missing umdraw-done")
+
+    before = after = None
+    for index, record in enumerate(records):
+        case_id = record.case_id
+        if record.status != "PASS":
+            raise ProtocolError(f"{tid}: {case_id} must be PASS (results are observations)")
+        if case_id in {"umd-state-before", "umd-state-after"}:
+            values = _io_fields(tid, record, {"result", "out0"}, set())
+            state = (_int_field(values, "result"), _int_field(values, "out0"))
+            if case_id == "umd-state-before":
+                before = state
+            else:
+                after = state
+        elif case_id in {"raw-open-extra", "readonly-open"}:
+            values = _io_fields(tid, record, {"result", "out0"}, set())
+            expected_flags = UMDRAW_RAW_FLAGS if case_id == "raw-open-extra" else UMDRAW_READONLY_FLAGS
+            if (_int_field(values, "out0") != expected_flags
+                    or _s32(_int_field(values, "result")) < 0):
+                raise ProtocolError(f"{tid}: {case_id} did not open read-only with its pinned flags")
+        elif case_id in UMDRAW_SEEK64_CASES:
+            _io_fields(tid, record, {"result", "out0"}, set())
+        elif case_id in UMDRAW_SEEK32_CASES:
+            _io_fields(tid, record, {"result"}, set())
+        elif case_id in UMDRAW_HEADER_READ_SIZES:
+            values = _io_fields(tid, record, {"result", "out0", "out1", "out2", "out3"}, set())
+            if _int_field(values, "out2") not in (0, 1):
+                raise ProtocolError(f"{tid}: {case_id} has an invalid whole-buffer-zero flag")
+            if _int_field(values, "out3") != UMDRAW_HEADER_READ_SIZES[case_id]:
+                raise ProtocolError(f"{tid}: {case_id} requested the wrong byte count")
+        elif case_id in {"unaligned-read", "far-read", "async-read"}:
+            _io_fields(tid, record, {"result"}, set())
+        elif case_id in {"async-poll", "async-wait"}:
+            _io_fields(tid, record, {"result", "out0", "out1"}, set())
+        elif case_id == "getstat":
+            _io_fields(tid, record, {"result", "out0", "out1", "out2"}, set())
+        elif case_id in {"raw-close", "readonly-close"}:
+            values = _io_fields(tid, record, {"result"}, set())
+            if _int_field(values, "result") != 0:
+                raise ProtocolError(f"{tid}: {case_id} did not close its descriptor")
+        elif case_id == "umdraw-done":
+            values = _io_fields(tid, record, {"result", "out0"}, set())
+            if _int_field(values, "result") != 0 or _int_field(values, "out0") != index:
+                raise ProtocolError(f"{tid}: umdraw-done record count disagrees")
+    return UmdRawReadReport(parsed, complete, before, after)
+
+
+# ---------------------------------------------------------------------------
+# PSP-CACHE-001 dcache/uncached-alias probe
+#
+# The record contract is derived from ``fixtures/psp_oracle/probe.c``
+# ``run_cache_alias`` at the frozen source commit: four ``defer_record`` calls in
+# emission order followed by the ``cache-done`` completion sentinel, all flushed
+# by ``flush_deferred(emulated, "PSP-CACHE-001")`` after the last cache-sensitive
+# cell.  Nothing here is inherited from an earlier manifest.
+#
+# ``cache-inval-contrast`` records ``c_stale`` in ``out0`` -- a value that is only
+# meaningful while the line written by ``cache-writeback-contrast`` is still
+# resident.  It is an observable, not an assertion, and it is only trustworthy
+# because the deferred-record buffer keeps every ``host0:`` round trip out of the
+# window between those two cells.
+# ---------------------------------------------------------------------------
+
+CACHE_EXPECTED_TEST_ID = "PSP-CACHE-001"
+
+CACHE_SEMANTIC_CASES = (
+    "cache-alias-init",
+    "cache-writeback-contrast",
+    "cache-inval-contrast",
+    "cache-wball",
+)
+CACHE_TERMINAL_CASE = "cache-done"
+CACHE_HOST0_LOG = "host0:/cache_alias_log.txt"
+
+CACHE_SPEC = StreamSpec(
+    test_id=CACHE_EXPECTED_TEST_ID,
+    semantic_cases=CACHE_SEMANTIC_CASES,
+    terminal_case=CACHE_TERMINAL_CASE,
+)
+CACHE_EXPECTED_CASES = CACHE_SPEC.ordered_cases
+CACHE_EXPECTED_TERMINAL_COUNT = CACHE_SPEC.terminal_count
+
+
+@dataclass(frozen=True)
+class CacheAliasReport:
+    sequence: SequenceReport
+    stale_cached_read: int | None
+    fresh_cached_read: int | None
+
+    @property
+    def complete(self) -> bool:
+        return self.sequence.complete
+
+    @property
+    def terminal_present(self) -> bool:
+        return self.sequence.terminal_present
+
+    @property
+    def all_passed(self) -> bool:
+        return self.sequence.all_passed
+
+    @property
+    def record_count(self) -> int:
+        return self.sequence.record_count
+
+    @property
+    def results(self):
+        return self.sequence.results
+
+
+def parse_cache_alias_output(
+    text: str, *, require_complete: bool = True
+) -> CacheAliasReport:
+    """Parse a captured PSP-CACHE-001 stream from one channel.
+
+    ``require_complete=True`` is complete-or-error.  ``require_complete=False``
+    diagnoses an ordered prefix and can never report ``all_passed``.
+    """
+
+    sequence = parse_sequence(text, CACHE_SPEC, require_complete=require_complete)
+    return CacheAliasReport(
+        sequence=sequence,
+        stale_cached_read=_observable(sequence, "cache-inval-contrast", "out0"),
+        fresh_cached_read=_observable(sequence, "cache-inval-contrast", "out1"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# PSP-IO-001 IoFileMgr matrix probe
+#
+# The record contract is derived from ``fixtures/psp_oracle/probe.c``
+# ``run_io_matrix`` at the frozen source commit: six ``defer_record`` calls in
+# emission order followed by the ``io-done`` completion sentinel, all flushed by
+# ``flush_deferred(emulated, "PSP-IO-001")`` after the last measured IoFileMgr
+# operation.  Nothing here is inherited from an earlier manifest.
+#
+# Every measured value is a raw ``SceUID`` / return code recorded as an
+# observable.  This parser asserts the *stream*, not the PSP: a complete strict
+# stream establishes that the probe ran to completion and reported its own
+# verdicts, which is the precondition for reading those observables at all.
+# ---------------------------------------------------------------------------
+
+IO_EXPECTED_TEST_ID = "PSP-IO-001"
+
+# ``run_io_matrix`` cell order.  Cells 2 and 4 are nested under a successful
+# open, so a probe that cannot create its scratch file emits fewer records --
+# which is precisely why a short stream must never be read as a pass.
+IO_SEMANTIC_CASES = (
+    "io-open-create",
+    "io-write",
+    "io-read-verify",
+    "io-lseek",
+    "io-append",
+    "io-errors",
+)
+IO_TERMINAL_CASE = "io-done"
+IO_HOST0_LOG = "host0:/io_matrix_log.txt"
+
+IO_SPEC = StreamSpec(
+    test_id=IO_EXPECTED_TEST_ID,
+    semantic_cases=IO_SEMANTIC_CASES,
+    terminal_case=IO_TERMINAL_CASE,
+)
+IO_EXPECTED_CASES = IO_SPEC.ordered_cases
+IO_EXPECTED_TERMINAL_COUNT = IO_SPEC.terminal_count
+
+
+@dataclass(frozen=True)
+class IoMatrixReport:
+    sequence: SequenceReport
+    open_fd: int | None
+    removed_rc: int | None
+
+    @property
+    def complete(self) -> bool:
+        return self.sequence.complete
+
+    @property
+    def terminal_present(self) -> bool:
+        return self.sequence.terminal_present
+
+    @property
+    def all_passed(self) -> bool:
+        return self.sequence.all_passed
+
+    @property
+    def record_count(self) -> int:
+        return self.sequence.record_count
+
+    @property
+    def results(self):
+        return self.sequence.results
+
+
+def parse_io_matrix_output(text: str, *, require_complete: bool = True) -> IoMatrixReport:
+    """Parse a captured PSP-IO-001 stream from one channel.
+
+    ``require_complete=True`` is complete-or-error.  ``require_complete=False``
+    diagnoses an ordered prefix and can never report ``all_passed``; see
+    :func:`tools.psp_oracle.protocol.parse_sequence` for the exact boundary.
+    """
+
+    sequence = parse_sequence(text, IO_SPEC, require_complete=require_complete)
+    return IoMatrixReport(
+        sequence=sequence,
+        # out0 of io-open-create is the raw SceUID the probe was handed.  It is
+        # only an IoFileMgr observable because no log descriptor is allocated
+        # inside the measured window; see the deferred-record buffer in probe.c.
+        open_fd=_observable(sequence, "io-open-create", "out0"),
+        removed_rc=_observable(sequence, "io-errors", "out2"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# PSP-KERNEL-001 mailbox delete/wait measurement
+#
+# The two ordered semantic rows record raw values from the isolated
+# ``mbx-delete-wait`` fixture case.  The parser checks only that the complete
+# measurement stream and its exact output fields arrived; none of the observed
+# return codes, pointer values, wait states, or timing values are PSP
+# expectations.
+# ---------------------------------------------------------------------------
+
+MBX_DELETE_WAIT_SPEC = StreamSpec(
+    test_id="PSP-KERNEL-001",
+    semantic_cases=("mbx-delete-wait", "mbx-timeout-control"),
+    terminal_case="mbx-done",
+)
+MBX_DELETE_WAIT_EXPECTED_FIELDS = {
+    "mbx-delete-wait": frozenset(
+        {"result", *(f"out{i}" for i in range(26))}
+    ),
+    "mbx-timeout-control": frozenset(
+        {"result", *(f"out{i}" for i in range(8))}
+    ),
+    "mbx-done": frozenset({"result", "out0"}),
+}
+
+
+@dataclass(frozen=True)
+class MbxDeleteWaitReport:
+    sequence: SequenceReport
+
+    @property
+    def complete(self) -> bool:
+        return self.sequence.complete
+
+    @property
+    def terminal_present(self) -> bool:
+        return self.sequence.terminal_present
+
+    @property
+    def all_passed(self) -> bool:
+        return self.sequence.all_passed
+
+    @property
+    def record_count(self) -> int:
+        return self.sequence.record_count
+
+    @property
+    def results(self):
+        return self.sequence.results
+
+
+def parse_mbx_delete_wait_output(
+    text: str, *, require_complete: bool = True
+) -> MbxDeleteWaitReport:
+    """Parse one exact mailbox delete/wait observation stream.
+
+    This parser validates stream completeness and exact record fields.  It does
+    not qualify transport or PSP semantics; raw API outcomes remain
+    observations for later PSP-versus-HLE review, not parser constants.
+    """
+
+    sequence = parse_sequence(
+        text, MBX_DELETE_WAIT_SPEC, require_complete=require_complete
+    )
+    for case_id, expected_fields in MBX_DELETE_WAIT_EXPECTED_FIELDS.items():
+        record = sequence.results.get(case_id)
+        if record is None:
+            continue
+        actual_fields = set(dict(record.values))
+        if actual_fields != expected_fields:
+            missing = sorted(expected_fields - actual_fields)
+            unexpected = sorted(actual_fields - expected_fields)
+            details = []
+            if missing:
+                details.append(f"missing {', '.join(missing)}")
+            if unexpected:
+                details.append(f"unexpected {', '.join(unexpected)}")
+            raise ProtocolError(
+                f"{MBX_DELETE_WAIT_SPEC.test_id}: {case_id} field set mismatch: "
+                + "; ".join(details)
+            )
+    return MbxDeleteWaitReport(sequence=sequence)
+
+
+# ---------------------------------------------------------------------------
+# PSP-CTRL-001 controller and clock probe (also PSP-SYSTEM-001)
+# ---------------------------------------------------------------------------
+
+EXPECTED_TEST_IDS = frozenset({"PSP-CTRL-001", "PSP-SYSTEM-001"})
+
+EXPECTED_SYSTEM_CASES = [
+    "ctrl-ts-pairs",
+    "ctrl-ts-vcount",
+    "clock-snapshot",
+    "delay-10ms",
+    "ctrl-zero-count",
+    "ctrl-peek-read",
+]
+
+EXPECTED_CTRL_CASES = [
+    "ctrl-clock-freqs",
+    "ctrl-delay-calibration",
+]
+
+
+@dataclass(frozen=True)
+class CtrlClockReport:
+    raw_record_count: int
+    cpu_freq_mhz: int
+    bus_freq_mhz: int
+    delay_measured_us: int
+    complete: bool
+    all_passed: bool
+    results: dict[str, TestResult]
+
+
+def parse_ctrl_clock_output(text: str, *, require_complete: bool = True) -> CtrlClockReport:
+    """Parse and validate a captured PSP-CTRL-001 or PSP-SYSTEM-001 stream.
+
+    ``require_complete`` decides whether an incomplete stream raises or is
+    returned for inspection; it never relaxes a verdict.  ``complete`` is
+    computed from the observed case sequence and gates ``all_passed`` in both
+    modes, so a partial stream can never report ``all_passed``.
+    """
+    parsed = parse_output(text)
+    ordered_results: list[TestResult] = []
+    seen: set[str] = set()
+    active_test_id: str | None = None
+
+    for r in parsed.results:
+        if r.test_id in EXPECTED_TEST_IDS:
+            if active_test_id is None:
+                active_test_id = r.test_id
+            elif r.test_id != active_test_id:
+                raise ProtocolError(f"mixed test_ids in stream: {active_test_id} and {r.test_id}")
+            if r.case_id in seen:
+                raise ProtocolError(f"duplicate ctrl/clock case: {r.case_id}")
+            seen.add(r.case_id)
+            ordered_results.append(r)
+
+    if not ordered_results or active_test_id is None:
+        raise ProtocolError("missing required ctrl/clock test records")
+
+    expected_cases = (
+        EXPECTED_SYSTEM_CASES if active_test_id == "PSP-SYSTEM-001" else EXPECTED_CTRL_CASES
+    )
+    results = {r.case_id: r for r in ordered_results}
+    actual_order = [r.case_id for r in ordered_results]
+
+    if require_complete:
+        if actual_order != expected_cases:
+            missing = [cid for cid in expected_cases if cid not in results]
+            if missing:
+                raise ProtocolError(f"ctrl/clock stream incomplete, missing: {missing}")
+            extra = [cid for cid in actual_order if cid not in expected_cases]
+            if extra:
+                raise ProtocolError(f"ctrl/clock stream contains unexpected cases: {extra}")
+            raise ProtocolError(
+                f"ctrl/clock cases out of order: expected {expected_cases}, got {actual_order}"
+            )
+    else:
+        expected_indices = {cid: idx for idx, cid in enumerate(expected_cases)}
+        indices = [expected_indices.get(cid, -1) for cid in actual_order if cid in expected_indices]
+        if any(indices[i] > indices[i + 1] for i in range(len(indices) - 1)):
+            raise ProtocolError(f"ctrl/clock cases out of order: {actual_order}")
+
+    cpu_mhz = 0
+    bus_mhz = 0
+    delay_us = 0
+
+    if "ctrl-clock-freqs" in results:
+        v = dict(results["ctrl-clock-freqs"].values)
+        cpu_mhz = int(v.get("out0", "0"), 0)
+        bus_mhz = int(v.get("out1", "0"), 0)
+
+    if "clock-snapshot" in results:
+        v = dict(results["clock-snapshot"].values)
+        cpu_mhz = int(v.get("out5", "0"), 0)
+        bus_mhz = cpu_mhz // 2 if cpu_mhz > 0 else 0
+
+    if "ctrl-delay-calibration" in results:
+        v = dict(results["ctrl-delay-calibration"].values)
+        delay_us = int(v.get("out0", "0"), 0)
+
+    if "delay-10ms" in results:
+        v = dict(results["delay-10ms"].values)
+        delay_us = int(v.get("out2", "0"), 0)
+
+    # Completeness is a property of the observed case sequence, never of the
+    # caller's strictness flag.
+    complete = actual_order == expected_cases
+    all_passed = complete and all(r.status == "PASS" for r in results.values())
+
+    return CtrlClockReport(
+        raw_record_count=len(parsed.results),
+        cpu_freq_mhz=cpu_mhz,
+        bus_freq_mhz=bus_mhz,
+        delay_measured_us=delay_us,
+        complete=complete,
+        all_passed=all_passed,
+        results=results,
+    )
+
+
+# ---------------------------------------------------------------------------
+# PSP-FPU-001 vector probe
+# ---------------------------------------------------------------------------
+
+FPU_EXPECTED_TEST_ID = "PSP-FPU-001"
+EXPECTED_CELLS = [
+    "fpu-boot-fcr31",
+    "fpu-cvt-rm0",
+    "fpu-cvt-rm1",
+    "fpu-cvt-rm2",
+    "fpu-cvt-rm3",
+    "fpu-ccast-trunc",
+    "fpu-cvt-s-w",
+    "fpu-flag-overflow",
+    "fpu-flag-div0",
+    "fpu-flag-invalid",
+    "fpu-flag-underflow",
+    "fpu-flag-inexact",
+    "fpu-ftz-contrast",
+    "fpu-signed-zero",
+    "fpu-nan-payload",
+    "fpu-done",
+]
+
+# ``fpu-done`` is the terminal completion sentinel, not a measurement.  It is
+# never counted as a semantic cell, and it carries the number of semantic cells
+# the probe believes it executed in ``out0``.  The probe emits cells 0..14 and
+# then reports 15, so the sentinel is cross-checkable against the protocol.
+TERMINAL_CELL = "fpu-done"
+SEMANTIC_CELLS = [cid for cid in EXPECTED_CELLS if cid != TERMINAL_CELL]
+FPU_EXPECTED_TERMINAL_COUNT = len(SEMANTIC_CELLS)
+
+
+@dataclass(frozen=True)
+class FpuVectorReport:
+    raw_record_count: int
+    cell_count: int
+    boot_fcr31: int
+    trap_enables: int
+    ftz_contrast_delta: int
+    complete: bool
+    terminal_present: bool
+    all_passed: bool
+    results: dict[str, TestResult]
+
+
+def parse_fpu_vector_output(text: str, *, require_complete: bool = True) -> FpuVectorReport:
+    """Parse and validate a captured PSP-FPU-001 probe stream.
+
+    ``require_complete=True`` is complete-or-error: an incomplete, reordered or
+    over-long cell sequence raises :class:`ProtocolError`.
+
+    ``require_complete=False`` permits *inspection* of an ordered prefix so a
+    truncated capture can still be classified.  It does not relax any verdict:
+    ``complete`` is computed from the cell sequence alone and ``all_passed``
+    is gated on it in both modes, so a partial stream can never report
+    ``all_passed``.  Presence of the ``fpu-done`` terminal record is reported
+    separately as ``terminal_present`` and never substitutes for completeness --
+    a probe that emits its terminal record after losing middle records is
+    exactly the shape the transport defect produces.
+    """
+    parsed = parse_output(text)
+    fpu_ordered_results: list[TestResult] = []
+    seen: set[str] = set()
+    known = set(EXPECTED_CELLS)
+    for r in parsed.results:
+        # A foreign test_id or an unknown cell is never a truncation, so both
+        # fail closed in *both* strictness modes.  Filtering them out instead
+        # would let a complete FPU run plus an appended record from another
+        # probe's run parse as an unqualified pass.
+        if r.test_id != FPU_EXPECTED_TEST_ID:
+            raise ProtocolError(
+                f"fpu stream carries a foreign test_id {r.test_id!r} (case {r.case_id!r})"
+            )
+        if r.case_id not in known:
+            raise ProtocolError(f"fpu stream contains unknown cell: {r.case_id}")
+        if r.case_id in seen:
+            raise ProtocolError(f"duplicate fpu cell: {r.case_id}")
+        seen.add(r.case_id)
+        fpu_ordered_results.append(r)
+
+    fpu_results = {r.case_id: r for r in fpu_ordered_results}
+
+    if "fpu-boot-fcr31" not in fpu_results:
+        raise ProtocolError("missing required fpu-boot-fcr31 diagnostic cell")
+
+    actual_order = [r.case_id for r in fpu_ordered_results]
+    if require_complete:
+        if actual_order != EXPECTED_CELLS:
+            missing = [cid for cid in EXPECTED_CELLS if cid not in fpu_results]
+            if missing:
+                raise ProtocolError(f"fpu stream incomplete, missing cells: {missing}")
+            # Unknown cells are rejected above, in both strictness modes, so a
+            # complete-set mismatch that is not a missing cell can only be an
+            # ordering fault.
+            raise ProtocolError(
+                f"fpu cells out of order: expected {EXPECTED_CELLS}, got {actual_order}"
+            )
+    else:
+        expected_indices = {cid: idx for idx, cid in enumerate(EXPECTED_CELLS)}
+        indices = [expected_indices.get(cid, -1) for cid in actual_order if cid in expected_indices]
+        if any(indices[i] > indices[i + 1] for i in range(len(indices) - 1)):
+            raise ProtocolError(f"fpu cells out of order: {actual_order}")
+
+    boot_rec = fpu_results["fpu-boot-fcr31"]
+    val_dict = dict(boot_rec.values)
+    boot_fcr = int(val_dict.get("result", "0"), 0)
+    enables = (boot_fcr >> 7) & 0x1F
+
+    ftz_delta = 0
+    if "fpu-ftz-contrast" in fpu_results:
+        ftz_rec = fpu_results["fpu-ftz-contrast"]
+        ftz_dict = dict(ftz_rec.values)
+        ftz_delta = int(ftz_dict.get("result", "0"), 0)
+
+    # Completeness is a property of the observed cell sequence, never of the
+    # caller's strictness flag.  ``require_complete`` only decides whether an
+    # incomplete stream raises or is returned for inspection.
+    complete = actual_order == EXPECTED_CELLS
+    terminal_present = TERMINAL_CELL in fpu_results
+
+    # A terminal record that disagrees with the protocol's semantic cell count
+    # is a corrupted or mismatched stream, not a truncation, so it fails closed
+    # in both strictness modes.  Without this check a sentinel claiming any
+    # count at all would be accepted, and the completion record would carry no
+    # verifiable meaning.
+    if terminal_present:
+        done_values = dict(fpu_results[TERMINAL_CELL].values)
+        if "out0" not in done_values:
+            raise ProtocolError(
+                f"fpu terminal record {TERMINAL_CELL!r} is missing its out0 completion count"
+            )
+        try:
+            claimed_count = int(done_values["out0"], 0)
+        except ValueError as exc:
+            raise ProtocolError(
+                f"fpu terminal count is not an integer: {done_values['out0']!r}"
+            ) from exc
+        if claimed_count != FPU_EXPECTED_TERMINAL_COUNT:
+            raise ProtocolError(
+                f"fpu terminal count mismatch: {TERMINAL_CELL} claims {claimed_count} "
+                f"semantic cells, protocol expects {FPU_EXPECTED_TERMINAL_COUNT}"
+            )
+        observed_semantic = len([cid for cid in actual_order if cid != TERMINAL_CELL])
+        if complete and observed_semantic != claimed_count:
+            raise ProtocolError(
+                f"fpu terminal count mismatch: {TERMINAL_CELL} claims {claimed_count} "
+                f"semantic cells, stream carries {observed_semantic}"
+            )
+
+    all_passed = complete and all(r.status == "PASS" for r in fpu_results.values())
+
+    return FpuVectorReport(
+        raw_record_count=len(parsed.results),
+        cell_count=len(fpu_results),
+        boot_fcr31=boot_fcr,
+        trap_enables=enables,
+        ftz_contrast_delta=ftz_delta,
+        complete=complete,
+        terminal_present=terminal_present,
+        all_passed=all_passed,
+        results=fpu_results,
+    )
+
+
+# ---------------------------------------------------------------------------
+# PSP-PHASEB-001 resident money-launch probe
+# ---------------------------------------------------------------------------
+
+PHASEB_EXPECTED_TEST_ID = "PSP-PHASEB-001"
+
+SECTION_A_CASES = [
+    "ED2-R77", "ED2-R00", "ED2-RNEG", "ED2-RERR",
+    "ED2-X77", "ED2-X00", "ED2-XNEG", "ED2-XERR",
+    "ED2-D77", "ED2-D00", "ED2-DNEG", "ED2-DERR",
+]
+
+SECTION_B_CASES = [
+    "MTX-CR-INIT0", "MTX-CR-INIT1", "MTX-CR-BADATTR", "MTX-CR-BADCNT", "MTX-CR-REC",
+    "MTX-LK-UNCONT", "MTX-LK-NOREC", "MTX-UL-UNCONT", "MTX-LK-REC", "MTX-UL-NOTOWN",
+    "MTX-TRY-LOCK", "MTX-TRY-FAIL", "MTX-TO-ZERO", "MTX-TO-FINITE",
+    "MTX-CANCEL", "MTX-DEL-WAKE", "MTX-WAIT-FIFO", "MTX-WAIT-PRIO",
+    "LWM-CR-LK-UL",
+]
+
+SECTION_C_CASES = [
+    "CB-ORDINARY-EXEC", "CB-STACK-LOC", "CB-STACK-DELTA",
+    "CB-REG-PRESERVE", "CB-NESTED-DEPTH2", "CB-FCR31",
+]
+
+SECTION_D_CASES = [
+    "GE-CB-FIRED", "GE-CB-THREAD", "GE-CB-STACK", "GE-CB-CLEANUP",
+]
+
+SUMMARY_CASE = "PHASEB-COMPLETE"
+EXPECTED_ALL_CASES = SECTION_C_CASES + SECTION_D_CASES + SECTION_B_CASES + SECTION_A_CASES
+EXPECTED_ORDERED_CASES = EXPECTED_ALL_CASES + [SUMMARY_CASE]
+
+# ``PHASEB-COMPLETE`` is the terminal completion sentinel, never a semantic
+# measurement.  It carries the number of semantic cases the probe believes it
+# executed in ``out0`` (41 = 6 C + 4 D + 19 B + 12 A).
+PHASEB_EXPECTED_TERMINAL_COUNT = len(EXPECTED_ALL_CASES)
+
+
+@dataclass(frozen=True)
+class PhaseBReport:
+    raw_record_count: int
+    section_a_count: int
+    section_b_count: int
+    section_c_count: int
+    section_d_count: int
+    summary_present: bool
+    completed: bool
+    all_passed: bool
+    results: dict[str, TestResult]
+
+
+def parse_phaseb_output(text: str, *, require_complete: bool = True) -> PhaseBReport:
+    """Parse and validate a captured PSP-PHASEB-001 stream.
+
+    ``require_complete=True`` is complete-or-error.  ``require_complete=False``
+    permits *inspection* of an ordered prefix after a crash, and nothing more:
+    ``completed`` means the exact 42-record C-D-B-A + summary sequence was
+    observed, and ``all_passed`` is gated on it in both modes.  The presence of
+    the ``PHASEB-COMPLETE`` summary record is reported separately as
+    ``summary_present`` and never substitutes for completeness.
+    """
+    parsed = parse_output(text)
+    ordered_results: list[TestResult] = []
+    seen: set[str] = set()
+    known = set(EXPECTED_ORDERED_CASES)
+    for r in parsed.results:
+        # A foreign test_id or an unknown case is never a truncation, so both
+        # fail closed in *both* strictness modes.  Filtering them out instead
+        # would let a complete Phase-B run plus an appended record from another
+        # run parse as an unqualified pass.
+        if r.test_id != PHASEB_EXPECTED_TEST_ID:
+            raise ProtocolError(
+                f"phaseb stream carries a foreign test_id {r.test_id!r} (case {r.case_id!r})"
+            )
+        if r.case_id not in known:
+            raise ProtocolError(f"phaseb stream contains unknown case: {r.case_id}")
+        if r.case_id in seen:
+            raise ProtocolError(f"duplicate phaseb case: {r.case_id}")
+        seen.add(r.case_id)
+        ordered_results.append(r)
+
+    results = {r.case_id: r for r in ordered_results}
+    actual_order = [r.case_id for r in ordered_results]
+
+    if require_complete:
+        if actual_order != EXPECTED_ORDERED_CASES:
+            missing = [cid for cid in EXPECTED_ORDERED_CASES if cid not in results]
+            if missing:
+                raise ProtocolError(
+                    f"phaseb stream incomplete, missing {len(missing)} cases: {missing[:5]}"
+                )
+            # Unknown cases are rejected above, in both strictness modes, so a
+            # complete-set mismatch that is not a missing case can only be an
+            # ordering fault.
+            raise ProtocolError(
+                f"phaseb cases out of order: expected {EXPECTED_ORDERED_CASES}, got {actual_order}"
+            )
+    else:
+        expected_indices = {cid: idx for idx, cid in enumerate(EXPECTED_ORDERED_CASES)}
+        indices = [expected_indices.get(cid, -1) for cid in actual_order if cid in expected_indices]
+        if any(indices[i] > indices[i + 1] for i in range(len(indices) - 1)):
+            raise ProtocolError(f"phaseb cases out of order: {actual_order}")
+
+    sec_a = sum(1 for cid in SECTION_A_CASES if cid in results)
+    sec_b = sum(1 for cid in SECTION_B_CASES if cid in results)
+    sec_c = sum(1 for cid in SECTION_C_CASES if cid in results)
+    sec_d = sum(1 for cid in SECTION_D_CASES if cid in results)
+
+    # Completeness is a property of the observed case sequence, never of the
+    # caller's strictness flag, and never of the summary record alone.
+    summary_present = SUMMARY_CASE in results
+
+    # A summary record disagreeing with the protocol's semantic case count is a
+    # corrupted or mismatched stream, not a truncation, so it fails closed in
+    # both strictness modes.
+    if summary_present:
+        summary_values = dict(results[SUMMARY_CASE].values)
+        if "out0" not in summary_values:
+            raise ProtocolError(
+                f"phaseb terminal record {SUMMARY_CASE!r} is missing its out0 completion count"
+            )
+        try:
+            claimed_count = int(summary_values["out0"], 0)
+        except ValueError as exc:
+            raise ProtocolError(
+                f"phaseb terminal count is not an integer: {summary_values['out0']!r}"
+            ) from exc
+        if claimed_count != PHASEB_EXPECTED_TERMINAL_COUNT:
+            raise ProtocolError(
+                f"phaseb terminal count mismatch: {SUMMARY_CASE} claims {claimed_count} "
+                f"semantic cases, protocol expects {PHASEB_EXPECTED_TERMINAL_COUNT}"
+            )
+        observed_semantic = len([cid for cid in actual_order if cid != SUMMARY_CASE])
+        if actual_order == EXPECTED_ORDERED_CASES and observed_semantic != claimed_count:
+            raise ProtocolError(
+                f"phaseb terminal count mismatch: {SUMMARY_CASE} claims {claimed_count} "
+                f"semantic cases, stream carries {observed_semantic}"
+            )
+
+    completed = actual_order == EXPECTED_ORDERED_CASES
+    all_passed = completed and all(r.status == "PASS" for r in results.values())
+
+    return PhaseBReport(
+        raw_record_count=len(parsed.results),
+        section_a_count=sec_a,
+        section_b_count=sec_b,
+        section_c_count=sec_c,
+        section_d_count=sec_d,
+        summary_present=summary_present,
+        completed=completed,
+        all_passed=all_passed,
+        results=results,
+    )

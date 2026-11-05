@@ -1,0 +1,2664 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2025-2026 the psp-recomp authors
+// Copyright (C) 2026 the Nakagawa Recomp authors
+// Derived from sal063/PSP-recompilation-project (GPL-2.0-or-later)
+// Modified by Nakagawa Recomp contributors, 2026-08-11.
+// See NOTICE.md for upstream lineage and modification provenance.
+// Derived from PPSSPP (https://github.com/hrydgard/ppsspp), GPL-2.0-or-later
+// Copyright (c) 2012- PPSSPP Project and contributors
+//
+/*
+ * The codegen emits one C function per guest function with signature void f_<hexaddr>(CpuState*).
+ * Those functions read and write this CpuState and access guest memory through the macros
+ * below. Computed transfers go through dispatch(). When tracing is enabled (a trace file is
+ * set), each translated instruction reports itself so the output can be diffed against the
+ * PPSSPP reference trace (tools/TRACE_FORMAT.md).
+ */
+
+#ifndef PSP_RECOMP_RT_H
+#define PSP_RECOMP_RT_H
+
+#include <stdint.h>
+#include <inttypes.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fp_convert.h"
+#ifdef __cplusplus
+#include <atomic>
+typedef std::atomic_int_least32_t atomic_int_least32_t;
+#else
+#include <stdatomic.h>
+#endif
+
+/* Debug framework — included early so sr_w32() can call sr_check_mem_watch(). */
+#include "debug.h"
+#include "flight_recorder.h"
+#include "perf.h"
+#include "stale_code.h"  /* TD-27 opt-in stale translated-code detector (declarations only) */
+
+/* The CpuState layout version (issue #812: v3). Generated code refuses to compile against
+ * another version (tools/codegen.py emits the guard), tools/mem_debug.py reads the same
+ * number, and flight_recorder.c stamps it into every bundle's runtime block, where
+ * assets/flight_recorder_schema.json pins it as a const and tools/flight_diff.py treats it
+ * as a comparability condition. Bump it here and in the schema together. */
+#ifndef SR_CPUSTATE_ABI_VERSION
+#define SR_CPUSTATE_ABI_VERSION 3u
+#endif
+
+typedef struct CpuState {
+    uint32_t r[32];     /* r[0] reads 0; the codegen never emits a write to r[0]. */
+    uint32_t hi, lo;
+    /* AOT code does NOT update this per instruction: sr_begin_impl() records the pc into
+     * its own static trace slot, never into this field. Outside the guest interpreter this
+     * therefore remains the last preemption/dispatch point and can be an entire call tree
+     * away from a fault. The production guest interpreter is the explicit exception: while
+     * it owns execution, it advances this field as the architectural PC and leaves the AOT
+     * handoff destination here. Diagnostics must distinguish those two execution modes.
+     * For the exact call site of the jal/jalr currently executing, use `r[31] - 8`: the
+     * generated code assigns ra = call+8 at the call instruction itself. (The reference
+     * interpreter in src/ref/cpu.h is different -- there pc IS exact.) */
+    uint32_t pc;
+    union {
+        float f[32];
+        uint32_t fi[32];
+    };
+    uint32_t fcr31;
+    uint32_t fpcond;    /* FP compare result, separate from fcr31 to match PPSSPP */
+    union {
+        float v[128];   /* VFPU register file; physical order matches PPSSPP's v[128] */
+        uint32_t vi[128];
+    };
+    uint32_t vfpuCtrl[16];  /* VFPU control: prefixes (S/T/D), cc, etc. */
+    uint32_t cop0[32];      /* COP0 register bank; status is cop0[SR_CP0_STATUS] */
+    uint32_t next_pc;       /* Branch/delay-slot bookkeeping for reference parity */
+    uint32_t in_delay_slot;  /* Parity with ref::CpuState */
+    uint32_t flow_kind;      /* Runtime transfer metadata, not architectural state */
+    uint32_t flow_target;    /* Runtime transfer metadata, not architectural state */
+    /* MIPS32 LLbit: 1 after `ll`, read by `sc`. Architectural, per thread. Cleared
+     * only through sr_cpu_link_clear() at the events that end an atomic window:
+     * exception return (eret), interrupt/callback return, HLE syscall return and
+     * thread switch-in. Nothing else writes it, so an ll..sc window that crosses
+     * none of those events always succeeds (ABI v3). */
+    uint32_t llbit;
+} CpuState;
+
+#define SR_CP0_STATUS 12u
+
+static inline uint32_t *sr_cp0_status_ptr(CpuState *s) {
+    return &s->cop0[SR_CP0_STATUS];
+}
+
+/* End the current ll..sc atomic window: the next `sc` fails and stores nothing.
+ * Called at every point where this runtime models an event the MIPS32 contract
+ * says breaks the link (an exception return, an interrupt or callback returning
+ * to the interrupted context, an HLE syscall returning, and a thread being
+ * switched in). See docs/ARCHITECTURE.md "LL/SC link state". */
+static inline void sr_cpu_link_clear(CpuState *s) {
+    s->llbit = 0u;
+}
+
+/* VFPU control state of a new thread: identity S/T prefixes, no D prefix, and the
+ * random-unit registers RCX0-7 (controls 8-15). The RCX words were measured on a
+ * PSP-3000 with mfvc at thread entry, before any vrnds (2026-10-24, issue #326):
+ * RCX0-3 = 3f800001 3f800002 3f800004 3f800008, RCX4-7 = 3f800000. The measurement
+ * cannot tell thread creation from reset, so every thread-entry seed site calls
+ * this. Controls 3-7 (CC and the rest) keep whatever the caller left. */
+static inline void sr_vfpu_thread_ctrl_init(CpuState *s) {
+    s->vfpuCtrl[0] = 0xe4u;
+    s->vfpuCtrl[1] = 0xe4u;
+    s->vfpuCtrl[2] = 0u;
+    for (int i = 0; i < 4; i++) {
+        s->vfpuCtrl[8 + i] = 0x3f800000u | (1u << i);
+        s->vfpuCtrl[12 + i] = 0x3f800000u;
+    }
+}
+
+/* One step of the VFPU random unit, as one vrndi.s draw takes it (issue #326). The
+ * rule is the PSP-3000 measurement in docs/HARDWARE_ORACLE.md (PSP-HLE-ISSUES-001,
+ * 2026-10-24): state Ck = (RCX(k+4) & 0xffff) << 16 | (RCXk & 0xffff) for k = 0..3
+ * and a carry c whose nibble k sits in bits 16-19 of RCXk; then C0' = 69069 C0 + 1,
+ * C1' = xorshift32(C1; 13, 17, 5), C2' = C3, C3' = 2 C3 + C2 + c (mod 2^32),
+ * c' = ((C2 >> 2) + (C3 >> 3) + (c >> 2)) >> 30, and the drawn word is
+ * C0' + C1' + C3'. It reproduces all 1792 measured rows (the drawn word and RCX0-7
+ * after the step). The new state goes back in the same layout. Bits 20-31 are not part
+ * of the state and are left as found: the probe wrote 0x3f8 there in every cell; what
+ * the unit does with other upper bits (reachable only through mtvc) is unmeasured.
+ * The generated code and sr_vfpu_interp both call this. */
+static inline uint32_t sr_vfpu_rnd_step(uint32_t rcx[8]) {
+    uint32_t c[4], carry = 0u;
+    for (int k = 0; k < 4; k++)
+        c[k] = ((rcx[k + 4] & 0xffffu) << 16) | (rcx[k] & 0xffffu);
+    for (int k = 0; k < 8; k++)
+        carry |= ((rcx[k] >> 16) & 0xfu) << (4 * k);
+    uint32_t x = c[1];
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    /* Each addend is below 2^30, so the 32-bit sum cannot wrap. */
+    const uint32_t next_carry = ((c[2] >> 2) + (c[3] >> 3) + (carry >> 2)) >> 30;
+    const uint32_t n[4] = {69069u * c[0] + 1u, x, c[3], 2u * c[3] + c[2] + carry};
+    for (int k = 0; k < 4; k++) {
+        rcx[k] = (rcx[k] & 0xfff00000u) | (((next_carry >> (4 * k)) & 0xfu) << 16) |
+                 (n[k] & 0xffffu);
+        rcx[k + 4] = (rcx[k + 4] & 0xfff00000u) |
+                     (((next_carry >> (4 * (k + 4))) & 0xfu) << 16) | (n[k] >> 16);
+    }
+    return n[0] + n[1] + n[3];
+}
+
+/* VFPU forms measured on a PSP-3000 by PSP-VFPU-FORMS-001 (2026-10-28, issue #326;
+ * docs/HARDWARE_ORACLE.md): the raw result words of vh2f, vuc2i, vsocp, vwbn and
+ * vrndf1/vrndf2 under identity S/T/D prefixes, which is all these helpers model. The
+ * generated code and sr_vfpu_interp both call them; a pending prefix and the widths no
+ * cell covered fail closed in both lanes. */
+
+/* vrndf1.s / vrndf2.s: one step of the random unit (sr_vfpu_rnd_step, the same state
+ * update as vrndi.s) whose low 23 bits become the mantissa of a float in [1, 2)
+ * (vrndf1) or [2, 4) (vrndf2). All 68 measured draws match. */
+static inline uint32_t sr_vfpu_rndf_step(uint32_t rcx[8], int two) {
+    return (two ? 0x40000000u : 0x3f800000u) | (sr_vfpu_rnd_step(rcx) & 0x7fffffu);
+}
+
+/* vh2f: one IEEE half to a float32 word. A half denormal becomes a zero of its sign;
+ * exponent 31 keeps the 10-bit payload in the LOW mantissa bits (0x7c01 -> 0x7f800001,
+ * 0x7e00 -> 0x7f800200), so infinities map to infinities; normals convert exactly. */
+static inline uint32_t sr_vfpu_h2f(uint32_t h) {
+    const uint32_t sign = (h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    if (e == 0u) return sign;
+    if (e == 31u) return sign | 0x7f800000u | m;
+    return sign | ((e + 112u) << 23) | (m << 13);
+}
+
+/* PSP-VFPU-FORMS2-001 (PSP-3000, 2026-10-29, issue #326), identity prefixes unless a
+ * helper says otherwise. */
+
+/* vrnds.s: the seed word becomes all four 32-bit components of the random unit and its
+ * 32-bit carry, whatever the state was (96 cells from two different states). The RCX
+ * image is the one sr_vfpu_rnd_step reads and writes. */
+static inline void sr_vfpu_rnd_seed(uint32_t rcx[8], uint32_t seed) {
+    for (int k = 0; k < 8; k++)
+        rcx[k] = (rcx[k] & 0xfff00000u) | (((seed >> (4 * k)) & 0xfu) << 16) |
+                 ((k < 4 ? seed : seed >> 16) & 0xffffu);
+}
+
+/* vf2h: one float32 word to an IEEE half by truncation (round toward zero). A result
+ * below the half normal range, a float denormal included, is a zero of its sign; an
+ * exponent past the half range is an infinity of its sign; a NaN keeps its sign and the
+ * LOW 10 mantissa bits, so 0x7fc00000 becomes 0x7c00 (vh2f's mapping run backwards). */
+static inline uint32_t sr_vfpu_f2h(uint32_t b) {
+    const uint32_t sign = (b >> 16) & 0x8000u, e = (b >> 23) & 0xffu, m = b & 0x7fffffu;
+    if (e == 0xffu) return sign | 0x7c00u | (m & 0x3ffu);
+    const int he = (int)e - 112;
+    if (he >= 31) return sign | 0x7c00u;
+    if (he <= 0) return sign;
+    return sign | ((uint32_t)he << 10) | (m >> 13);
+}
+
+/* vc2i: one byte b to the top byte of a word, the rest zero. */
+static inline uint32_t sr_vfpu_c2i(uint32_t b) {
+    return (b & 0xffu) << 24;
+}
+
+/* vuc2i: one byte b to the word (b * 0x01010101) >> 1. */
+static inline uint32_t sr_vfpu_uc2i(uint32_t b) {
+    return ((b & 0xffu) * 0x01010101u) >> 1;
+}
+
+/* vwbn.s with exponent imm8 e: a word whose exponent field is 0xff passes unchanged.
+ * Otherwise the significand (implicit bit included for a normal, the raw mantissa for a
+ * zero or denormal) shifts left by (x_exp - e) & 15 when x_exp > e, right by
+ * (e - x_exp) & 15 when 0 < x_exp < e, not at all otherwise, and the low 23 bits become
+ * the mantissa of a float with the operand's sign and exponent e. The 4-bit shift count
+ * is what the cells show: 1e10 at e = 0x7f shifts by 1, the largest normal by 15, the
+ * smallest normal right by 14. All 448 measured words (eight exponents) match. */
+static inline uint32_t sr_vfpu_wbn(uint32_t x, uint32_t e) {
+    const uint32_t xe = (x >> 23) & 0xffu;
+    if (xe == 0xffu) return x;
+    uint32_t sig = (x & 0x7fffffu) | (xe != 0u ? 0x800000u : 0u);
+    if (xe > e) sig <<= (xe - e) & 15u;
+    else if (xe != 0u && xe < e) sig >>= (e - xe) & 15u;
+    return (x & 0x80000000u) | ((e & 0xffu) << 23) | (sig & 0x7fffffu);
+}
+
+/* vsocp: one operand x to the pair (sat0(1 - x), sat0(x)), sat0 clamping to [0, 1]
+ * with +0 for anything at or below zero. A denormal operand counts as a zero of its
+ * sign; a NaN operand writes the canonical 0x7f800001 to both lanes. */
+static inline void sr_vfpu_socp(uint32_t x, uint32_t out[2]) {
+    if ((x & 0x7f800000u) == 0u) x &= 0x80000000u;
+    if ((x & 0x7fffffffu) > 0x7f800000u) {
+        out[0] = out[1] = 0x7f800001u;
+        return;
+    }
+    float f, a;
+    memcpy(&f, &x, 4);
+    a = 1.0f - f;
+    a = a <= 0.0f ? 0.0f : (a > 1.0f ? 1.0f : a);
+    f = f <= 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+    memcpy(&out[0], &a, 4);
+    memcpy(&out[1], &f, 4);
+}
+
+/* LLE Phase 1 (PR 2): COP0/exception/eret helpers and flow metadata. Included
+ * here so generated code and the interpreter share one declaration site. */
+#include "cpu_lle.h"
+
+/* LLE Phase 1 (PR 3): per-domain HLE/LLE selection and the import-call seam.
+ * Included here so generated import stubs share one declaration site. The
+ * header only forward-declares struct CpuState, so include order is free. */
+#include "domain_mode.h"
+
+#ifndef __cplusplus
+_Static_assert(SR_CPUSTATE_ABI_VERSION == 3u, "unsupported CpuState ABI version");
+_Static_assert(offsetof(CpuState, cop0) == 852u, "CpuState cop0 offset drift");
+_Static_assert(offsetof(CpuState, next_pc) == 980u, "CpuState next_pc offset drift");
+_Static_assert(offsetof(CpuState, in_delay_slot) == 984u,
+               "CpuState in_delay_slot offset drift");
+_Static_assert(offsetof(CpuState, flow_kind) == 988u, "CpuState flow_kind offset drift");
+_Static_assert(offsetof(CpuState, flow_target) == 992u,
+               "CpuState flow_target offset drift");
+_Static_assert(offsetof(CpuState, llbit) == 996u, "CpuState llbit offset drift");
+_Static_assert(sizeof(CpuState) == 1000u, "CpuState size drift");
+#endif
+
+/* Guest memory: a single host region. g_mem points at guest 0x08000000, and the underlying
+ * allocation also extends 0x04000000 bytes *below* g_mem so the same arena covers VRAM/eDRAM
+ * (0x04000000..0x041fffff). SR_HOST maps a VRAM address to g_mem minus an offset that still
+ * lands inside the allocation. Keeping SR_RAM_BASE at 0x08000000 means the recompiled code's
+ * MEM_* macros are unchanged (no rebuild of the big object). */
+extern uint8_t *g_mem;
+#define SR_RAM_BASE 0x08000000u
+#define SR_PHYS(a)  ((a) & 0x1FFFFFFFu)
+#define SR_VRAM_CPU_BASE 0x04000000u
+#define SR_VRAM_CPU_END  0x04800000u
+#define SR_VRAM_CPU_MASK 0xFF800000u
+
+/* CPU addresses in the 2 MiB VRAM mirror window share the same physical eDRAM.
+ * The 0x042 and 0x046 views are swizzled; scalar accesses can translate each byte,
+ * while a C host pointer cannot represent spans that cross a swizzle boundary. */
+static inline int sr_vram_cpu_aperture(uint32_t address) {
+    return (SR_PHYS(address) & SR_VRAM_CPU_MASK) == SR_VRAM_CPU_BASE;
+}
+
+static inline int sr_vram_cpu_span_touches(uint32_t address, uint32_t width) {
+    if (width == 0u) return 0;
+    uint32_t first = SR_PHYS(address);
+    uint32_t last = SR_PHYS(address + width - 1u);
+    return first < SR_VRAM_CPU_END && last >= SR_VRAM_CPU_BASE;
+}
+
+static inline uint32_t sr_vram_cpu_address(uint32_t address) {
+    uint32_t phys = SR_PHYS(address);
+    if (!sr_vram_cpu_aperture(address)) return phys;
+
+    uint32_t mirror = (phys >> 21) & 3u;
+    uint32_t offset = phys & 0x001FFFFFu;
+    if (mirror == 1u) {
+        offset ^= 0x2040u;
+    } else if (mirror == 3u) {
+        uint32_t bank = (offset >> 5) & 0x1Fu;
+        bank = ((bank << 1) | (bank >> 4)) & 0x1Fu;
+        offset = (offset & ~0x3E0u) | (bank << 5);
+        offset ^= 0x2040u;
+    }
+    return SR_VRAM_CPU_BASE + offset;
+}
+
+static inline int sr_guest_span_hits_swizzled_vram_mirror(uint32_t address,
+                                                           uint32_t size) {
+    if (size == 0u) return 0;
+    uint64_t first = SR_PHYS(address);
+    uint64_t end = first + (uint64_t)size;
+    int intersects = (first < 0x04400000ull && end > 0x04200000ull) ||
+                     (first < 0x04800000ull && end > 0x04600000ull);
+    if (!intersects) return 0;
+    uint64_t last = end - 1u;
+    if (first < 0x04200000ull || last >= 0x04800000ull ||
+        ((first >> 21) & 3u) != ((last >> 21) & 3u)) return 1;
+    uint32_t region = (uint32_t)((first >> 21) & 3u);
+    uint32_t first_offset = (uint32_t)first & 0x001FFFFFu;
+    uint32_t last_offset = (uint32_t)last & 0x001FFFFFu;
+    if (region == 1u)
+        return (first_offset >> 6) != (last_offset >> 6) ||
+               (first_offset >> 13) != (last_offset >> 13);
+    if (region == 3u) return (first_offset >> 5) != (last_offset >> 5);
+    return 1;
+}
+
+/* `caller` names the function that asked for the refused span (the span
+ * predicates below pass their caller's __func__), so a log line identifies the
+ * bulk path that still forms one host pointer over a swizzled mirror. */
+static inline void sr_guest_span_report_vram_mirror_boundary(const char *caller) {
+    static int reported;
+    if (!reported) {
+        reported = 1;
+        fprintf(stderr,
+                "SEMANTIC_BOUNDARY: VRAM_MIRROR_BULK_UNSUPPORTED; bulk access through "
+                "a swizzled VRAM mirror is not supported yet (caller: %s).\n",
+                caller ? caller : "unknown");
+    }
+}
+
+/* Signed offset so addresses below SR_RAM_BASE map below g_mem.
+ * With SR_RAM_BASE=0x08000000, RAM starts at g_mem and VRAM/eDRAM at 0x04000000 is at g_mem - 0x04000000. */
+static inline uint8_t *sr_host_address(uint32_t address) {
+    return g_mem + (int32_t)(sr_vram_cpu_address(address) - SR_RAM_BASE);
+}
+#define SR_HOST(a)  sr_host_address((uint32_t)(a))
+/* Scalar accessors use this only after proving a normal-RAM/non-mirror span, keeping
+ * the common path to one VRAM-range test rather than repeating alias translation. */
+#define SR_HOST_LINEAR(a) (g_mem + (int32_t)(SR_PHYS(a) - SR_RAM_BASE))
+
+/* The arena covers guest physical [0, 0x0c000000). */
+static inline int sr_inrange(uint32_t a) {
+    return (uint32_t)SR_PHYS(a) < 0x0c000000u;
+}
+/* Width-aware variant for multi-byte accesses. sr_inrange(a) alone only checks the
+ * FIRST byte, so e.g. a 4-byte read starting at phys 0x0bfffffe would pass it while
+ * its last byte lands past the arena's actual end (past the calloc'd allocation).
+ * Used by the r16/r32/w16/w32 accessors below; sr_inrange(a) (width 1) is unchanged
+ * for sr_r8/sr_w8_pc and the arena/texture-bounds checks elsewhere in the runtime. */
+static inline int sr_inrange_n(uint32_t a, uint32_t width) {
+    uint32_t phys = (uint32_t)SR_PHYS(a);
+    return phys < 0x0c000000u && (0x0c000000u - phys) >= width;
+}
+extern volatile int g_sr_vram_read_pending;
+void sr_ge_vram_read_prepare(uint32_t physical_addr, uint32_t width);
+void sr_ge_vram_write_prepare(uint32_t physical_addr, uint32_t width);
+void sr_ge_vram_write_commit(uint32_t physical_addr, uint32_t width);
+static inline void sr_guest_vram_read_prepare_bytes(uint32_t addr, uint32_t width);
+
+/* --- Guest-memory span validation (issue #15) --------------------------------
+ * Overflow-safe bounds checks for BULK / string / parser accesses, where a whole
+ * [addr, addr+size) range is touched at once (a memcpy, a string walk, a parsed
+ * record) rather than one scalar. The scalar accessors already use sr_inrange_n();
+ * these give bulk boundaries the same overflow-safe guarantee under an
+ * intent-revealing name. Routing existing HLE/parser call sites through them is
+ * tracked by #15; the checks themselves are proven by tests/native/guestmem_selftest.c.
+ *
+ * A zero-size span is always valid (it touches no bytes, so the base need not be
+ * in range). readable/writable are identical today because the guest arena is one
+ * uniformly read/write region; they are kept distinct so a call site states intent
+ * and a future read-only region only changes one of them. */
+static inline int sr_guest_span_readable_at(uint32_t addr, uint32_t size,
+                                            const char *caller) {
+    if (size == 0u) return 1;
+    if (!sr_inrange_n(addr, size)) return 0;
+    if (sr_guest_span_hits_swizzled_vram_mirror(addr, size)) {
+        sr_guest_span_report_vram_mirror_boundary(caller);
+        return 0;
+    }
+    return 1;
+}
+static inline int sr_guest_span_writable_at(uint32_t addr, uint32_t size,
+                                            const char *caller) {
+    if (size == 0u) return 1;
+    if (!sr_inrange_n(addr, size)) return 0;
+    if (sr_guest_span_hits_swizzled_vram_mirror(addr, size)) {
+        sr_guest_span_report_vram_mirror_boundary(caller);
+        return 0;
+    }
+    return 1;
+}
+
+/* Range-checked destination test for writers that copy through sr_guest_copy_out()
+ * or sr_guest_fill() instead of forming one host pointer over the span (#1049).
+ * Unlike sr_guest_span_writable() it accepts a span through the swizzled VRAM
+ * mirrors: those helpers walk the span in sr_guest_host_run() pieces, each inside
+ * one block that stays contiguous in physical VRAM, and translate every piece
+ * through SR_HOST(). A span that starts in one VRAM view and ends in another is
+ * therefore exact as well: the bytes are guest-contiguous, and each lands where a
+ * scalar store to that guest address would. Only a span that leaves the arena is
+ * refused. Callers that still form a host pointer keep using
+ * sr_guest_span_writable() and its VRAM_MIRROR_BULK_UNSUPPORTED report. */
+static inline int sr_guest_span_writable_any_view(uint32_t addr, uint32_t size) {
+    return size == 0u || sr_inrange_n(addr, size);
+}
+
+/* Bulk readers call this immediately before forming their host pointer. */
+static inline int sr_guest_span_readable_current_at(uint32_t addr, uint32_t size,
+                                                    const char *caller) {
+    if (!sr_guest_span_readable_at(addr, size, caller)) return 0;
+    if (__builtin_expect(g_sr_vram_read_pending, 0) &&
+        sr_vram_cpu_span_touches(addr, size))
+        sr_ge_vram_read_prepare(sr_vram_cpu_address(addr), size);
+    return 1;
+}
+
+/* Call sites keep the short names; the boundary report names the calling function. */
+#define sr_guest_span_readable(addr, size) \
+    sr_guest_span_readable_at((addr), (size), __func__)
+#define sr_guest_span_writable(addr, size) \
+    sr_guest_span_writable_at((addr), (size), __func__)
+#define sr_guest_span_readable_current(addr, size) \
+    sr_guest_span_readable_current_at((addr), (size), __func__)
+
+/* Return the largest prefix of [addr, addr + size) that remains inside the
+ * flat guest arena.  This is intentionally a prefix calculation, not a
+ * validity predicate: the measured PSP DMAC path can complete a one-byte tail
+ * request when the valid prefix ends at an allocation boundary.  Callers must
+ * apply their own policy to larger or otherwise ambiguous overruns before
+ * forming a host pointer. */
+static inline uint32_t sr_guest_span_prefix(uint32_t addr, uint32_t size) {
+    if (size == 0u) return 0u;
+    const uint32_t phys = (uint32_t)SR_PHYS(addr);
+    if (phys >= 0x0c000000u) return 0u;
+    const uint32_t available = 0x0c000000u - phys;
+    return available < size ? available : size;
+}
+
+/* Checked size arithmetic for computing a span extent BEFORE validating it, so a
+ * parser cannot wrap uint32_t (e.g. count*stride, base+len) into a small value that
+ * then passes a bounds check. Return 1 and store the result on success; return 0 on
+ * overflow and leave *out unmodified. `out` may be NULL to test only for overflow. */
+static inline int sr_size_add_ok(uint32_t a, uint32_t b, uint32_t *out) {
+    if (a > 0xFFFFFFFFu - b) return 0;
+    if (out) *out = a + b;
+    return 1;
+}
+static inline int sr_size_mul_ok(uint32_t a, uint32_t b, uint32_t *out) {
+    if (a != 0u && b > 0xFFFFFFFFu / a) return 0;
+    if (out) *out = a * b;
+    return 1;
+}
+
+/* A checked pitched rectangle, expressed in bytes after resolving its pixel-space
+ * origin.  `first` is the first byte touched and `total_bytes` is the bounding span:
+ * (rows - 1) * row_pitch + row_bytes.  Rows may overlap (row_pitch < row_bytes);
+ * framebuffer callers that forbid that shape must enforce their semantic constraint
+ * before asking for the memory span. */
+typedef struct SrGuestRectSpan {
+    uint32_t first;
+    uint32_t row_pitch;
+    uint32_t row_bytes;
+    uint32_t total_bytes;
+} SrGuestRectSpan;
+
+static inline int sr_guest_rect_geometry(uint32_t base, uint32_t x, uint32_t y,
+                                         uint32_t stride, uint32_t width,
+                                         uint32_t rows, uint32_t bytes_per_pixel,
+                                         SrGuestRectSpan *out) {
+    SrGuestRectSpan span;
+    if (width == 0u || rows == 0u) {
+        span.first = base;
+        span.row_pitch = 0u;
+        span.row_bytes = 0u;
+        span.total_bytes = 0u;
+        if (out) *out = span;
+        return 1;
+    }
+    if (bytes_per_pixel == 0u) return 0;
+
+    uint32_t y_offset, first_pixel, first_offset, last_row;
+    if (!sr_size_mul_ok(y, stride, &y_offset) ||
+        !sr_size_add_ok(y_offset, x, &first_pixel) ||
+        !sr_size_mul_ok(first_pixel, bytes_per_pixel, &first_offset) ||
+        !sr_size_add_ok(base, first_offset, &span.first) ||
+        !sr_size_mul_ok(stride, bytes_per_pixel, &span.row_pitch) ||
+        !sr_size_mul_ok(width, bytes_per_pixel, &span.row_bytes) ||
+        !sr_size_mul_ok(rows - 1u, span.row_pitch, &last_row) ||
+        !sr_size_add_ok(last_row, span.row_bytes, &span.total_bytes))
+        return 0;
+
+    if (out) *out = span;
+    return 1;
+}
+
+static inline int sr_guest_rect_readable(uint32_t base, uint32_t x, uint32_t y,
+                                         uint32_t stride, uint32_t width,
+                                         uint32_t rows, uint32_t bytes_per_pixel,
+                                         SrGuestRectSpan *out) {
+    SrGuestRectSpan span;
+    if (!sr_guest_rect_geometry(base, x, y, stride, width, rows,
+                                bytes_per_pixel, &span) ||
+        !sr_guest_span_readable(span.first, span.total_bytes))
+        return 0;
+    if (out) *out = span;
+    return 1;
+}
+
+static inline int sr_guest_rect_writable(uint32_t base, uint32_t x, uint32_t y,
+                                         uint32_t stride, uint32_t width,
+                                         uint32_t rows, uint32_t bytes_per_pixel,
+                                         SrGuestRectSpan *out) {
+    SrGuestRectSpan span;
+    if (!sr_guest_rect_geometry(base, x, y, stride, width, rows,
+                                bytes_per_pixel, &span) ||
+        !sr_guest_span_writable(span.first, span.total_bytes))
+        return 0;
+    if (out) *out = span;
+    return 1;
+}
+extern void sr_oor(uint32_t a, uint32_t v, int store);   /* records out-of-range access (diag) */
+/* SR_HEAP_WATCH tracks allocator-owned free headers dynamically, so diagnostics survive
+ * allocation-layout changes. The branch stays cold in normal runs; bulk native copy/clear
+ * fast paths call sr_heap_note_bulk_write explicitly because they bypass MEM_W*. */
+extern int g_sr_heap_watch;
+extern int g_sr_metadata_watch;
+extern int g_hle_depth;
+extern CpuState *s_cpu;
+
+/* A matched address/value watch can request a bounded register snapshot at one
+ * exact writer PC. This is observational and inactive unless both a watch and
+ * SR_WATCH_CONTEXT_PC are configured. */
+static inline void sr_log_mem_watch_context(uint32_t pc) {
+    if (__builtin_expect(g_sr_mem_watch_context_pc == 0u ||
+                         pc != g_sr_mem_watch_context_pc ||
+                         g_sr_mem_watch_context_count >= g_sr_mem_watch_context_limit ||
+                         s_cpu == NULL ||
+                         (g_sr_mem_watch_context_fpr >= 0 &&
+                          s_cpu->fi[g_sr_mem_watch_context_fpr] != g_sr_mem_watch_context_fpr_value), 1)) {
+        return;
+    }
+    unsigned hit = ++g_sr_mem_watch_context_count;
+    fprintf(stderr,
+            "MEM_WATCH_CONTEXT pc=0x%08" PRIx32 " hit=%u last_yield_pc=0x%08" PRIx32 " hi=0x%08" PRIx32 " lo=0x%08" PRIx32 " fcr31=0x%08" PRIx32 " fpcond=%" PRIu32 "\n",
+            pc, hit, s_cpu->pc, s_cpu->hi, s_cpu->lo, s_cpu->fcr31, s_cpu->fpcond);
+    for (unsigned base = 0; base < 32; base += 8) {
+        fprintf(stderr, "MEM_WATCH_CONTEXT_GPR");
+        for (unsigned i = base; i < base + 8; i++) {
+            fprintf(stderr, " r%u=0x%08" PRIx32, i, s_cpu->r[i]);
+        }
+        fputc('\n', stderr);
+    }
+    for (unsigned base = 0; base < 32; base += 8) {
+        fprintf(stderr, "MEM_WATCH_CONTEXT_FPR");
+        for (unsigned i = base; i < base + 8; i++) {
+            fprintf(stderr, " f%u=0x%08" PRIx32, i, s_cpu->fi[i]);
+        }
+        fputc('\n', stderr);
+    }
+}
+
+/* Bounded context for one exact generated store PC. Unlike value watches this
+ * does not log unrelated stores that happen to carry the same common value. */
+static inline void sr_log_store_context(uint32_t addr, uint32_t value,
+                                        unsigned width, uint32_t pc) {
+    if (__builtin_expect(g_sr_store_context_pc == 0u ||
+                         pc != g_sr_store_context_pc ||
+                         g_sr_store_context_count >= g_sr_store_context_limit ||
+                         s_cpu == NULL, 1)) {
+        return;
+    }
+    unsigned hit = ++g_sr_store_context_count;
+    fprintf(stderr,
+            "STORE_CONTEXT pc=0x%08" PRIx32 " hit=%u addr=0x%08" PRIx32 " width=%u val=0x%08" PRIx32 " last_yield_pc=0x%08" PRIx32 " hi=0x%08" PRIx32 " lo=0x%08" PRIx32 "\n",
+            pc, hit, addr, width, value, s_cpu->pc, s_cpu->hi, s_cpu->lo);
+    for (unsigned base = 0; base < 32; base += 8) {
+        fprintf(stderr, "STORE_CONTEXT_GPR");
+        for (unsigned i = base; i < base + 8; i++) {
+            fprintf(stderr, " r%u=0x%08" PRIx32, i, s_cpu->r[i]);
+        }
+        fputc('\n', stderr);
+    }
+    for (unsigned base = 0; base < 32; base += 8) {
+        fprintf(stderr, "STORE_CONTEXT_FPR");
+        for (unsigned i = base; i < base + 8; i++) {
+            fprintf(stderr, " f%u=0x%08" PRIx32, i, s_cpu->fi[i]);
+        }
+        fputc('\n', stderr);
+    }
+    if (g_sr_store_context_mem_gpr >= 0) {
+        uint32_t base = s_cpu->r[g_sr_store_context_mem_gpr] +
+                        g_sr_store_context_mem_offset;
+        fprintf(stderr, "STORE_CONTEXT_MEM r%d+0x%08" PRIx32 " base=0x%08" PRIx32,
+                g_sr_store_context_mem_gpr, g_sr_store_context_mem_offset, base);
+        for (unsigned i = 0; i < g_sr_store_context_mem_words; i++) {
+            uint32_t word_addr = base + i * 4u;
+            uint32_t word = 0;
+            if (sr_inrange_n(word_addr, 4u)) {
+                sr_guest_vram_read_prepare_bytes(word_addr, 4u);
+                if (sr_vram_cpu_aperture(word_addr) || sr_vram_cpu_aperture(word_addr + 3u)) {
+                    for (uint32_t j = 0; j < 4u; j++)
+                        word |= (uint32_t)SR_HOST(word_addr + j)[0] << (j * 8u);
+                } else {
+                    memcpy(&word, SR_HOST(word_addr), sizeof word);
+                }
+                fprintf(stderr, " w%u=0x%08" PRIx32, i, word);
+            } else {
+                fprintf(stderr, " w%u=<oor>", i);
+            }
+        }
+        fputc('\n', stderr);
+    }
+    fflush(stderr);
+}
+
+void sr_heap_note_write(uint32_t addr, uint32_t width, uint32_t value, uint32_t pc);
+void sr_heap_note_bulk_write(uint32_t addr, uint32_t width, uint32_t pc);
+
+static inline int sr_guest_vram_mapped_span(uint32_t addr, uint32_t width,
+                                            uint32_t *physical_addr) {
+    if (width == 0u || !sr_vram_cpu_aperture(addr) ||
+        !sr_vram_cpu_aperture(addr + width - 1u) ||
+        ((SR_PHYS(addr) >> 21) & 3u) !=
+            ((SR_PHYS(addr + width - 1u) >> 21) & 3u) ||
+        sr_guest_span_hits_swizzled_vram_mirror(addr, width)) return 0;
+    if (physical_addr) *physical_addr = sr_vram_cpu_address(addr);
+    return 1;
+}
+
+static inline void sr_guest_vram_read_prepare_bytes(uint32_t addr, uint32_t width) {
+    if (!__builtin_expect(g_sr_vram_read_pending, 0)) return;
+    if (!sr_vram_cpu_span_touches(addr, width)) return;
+    uint32_t physical_addr;
+    if (sr_guest_vram_mapped_span(addr, width, &physical_addr)) {
+        sr_ge_vram_read_prepare(physical_addr, width);
+        return;
+    }
+    for (uint32_t i = 0; i < width; i++) {
+        uint32_t byte_addr = addr + i;
+        if (sr_vram_cpu_aperture(byte_addr))
+            sr_ge_vram_read_prepare(sr_vram_cpu_address(byte_addr), 1u);
+    }
+}
+
+static inline void sr_guest_vram_write_prepare_bytes(uint32_t addr, uint32_t width) {
+    if (!__builtin_expect(g_sr_vram_read_pending, 0)) return;
+    if (!sr_vram_cpu_span_touches(addr, width)) return;
+    if (sr_guest_vram_mapped_span(addr, width, NULL)) {
+        sr_ge_vram_write_prepare(addr, width);
+        return;
+    }
+    for (uint32_t i = 0; i < width; i++) {
+        uint32_t byte_addr = addr + i;
+        if (sr_vram_cpu_aperture(byte_addr))
+            sr_ge_vram_write_prepare(byte_addr, 1u);
+    }
+}
+
+static inline void sr_guest_vram_write_commit_bytes(uint32_t addr, uint32_t width) {
+    if (width == 0u) return;
+    if (sr_guest_vram_mapped_span(addr, width, NULL)) {
+        sr_ge_vram_write_commit(addr, width);
+        return;
+    }
+    if (!sr_vram_cpu_span_touches(addr, width)) {
+        sr_ge_vram_write_commit(addr, width);
+        return;
+    }
+    for (uint32_t i = 0; i < width; i++) {
+        uint32_t byte_addr = addr + i;
+        if (sr_vram_cpu_aperture(byte_addr))
+            sr_ge_vram_write_commit(byte_addr, 1u);
+    }
+}
+
+/* --- Bulk guest copies through the swizzled VRAM mirrors (#1049) -------------
+ * sr_vram_cpu_address() applies the CPU-view transforms measured on a PSP-3000
+ * (docs/HARDWARE_ORACLE.md, PSP-VRAM-MIRROR-001). The 0x04200000 view XORs the
+ * offset with 0x2040 (bits 6 and 13), so each aligned 64-byte block stays
+ * contiguous in physical VRAM. The 0x04600000 view also rotates bits 5..9, so
+ * only each aligned 32-byte block does. The base and 0x04400000 views, RAM and
+ * the rest of the arena are linear. One host pointer therefore covers at most
+ * one such block of a swizzled view; sr_guest_host_run() returns how many
+ * leading bytes of a span one host pointer covers. The helpers below walk a
+ * span in those pieces with the per-piece VRAM read preparation and write
+ * prepare/commit of the scalar accessors, so a bulk CPU copy lands where the
+ * same copy made of scalar stores would. Each checks its whole span first and
+ * touches no guest byte when the span leaves the arena. */
+#define SR_VRAM_MIRROR_XOR_RUN    0x40u  /* 0x04200000 view: offset ^ 0x2040 */
+#define SR_VRAM_MIRROR_ROTATE_RUN 0x20u  /* 0x04600000 view: bits 5..9 rotated */
+
+static inline uint32_t sr_guest_host_run(uint32_t addr, uint32_t size) {
+    const uint32_t phys = (uint32_t)SR_PHYS(addr);
+    uint32_t run;
+    if (phys < 0x04200000u) {
+        run = 0x04200000u - phys;
+    } else if (phys < 0x04400000u) {
+        run = SR_VRAM_MIRROR_XOR_RUN - (phys & (SR_VRAM_MIRROR_XOR_RUN - 1u));
+    } else if (phys < 0x04600000u) {
+        run = 0x04600000u - phys;
+    } else if (phys < 0x04800000u) {
+        run = SR_VRAM_MIRROR_ROTATE_RUN - (phys & (SR_VRAM_MIRROR_ROTATE_RUN - 1u));
+    } else {
+        return size;
+    }
+    return run < size ? run : size;
+}
+
+/* Guest [src, src + size) to host memory. */
+static inline int sr_guest_copy_in(void *host, uint32_t src, uint32_t size) {
+    if (size == 0u) return 1;
+    if (!host || !sr_inrange_n(src, size)) return 0;
+    uint8_t *out = (uint8_t *)host;
+    while (size != 0u) {
+        const uint32_t run = sr_guest_host_run(src, size);
+        sr_guest_vram_read_prepare_bytes(src, run);
+        memcpy(out, SR_HOST(src), run);
+        out += run;
+        src += run;
+        size -= run;
+    }
+    return 1;
+}
+
+/* Host memory to guest [dst, dst + size). */
+static inline int sr_guest_copy_out(uint32_t dst, const void *host, uint32_t size) {
+    if (size == 0u) return 1;
+    if (!host || !sr_inrange_n(dst, size)) return 0;
+    const uint8_t *in = (const uint8_t *)host;
+    while (size != 0u) {
+        const uint32_t run = sr_guest_host_run(dst, size);
+        sr_guest_vram_write_prepare_bytes(dst, run);
+        memcpy(SR_HOST(dst), in, run);
+        sr_guest_vram_write_commit_bytes(dst, run);
+        in += run;
+        dst += run;
+        size -= run;
+    }
+    return 1;
+}
+
+/* Fill guest [dst, dst + size) with one byte value. */
+static inline int sr_guest_fill(uint32_t dst, uint8_t value, uint32_t size) {
+    if (size == 0u) return 1;
+    if (!sr_inrange_n(dst, size)) return 0;
+    while (size != 0u) {
+        const uint32_t run = sr_guest_host_run(dst, size);
+        sr_guest_vram_write_prepare_bytes(dst, run);
+        memset(SR_HOST(dst), value, run);
+        sr_guest_vram_write_commit_bytes(dst, run);
+        dst += run;
+        size -= run;
+    }
+    return 1;
+}
+
+/* Physical arena bytes a span can reach, as one conservative interval: its own
+ * linear range, widened to all of VRAM when any byte lies in the VRAM CPU
+ * window (every view there maps into the 2 MiB at SR_VRAM_CPU_BASE). */
+static inline void sr_guest_span_physical_hull(uint32_t addr, uint32_t size,
+                                               uint32_t *lo, uint32_t *hi) {
+    uint32_t first = (uint32_t)SR_PHYS(addr);
+    uint32_t last = first + (size - 1u);
+    if (sr_vram_cpu_span_touches(addr, size)) {
+        if (first > SR_VRAM_CPU_BASE) first = SR_VRAM_CPU_BASE;
+        if (last < SR_VRAM_CPU_BASE + 0x001FFFFFu) last = SR_VRAM_CPU_BASE + 0x001FFFFFu;
+    }
+    *lo = first;
+    *hi = last;
+}
+
+/* Guest-to-guest copy with memmove semantics: the result equals reading the
+ * whole source before writing any destination byte. Spans that avoid the
+ * swizzled views keep the single host memmove. A span through a swizzled view
+ * is copied piece by piece, each piece no longer than one host pointer covers
+ * on either side; when the two spans cannot share a physical byte the pieces
+ * are copied directly. Otherwise a swizzled view permutes bytes within VRAM,
+ * so the spans' physical bytes can overlap in any order, and the source is
+ * staged through host memory first. Returns 0, touching nothing, when a span
+ * leaves the arena or the staging buffer cannot be allocated. */
+static inline int sr_guest_memmove(uint32_t dst, uint32_t src, uint32_t size) {
+    if (size == 0u) return 1;
+    if (!sr_inrange_n(dst, size) || !sr_inrange_n(src, size)) return 0;
+    if (!sr_guest_span_hits_swizzled_vram_mirror(dst, size) &&
+        !sr_guest_span_hits_swizzled_vram_mirror(src, size)) {
+        if (__builtin_expect(g_sr_vram_read_pending, 0) &&
+            sr_vram_cpu_span_touches(src, size))
+            sr_ge_vram_read_prepare(sr_vram_cpu_address(src), size);
+        sr_guest_vram_write_prepare_bytes(dst, size);
+        memmove(SR_HOST(dst), SR_HOST(src), size);
+        sr_guest_vram_write_commit_bytes(dst, size);
+        return 1;
+    }
+    uint32_t src_lo, src_hi, dst_lo, dst_hi;
+    sr_guest_span_physical_hull(src, size, &src_lo, &src_hi);
+    sr_guest_span_physical_hull(dst, size, &dst_lo, &dst_hi);
+    if (src_hi < dst_lo || dst_hi < src_lo) {
+        while (size != 0u) {
+            uint32_t run = sr_guest_host_run(src, size);
+            run = sr_guest_host_run(dst, run);
+            sr_guest_vram_read_prepare_bytes(src, run);
+            sr_guest_vram_write_prepare_bytes(dst, run);
+            memcpy(SR_HOST(dst), SR_HOST(src), run);
+            sr_guest_vram_write_commit_bytes(dst, run);
+            src += run;
+            dst += run;
+            size -= run;
+        }
+        return 1;
+    }
+    uint8_t *staged = (uint8_t *)malloc(size);
+    if (!staged) return 0;
+    const int ok = sr_guest_copy_in(staged, src, size) &&
+                   sr_guest_copy_out(dst, staged, size);
+    free(staged);
+    return ok;
+}
+
+/* The full scalar accessors. They stay out of line so the inline fast paths below stay
+ * small in generated code, and stay `inline` so a unit that never calls one emits nothing;
+ * GCC reports that pair under -Wattributes. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattributes"
+#endif
+static inline __attribute__((noinline)) uint8_t sr_r8_slow(uint32_t a) {
+    if (sr_inrange(a)) {
+        uint8_t v;
+        if (sr_vram_cpu_aperture(a)) {
+            if (__builtin_expect(g_sr_vram_read_pending, 0))
+                sr_ge_vram_read_prepare(sr_vram_cpu_address(a), 1u);
+            v = *(uint8_t *)SR_HOST(a);
+        } else {
+            v = *(uint8_t *)SR_HOST_LINEAR(a);
+        }
+        return v;
+    }
+    sr_oor(a,0,0); return 0u;
+}
+static inline __attribute__((noinline)) uint16_t sr_r16_slow(uint32_t a) {
+    if (sr_inrange_n(a, 2)) {
+        if (sr_vram_cpu_span_touches(a, 2u)) {
+            sr_guest_vram_read_prepare_bytes(a, 2u);
+            uint16_t v = (uint16_t)SR_HOST(a)[0] |
+                         (uint16_t)((uint16_t)SR_HOST(a + 1u)[0] << 8);
+            return v;
+        }
+        uint16_t v; memcpy(&v, SR_HOST_LINEAR(a), sizeof v);
+        return v;
+    }
+    sr_oor(a,0,0); return 0u;
+}
+static inline __attribute__((noinline)) uint32_t sr_r32_slow(uint32_t a) {
+    if ((a & 0xFFFFFFFC) == 0x04084000) {
+        extern uint32_t sr_get_ge_status(void);
+        return sr_get_ge_status();
+    }
+    if (sr_inrange_n(a, 4)) {
+        if (sr_vram_cpu_span_touches(a, 4u)) {
+            sr_guest_vram_read_prepare_bytes(a, 4u);
+            uint32_t v = 0u;
+            for (uint32_t i = 0; i < 4u; i++)
+                v |= (uint32_t)SR_HOST(a + i)[0] << (i * 8u);
+            return v;
+        }
+        uint32_t v; memcpy(&v, SR_HOST_LINEAR(a), sizeof v);
+        return v;
+    }
+    sr_oor(a,0,0); return 0u;
+}
+static inline __attribute__((noinline)) void sr_w8_pc_slow(uint32_t a, uint8_t v, uint32_t pc) {
+    if (__builtin_expect(g_sr_store_context_pc != 0u, 0)) sr_log_store_context(a, v, 1u, pc);
+    if (__builtin_expect(g_sr_last_writer_enabled, 0)) sr_note_mem_write(a, 1u, v, pc);
+    if (sr_check_mem_watch(a, v, 1, pc)) sr_log_mem_watch_context(pc);
+    if (__builtin_expect(g_sr_heap_watch, 0)) sr_heap_note_write(a, 1u, v, pc);
+    if (sr_inrange(a)) {
+        if (sr_vram_cpu_aperture(a)) {
+            if (__builtin_expect(g_sr_vram_read_pending, 0))
+                sr_guest_vram_write_prepare_bytes(a, 1u);
+            *(uint8_t *)SR_HOST(a) = v;
+            sr_guest_vram_write_commit_bytes(a, 1u);
+        } else {
+            *(uint8_t *)SR_HOST_LINEAR(a) = v;
+        }
+        SR_WATCH_STORE_IF_ARMED(pc, a, v, 1u);
+    } else sr_oor(a, v, 1);
+}
+static inline __attribute__((noinline)) void sr_w16_pc_slow(uint32_t a, uint16_t v, uint32_t pc) {
+    if (__builtin_expect(g_sr_store_context_pc != 0u, 0)) sr_log_store_context(a, v, 2u, pc);
+    if (__builtin_expect(g_sr_last_writer_enabled, 0)) sr_note_mem_write(a, 2u, v, pc);
+    if (sr_check_mem_watch(a, v, 1, pc)) sr_log_mem_watch_context(pc);
+    if (__builtin_expect(g_sr_heap_watch, 0)) sr_heap_note_write(a, 2u, v, pc);
+    if (sr_inrange_n(a, 2)) {
+        if (sr_vram_cpu_span_touches(a, 2u)) {
+            if (__builtin_expect(g_sr_vram_read_pending, 0))
+                sr_guest_vram_write_prepare_bytes(a, 2u);
+            for (uint32_t i = 0; i < 2u; i++)
+                SR_HOST(a + i)[0] = (uint8_t)(v >> (i * 8u));
+            sr_guest_vram_write_commit_bytes(a, 2u);
+        } else {
+            memcpy(SR_HOST_LINEAR(a), &v, sizeof v);
+        }
+        SR_WATCH_STORE_IF_ARMED(pc, a, v, 2u);
+    } else sr_oor(a, v, 1);
+}
+static inline __attribute__((noinline)) void sr_w32_pc_slow(uint32_t a, uint32_t v, uint32_t pc) {
+    if (__builtin_expect(g_sr_store_context_pc != 0u, 0)) sr_log_store_context(a, v, 4u, pc);
+    if (__builtin_expect(g_sr_last_writer_enabled, 0)) sr_note_mem_write(a, 4u, v, pc);
+    if (sr_check_mem_watch(a, v, 1, pc)) sr_log_mem_watch_context(pc);
+    if (__builtin_expect(g_sr_heap_watch, 0)) sr_heap_note_write(a, 4u, v, pc);
+    if (sr_inrange_n(a, 4)) {
+        if (sr_vram_cpu_span_touches(a, 4u)) {
+            if (__builtin_expect(g_sr_vram_read_pending, 0))
+                sr_guest_vram_write_prepare_bytes(a, 4u);
+            for (uint32_t i = 0; i < 4u; i++)
+                SR_HOST(a + i)[0] = (uint8_t)(v >> (i * 8u));
+            sr_guest_vram_write_commit_bytes(a, 4u);
+        } else {
+            memcpy(SR_HOST_LINEAR(a), &v, sizeof v);
+        }
+        SR_WATCH_STORE_IF_ARMED(pc, a, v, 4u);
+    } else sr_oor(a, v, 1);
+}
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
+/* The accessors guest code calls on every load and store. Main RAM with no store
+ * instrumentation armed is a plain host access, small enough to inline; everything else
+ * (VRAM, the GE status word, out-of-range addresses, watches) takes the *_slow body. */
+static inline uint32_t sr_ram_offset(uint32_t a) { return SR_PHYS(a) - SR_RAM_BASE; }
+static inline int sr_store_plain(void) {
+#ifdef __SWITCH__
+    return 1;    /* The debug store watches this reads are never armed on this host. */
+#endif
+    return !(g_sr_store_context_pc | (uint32_t)g_sr_last_writer_enabled |
+             (uint32_t)g_sr_mem_watch_count | (uint32_t)g_sr_heap_watch |
+             (uint32_t)SR_WATCH_ACTIVE());
+}
+static inline uint8_t sr_r8(uint32_t a) {
+    const uint32_t o = sr_ram_offset(a);
+    if (__builtin_expect(o < 0x04000000u, 1)) return g_mem[o];
+    return sr_r8_slow(a);
+}
+static inline uint16_t sr_r16(uint32_t a) {
+    const uint32_t o = sr_ram_offset(a);
+    if (__builtin_expect(o <= 0x04000000u - 2u, 1)) { uint16_t v; memcpy(&v, g_mem + o, 2); return v; }
+    return sr_r16_slow(a);
+}
+static inline uint32_t sr_r32(uint32_t a) {
+    const uint32_t o = sr_ram_offset(a);
+    if (__builtin_expect(o <= 0x04000000u - 4u, 1)) { uint32_t v; memcpy(&v, g_mem + o, 4); return v; }
+    return sr_r32_slow(a);
+}
+static inline void sr_w8_pc(uint32_t a, uint8_t v, uint32_t pc) {
+    const uint32_t o = sr_ram_offset(a);
+    if (__builtin_expect(o < 0x04000000u && sr_store_plain(), 1)) { g_mem[o] = v; return; }
+    sr_w8_pc_slow(a, v, pc);
+}
+static inline void sr_w16_pc(uint32_t a, uint16_t v, uint32_t pc) {
+    const uint32_t o = sr_ram_offset(a);
+    if (__builtin_expect(o <= 0x04000000u - 2u && sr_store_plain(), 1)) { memcpy(g_mem + o, &v, 2); return; }
+    sr_w16_pc_slow(a, v, pc);
+}
+static inline void sr_w32_pc(uint32_t a, uint32_t v, uint32_t pc) {
+    const uint32_t o = sr_ram_offset(a);
+    if (__builtin_expect(o <= 0x04000000u - 4u && sr_store_plain(), 1)) { memcpy(g_mem + o, &v, 4); return; }
+    sr_w32_pc_slow(a, v, pc);
+}
+static inline void sr_w8 (uint32_t a, uint8_t v) { sr_w8_pc(a, v, 0); }
+static inline void sr_w16(uint32_t a, uint16_t v) { sr_w16_pc(a, v, 0); }
+static inline void sr_w32(uint32_t a, uint32_t v) { sr_w32_pc(a, v, 0); }
+
+/* Native bulk copy/fill bodies for generated stubs that replace a title's own
+ * memmove/memset (#1170).  They keep the same VRAM coherence contract as the
+ * MEM_* accessors and h_Memcpy/h_Memset: a renderer-owned source is read back
+ * before the host pointer is formed, and the destination is prepared and
+ * committed so GPU targets and cached textures observe the store.  A span
+ * through a swizzled VRAM mirror is copied in measured-contiguous pieces
+ * (sr_guest_memmove/sr_guest_fill, #1049), as the translated body's scalar
+ * stores would land it. */
+static inline void sr_native_memmove(uint32_t dest, uint32_t src, uint32_t size, uint32_t pc) {
+    if (size > 0u && size < 0x04000000u &&
+        sr_inrange_n(dest, size) && sr_inrange_n(src, size)) {
+        if (g_sr_heap_watch) sr_heap_note_bulk_write(dest, size, pc);
+        if (sr_guest_memmove(dest, src, size)) return;
+    }
+    if (size) {
+        sr_oor(dest, 0u, 1); sr_oor(src, 0u, 0);
+    }
+}
+static inline void sr_native_memset(uint32_t dest, uint8_t val, uint32_t size, uint32_t pc) {
+    if (size > 0u && size < 0x04000000u && sr_inrange_n(dest, size)) {
+        if (g_sr_heap_watch) sr_heap_note_bulk_write(dest, size, pc);
+        sr_guest_fill(dest, val, size);
+    } else if (size) {
+        sr_oor(dest, val, 1);
+    }
+}
+
+/* The PSP maps nothing below the scratchpad at 0x00010000, so a null base plus a field
+ * offset faults there. A zero-based image occupies that range in this arena, where the same
+ * access would read the image's first bytes and run on. Generated code for such an image
+ * defines SR_NULL_PAGE_GUARD (tools/codegen.py), and its data accesses stop by name instead
+ * (#363). Runtime code keeps the plain accessors: it reads the image for its own reasons and
+ * reports the bad guest pointers it is handed. */
+#define SR_PSP_UNMAPPED_END 0x00010000u
+__attribute__((noreturn, cold)) void sr_null_data_pointer(uint32_t address, const char *function);
+static inline uint32_t sr_null_page_checked(uint32_t address, const char *function) {
+    if (__builtin_expect(SR_PHYS(address) < SR_PSP_UNMAPPED_END, 0))
+        sr_null_data_pointer(address, function);
+    return address;
+}
+#define SR_DATA_ADDRESS(a) sr_null_page_checked((uint32_t)(a), __func__)
+/* A span a generated body touches in one native pass, such as a fill or copy standing in
+ * for a translated loop. An empty span touches nothing; any other stops at its lowest
+ * address before a byte moves. */
+static inline uint32_t sr_null_span_checked(uint32_t address, uint32_t size, const char *function) {
+    return size ? sr_null_page_checked(address, function) : address;
+}
+
+#ifdef SR_NULL_PAGE_GUARD
+#define MEM_R8(a)   sr_r8(SR_DATA_ADDRESS(a))
+#define MEM_R16(a)  sr_r16(SR_DATA_ADDRESS(a))
+#define MEM_R32(a)  sr_r32(SR_DATA_ADDRESS(a))
+#define MEM_W8(a,v)  sr_w8(SR_DATA_ADDRESS(a), (uint8_t)(v))
+#define MEM_W16(a,v) sr_w16(SR_DATA_ADDRESS(a), (uint16_t)(v))
+#define MEM_W32(a,v) sr_w32(SR_DATA_ADDRESS(a), (uint32_t)(v))
+#define MEM_W8_PC(a,v,pc)  sr_w8_pc(SR_DATA_ADDRESS(a), (uint8_t)(v), (pc))
+#define MEM_W16_PC(a,v,pc) sr_w16_pc(SR_DATA_ADDRESS(a), (uint16_t)(v), (pc))
+#define MEM_W32_PC(a,v,pc) sr_w32_pc(SR_DATA_ADDRESS(a), (uint32_t)(v), (pc))
+#else
+#define MEM_R8(a)   sr_r8(a)
+#define MEM_R16(a)  sr_r16(a)
+#define MEM_R32(a)  sr_r32(a)
+#define MEM_W8(a,v)  sr_w8((a), (uint8_t)(v))
+#define MEM_W16(a,v) sr_w16((a), (uint16_t)(v))
+#define MEM_W32(a,v) sr_w32((a), (uint32_t)(v))
+#define MEM_W8_PC(a,v,pc)  sr_w8_pc((a), (uint8_t)(v), (pc))
+#define MEM_W16_PC(a,v,pc) sr_w16_pc((a), (uint16_t)(v), (pc))
+#define MEM_W32_PC(a,v,pc) sr_w32_pc((a), (uint32_t)(v), (pc))
+#endif
+
+/* Generated bulk code forms a host pointer only through SR_HOST(SR_DATA_SPAN(a, n)), and the
+ * native memmove/memset stubs check both spans the same way, so a null base stops as it would
+ * in the translated loop it replaces. */
+#ifdef SR_NULL_PAGE_GUARD
+#define SR_DATA_SPAN(a, n) sr_null_span_checked((uint32_t)(a), (uint32_t)(n), __func__)
+static inline void sr_native_memmove_checked(uint32_t dest, uint32_t src, uint32_t size, uint32_t pc,
+                                             const char *function) {
+    sr_native_memmove(sr_null_span_checked(dest, size, function),
+                      sr_null_span_checked(src, size, function), size, pc);
+}
+static inline void sr_native_memset_checked(uint32_t dest, uint8_t val, uint32_t size, uint32_t pc,
+                                            const char *function) {
+    sr_native_memset(sr_null_span_checked(dest, size, function), val, size, pc);
+}
+#define sr_native_memmove(dest, src, size, pc) \
+    sr_native_memmove_checked((dest), (src), (size), (pc), __func__)
+#define sr_native_memset(dest, val, size, pc) \
+    sr_native_memset_checked((dest), (val), (size), (pc), __func__)
+#else
+#define SR_DATA_SPAN(a, n) ((uint32_t)(a))
+#endif
+
+void  sr_mem_init(void);
+void  sr_mem_reset(void);              /* LoadExec: zero guest RAM and retire executable spans */
+void  sr_load_segment(uint32_t vaddr, const void *data, uint32_t len);
+uint32_t sr_loaded_end(void);   /* highest guest address the loader wrote (module end incl. BSS) */
+uint32_t sr_loaded_base(void);  /* lowest guest address the loader wrote; UINT32_MAX when none */
+void  sr_loaded_end_set(uint32_t end); /* host loader seed for a new package program */
+
+/* Backing store for the game's newlib allocation API (see tools/codegen.py custom
+ * stubs). The retail memalign/realloc bodies edit dlmalloc metadata directly, so every
+ * metadata-manipulating entry point must stay on this host allocator's header ABI. */
+uint32_t sr_newlib_malloc(uint32_t size, uint32_t guest_ra);
+void     sr_newlib_free(uint32_t ptr, uint32_t guest_ra);
+uint32_t sr_newlib_memalign(uint32_t alignment, uint32_t size, uint32_t guest_ra);
+uint32_t sr_newlib_realloc(uint32_t ptr, uint32_t size, uint32_t guest_ra);
+
+/* Unaligned word access (MIPS LWL/LWR/SWL/SWR), little-endian, matching PPSSPP's
+ * interpreter. The load forms take the current rt and the effective address and return the
+ * merged register value; the store forms read-modify-write the aligned word at addr&~3. */
+uint32_t sr_lwl(uint32_t rtv, uint32_t addr);
+uint32_t sr_lwr(uint32_t rtv, uint32_t addr);
+void     sr_swl(uint32_t addr, uint32_t rtv);
+void     sr_swr(uint32_t addr, uint32_t rtv);
+void     sr_swl_pc(uint32_t addr, uint32_t rtv, uint32_t pc);
+void     sr_swr_pc(uint32_t addr, uint32_t rtv, uint32_t pc);
+#ifdef SR_NULL_PAGE_GUARD
+#define sr_lwl(rtv, a) sr_lwl((rtv), SR_DATA_ADDRESS(a))
+#define sr_lwr(rtv, a) sr_lwr((rtv), SR_DATA_ADDRESS(a))
+#define sr_swl_pc(a, rtv, pc) sr_swl_pc(SR_DATA_ADDRESS(a), (rtv), (pc))
+#define sr_swr_pc(a, rtv, pc) sr_swr_pc(SR_DATA_ADDRESS(a), (rtv), (pc))
+#endif
+void     sr_break(CpuState *s, uint32_t code, uint32_t pc);
+void     sr_raw_syscall(CpuState *s, uint32_t code, uint32_t pc);
+uint32_t sr_bitrev(uint32_t x);
+
+/* Fired-patch report (#1274), defined in title_config.c and declared in title_config.h
+ * too: generated code calls it where a codegen temporary compatibility patch applies. */
+void sr_compat_fired(const char *collection, uint32_t anchor, const char *name);
+
+/* PSP-EABI bridge used by the generated guest sprintf entry. */
+void sr_guest_sprintf(CpuState *s);
+/* Format the guest string at `fmt` with variadic words starting in register
+ * `first_reg` into a bounded host buffer (NUL-terminated; never guest-visible).
+ * Returns the full formatted length, as printf does. */
+int sr_guest_format_host(CpuState *s, uint32_t fmt, uint32_t first_reg,
+                         char *buf, int cap);
+
+/* VFPU source/destination prefix application (ARCHITECTURE section 6.4), ported from
+ * PPSSPP. sr_vread reads n lanes from physical indices idx[], then applies a source
+ * prefix (swizzle/abs/negate/constant). sr_vwrite applies the destination prefix
+ * (saturate) and write mask, then stores. The prefix value comes from s->vfpuCtrl. */
+void sr_vread(float *r, const CpuState *s, const uint8_t *idx, int n, uint32_t prefix);
+void sr_vwrite(CpuState *s, const uint8_t *idx, float *d, int n, uint32_t dprefix);
+
+/* VFPU lane arithmetic with the NaN result fixed by rule (issue #326). C leaves the NaN
+ * that a NaN-producing operation returns to the host: x86-64 SSE keeps the first NaN
+ * source, and an optimiser may swap the operands of a commutative + or *. So the
+ * generated code and sr_vfpu_interp, each compiled on its own, kept different NaNs when
+ * two met (the alias-edge sweep in tests/native/vfpu_interp_selftest.c, built at -O1 or
+ * -O2). Both lanes call these helpers for every lane operation of vadd, vsub, vmul, vdiv,
+ * vscl, vdot, vhdp, vcrs, vcrsp, vqmul, vmmul, vtfm and vmscl. The rule: the first NaN
+ * operand, quieted, else the invalid-operation NaN 0xFFC00000 (Inf - Inf, 0 * Inf, 0 / 0,
+ * Inf / Inf). That is what x86-64 SSE returns for the operands in source order, but it is a
+ * change for default builds too: even at -O0 (RECOMP_OPT, the Makefile default) GCC may
+ * evaluate a plain + or * with its operands swapped, as MSYS2 GCC 16.2 does for the old
+ * vadd and vmul lane loops, so NaN-with-NaN lanes of vadd, vmul, vcrsp and vqmul now keep
+ * the first source where they used to keep the second. Results without a NaN are unchanged.
+ * It is project semantics, not PSP evidence: the PSP's NaN word for these forms is
+ * unmeasured or contested. docs/HARDWARE_ORACLE.md PSP-GE-001 and the issue #40 fixture
+ * fixtures/vfpu_nan_payload/vfpu_nan_cases.h disagree, and the dot-product adder measured
+ * as PSP-VFPU-FUNNEL-001 (vfpu_dot_bits in vfpu_interp.c, used by vfad and vavg) returns
+ * the fixed 0x7F800001 for any NaN operand, which this rule for vdot does not follow.
+ * At -O0 GCC does not inline these static inline helpers, so an ad-hoc build makes one
+ * call per lane operation; package builds (-O1, PACKAGE_RECOMP_OPT) inline them. */
+static inline float sr_vf_nan(float a, float b) {
+    uint32_t u;
+    float r;
+    if (a != a) memcpy(&u, &a, 4);
+    else if (b != b) memcpy(&u, &b, 4);
+    else u = 0xffc00000u;
+    u |= 0x00400000u;
+    memcpy(&r, &u, 4);
+    return r;
+}
+static inline float sr_vf_add(float a, float b) { const float r = a + b; return r == r ? r : sr_vf_nan(a, b); }
+static inline float sr_vf_sub(float a, float b) { const float r = a - b; return r == r ? r : sr_vf_nan(a, b); }
+static inline float sr_vf_mul(float a, float b) { const float r = a * b; return r == r ? r : sr_vf_nan(a, b); }
+static inline float sr_vf_div(float a, float b) { const float r = a / b; return r == r ? r : sr_vf_nan(a, b); }
+
+/* VFPU transcendentals, exact ports of PPSSPP's table-based kernels (the PSP hardware does
+ * not compute these with IEEE math). The lookup tables are loaded once from assets/vfpu/
+ * (override the directory with PSP_VFPU_TABLES); the loader validates exact length, EOF,
+ * SHA-256 and value-domain invariants before atomic publication (see vfpu_tables.h, #187). */
+float sr_vfpu_rcp(float x);
+float sr_vfpu_rsqrt(float x);
+float sr_vfpu_sqrt(float x);
+float sr_vfpu_asin(float x);
+float sr_vfpu_log2(float x);
+float sr_vfpu_sin(float x);
+float sr_vfpu_cos(float x);
+float sr_vfpu_exp2(float x);
+
+/* Single-instruction VFPU interpreter (src/rt/vfpu_interp.c). Returns SR_VFPU_COMPUTE for a
+ * value-producing op (compare v[]/f[] to the reference trace), SR_VFPU_STATE for a prefix,
+ * control, or store op, or SR_VFPU_OTHER for an instruction it cannot execute. */
+#define SR_VFPU_OTHER   0
+#define SR_VFPU_COMPUTE 1
+#define SR_VFPU_STATE   2
+int sr_vfpu_interp(CpuState *s, uint32_t op);
+
+/* ---- SR_NAN_TRAP: opt-in NaN/Inf origin diagnostic (issue #69) -------------
+ *
+ * A guest instruction that turns all-finite operands into a NaN or an Inf is the
+ * place where this implementation and PSP hardware can disagree: the Allegrex
+ * FPU/VFPU kernels return a finite value for arguments the host evaluates the
+ * other way (0/0, rcp(0), sqrt of a negative, an overflowing intermediate), and
+ * everything downstream -- here the skeletal animation math that fills the GE
+ * BONE matrices -- is then finite. Under -DSR_NAN_TRAP every FPU and VFPU result
+ * write, in generated code and in the interpreter alike, is followed by a check
+ * that prints the first SR_NAN_TRAP_LIMIT of them (default 20) to stderr:
+ *
+ *   NAN_TRAP pc=0x00001234 op=add.s dst=f4 vbl=1180 in=[1,2] out=[nan]
+ *   NAN_TRAP pc=0x0000123c op=vrcp.s dst=v0 vbl=1180 in=[0] out=[inf]
+ *
+ * The check fires only when the result is non-finite AND every input was finite,
+ * so an instruction that merely propagates an existing NaN is not reported: the
+ * report names the origin, not the echo. It is a diagnostic and never a semantic
+ * gate -- no result is altered on any path.
+ *
+ * `in=` lists EVERY operand the instruction consumed, in operand order, so a
+ * report can be read lane by lane: the scalar forms list their sources, the
+ * lane forms list their source vectors, vmmul lists the S rows then the T rows
+ * (side*side each), and vtfm/vhtfm lists the matrix lanes (side*side, row-major)
+ * then the vector lanes it multiplies by. A form that reported only part of its
+ * operands would classify a propagation as an origin, which is how a vtfm whose
+ * vector lane already carried a NaN was once reported as the instruction that
+ * made it.
+ *
+ * `vbl=` is the guest VBLANK counter -- the same counter the SR_GE_TRANSITION_TRACE
+ * stamps as its `frame` field, so a trap record and the draw that showed its
+ * effect can be placed in the same frame without inference.
+ *
+ * Without the define both macros expand to ((void)0): no call, no symbol, no
+ * branch, no argument evaluated. tools/codegen.py only emits the checks at all
+ * when it is run with --nan-trap, so a default build's generated C is unchanged
+ * byte for byte. Build the two halves together: `make NAN_TRAP=1` passes
+ * --nan-trap to codegen AND -DSR_NAN_TRAP to every translation unit.
+ */
+#ifdef SR_NAN_TRAP
+#define SR_NAN_TRAP_DEFAULT_LIMIT 20
+/* The guest VBLANK count, for the report's `vbl=` field. hle.c keeps this as the
+ * mirror it hands to ge_set_frame(), so the number here is the same frame index
+ * the SR_GE_TRANSITION_TRACE records carry. */
+uint32_t sr_audio_vbl(void);
+/* SR_NAN_TRAP_CONTEXT dump, registered by sr_mem_init; NULL in harnesses without a runtime. */
+extern void (*sr_nan_trap_context_hook)(void);
+void sr_nan_trap_note(uint32_t pc, const char *op, uint32_t fd,
+                      float out, const float *in, int nin);
+void sr_nan_trap_note_v(uint32_t pc, const char *op, uint32_t vd,
+                        const float *out, int nout,
+                        const float *in1, int nin1,
+                        const float *in2, int nin2);
+/* One scalar result, as a standalone statement after the destination has
+ * already been written. Inputs are supplied as a braced list of values, which
+ * the macro packs into a compound literal for the call; because they are read
+ * after the store, only use this where the operands were sampled into locals
+ * first. */
+#define SR_NAN_TRAP_F(PC, OP, FD, OUT, ...) \
+    sr_nan_trap_note((PC), (OP), (FD), (OUT), \
+                     (const float[]){__VA_ARGS__}, \
+                     (int)(sizeof((const float[]){__VA_ARGS__}) / sizeof(float)))
+/* One scalar result AND its destination store, for hand-written C that has not
+ * already sampled its operands. The source register indices are separate
+ * parameters (one macro per source count) so the operand list cannot be split
+ * across macro arguments; they are read BEFORE the store, so a destination that
+ * aliases a source still reports what the instruction actually consumed. Without
+ * the define these expand to the plain assignment and to nothing else, which is
+ * why an untrapped interpreter object stays byte-identical. Requires the
+ * CpuState pointer to be named `s`. */
+#define SR_NAN_TRAP_STORE_F1(PC, OP, FD, S0, EXPR)                      \
+    do {                                                                \
+        const float _ntr_in[1] = { s->f[S0] };                          \
+        const float _ntr_res = (EXPR);                                   \
+        sr_nan_trap_note((PC), (OP), (FD), _ntr_res, _ntr_in, 1);       \
+        s->f[FD] = _ntr_res;                                            \
+    } while (0)
+#define SR_NAN_TRAP_STORE_F2(PC, OP, FD, S0, S1, EXPR)                  \
+    do {                                                                \
+        const float _ntr_in[2] = { s->f[S0], s->f[S1] };                \
+        const float _ntr_res = (EXPR);                                   \
+        sr_nan_trap_note((PC), (OP), (FD), _ntr_res, _ntr_in, 2);       \
+        s->f[FD] = _ntr_res;                                            \
+    } while (0)
+/* One vector result with one source vector. */
+#define SR_NAN_TRAP_V(PC, OP, VD, OUT, NOUT, IN, NIN) \
+    sr_nan_trap_note_v((PC), (OP), (VD), (OUT), (NOUT), (IN), (NIN), \
+                       (const float *)0, 0)
+/* One vector result with two source vectors (the usual binary VFPU shape). */
+#define SR_NAN_TRAP_V2(PC, OP, VD, OUT, NOUT, IN1, NIN1, IN2, NIN2) \
+    sr_nan_trap_note_v((PC), (OP), (VD), (OUT), (NOUT), (IN1), (NIN1), (IN2), (NIN2))
+#else
+#define SR_NAN_TRAP_F(PC, OP, FD, OUT, ...) ((void)0)
+#define SR_NAN_TRAP_STORE_F1(PC, OP, FD, S0, EXPR) s->f[FD] = (EXPR)
+#define SR_NAN_TRAP_STORE_F2(PC, OP, FD, S0, S1, EXPR) s->f[FD] = (EXPR)
+#define SR_NAN_TRAP_V(PC, OP, VD, OUT, NOUT, IN, NIN) ((void)0)
+#define SR_NAN_TRAP_V2(PC, OP, VD, OUT, NOUT, IN1, NIN1, IN2, NIN2) ((void)0)
+#endif
+
+/* Codegen tags a per-instruction VFPU fallback address and sends it through dispatch().
+ * The tag is outside the PSP physical arena; dispatch reads the original word at the low
+ * address and invokes sr_vfpu_interp without changing CpuState's ABI/layout. */
+#define SR_DISPATCH_VFPU_TAG  0x40000000u
+#define SR_DISPATCH_VFPU_MASK 0xFC000000u
+
+/* Dispatch: guest address -> native recompiled function (section 7). Computed jumps/calls go
+ * through here; an AOT miss may execute only inside an explicitly registered executable span,
+ * and unsupported/unowned targets terminate rather than fabricating guest completion. */
+typedef void (*RecompFn)(CpuState *);
+void     sr_register(uint32_t addr, RecompFn fn);
+uint32_t sr_register_count(void);  /* number of sr_register() calls performed so far */
+/* Returns a registered body only when the same PC has complete four-byte
+ * executable ownership. Interpreter-readable bytes are required only to
+ * interpret; entering the translated body does not re-read them. This static
+ * first slice does not yet provide content guards: sr_lookup stays structural
+ * (and hot-path cheap) by design. Opt-in content checking lives separately
+ * in src/rt/stale_code.h (SR_STALE_DETECT, checked at cache-invalidate time,
+ * never on this path), so enabling detection cannot slow dispatch itself. */
+RecompFn sr_lookup(uint32_t addr);
+
+/* Guest function names from tools/codegen.py --symbol-map (names and addresses only). The
+ * generated sr_register_all() hands over one table sorted by address; size 0 means only the
+ * start address is named. A build without a map registers nothing, so every lookup is NULL
+ * and every report prints exactly what it printed before. */
+typedef struct SrGuestSymbol {
+    uint32_t addr;
+    uint32_t size;
+    const char *name;
+} SrGuestSymbol;
+void sr_guest_symbols_register(const SrGuestSymbol *table, uint32_t count);
+/* The registered symbol naming pc, or NULL. */
+const SrGuestSymbol *sr_guest_symbol_at(uint32_t pc);
+/* "name" or "name+0x<offset>" for pc in buf, or "" when no symbol names it. */
+const char *sr_guest_symbol_label(uint32_t pc, char *buf, size_t len);
+
+/* The entry of a sorted table whose start is pc, or whose nonzero size covers pc. */
+static inline const SrGuestSymbol *sr_guest_symbol_find(const SrGuestSymbol *table,
+                                                        uint32_t count, uint32_t pc) {
+    uint32_t lo = 0u, hi = count;  /* first entry whose start is above pc */
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2u;
+        if (table[mid].addr <= pc) lo = mid + 1u;
+        else hi = mid;
+    }
+    if (lo == 0u) return NULL;
+    const SrGuestSymbol *sym = &table[lo - 1u];
+    return pc == sym->addr || pc - sym->addr < sym->size ? sym : NULL;
+}
+
+/* sr_guest_symbol_label's text for a symbol found for pc (NULL gives ""). */
+static inline const char *sr_guest_symbol_format(const SrGuestSymbol *sym, uint32_t pc,
+                                                 char *buf, size_t len) {
+    if (len == 0u) return "";
+    buf[0] = '\0';
+    if (!sym) return buf;
+    if (pc == sym->addr) snprintf(buf, len, "%s", sym->name);
+    else snprintf(buf, len, "%s+0x%" PRIx32, sym->name, pc - sym->addr);
+    return buf;
+}
+
+/* Codegen registers exact analyzer-owned, end-exclusive executable spans before
+ * guest execution. Mapped RAM alone never grants interpreter fetch authority.
+ * Registration validates structural ownership (alignment, non-empty extent) and
+ * deliberately does not require the flat arena to back the span: extra modules
+ * are translated at build time and their load addresses need not be guest-RAM
+ * resident. Interpreting a span's bytes additionally requires them to be
+ * readable, enforced fail-closed at fetch time. */
+#define SR_HAS_EXEC_SPAN_REGISTRY 1
+void     sr_exec_span_reset(void);
+int      sr_exec_span_register(uint32_t start, uint32_t end);
+int      sr_exec_span_owns_fetch(uint32_t pc);
+
+/* ---- Runtime-placed guest modules (issue #704) -------------------------------
+ * A guest module translated with `tools/codegen.py --extra-elf=<module>@runtime` is
+ * position independent: its generated code names every guest address of its own
+ * image as `*code->base + <link address>`. An instruction whose 16-bit immediate the
+ * module loader relocates (tools/prx_reloc_model.py identifies them) reads that
+ * immediate from the loaded image itself, so the translation agrees with the runtime
+ * loader by construction; a relocated jump is translated to its link-space target,
+ * which the loader moves by exactly the base (tools/test_prx_reloc_model.py pins the
+ * model to src/rt/prx_loader.c). The loader checks the module file's identity against
+ * the descriptor before laying it out. Nothing of the module is registered at startup
+ * beyond this descriptor. When the game loads the module, the runtime lays the image
+ * out wherever the guest allocator placed it and binds the descriptor at that base;
+ * from then until the module is unloaded, the image's range dispatches to the
+ * module's functions and grants executable authority to its analyzer-owned spans,
+ * and to nothing else. Unbinding retires both, so a later module placed at the same
+ * addresses never meets this module's translations.
+ *
+ * Link space: a relocatable module's link addresses are its ELF addresses with the
+ * image laid out at base 0, and a guest address is base + link address. A
+ * fixed-address module (ELF type 2) links at its absolute addresses and binds only
+ * at base 0. Implemented in src/rt/guest_interp.c beside the span registry above,
+ * which owns executable authority. */
+typedef struct SrModuleFunc {
+    uint32_t offset;   /* link address of the function's entry */
+    uint32_t nwords;   /* contiguous translated words from the entry (stale tracking) */
+    RecompFn fn;
+} SrModuleFunc;
+
+typedef struct SrModuleSpan {
+    uint32_t start;    /* end-exclusive link-space executable span */
+    uint32_t end;
+} SrModuleSpan;
+
+/* A variable a module imports from another module's library, and the words its loader
+ * patches with the variable's address (tools/imports.py variable_imports). kind is the PSP
+ * reference type: 2 the whole word, 5 a HI16 immediate, 6 a LO16 immediate. The sites are in
+ * reference-list order: the patching of a HI16 run reads the LO16 entry that follows it. A
+ * runtime-placed module's sites are link addresses (the bind adds its base); the main
+ * image's are absolute. Generated code reads every HI16/LO16 site's immediate from memory, so
+ * the patched value reaches it (sr_var_import_*, src/rt/hle.c). */
+typedef struct SrVarImportRef {
+    uint32_t site;
+    uint32_t kind;
+} SrVarImportRef;
+
+typedef struct SrVarImport {
+    const char *library;
+    uint32_t nid;
+    const SrVarImportRef *refs;
+    uint32_t nrefs;
+} SrVarImport;
+
+typedef struct SrModuleCode {
+    const char *name;                 /* module file name, as the title manifest names it */
+    uint32_t file_size;               /* identity of the exact bytes that were translated */
+    const char *file_sha256;          /* lowercase hex SHA-256 of those bytes */
+    uint32_t link_low;                /* image extent in link space: [link_low, link_high) */
+    uint32_t link_high;
+    uint32_t alignment;               /* largest PT_LOAD alignment */
+    uint32_t relocatable;             /* 1: any base; 0: fixed-address image, base 0 only */
+    const char *unsupported_reason;   /* non-NULL: the build could not translate it */
+    uint32_t *base;                   /* the generated code's base variable */
+    const SrModuleFunc *funcs;        /* sorted by offset */
+    uint32_t nfuncs;
+    const SrModuleSpan *spans;
+    uint32_t nspans;
+    /* Non-zero: a code overlay the game copies into memory itself (tools/analyze.py: MWo3,
+     * or ELF type 0xFFA8). It is bound, at its link address, when the guest invalidates the instruction
+     * cache over it and these leading bytes of the file (header and text) are in memory,
+     * and unbound when they no longer are. sceKernelLoadModule never binds it. */
+    uint32_t overlay_check_len;
+    uint64_t overlay_check_fnv1a64;
+    /* The variables the module imports, linked when it loads and its exporter is loaded. */
+    const SrVarImport *var_imports;
+    uint32_t nvar_imports;
+    /* Non-NULL: the overlay check covers these link ranges, in order (overlay_check_len
+     * bytes in all), instead of the leading bytes. A fixed-address ELF overlay (ELF type
+     * 0xFFA8) mixes code and data in one segment, so every word of its translated code,
+     * and only that, identifies it (tools/codegen.py translate_runtime_module). */
+    const SrModuleSpan *overlay_check_spans;
+    uint32_t noverlay_check_spans;
+} SrModuleCode;
+
+typedef enum SrModuleBindResult {
+    SR_MODULE_BIND_OK = 0,
+    SR_MODULE_BIND_UNSUPPORTED,           /* code->unsupported_reason is set */
+    SR_MODULE_BIND_ALREADY_BOUND,         /* one live instance per translation */
+    SR_MODULE_BIND_BAD_BASE,              /* fixed image off its link address, or range overflow */
+    SR_MODULE_BIND_OVERLAP,               /* another bound image owns part of the range */
+    SR_MODULE_BIND_IMAGE_UNREADABLE,      /* the image range is not guest memory */
+    SR_MODULE_BIND_TABLE_FULL
+} SrModuleBindResult;
+
+typedef struct SrModuleBindDetail {
+    uint32_t address;    /* the conflicting or unreadable address */
+} SrModuleBindDetail;
+
+#define SR_MODULE_CODE_MAX_BOUND 64u
+
+void sr_module_code_register(const SrModuleCode *code);   /* from generated sr_register_all() */
+/* An enhancement build's rewritten disc file (docs/ENHANCEMENT_CONTRACT.md section 9.6), from
+ * generated sr_register_all() while SR_EXPERIMENTAL_60HZ=1. Returns 0 when it cannot be held. */
+int sr_enhancement_file_register(const char *disc_path, const uint8_t stock_sha256[32],
+                                 const uint8_t *data, uint32_t size);
+/* An enhancement build's logic-update counter, registered while SR_EXPERIMENTAL_60HZ=1, and
+ * whether that logic has stayed under 60 updates/s long enough to report (section 9.5).
+ * sr_enhancement_logic_slowed() may be called from the presenter thread. */
+void sr_enhancement_register_updates(const volatile uint32_t *counter);
+int sr_enhancement_logic_slowed(unsigned *rate);
+
+/* The kernel's record of the main module, emitted by tools/codegen.py from the ELF (PT_LOAD
+ * segments, SceModuleInfo, section or program headers, and the syslib's
+ * module_start_thread_parameter). Field meanings follow uOFW's SceModule / SceKernelModuleInfo;
+ * addresses are final guest addresses. A build whose ELF has no SceModuleInfo emits none. */
+typedef struct SrMainModuleRecord {
+    uint32_t nsegment;                    /* PT_LOAD segments, at most 4 */
+    uint32_t segment_addr[4];
+    uint32_t segment_size[4];             /* p_memsz */
+    uint32_t entry_addr;
+    uint32_t gp_value;                    /* SceModuleInfo gp */
+    uint32_t text_addr;                   /* first PT_LOAD address */
+    uint32_t text_size, data_size, bss_size;
+    uint32_t attribute;                   /* SceModuleInfo modAttribute */
+    uint8_t  version[2];                  /* modVersion: [0] minor, [1] major */
+    uint8_t  name[27];                    /* modName, NUL padded (SCE_MODULE_NAME_LEN) */
+    uint32_t has_start_thread_param;      /* 1 when module_start_thread_parameter is declared */
+    uint32_t start_thread_priority;
+    uint32_t start_thread_stack_size;
+    uint32_t start_thread_attr;
+} SrMainModuleRecord;
+void sr_main_module_register(const SrMainModuleRecord *record);  /* from generated sr_register_all() */
+/* The main image's variable imports (absolute sites), from generated sr_register_all(). They
+ * link as their exporters load (src/rt/hle.c). */
+void sr_main_var_imports_register(const SrVarImport *imports, uint32_t count);
+/* A variable the main image exports: importers link to it from boot. */
+typedef struct SrVarExportDecl {
+    const char *library;
+    uint32_t nid;
+    uint32_t addr;
+} SrVarExportDecl;
+void sr_main_var_exports_register(const SrVarExportDecl *exports, uint32_t count);
+/* A function the main image exports. The table is sorted by NID, unique, and outlives the run:
+ * the executable is started before any module, so importers link to these from boot. */
+typedef struct SrMainFuncExport {
+    uint32_t nid;
+    uint32_t addr;
+} SrMainFuncExport;
+void sr_main_func_exports_register(const SrMainFuncExport *exports, uint32_t count);
+/* The variable imports of a module translated at a fixed base (absolute sites), keyed by its
+ * file name; they link when that module loads and unlink when it unloads. */
+void sr_fixed_var_imports_register(const char *module, const SrVarImport *imports,
+                                   uint32_t count);
+const SrModuleCode *sr_module_code_find(const char *name); /* case-insensitive file name */
+unsigned sr_module_code_count(void);
+const SrModuleCode *sr_module_code_at(unsigned index);
+/* Identity digest of a module file: lowercase hex SHA-256, as tools/codegen.py records it. */
+void sr_module_code_sha256(const void *bytes, size_t size, char out[65]);
+/* FNV-1a, 64-bit: the digest of an overlay's leading bytes in guest memory, which is checked
+ * on every instruction-cache invalidate that reaches it. It says whether the overlay is
+ * present, not whose file it is. */
+uint64_t sr_module_code_fnv1a64(const void *bytes, size_t size);
+const char *sr_module_bind_result_name(SrModuleBindResult result);
+/* Bind `code` with its image already laid out in guest memory at `base`. */
+SrModuleBindResult sr_module_code_bind(const SrModuleCode *code, uint32_t base,
+                                       SrModuleBindDetail *detail);
+void sr_module_code_unbind(const SrModuleCode *code);
+int  sr_module_code_is_bound(const SrModuleCode *code, uint32_t *base_out);
+/* Dispatch: the native body for pc when a bound image owns pc. *in_bound_image is set
+ * whenever pc lies in a bound image, so the caller treats that image as the only
+ * authority for its range even when no body exists there. */
+RecompFn sr_module_code_lookup(uint32_t pc, int *in_bound_image);
+/* Fetch authority: -1 when no bound image owns pc, else 1/0 for whether one of the
+ * owning image's executable spans covers pc's complete fetch slot. */
+int  sr_module_code_fetch_authority(uint32_t pc);
+void sr_module_code_reset(void);   /* drop every registration and binding (fixtures) */
+/* Instruction-cache maintenance over guest [lo, hi): unbind each code overlay there whose
+ * identifying bytes are no longer in memory, then bind each one whose bytes are. Returns
+ * the number of bindings changed. */
+uint32_t sr_module_code_sync_overlays(uint32_t lo, uint32_t hi);
+
+#if defined(SR_STACK_CENSUS_ENABLED)
+/* Opt-in dynamic check of guest stack preservation at generated callable
+ * boundaries. Codegen supplies its sorted callable-entry set. Resume entries
+ * share an existing callable frame and are deliberately not counted. */
+typedef enum SrStackCensusStatus {
+    SR_STACK_CENSUS_NOT_OBSERVED = 0,
+    SR_STACK_CENSUS_COMPLETE = 1,
+    SR_STACK_CENSUS_PARTIAL = 2,
+    SR_STACK_CENSUS_FAILED = 3
+} SrStackCensusStatus;
+typedef struct SrStackCensusSummary {
+    SrStackCensusStatus status;
+    uint32_t unobserved;
+    int unobserved_known;
+    uint64_t entries;
+    uint64_t returns;
+    uint64_t excluded;
+    uint64_t unexpected;
+    uint64_t mismatches;
+    uint32_t first_mismatch_entry;
+    uint32_t first_mismatch_expected_sp;
+    uint32_t first_mismatch_actual_sp;
+    uint32_t first_mismatch_flow;
+    int has_mismatch;
+} SrStackCensusSummary;
+void sr_stack_census_begin(const uint32_t *expected_entries, uint32_t expected_count);
+void sr_stack_census_enter(uint32_t entry);
+void sr_stack_census_exit(uint32_t entry, uint32_t expected_sp,
+                          uint32_t actual_sp, uint32_t flow_kind);
+void sr_stack_census_snapshot(SrStackCensusSummary *summary);
+SrStackCensusStatus sr_stack_census_status(void);
+void sr_stack_census_report(void);
+#endif
+
+#define SR_HAS_GUEST_CALL_BOUNDARY 1
+void     dispatch(CpuState *s, uint32_t target);  /* TAIL/no native resume boundary */
+int      dispatch_call_try(CpuState *s, uint32_t target, uint32_t resume_pc);
+void     dispatch_call(CpuState *s, uint32_t target, uint32_t resume_pc);
+/* A generated linked call to a target with no direct body: dispatch_call inside the
+ * call's own return boundary, as a direct call has. Returns 1 when the caller must
+ * return without running its continuation (sr_aot_return_boundary_end). */
+int      dispatch_call_checked(CpuState *s, uint32_t target, uint32_t resume_pc);
+
+/* A computed jr/jalr whose target register holds 0 is a null code pointer (#1375): report
+ * it and stop the run. Generated code tests the latched target before the transfer's link
+ * write and delay slot, so a static transfer to offset 0 of a zero-based image (a direct
+ * call, a branch, the module entry) is never mistaken for one. */
+__attribute__((noreturn, cold)) void sr_null_code_pointer(CpuState *s, uint32_t transfer_pc);
+#define SR_CODE_POINTER(s, target, transfer_pc) do { \
+    if (__builtin_expect((target) == 0u, 0)) sr_null_code_pointer((s), (transfer_pc)); \
+} while (0)
+/* A generated `jr $ra` whose $ra holds 0 (SR_AOT_RETURN_CAPTURE): the same null code pointer,
+ * reported without the transfer's address, which the capture site does not carry. */
+__attribute__((noreturn, cold)) void sr_null_return_address(CpuState *s);
+/* A thread entry or callback function the guest handed the kernel as 0 (#1375), stopped
+ * before the entry's first instruction. `owner` names the entry kind. */
+__attribute__((noreturn, cold)) void sr_null_code_entry(CpuState *s, const char *owner);
+
+/* The return address the host hands a guest entry (#1375): a thread entry, a callback, an
+ * interrupt or GE handler, the boot entry. It is never 0, which is a null code pointer on
+ * every image (address 0 is a zero-based image's offset-0 function). It is word-aligned and
+ * outside the VFPU fallback tag window, and its SR_PHYS form 0x1FFFFFF0 lies outside the
+ * guest arena, so no dispatch normalization can map it onto code; on the PSP it is a
+ * kernel-segment address that user code cannot fetch. The host enters the guest by
+ * dispatch_from_host, a linked call whose resume PC is this value, so a guest `jr $ra` to it
+ * is that call's return in both tiers. */
+#define SR_HOST_RETURN_PC 0xFFFFFFF0u
+void     dispatch_from_host(CpuState *s, uint32_t entry);
+
+/* AOT `jr $ra` returns are structural host returns, so a linked call needs a
+ * small host-side boundary to compare the guest target latched at `jr` with the
+ * caller's explicit resume PC. This state is separate from CpuState: it is not
+ * guest architecture and does not change the generated CpuState ABI. */
+typedef struct SrAotReturnBoundary {
+    CpuState *state;
+    uint32_t resume_pc;
+    uint32_t has_resume_pc;
+    uint64_t observed_target;  /* bit 32 marks a captured target, including target 0 */
+    uint32_t call_sp;          /* guest $sp at the call, after its delay slot: the callee's entry $sp */
+    uint32_t dispatch_owned;   /* begun by dispatch_call_aot, whose caller ignores the end result */
+    uint32_t unwinding;        /* abandoned by a guest return to an enclosing linked call */
+    uint32_t resume_sp;        /* unwinding 3: the guest $sp a longjmp restored, reapplied
+                                * after the abandoned bodies' host returns */
+} SrAotReturnBoundary;
+
+/* The active AOT return stack follows the running guest fiber. Each TCB owns
+ * one descriptor; sched_run swaps it with the active descriptor around every
+ * guest-fiber switch. Storage grows only when a new high-water depth is reached,
+ * never once per generated call. */
+typedef struct {
+    SrAotReturnBoundary *boundaries;
+    size_t depth;
+    size_t capacity;
+    size_t floor;
+    SrAotReturnBoundary *top;
+} SrAotReturnBoundaryStack;
+
+/* A same-fiber callback or interrupt may run while caller frames are suspended.
+ * Its floor prevents the nested return path from popping those frames. */
+typedef struct {
+    size_t depth;
+    size_t previous_floor;
+} SrAotReturnBoundaryScope;
+
+#ifdef SR_VERIFY
+/* Sampled in-play differential checking (src/rt/verify.c, issue #1843). Verify builds only. */
+#define SR_VERIFY_STOP_SYSCALL 1
+#define SR_VERIFY_STOP_IMPORT  2
+extern int sr_verify_suppress_direct;
+void sr_verify_begin(CpuState *s, uint32_t target, uint32_t call_pc, uint32_t resume_pc);
+void sr_verify_note_entry(uint32_t target);
+void sr_verify_end(CpuState *s, const SrAotReturnBoundary *boundary);
+void sr_verify_at_stop(CpuState *s, int kind, uint32_t code, uint32_t pc);
+void sr_verify_note_preempt(const char *why);
+void sr_verify_abandon(const char *why);
+/* Write SR_VERIFY_REPORT now, once. The runtime's _Exit paths skip atexit and call this. */
+void sr_verify_report_now(void);
+#define SR_VERIFY_REPORT_NOW() sr_verify_report_now()
+#else
+#define SR_VERIFY_REPORT_NOW() ((void)0)
+#endif
+
+extern SrAotReturnBoundary *sr_aot_return_boundary_top;
+int sr_aot_return_boundary_begin(CpuState *s, uint32_t resume_pc,
+                                 uint32_t call_pc, uint32_t has_resume_pc);
+int sr_aot_return_boundary_end(CpuState *s);
+/* How many guest returns past their caller the runtime has unwound (#1034). */
+uint64_t sr_aot_return_unwind_count(void);
+void sr_aot_return_boundaries_reset(void);
+void sr_aot_return_boundary_stack_swap(SrAotReturnBoundaryStack *other);
+void sr_aot_return_boundary_stack_destroy(SrAotReturnBoundaryStack *stack);
+void sr_aot_return_boundary_scope_begin(SrAotReturnBoundaryScope *scope);
+int sr_aot_return_boundary_scope_end(CpuState *s,
+                                     const SrAotReturnBoundaryScope *scope,
+                                     const char *owner);
+
+/* An interpreted transfer to the resume PC of the innermost live linked call of `s` is that
+ * call's return: record it as SR_AOT_RETURN_CAPTURE would and return 1, so the interpreter
+ * hands back to the native caller instead of running its continuation a second time. */
+int sr_aot_return_boundary_capture_resume(CpuState *s, uint32_t target);
+
+/* Generated `jr $ra` captures before its delay slot. Keep the hot transfer path
+ * inline: one target store per return, with the linked-call comparison at the
+ * boundary after the native body returns. A return address of 0 is a null code pointer
+ * (#1375): the host never hands one out (SR_HOST_RETURN_PC). */
+#define SR_AOT_RETURN_CAPTURE(s, target) do { \
+    if (__builtin_expect((uint32_t)(target) == 0u, 0)) sr_null_return_address((s)); \
+    SrAotReturnBoundary *sr_aot_boundary_ = sr_aot_return_boundary_top; \
+    if (sr_aot_boundary_ != NULL && sr_aot_boundary_->state == (s)) \
+        sr_aot_boundary_->observed_target = UINT64_C(0x100000000) | (uint32_t)(target); \
+} while (0)
+
+/* TAIL transfer protocol (#855).
+ *
+ * A guest TAIL transfer -- `j`, `jr rs`, `jalr $zero` or a branch to another body, or a
+ * fall-through into another entry -- must not nest a native call: a guest loop of tail
+ * transfers would otherwise grow the host stack without bound while guest call depth stays
+ * constant. Generated code records the transfer here and returns; whoever invoked that body
+ * drains it: a generated CALL site (SR_TAIL_DRAIN), dispatch_call_aot, or sr_call_body. Each
+ * drained body may record the next transfer, so a whole chain runs in one native frame.
+ *
+ * Guest code runs on one OS thread, and a recorded transfer is consumed before any guest
+ * instruction runs, so one slot suffices and it is never live across a yield (asserted at
+ * the yield, syscall and dispatch entry points). A callable body owes its caller the
+ * restore of its entry SP once the chain completes; the drain applies the first restore
+ * recorded in its chain, which is the value the nested native returns used to leave. It
+ * gives back a frame the chain handed on live, so it only raises SP: a chain that ends
+ * above it left through a longjmp or an unwind, and the guest's SP stands (#1935).
+ *
+ * A transfer to a computed target is one dispatch (dispatch_tail_step). The direct transfers
+ * that follow it used to nest inside that dispatch, so the step drains them itself
+ * (sr_tail_drain_segment): exception and ERET flow they raise is handled by the step's own
+ * dispatch, at the SP the nested model had there. The step hands only the next computed
+ * transfer back to the enclosing drain, so native depth stays constant. */
+typedef struct {
+    RecompFn fn;            /* native body of a known target, or NULL to dispatch by address */
+    CpuState *state;        /* the CpuState that recorded the transfer */
+    uint32_t target;        /* guest target address */
+    uint32_t restore_sp;    /* the recording body's entry SP, when it owes the restore */
+    uint8_t pending;
+    uint8_t has_restore;
+} SrTailTransfer;
+extern SrTailTransfer sr_tail_transfer;    /* defined in guest_interp.c */
+/* Fatal, named stop for a broken protocol (double record, leaked slot, foreign state). */
+void sr_tail_fatal(const char *what, uint32_t target);
+/* Run every pending transfer to completion, then apply the chain's SP restore. */
+void sr_tail_drain(CpuState *s);
+/* Inside a computed step's dispatch: run the pending direct transfers, stopping at exception
+ * flow or at the next computed transfer, which is left for the enclosing drain. */
+void sr_tail_drain_segment(CpuState *s);
+/* One dispatch of a recorded computed target (recomp.c). It drains only that target's direct
+ * successors; the enclosing drain loop runs the next computed transfer. */
+void dispatch_tail_step(CpuState *s, uint32_t target);
+
+static inline void sr_tail_record(CpuState *s, uint32_t target, RecompFn fn,
+                                  uint32_t restore_sp, uint32_t owes_restore) {
+    if (sr_tail_transfer.pending) sr_tail_fatal("tail-transfer-recorded-twice", target);
+    sr_tail_transfer.fn = fn;
+    sr_tail_transfer.state = s;
+    sr_tail_transfer.target = target;
+    sr_tail_transfer.restore_sp = restore_sp;
+    sr_tail_transfer.has_restore = owes_restore ? 1u : 0u;
+    sr_tail_transfer.pending = 1u;
+}
+#define SR_TAIL_DRAIN(s) do { \
+    if (__builtin_expect(sr_tail_transfer.pending != 0u, 0)) sr_tail_drain(s); \
+} while (0)
+/* Invoke a native body and complete its tail chain (runtime direct calls). */
+static inline void sr_call_body(RecompFn fn, CpuState *s) {
+    if (sr_aot_return_boundary_begin(s, 0u, s->pc, 0u)) return;
+    fn(s);
+    if (sr_tail_transfer.pending) sr_tail_drain(s);
+    if (sr_aot_return_boundary_end(s)) return;
+}
+/* A recorded transfer must never survive to a yield, syscall or new dispatch. */
+static inline void sr_tail_assert_empty(const char *where) {
+    if (sr_tail_transfer.pending) sr_tail_fatal(where, sr_tail_transfer.target);
+}
+
+/* Tracing. When a trace file is open, the generated code reports each instruction. sr_begin
+ * snapshots the register file and records pc/op; sr_end diffs and emits the line, with an
+ * optional store (addr/size) read back from guest memory. Emit order follows PPSSPP: a branch
+ * reports before its delay slot. */
+int  sr_trace_open(const char *path, const char *target, uint32_t start_pc);
+void sr_trace_close(void);
+/* The SR_TRACE_PC address window over this trace is declared in flight_recorder.h and
+ * implemented in src/rt/flight_recorder.c, with the runtime's other opt-in diagnostics. */
+/* Throughput: the generated chunks emit an sr_begin/sr_end pair around *every* guest
+ * instruction (~1.5M call sites total). Since those huge files must compile at -O0, the
+ * release build removes the hooks in the preprocessor. TRACE=1 retains a predicted-false
+ * runtime gate and byte-accurate instruction tracing for oracle/diff builds. The address
+ * expression passed to sr_end is a pure register-plus-constant computation. */
+#ifndef PERF_AOT_INSTRUCTIONS
+#define PERF_AOT_INSTRUCTIONS 0
+#endif
+extern int sr_trace_active;
+void sr_begin_impl(CpuState *s, uint32_t pc, uint32_t op);
+void sr_end_impl(CpuState *s, uint32_t mem_addr, int mem_size);
+#if PERF_AOT_INSTRUCTIONS
+#define sr_begin(s, pc, op) do { \
+    if (__builtin_expect(sr_perf_aot_active, 0)) sr_perf_aot_instruction((pc), (op)); \
+    if (__builtin_expect(sr_trace_active, 0)) sr_begin_impl((s), (pc), (op)); \
+} while (0)
+#define sr_end(s, mem_addr, size) do { \
+    if (__builtin_expect(sr_trace_active, 0)) sr_end_impl((s), (mem_addr), (size)); \
+} while (0)
+#elif defined(SR_INSTRUCTION_TRACE)
+#define sr_begin(s, pc, op)       do { if (__builtin_expect(sr_trace_active, 0)) sr_begin_impl((s), (pc), (op)); } while (0)
+#define sr_end(s, mem_addr, size) do { if (__builtin_expect(sr_trace_active, 0)) sr_end_impl((s), (mem_addr), (size)); } while (0)
+#else
+/* The generated chunks are intentionally compiled at -O0 to avoid compiler
+ * OOM.  At that optimization level even a predicted-false trace test remains
+ * in every guest instruction.  Compile the hooks completely out of release
+ * chunks; TRACE=1 restores the byte-accurate oracle/diff instrumentation. */
+#define sr_begin(s, pc, op)       ((void)0)
+#define sr_end(s, mem_addr, size) ((void)0)
+#endif
+
+/* Local guest-register promotion (tools/codegen.py --promote-registers, #284): a
+ * promoted instruction writes a C local, and the body writes dirty locals back to
+ * s->r[] at every label, control transfer and other boundary. A build that compiles
+ * the trace hooks in also mirrors each promoted write at once, so the
+ * per-instruction trace and the cosimulation see the architectural register file
+ * after every instruction. Elsewhere the mirror compiles out. */
+#if PERF_AOT_INSTRUCTIONS || defined(SR_INSTRUCTION_TRACE)
+#define SR_PROMO_SYNC(s, i, v) ((s)->r[(i)] = (v))
+#else
+#define SR_PROMO_SYNC(s, i, v) ((void)0)
+#endif
+
+/* HLE boundary marker used by the bring-up driver: a call to an unresolved import stop the
+ * traced run so the comparison ends exactly where the reference trace reaches its first syscall. */
+void sr_hle_call(CpuState *s, uint32_t nid);
+void sr_hle_advance_time(uint32_t us);                                              /* virtual-time charge per HLE (sched.c) */
+extern int sr_hit_hle;
+
+/* HLE syscall dispatch. The recompiled import stub at <stub> calls sr_syscall with the NID
+ * resolved from the PRX import table. It dispatches to the registered handler (which reads
+ * arguments from $a0-$a3 and returns the $v0 value), then poisons the caller-saved temp
+ * registers to 0xDEADBEEF exactly as PPSSPP's kernel does, and writes the return to $v0. A
+ * NID with no handler logs and stops at the HLE boundary (longjmp) so bring-up can see which
+ * import to implement next. sr_last_nid records the most recent dispatched NID. */
+uint32_t sr_alloc_uid(void);
+
+/* sceGe display-list GPU (src/rt/ge.c): execute a GE command list, rasterising into VRAM. */
+uint32_t ge_run_list(uint32_t addr, int resume);
+/* ge_run_list that also stops at a command boundary once *stop is set, after at least one
+ * command, exactly as it stops at a stall address: it returns the next command's address, with
+ * *stopped set, and resuming there continues the list. */
+uint32_t ge_run_list_until(uint32_t addr, int resume, atomic_int_least32_t *stop, int *stopped);
+/* The 16-bit argument of the FINISH command the last ge_run_list call executed. */
+uint32_t ge_last_finish_id(void);
+/* Opt-in GE time model (ge.c, SR_GE_TIMING; issue #1296), in GE clocks (the bus clock),
+ * measured on a PSP-3000 with CASE=ge-timing: enable charging, the fixed cost of one list
+ * (enqueue to finish of an empty list), and the work the last ge_run_list call executed. */
+void     ge_timing_set_enabled(int on);
+double   ge_timing_list_clk(void);
+double   ge_timing_run_clk(void);
+/* SR_GE_TRANSITION_TRACE late-write check (issue #69): re-hash the vertex and index bytes of
+ * every weighted draw recorded since the last check; a no-op unless the trace is armed. */
+void ge_transition_trace_check(const char *why, uint32_t vcount);
+extern uint32_t g_ge_stall_addr;
+/* Diagnostic counters the watchdog and statistics reports print (hle.c). The GE ones
+ * are kept by ge.c, the MPEG ones by mpeg.c. */
+extern uint32_t g_frame_prims;
+extern unsigned long g_ge_list_sig, g_ge_prim_count;
+extern unsigned long g_list_writes, g_list_nonblack, g_list_clearpx;
+extern unsigned long g_ge_list_through_cmds, g_ge_list_transform_cmds;
+extern unsigned long g_ge_mip_draws;          /* draws with mip sampling enabled, every route, whole run (#1373) */
+extern unsigned long g_ge_mip_lines_printed;  /* "GE mip:" lines printed: 0 or 1 (#1373) */
+extern unsigned long g_ge_list_through_vertices, g_ge_list_transform_vertices;
+extern unsigned long g_ge_list_through_sprites, g_ge_list_transform_sprites;
+extern unsigned long g_ge_pixels;
+extern unsigned long g_tex_samples, g_tex_nonzero;
+extern unsigned long g_mpeg_put, g_mpeg_getavc, g_mpeg_avcdec, g_mpeg_nodata;
+uint32_t ge_framebuffer(void);
+/* Last word written for GE command `cmd` (0..0xFF). Callers validate the index first
+ * (sceGeGetCmd returns SCE_KERNEL_ERROR_INVALID_VALUE); an out-of-range index yields 0,
+ * which is indistinguishable from a stored GE_NOP word. */
+uint32_t ge_get_cmd(uint32_t cmd);
+
+/* Host presenter front-end (src/rt/gui.c). gui_init selects the interactive window or the
+ * explicit offscreen sink; gui_present is called from sceDisplaySetFrameBuf to accept a frame,
+ * pump messages, and sample live input on interactive routes. */
+#define SR_APP_TITLE "Nakagawa Recomp"   /* canonical window caption; see also gpu_sdl3vk/sdl3vk.c */
+/* Window caption for the running game: "Nakagawa Recomp - <game title>". The launcher hands the
+ * title of the user's own disc (PARAM.SFO TITLE) to the runtime in SR_GAME_TITLE; these turn it
+ * into a safe caption. No game names live here: with no title, or one that sanitises to nothing,
+ * the caption is the plain SR_APP_TITLE. */
+#define SR_WINDOW_TITLE_APP SR_APP_TITLE
+#define SR_WINDOW_TITLE_GAME_MAX 96   /* bytes of game title kept, on a character boundary */
+#define SR_WINDOW_TITLE_CAP (sizeof(SR_WINDOW_TITLE_APP) + 3 + SR_WINDOW_TITLE_GAME_MAX + 1)
+
+/* Length of the well-formed UTF-8 sequence at s (1..4), or 0 when it is malformed, overlong,
+ * a surrogate or beyond U+10FFFF. */
+static inline size_t sr_window_title_utf8_len(const unsigned char *s) {
+    if (s[0] < 0x80) return 1;
+    if (s[0] >= 0xC2 && s[0] <= 0xDF) return (s[1] & 0xC0) == 0x80 ? 2 : 0;
+    if (s[0] >= 0xE0 && s[0] <= 0xEF) {
+        if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80) return 0;
+        if (s[0] == 0xE0 && s[1] < 0xA0) return 0;   /* overlong */
+        if (s[0] == 0xED && s[1] >= 0xA0) return 0;  /* surrogate */
+        return 3;
+    }
+    if (s[0] >= 0xF0 && s[0] <= 0xF4) {
+        if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80 || (s[3] & 0xC0) != 0x80) return 0;
+        if (s[0] == 0xF0 && s[1] < 0x90) return 0;   /* overlong */
+        if (s[0] == 0xF4 && s[1] >= 0x90) return 0;  /* beyond U+10FFFF */
+        return 4;
+    }
+    return 0;
+}
+
+/* Copy the printable, valid-UTF-8 part of `raw` into out (capacity cap, always terminated): control
+ * characters (C0, DEL, C1) and malformed bytes are dropped, whitespace runs collapse to one space,
+ * leading/trailing space is trimmed, and the result stops at SR_WINDOW_TITLE_GAME_MAX bytes on a
+ * character boundary. Returns the byte length. */
+static inline size_t sr_window_title_sanitize(const char *raw, char *out, size_t cap) {
+    size_t n = 0, limit = cap ? cap - 1 : 0;
+    int pending_space = 0;
+    if (limit > SR_WINDOW_TITLE_GAME_MAX) limit = SR_WINDOW_TITLE_GAME_MAX;
+    if (!out || !cap) return 0;
+    for (const unsigned char *p = (const unsigned char *)(raw ? raw : ""); *p;) {
+        size_t len = sr_window_title_utf8_len(p);
+        if (len == 0) { p++; continue; }
+        if (len == 1 && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) {
+            pending_space = 1; p++; continue;
+        }
+        if ((len == 1 && (*p < 0x20 || *p == 0x7F)) || (len == 2 && p[0] == 0xC2 && p[1] < 0xA0)) {
+            p += len; continue;
+        }
+        size_t need = len + ((pending_space && n) ? 1 : 0);
+        if (n + need > limit) break;
+        if (pending_space && n) out[n++] = ' ';
+        pending_space = 0;
+        for (size_t i = 0; i < len; i++) out[n++] = (char)p[i];
+        p += len;
+    }
+    out[n] = '\0';
+    return n;
+}
+
+/* Format the caption for `game_title` (may be NULL or empty) into out. Returns the byte length. */
+static inline size_t sr_window_title_format(const char *game_title, char *out, size_t cap) {
+    char title[SR_WINDOW_TITLE_GAME_MAX + 1];
+    int n;
+    if (!out || !cap) return 0;
+    if (sr_window_title_sanitize(game_title, title, sizeof(title)) == 0)
+        n = snprintf(out, cap, "%s", SR_WINDOW_TITLE_APP);
+    else
+        n = snprintf(out, cap, "%s - %s", SR_WINDOW_TITLE_APP, title);
+    return n < 0 ? 0 : ((size_t)n < cap ? (size_t)n : cap - 1);
+}
+/* Shared one-shot gate used by the visible GDI and SDL/Vulkan presenters.
+ * The boot-event file is the launcher's handoff marker; headless presenters
+ * and already-serviced launches never invoke the supplied window operation. */
+typedef void (*SrGuiForegroundRequestFn)(void *context);
+static inline bool sr_gui_request_launcher_foreground_once(
+    const char *boot_event_file,
+    bool window_visible,
+    bool headless_presenter,
+    bool *request_issued,
+    void *context,
+    SrGuiForegroundRequestFn raise_window
+) {
+    if (!boot_event_file || !boot_event_file[0] || !window_visible ||
+        headless_presenter || !request_issued || *request_issued || !raise_window) {
+        return false;
+    }
+    *request_issued = true;
+    raise_window(context);
+    return true;
+}
+/* The game window opens on the display that holds the launcher window. SDL display IDs are
+ * per process, so the launcher (nk_launch.c) passes that display's desktop bounds instead, as
+ * SR_LAUNCHER_DISPLAY_BOUNDS=x,y,w,h, and the runtime picks its own display containing the
+ * centre of that rectangle. An empty value means the launcher did not know; the runtime then
+ * uses the primary display. */
+static inline bool sr_display_bounds_field(const char **p, int *out, char end) {
+    const char *s = *p;
+    bool negative = *s == '-';
+    int value = 0, digits = 0;
+    if (negative) s++;
+    /* At most nine digits, so the value always fits an int; no desktop is that large. */
+    while (*s >= '0' && *s <= '9' && digits < 9) {
+        value = value * 10 + (*s - '0');
+        s++;
+        digits++;
+    }
+    if (digits == 0 || *s != end) return false;
+    *out = negative ? -value : value;
+    *p = end ? s + 1 : s;
+    return true;
+}
+
+/* Parse an SR_LAUNCHER_DISPLAY_BOUNDS value into bounds (x, y, w, h). Returns false, leaving
+ * bounds unspecified, for NULL, empty, or anything other than four decimal integers separated
+ * by commas with a positive width and height. */
+static inline bool sr_parse_display_bounds(const char *value, int bounds[4]) {
+    const char *p = value;
+    if (!p || !bounds) return false;
+    if (!sr_display_bounds_field(&p, &bounds[0], ',') ||
+        !sr_display_bounds_field(&p, &bounds[1], ',') ||
+        !sr_display_bounds_field(&p, &bounds[2], ',') ||
+        !sr_display_bounds_field(&p, &bounds[3], '\0'))
+        return false;
+    return bounds[2] > 0 && bounds[3] > 0;
+}
+
+/* The index of the first of `count` displays (x, y, w, h each, in `displays`) whose bounds
+ * contain the centre of `bounds`, or -1 when none does; the caller then uses the primary
+ * display. A display with no width or height never matches. */
+static inline int sr_pick_display(const int bounds[4], const int *displays, int count) {
+    if (!bounds || !displays || count <= 0) return -1;
+    long long cx = (long long)bounds[0] + bounds[2] / 2;
+    long long cy = (long long)bounds[1] + bounds[3] / 2;
+    for (int i = 0; i < count; i++) {
+        const int *d = displays + 4 * i;
+        if (d[2] <= 0 || d[3] <= 0) continue;
+        if (cx >= d[0] && cx < (long long)d[0] + d[2] &&
+            cy >= d[1] && cy < (long long)d[1] + d[3])
+            return i;
+    }
+    return -1;
+}
+void     gui_init(const char *title);
+int      gui_on(void);
+int      gui_interactive(void);                  /* 1 when a person is at a real window: not offscreen, headless or acceptance */
+uint32_t gui_buttons(void);
+void     gui_consume_button_pulses(void);          /* after one PSP VBLANK sample */
+/* Gamepad buttons that went down since the last call, as PSP button bits: the on-screen
+ * keyboard's pad input (osk_overlay.h). Taken every VBLANK whether or not it is open. Returns 0
+ * when no SDL3 presenter is up (the GDI and offscreen presenters have no SDL3 gamepad). */
+uint32_t gui_pad_pulses_take(void);
+void     gui_analog(uint8_t *lx, uint8_t *ly);   /* live left-stick (0..255, 128=centre) */
+int      gui_pad_present(void);                  /* 1 when a game controller is connected */
+void     gui_ace_vblank(uint32_t vcount);        /* Ace Mode's smooth motion: a held frame's VBLANK */
+/* Returns 1 only when the selected presenter accepted the validated frame. */
+int      gui_present(uint32_t fbaddr, int fmt, uint32_t stride);
+void     gui_pump(void);                         /* service the window's pending events */
+int      gui_headless_acceptance_requested(void);
+int      gui_headless_acceptance_ready(void);
+int      gui_headless_acceptance_complete(void);
+uint32_t gui_headless_acceptance_presented_frames(void);
+/* Runtime exit codes for a headless acceptance launch. The launcher reads them as
+ * NK_LAUNCH_EXIT_ACCEPTANCE_* in src/core/nk_launch.h; the two sets must stay equal. */
+#define SR_HEADLESS_ACCEPTANCE_EXIT_REACHED 42
+#define SR_HEADLESS_ACCEPTANCE_EXIT_PRESENTER_UNAVAILABLE 43
+#define SR_HEADLESS_ACCEPTANCE_EXIT_NOT_REACHED 44
+/* The scheduler-run stop the window reports (#1377): an acceptance launch presented its frames,
+ * or the person quit and sr_exit_request_stop_due says the run should end now. A quit request
+ * never exits from inside the presenter; the scheduler returns and the driver tears down. */
+int      gui_stop_requested(void);
+/* 1 once the person asked to quit, whether or not the stop is due yet: a run the scheduler hands
+ * back after that (a LoadExec from the guest's exit callback) is not continued. */
+int      gui_quit_requested(void);
+/* Releases the presenter, the SR_PERF summary first; idempotent. The driver calls it once the
+ * scheduler returns, and gui_init registers it with atexit for a run that ends otherwise. */
+void     gui_shutdown(void);
+/* 1 once SR_GE_CAPTURE_EXIT's capture was written (ge.c). After
+ * ge_capture_exit_set_deferred(1) (the driver, for a scheduler run that polls it) the run stops
+ * at the scheduler's next boundary; otherwise the capture exit leaves at once through exit(). */
+int      ge_capture_exit_due(void);
+void     ge_capture_exit_set_deferred(int deferred);
+/* Optional stop request polled by sched_run between guest slices and by sr_yield, which
+ * returns a lone running thread to the scheduler when it is set, as for a pause. The driver
+ * points it at its stop check for a scheduler run (the window's, a GE capture's); NULL (the
+ * default) never stops. */
+extern int (*sr_sched_stop_requested)(void);
+
+/* Player pause is a scheduler-context host stall. C9a owns the audio callbacks;
+ * the window's presenter supplies the presenter, input claim and busy-reason callbacks. */
+typedef enum {
+    SR_PAUSE_FRAME_CONTINUE = 0,
+    SR_PAUSE_FRAME_RESUME = 1
+} SrPauseFrame;
+typedef enum {
+    SR_PAUSE_ACCEPTED = 0,
+    SR_PAUSE_ALREADY,
+    SR_PAUSE_REFUSED_NO_PRESENTER,
+    SR_PAUSE_REFUSED_AUTOMATION,
+    SR_PAUSE_REFUSED_KEYBOARD,
+    SR_PAUSE_REFUSED_STOPPING
+} SrPauseVerdict;
+typedef enum {
+    SR_PAUSE_SRC_USER = 1,
+    SR_PAUSE_SRC_PAD_LOST,
+    SR_PAUSE_SRC_SCRIPT
+} SrPauseSource;
+typedef struct SrPauseHost {
+    void (*audio_enter)(void);
+    void (*audio_leave)(void);
+    /* Test-script seam: nonzero once its pending audio stimulus is queued. */
+    int (*script_ready)(void);
+    /* Returns 0 or a refusal verdict: the keyboard is open, or the presenter is stopping. */
+    int (*busy_reason)(void);
+    void (*enter)(void);
+    SrPauseFrame (*frame)(void);
+    void (*leave)(void);
+} SrPauseHost;
+extern const SrPauseHost *sr_sched_pause_host;
+/* The window's pause presenter (src/rt/gui.c, C9b). gui_pause_presenter is 1 when the
+ * SDL3/Vulkan window can draw the overlay; only then does the driver install enter, frame
+ * and leave. busy_reason applies to every presenter. */
+int          gui_pause_presenter(void);
+int          gui_pause_busy_reason(void);
+void         gui_pause_enter(void);
+SrPauseFrame gui_pause_frame(void);
+void         gui_pause_leave(void);
+/* A player quit request notifies the guest's registered exit callback (src/rt/hle.c, #1392).
+ * sr_exit_request_quit returns 1 while the guest has its bounded window to call
+ * sceKernelExitGame, 0 when the player should exit now; sr_exit_request_expired is 1 once that
+ * window has passed. sr_exit_request_stop_due is the player's stop decision at a scheduler
+ * boundary: 0 while that window is open or a save the guest started is still running inside
+ * it, 1 when the run should end now (#1377). */
+int      sr_exit_request_quit(void);
+int      sr_exit_request_expired(void);
+int      sr_exit_request_stop_due(void);
+SrPauseVerdict sched_pause_request(SrPauseSource source);
+int      sched_pause_active(void);
+/* The source of the pause requested or open now (the presenter opens on the controller
+ * dialog for SR_PAUSE_SRC_PAD_LOST); meaningful while sched_pause_pending() is nonzero. */
+SrPauseSource sched_pause_source(void);
+int      sched_pause_pending(void);
+uint64_t sched_pause_total_ns(void);
+uint32_t sr_display_vcount(void);
+
+typedef uint32_t (*HleFn)(CpuState *s);
+void     sr_hle_register(uint32_t nid, const char *name, HleFn fn);
+void     sr_hle_init(void);     /* registers all built-in handlers (idempotent) */
+uint32_t sr_syscall(CpuState *s, uint32_t nid);
+typedef struct SrLoadExecRequest {
+    char guest_path[256];
+    uint32_t arglen;
+    uint8_t *args; /* host-owned copy; released by sr_hle_loadexec_release */
+} SrLoadExecRequest;
+int  sr_hle_loadexec_take(SrLoadExecRequest *out);
+void sr_hle_loadexec_release(SrLoadExecRequest *request);
+void sr_hle_loadexec_reset_guest_state(void);
+int  sr_hle_loadexec_boot_module(const char *guest_path, uint32_t *entry_out,
+                                 uint32_t *gp_out);
+void sr_hle_loadexec_finish(void);
+extern uint32_t sr_last_nid;
+/* The import the running guest thread is inside. sr_last_nid is process-wide and outlives
+ * the call, so it can name another thread's import or one that already returned; this pair is
+ * scoped to the call instead. sr_syscall sets it around its handler and restores the outer
+ * pair on return (a nested import inside a callback does not leak out), and the scheduler
+ * (src/rt/sched.c) saves it per thread across switches. sr_import_active is 0 outside any
+ * import. The flight recorder's thread snapshot reads it at each block. */
+extern uint32_t sr_import_nid;
+extern int sr_import_active;
+
+/* Late-import resolution contract (src/rt/hle.c, Track B). Runtime-loaded PRX exports are
+ * published by module load through sr_hle_register_late_import(); dispatch() queries
+ * sr_hle_resolve_late_import() on a lookup miss. Result meanings:
+ *   0                    unresolved — caller falls back to its miss handling
+ *   SR_HLE_LATE_BUILTIN  the id names a built-in HLE handler — trap into sr_syscall
+ *   anything else        a rebased guest export address — dispatch to that target
+ * The registry is protected by hle.c's spinlock; both calls are fiber/thread safe. */
+#define SR_HLE_LATE_BUILTIN (UINT32_MAX - 1u)
+int      sr_hle_register_late_import(uint32_t nid, uint32_t target);
+uint32_t sr_hle_resolve_late_import(uint32_t nid);
+
+/* Cooperative scheduler with preemptive yield points (src/rt/sched.c). The recompiled code
+ * calls SR_YIELD at function entry and loop back-edges; when the scheduler is active and the
+ * thread's timeslice runs out, it switches to another ready thread (Windows fibers). When the
+ * scheduler is off (per-function differential, plain driver) SR_YIELD is a cheap no-op that
+ * changes nothing, so it does not affect the existing trace verification. */
+extern int     sr_sched_on;
+/* Host-stack probe the scheduler installs when it owns the guest fibers
+ * (sr_coro_stack_remaining). Defined in guest_interp.c, which every dispatcher
+ * build links; harnesses without the scheduler leave it NULL and the dispatcher's
+ * preflight stays off because sr_sched_on is 0 there. */
+extern int   (*sr_dispatch_host_stack_remaining)(size_t *remaining_out);
+/* The high end of the running stack, installed beside it (sr_coro_stack_top); may stay NULL. */
+extern int   (*sr_dispatch_host_stack_top)(uintptr_t *top_out);
+/* The same host-stack bound for direct compiled calls (#855). A `jal` to a known body is a
+ * native C call that never enters the dispatcher, so codegen opens every body that makes such
+ * a call with SR_HOST_STACK_CHECK; leaves and bodies whose calls all go through the dispatcher
+ * need none, since every native recursion of generated code passes through one or the other.
+ *
+ * The hot path is one test of the body's frame address against sr_host_stack_window: frame
+ * addresses on the running stack already known to leave the dispatcher's reserve. Frames in
+ * [low, low + span] pass; {0, 0} passes nothing. A frame outside it calls
+ * sr_host_stack_entry_slow (recomp.c), which takes the dispatcher's measurement: when the
+ * stack is exhausted (or its bounds are unknown) the run stops at the dispatcher's named
+ * boundary with the dispatcher's report; otherwise it refills the window for the running stack
+ * and returns. The window spans one stack and is never an estimate, so a frame on any other
+ * live stack falls outside it and refills it; the scheduler clears it when it creates a guest
+ * stack, which may reuse the range of a released one. A plain global: guest code runs on one
+ * OS thread (as for sr_tail_transfer). Defined in guest_interp.c. */
+typedef struct {
+    uintptr_t low;
+    uintptr_t span;
+} SrHostStackWindow;
+extern SrHostStackWindow sr_host_stack_window;
+void  sr_host_stack_entry_slow(uint32_t entry, uintptr_t frame);
+#define SR_HOST_STACK_CHECK(entry) \
+    SR_HOST_STACK_CHECK_FRAME((entry), (uintptr_t)__builtin_frame_address(0))
+/* The same check for a frame address the caller supplies: the LLVM backend (#330) passes
+ * its body's own frame (llvm.frameaddress) through src/rt/llvm_abi.c. */
+#define SR_HOST_STACK_CHECK_FRAME(entry, frame) do { \
+    uintptr_t _sr_frame = (frame); \
+    if (__builtin_expect(_sr_frame - sr_host_stack_window.low > sr_host_stack_window.span, 0)) \
+        sr_host_stack_entry_slow((entry), _sr_frame); \
+} while (0)
+static inline void sr_host_stack_window_clear(void) {
+    sr_host_stack_window.low = 0;
+    sr_host_stack_window.span = 0;
+}
+extern atomic_int_least32_t sr_timeslice;
+/* Spend one unit of the time slice. Only the guest thread decrements it. On the Switch's
+ * Cortex-A57, which has no atomic add, a read-modify-write here is an exclusive-access loop in
+ * every guest function and loop. A load and a store cost far less; a timer's slice end that lands
+ * between them is lost, and the slice then ends by count. */
+#ifdef __SWITCH__
+static inline int32_t sr_timeslice_take(void) {
+    const int32_t left = atomic_load_explicit(&sr_timeslice, memory_order_relaxed);
+    atomic_store_explicit(&sr_timeslice, left - 1, memory_order_relaxed);
+    return left;
+}
+#define SR_TIMESLICE_TAKE() sr_timeslice_take()
+#else
+#define SR_TIMESLICE_TAKE() atomic_fetch_sub_explicit(&sr_timeslice, 1, memory_order_relaxed)
+#endif
+void sr_yield(CpuState *s);
+/* Returns 1 if the host wall-clock has crossed the vblank quantum since the last vblank
+ * delivery. Defined in sched.c; safe to call from anywhere reactive. Used by SR_YIELD to
+ * force a premature slice expiry when the recomp-emitted yield cadence is too sparse to
+ * keep the engine vblank callback chain alive (e.g. during a busy-wait on a guest latch). */
+int sr_vblank_quantum_due(void);
+/* f_00065c60 field-writer intercept: the container walker reads count from
+ * r18+0x04 but f_0005a500's control block init puts count at r18+0x00 and
+ * cursor at r18+0x04.  Since both functions are called directly (not via
+ * dispatch()), the only hook point is SR_YIELD at function entry.  Copy
+ * count from +0x00 to +0x04 before the walker body executes.  Idempotent:
+ * if +0x04 already holds count, writing it again is harmless. */
+extern int g_prof_enabled;
+void sr_profile_init(void);
+void sr_profile_dump(void);
+void sr_profile_block(uint32_t target_pc);
+/* Test accessors: defined only in SR_PROFILER_SELFTEST builds (recomp.c), but
+ * declared unconditionally so no translation unit ever sees an implicit
+ * declaration under any flag combination. */
+void sr_profile_test_reset(void);
+uint64_t sr_profile_test_block_count(uint32_t pc);
+uint64_t sr_profile_test_lookup_drops(void);
+
+#ifdef SR_VERIFY
+#define SR_VERIFY_NOTE_YIELD() sr_verify_note_preempt("yield")
+#else
+#define SR_VERIFY_NOTE_YIELD() ((void)0)
+#endif
+
+#define SR_YIELD(s, target_pc) do { \
+    if (__builtin_expect(g_prof_enabled, 0)) { \
+        sr_profile_block(target_pc); \
+    } \
+    if (__builtin_expect(sr_sched_on, 1)) { \
+        if (SR_TIMESLICE_TAKE() <= 1) { \
+            (s)->pc = (target_pc); \
+            SR_VERIFY_NOTE_YIELD(); \
+            sr_yield(s); \
+        } \
+    } \
+} while (0)
+
+
+
+/* Scheduler API used by the thread HLE handlers and the driver. */
+#define SCHED_INTR_VBLANK 0x00000001u /* coalescing display source */
+#define SCHED_INTR_GE     0x00000002u /* reserved GE source; retained until its handler lands */
+
+/* Extracted-data census preparation (src/rt/hle.c). The driver calls this ONCE
+ * on the startup thread AFTER configuration is final and BEFORE gui_init,
+ * sched_init, or any guest execution: the cold index must never begin from a
+ * guest HLE call. Returns a terminal SR_DATA_STATE_* value (READY, FAILED, or
+ * DISABLED); guest-time lookups consume terminal states only. */
+int sr_host_data_prepare(void);
+size_t sr_host_data_entry_count(void);      /* valid after READY */
+
+void     sched_init(CpuState *cpu);                 /* CpuState the running thread reads/writes */
+void     sched_preempt_timer_start(void);          /* paced runs: a stronger due thread preempts at once (#1296) */
+int      sched_reset_for_loadexec(void);            /* retire the old guest threads after scheduler return */
+void     sched_set_guest_process_gp(uint32_t gp);    /* seed the replacement program's initial $gp */
+/* The module-start thread sched_run creates: priority, stack size (0 = the 256 KiB default),
+ * attribute, name and $gp, as the module manager creates it from the module's record. */
+void     sched_set_module_start_thread(int priority, uint32_t stack_size, uint32_t attr,
+                                       const char *name, uint32_t gp);
+uint32_t sched_create_thread(uint32_t entry, int priority, uint32_t stack_size);
+uint32_t sched_create_thread_ex(uint32_t entry, int priority, uint32_t stack_size,
+                                uint32_t attr, const char *name);
+/* The thread's entry is a guest code pointer (sceKernelCreateThread), not loader-known. */
+void     sched_mark_code_pointer_entry(uint32_t uid);
+uint32_t sched_start_thread(uint32_t uid, uint32_t arglen, uint32_t argp);
+int      sched_thread_set_gp(uint32_t uid, uint32_t gp);
+int      sched_module_range_busy(uint32_t start, uint32_t end, uint32_t ignored_uid);
+typedef void (*SrSchedThreadExitHook)(uint32_t uid);
+void     sched_set_thread_exit_hook(SrSchedThreadExitHook hook);
+/* Watchdog thread-dump detail: hle.c names the kernel object an object wait is on (returns
+ * 0 when no object has the uid) and the NID of an import; sr_syscall reports each import's
+ * return on the current thread. */
+typedef int (*SrSchedWaitDescriber)(uint32_t thread_uid, uint32_t obj, char *out, size_t cap);
+typedef const char *(*SrSchedNidNamer)(uint32_t nid);
+void     sched_set_watchdog_describers(SrSchedWaitDescriber describe, SrSchedNidNamer name);
+void     sched_note_import_return(uint32_t nid, uint32_t ret);
+/* Opt-in GE completion timing (hle.c, SR_GE_TIMING): the earliest guest-time deadline of a
+ * list the modelled GE is still drawing (SCHED_WAIT_FOREVER-style UINT64_MAX when none), and
+ * the interrupt-service step that completes every due list.  With no hooks registered --
+ * every build that does not link hle.c -- the scheduler behaves as before. */
+typedef uint64_t (*SrSchedGeNextDeadline)(void);
+typedef void (*SrSchedGeServiceDue)(void);
+void     sched_set_ge_timing_hooks(SrSchedGeNextDeadline next_deadline, SrSchedGeServiceDue service_due);
+/* VTimer handlers (hle.c): the earliest guest-time deadline of a running VTimer with a
+ * handler (UINT64_MAX when none), and the interrupt-service step that runs the most overdue
+ * handler once.  With no hooks registered the scheduler behaves as before. */
+typedef uint64_t (*SrSchedVtimerNextDeadline)(void);
+typedef void (*SrSchedVtimerServiceOne)(void);
+void     sched_set_vtimer_hooks(SrSchedVtimerNextDeadline next_deadline,
+                                SrSchedVtimerServiceOne service_one);
+/* hle.c's user-partition overlap test: sched.c refuses a thread stack range it reports. */
+typedef int (*SrSchedStackRangeRefusal)(uint32_t base, uint32_t end);
+void     sched_set_stack_range_refusal(SrSchedStackRangeRefusal refusal);
+CpuState *sr_cpu_for_callbacks(void);               /* the CpuState guest callbacks run on */
+void     sched_dump_threads(void);                  /* the watchdog's thread table, to stderr */
+void     sched_watchdog_summary(uint32_t *ready, uint32_t *delay,
+                                uint32_t *wait, uint32_t *spin);
+/* Callback and VBLANK service hle.c provides to the scheduler. */
+int      sr_thread_has_pending_callbacks(uint32_t thread_uid);
+int      sr_thread_dispatch_callbacks(void);
+int      sr_vblank_dispatch_registered(void);
+void     sr_vblank_tick(void);
+/* The guest VBLANK count (hle.c) and the host audio backend's statistics dump. */
+uint32_t sr_audio_vbl(void);
+void     sr_audio_dump_stats(void);
+void     sr_audio_dump_finish(void);
+int      sched_guest_thread_running(void);
+void     sched_request_guest_reset(void);
+void     sched_exit_current(int32_t status);        /* non-delete exit; normalize signed-negative status */
+void     sched_exit_current_unchecked(int32_t status); /* raw status for non-ThreadMan teardown */
+void     sched_exit_current_delete(int32_t status); /* current thread exits and deletes its object */
+/* PSP interrupt suspension also suppresses preemption on the single CPU.  Retail
+ * newlib relies on this around every mutation of its global malloc-bin state. */
+uint32_t sched_suspend_interrupts(void);             /* returns previous enabled state */
+void     sched_resume_interrupts(uint32_t state);    /* restores a prior state */
+int      sched_interrupts_enabled(void);
+uint32_t sched_suspend_dispatch(void);              /* sceKernelSuspendDispatchThread */
+uint32_t sched_resume_dispatch(uint32_t state);     /* sceKernelResumeDispatchThread */
+int      sched_dispatch_enabled(void);
+/* State-only query: interrupts enabled AND dispatch enabled. Carries no policy --
+ * each blocking handler asks it at its own point, after its own validation. See the
+ * definition in sched.c for why a universal pre-handler gate is ruled out. */
+int      sched_wait_permitted(void);
+int      sched_current_has_pending_wakeup(void);        /* banked sceKernelWakeupThread count */
+int      sched_current_join_result_pending(uint32_t uid); /* non-consuming join-result peek */
+void     sched_raise_interrupt(uint32_t source);     /* latch source; delivery occurs at a scheduler boundary */
+uint32_t sched_pending_interrupts(void);             /* source bits not yet serviced */
+void     sched_delay_current(uint64_t usec);        /* block current thread for usec */
+void     sched_preempt(void);                       /* yield now if a higher-priority thread is ready */
+/* Set by the preemption timer when a stronger thread's deadline comes. A long HLE call polls it
+ * between units of work and, holding nothing another guest thread could trip on, calls
+ * sched_preempt_point(): that thread then runs inside the call, as it would on the PSP (#1296). */
+extern atomic_int_least32_t sr_preempt_due;
+void     sched_preempt_point(void);
+void     sched_block_on(uint32_t obj);              /* block current thread until sched_wake(obj) */
+void     sched_wait_vblank_start(void);             /* sceDisplayWaitVblankStart: always block to the next vblank start edge */
+int      sched_wait_vblank(void);                   /* sceDisplayWaitVblank: 1 if already inside the vblank interval (no block), else blocks and returns 0 */
+int      sched_wait_vblank_cb(int wait_start);       /* callback-aware display wait; wait_start selects WaitVblankStart semantics */
+int      sched_block_on_timeout(uint32_t obj, uint32_t usec);  /* returns 1 if timed out */
+void     sched_wake(uint32_t obj);                  /* ready all threads blocked on obj */
+void     sched_wake_with_result(uint32_t obj, uint32_t result); /* sched_wake + a wait result */
+int      sched_take_wake_result(uint32_t *result_out); /* 1 + code when a wake result is pending, else 0 */
+int      sched_count_waiters(uint32_t obj);         /* threads currently blocked on obj */
+int      sched_wake_one_object_waiter_with_result(uint32_t thread_uid, uint32_t result);
+int      sched_wake_one_object_waiter(uint32_t obj, uint32_t thread_uid); /* ready single thread blocked on obj */
+/* Device transfer channel (#303): begin starts the current thread's transfer of
+ * duration_us guest microseconds (0 when another thread holds the channel, waiters are
+ * queued ahead, or no thread is current). At the deadline the scheduler wakes the owner
+ * and hands the channel to the oldest queued waiter (enqueue), which then holds it
+ * reserved (granted) until it begins its own transfer. pending is 1 while the channel is
+ * held, by an open window or a reservation. */
+int      sched_transfer_begin(uint32_t obj, uint32_t duration_us);
+int      sched_transfer_pending(uint32_t obj, uint32_t *owner_uid);
+int      sched_transfer_granted(uint32_t obj);   /* reserved for the current thread */
+int      sched_transfer_enqueue(uint32_t obj);   /* the current thread waits for the channel */
+/* Semantic wait lifetime, independent of SrCoro's executable stack. Only the
+ * innermost block attaches to the TCB; callback-parked parents remain live.
+ * Detach hooks are object policy and MUST NOT preempt during owner teardown. */
+typedef uint64_t SrWaitHandle;
+typedef int (*SrWaitDetach)(SrWaitHandle handle, uint32_t object);
+typedef enum {
+    SR_WAIT_EXECUTING, SR_WAIT_CALLBACK, SR_WAIT_BLOCKED,
+    SR_WAIT_NOTIFIED, SR_WAIT_TERMINAL
+} SrWaitState;
+SrWaitHandle sched_wait_begin(uint32_t object, uint64_t deadline, int callback_enabled,
+                              SrWaitDetach detach);
+int      sched_wait_block(SrWaitHandle handle, uint32_t remaining, int timed);
+void     sched_wait_callback(SrWaitHandle handle, int active);
+int      sched_wait_state(SrWaitHandle handle, SrWaitState *state, uint32_t *owner);
+int      sched_wait_notify(SrWaitHandle handle); /* notification, not an object grant */
+int      sched_wait_complete(SrWaitHandle handle, uint32_t result); /* exact invocation, including callback parents */
+SrWaitHandle sched_wait_begin_join(uint32_t target, uint64_t deadline, int callback_enabled);
+int      sched_wait_take_result(SrWaitHandle handle, uint32_t *result);
+int      sched_wait_finish(SrWaitHandle handle); /* returns notifications; caller owns preemption */
+void     sched_wait_cancel_object(uint32_t object, uint32_t result);
+void     sched_set_current_wait_kind(int kind); /* latch Refer waitType before blocking */
+int      sched_is_intr_context(void);               /* 1 if running in interrupt context, 0 otherwise */
+void     sr_hle_release_thread_resources(uint32_t thread_uid); /* release HLE resources on thread teardown */
+/* Wait-object ids shared between hle.c (wait side) and sched.c (thread-dump side). */
+#define CTRL_WAIT_OBJ 0xC471D000u                   /* sceCtrl blocking reads park on this object */
+uint64_t sched_vtime_us(void);
+uint64_t sched_vtime_deadline_after(uint64_t delta); /* saturating guest-time deadline */
+void     sched_vtime_refresh(void);
+/* Display scanout observations derived from the same monotonic guest timeline.  The
+ * 59.94-Hz frame phase is rational (60000/1001), so repeated reads are stable and
+ * elapsed scheduler time—not HLE call count—advances the HCOUNT source. */
+uint32_t sched_display_current_hcount(void);
+uint32_t sched_display_accumulated_hcount(void);
+int      sched_display_is_vblank(void);
+/* Advance guest-visible VCOUNT by the number of elapsed display periods the
+ * scheduler source just latched.  This is display-period accounting, deliberately
+ * separate from deliver_vblank()/sr_vblank_tick(), which runs once per serviced
+ * source event and owns framebuffer/interrupt/callback side effects. */
+void     sr_display_advance_vcount(uint32_t elapsed_periods);
+/* Periodic VCOUNT windows (statistics windows, periodic dumps, cadence logs).
+ *
+ * Because VCOUNT advances by every elapsed period at the source latch while the
+ * per-episode tick runs once per serviced event, consecutive ticks can step over a
+ * multiple of `period` (59 -> 61 when the host was late by more than one display
+ * period) or observe the same VCOUNT more than once (61, 61 while a coalesced batch
+ * is serviced).  An exact-modulus test (`vcount % period == 0`) therefore skips a
+ * boundary in the first case and repeats it in the second.  This reports each
+ * boundary CROSSING exactly once: it returns 1 on the first call whose `vcount` lies
+ * in a later window than `*last_window` and records that window.  Window 0 counts
+ * as already seen, so the first report is at the first VCOUNT >= period; a jump over
+ * several boundaries is one report.  `*last_window` starts at 0 and VCOUNT is
+ * monotonic for the life of the process. */
+static inline int sr_vcount_window_crossed(uint32_t vcount, uint32_t period,
+                                           uint32_t *last_window) {
+    if (!period || !last_window) return 0;
+    uint32_t window = vcount / period;
+    if (window <= *last_window) return 0;
+    *last_window = window;
+    return 1;
+}
+void     sched_set_current_cb_wait(int cb_wait);    /* mark running thread as callback-waiting */
+void     sched_wake_callbacks(uint32_t thread_uid); /* wake thread waiting in CB-wait */
+void     sched_thread_sleep(void);                  /* sceKernelSleepThread (wakeup-count) */
+void     sched_thread_sleep_cb(void);               /* sceKernelSleepThreadCB (wakeup-count) */
+uint32_t sched_thread_wakeup(uint32_t uid);         /* sceKernelWakeupThread (banks if not asleep) */
+uint32_t sched_set_priority(uint32_t uid, int priority);   /* sceKernelChangeThreadPriority */
+uint32_t sched_change_current_thread_attr(uint32_t clear_mask, uint32_t set_mask); /* sceKernelChangeCurrentThreadAttr */
+uint32_t sched_terminate_thread(uint32_t uid);      /* sceKernelTerminateThread */
+uint32_t sched_suspend_thread(uint32_t uid);        /* sceKernelSuspendThread */
+uint32_t sched_resume_thread(uint32_t uid);         /* sceKernelResumeThread */
+uint32_t sched_rotate_thread_ready_queue(int priority); /* sceKernelRotateThreadReadyQueue; 0 = caller's priority */
+uint32_t sched_alarm_set(uint32_t clock_us, uint32_t handler, uint32_t common); /* sceKernelSetAlarm: UID, or an error >= 0x80000000 */
+uint32_t sched_alarm_cancel(uint32_t uid);          /* sceKernelCancelAlarm; 0 or UNKNOWN_ALMID */
+uint32_t sched_delete_thread(uint32_t uid);          /* sceKernelDeleteThread object removal */
+int      sched_thread_cancel_wakeup(uint32_t uid);  /* sceKernelCancelWakeupThread; uid 0=current */
+/* Thread role identity.
+ *
+ * A role UID is an OUTCOME of allocation, never configuration: the scheduler records
+ * whichever UID the allocator happened to give the thread that took the role. UIDs are
+ * handed out from 0x110 upward, so any plausible-looking UID is also an ordinary UID --
+ * which is why "no role" must be represented structurally rather than by a numeric
+ * default. SR_ROLE_UID_NONE is that representation, and sr_alloc_uid() never returns it.
+ *
+ * Read a role UID with the accessors below only when you want the number itself (a
+ * diagnostic label, a table key). To ask "is this thread the worker?", use the
+ * predicates: they fail closed on an uncaptured role, and they never treat UID 0 --
+ * PSP's "current thread" / "no thread" value -- as a captured role. */
+#define SR_ROLE_UID_NONE 0xFFFFFFFFu
+
+uint32_t sched_root_uid(void);                      /* captured root UID, or SR_ROLE_UID_NONE */
+uint32_t sched_worker_uid(void);                    /* captured worker UID, or SR_ROLE_UID_NONE */
+uint32_t sched_launcher_uid(void);                  /* captured launcher UID, or SR_ROLE_UID_NONE */
+int      sched_role_uid_captured(uint32_t role_uid);/* 1 when a role accessor returned a real UID */
+int      sched_uid_is_root(uint32_t uid);           /* fail-closed role tests: 0 when uncaptured */
+int      sched_uid_is_worker(uint32_t uid);
+int      sched_uid_is_launcher(uint32_t uid);
+int      sched_current_is_worker(void);             /* 0 when there is no current thread */
+int      sched_current_is_launcher(void);
+typedef struct SrThreadRunStatus {
+    uint32_t size;
+    uint32_t status;
+    uint32_t currentPriority;
+    uint32_t waitType;
+    uint32_t waitId;
+    uint32_t wakeupCount;
+    uint32_t runClocksLow;
+    uint32_t runClocksHigh;
+    uint32_t intrPreemptCount;
+    uint32_t threadPreemptCount;
+    uint32_t releaseCount;
+} SrThreadRunStatus;
+int      sched_thread_run_status(uint32_t uid, SrThreadRunStatus *out);
+typedef struct SrThreadInfo {
+    uint32_t size;
+    char name[32];
+    uint32_t attr;
+    uint32_t status;
+    uint32_t entry;
+    uint32_t stack;
+    uint32_t stackSize;
+    uint32_t gpReg;
+    uint32_t initPriority;
+    uint32_t currentPriority;
+    uint32_t waitType;
+    uint32_t waitId;
+    uint32_t wakeupCount;
+    uint32_t exitStatus;
+    uint32_t runClocksLow;
+    uint32_t runClocksHigh;
+    uint32_t intrPreemptCount;
+    uint32_t threadPreemptCount;
+    uint32_t releaseCount;
+} SrThreadInfo;
+int      sched_thread_info(uint32_t uid, SrThreadInfo *out);
+/* sceKernelGetThreadmanIdList list classes: the public PSPSDK SceKernelIdListType values
+ * (pspthreadman.h). Which other values a PSP accepts is UNMEASURED. */
+#define SR_TMID_THREAD                1
+#define SR_TMID_SEMAPHORE             2
+#define SR_TMID_EVENT_FLAG            3
+#define SR_TMID_MBOX                  4
+#define SR_TMID_VPL                   5
+#define SR_TMID_FPL                   6
+#define SR_TMID_MPIPE                 7
+#define SR_TMID_CALLBACK              8
+#define SR_TMID_THREAD_EVENT_HANDLER  9
+#define SR_TMID_ALARM                 10
+#define SR_TMID_VTIMER                11
+#define SR_TMID_SLEEP_THREAD          64
+#define SR_TMID_DELAY_THREAD          65
+#define SR_TMID_SUSPEND_THREAD        66
+#define SR_TMID_DORMANT_THREAD        67
+typedef void (*SrUidVisitor)(uint32_t uid, void *ctx);
+/* Calls visit(uid, ctx), in table order, for every live object of list class `tmid` that
+ * the scheduler owns: threads, the four thread-state lists and alarms. The state lists use
+ * the same status and wait type sceKernelReferThreadStatus reports. Returns 1 when `tmid` is
+ * one of those classes, 0 otherwise (nothing visited). */
+int      sched_visit_threadman_ids(int tmid, SrUidVisitor visit, void *ctx);
+uint32_t sched_thread_exit_status(uint32_t uid);
+uint32_t sched_thread_stack_free_size(uint32_t uid);  /* sceKernelGetThreadStackFreeSize */
+/* The calling thread's user-visible stack range (sceKernelCheckThreadStack); 0 with no thread. */
+int      sched_current_thread_stack_range(uint32_t *base_out, uint32_t *size_out);
+/* High user-partition blocks, carved from the top of the thread-stack arena (sched.c). */
+int      sched_partition_alloc_high(uint32_t size, uint32_t ceiling, uint32_t *base_out);
+void     sched_partition_release_high(uint32_t base, uint32_t size);
+void     sched_set_current_join_target(uint32_t uid);
+void     sched_clear_current_join_target(void);
+int      sched_take_current_join_result(uint32_t uid, uint32_t *result_out);
+int      sched_current_priority(void);
+int      sched_is_dormant(uint32_t uid);
+uint32_t sched_current_uid(void);                   /* 0 when no thread is current */
+void     sched_run(uint32_t entry, uint32_t arglen, uint32_t argp);  /* run from the entry thread */
+
+/* PSP callback ABI: SceKernelCallbackFunction(int count, int arg, void *common).
+ * PPSSPP (__KernelRunCallbackOnThread) passes { notifyCount, notifyArg, commonArgument },
+ * so $a0 = notify count, $a1 = notify argument, $a2 = the arg registered at
+ * sceKernelCreateCallback time.  Shared by the production dispatcher (hle.c) and the
+ * scheduler selftest so the register order is asserted against the code the game runs. */
+static inline void sr_callback_pack_args(CpuState *cpu, int notify_count,
+                                         uint32_t notify_arg, uint32_t common_arg) {
+    cpu->r[4] = (uint32_t)notify_count;
+    cpu->r[5] = notify_arg;
+    cpu->r[6] = common_arg;
+}
+
+/* Run one already-armed callback as a nested call on the owning thread's live register
+ * file, the same way any other guest `jal` is dispatched: only the registers a real `jal`
+ * sets (argument registers, $ra, $pc) are touched, and the full pre-call snapshot is
+ * restored once the callback returns. Everything else -- callee-saved regs, HI/LO,
+ * FPU/VFPU state, the guest stack -- is left exactly as the interrupted thread had it,
+ * and is the callback's own prologue/epilogue's responsibility to save/restore per the
+ * MIPS calling convention, matching real hardware/PPSSPP callback dispatch.
+ *
+ * dispatch_fn is injected (rather than calling dispatch_from_host() directly) so this exact
+ * production code path can be unit-tested with a stand-in dispatcher instead of linking
+ * the full recompiled runtime; hle.c passes the real dispatch_from_host().
+ *
+ * A callback function of 0 is a null code pointer the guest registered (#1375): the PSP
+ * faults fetching it, so the run stops by name before any register is touched, and a
+ * zero-based image's offset-0 function never runs in its place.
+ *
+ * Returns the callback's $v0 (observed before the interrupted context is restored), so
+ * the caller can implement the PSP kernel's "a callback that returns non-zero is
+ * automatically deleted" rule. */
+static inline uint32_t sr_callback_dispatch_one(CpuState *cpu, uint32_t entry, int notify_count,
+                                                uint32_t notify_arg, uint32_t common_arg,
+                                                void (*dispatch_fn)(CpuState *, uint32_t)) {
+    if (entry == 0u) sr_null_code_entry(cpu, "callback");
+    CpuState save = *cpu;
+    SrAotReturnBoundaryScope boundary_scope;
+    sr_aot_return_boundary_scope_begin(&boundary_scope);
+    sr_callback_pack_args(cpu, notify_count, notify_arg, common_arg);
+    /* PSP callbacks are nested calls on the interrupted thread. In particular, $gp
+     * is inherited from that live context; the kernel does not install a
+     * callback-global GP. */
+    cpu->r[31] = SR_HOST_RETURN_PC;
+    cpu->pc = entry;
+    dispatch_fn(cpu, entry);
+    uint32_t ret = cpu->r[2];
+    int boundary_scope_failed = sr_aot_return_boundary_scope_end(
+        cpu, &boundary_scope, "PSP callback");
+    uint32_t callback_flow_kind = cpu->flow_kind;
+    uint32_t callback_flow_target = cpu->flow_target;
+    *cpu = save;
+    if (boundary_scope_failed || callback_flow_kind == SR_FLOW_FATAL) {
+        cpu->flow_kind = SR_FLOW_FATAL;
+        cpu->flow_target = callback_flow_target;
+    }
+    /* The interrupted thread resumes as after an exception return: its ll..sc
+     * window, if any, is over (MIPS32 LLbit is cleared by eret). */
+    sr_cpu_link_clear(cpu);
+    return ret;
+}
+
+void sr_unimplemented(uint32_t pc, const char *reason);
+
+#include <setjmp.h>
+extern jmp_buf g_hle_jmp;
+
+/* ---- register conflict resolution ---- */
+#undef r0
+#undef r1
+#undef r2
+#undef r3
+#undef r4
+#undef r5
+#undef r6
+#undef r7
+#undef r8
+#undef r9
+#undef r10
+#undef r11
+#undef r12
+#undef r13
+#undef r14
+#undef r15
+#undef r16
+#undef r17
+#undef r18
+#undef r19
+#undef r20
+#undef r21
+#undef r22
+#undef r23
+#undef r24
+#undef r25
+#undef r26
+#undef r27
+#undef r28
+#undef r29
+#undef r30
+#undef r31
+
+
+#ifdef __cplusplus
+#include "cpu.h"
+static_assert(SR_CPUSTATE_ABI_VERSION == 3u, "unsupported CpuState ABI version");
+static_assert(sizeof(::CpuState) == sizeof(ref::CpuState), "CpuState structural layout drift detected!");
+#define SR_CPUSTATE_OFFSET_ASSERT(field) \
+    static_assert(offsetof(::CpuState, field) == offsetof(ref::CpuState, field), \
+                  "CpuState offset drift: " #field)
+SR_CPUSTATE_OFFSET_ASSERT(r);
+SR_CPUSTATE_OFFSET_ASSERT(hi);
+SR_CPUSTATE_OFFSET_ASSERT(lo);
+SR_CPUSTATE_OFFSET_ASSERT(pc);
+SR_CPUSTATE_OFFSET_ASSERT(f);
+SR_CPUSTATE_OFFSET_ASSERT(fi);
+SR_CPUSTATE_OFFSET_ASSERT(fcr31);
+SR_CPUSTATE_OFFSET_ASSERT(fpcond);
+SR_CPUSTATE_OFFSET_ASSERT(v);
+SR_CPUSTATE_OFFSET_ASSERT(vi);
+SR_CPUSTATE_OFFSET_ASSERT(vfpuCtrl);
+SR_CPUSTATE_OFFSET_ASSERT(cop0);
+SR_CPUSTATE_OFFSET_ASSERT(next_pc);
+SR_CPUSTATE_OFFSET_ASSERT(in_delay_slot);
+SR_CPUSTATE_OFFSET_ASSERT(flow_kind);
+SR_CPUSTATE_OFFSET_ASSERT(flow_target);
+SR_CPUSTATE_OFFSET_ASSERT(llbit);
+#undef SR_CPUSTATE_OFFSET_ASSERT
+#endif
+
+#endif

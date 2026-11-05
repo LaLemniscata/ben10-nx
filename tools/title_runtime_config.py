@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+"""Emit the build-local runtime title configuration consumed by ``src/rt/title_config.c``.
+
+The compiled runtime carries no title identity of its own. This generator turns a
+*validated* public title manifest's optional ``runtime_bindings`` block into a
+deterministic build-local C header under ``build/<game>/``; with no manifest it emits
+the generic configuration in which every optional binding is disabled.
+
+It deliberately depends on the manifest alone: no guest executable, no analysis
+product, and no generated retail translation unit is read, so a generic
+``runtime-objects`` build never needs a retail input to compile.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+from typing import Any
+
+# The Windows embeddable Python runtime uses a fixed ``._pth`` search path and
+# may omit the directory containing this script. Keep sibling tool imports
+# available when the package builder launches this script from that runtime.
+_TOOLS_DIRECTORY = str(Path(__file__).resolve().parent)
+if _TOOLS_DIRECTORY not in sys.path:
+    sys.path.insert(0, _TOOLS_DIRECTORY)
+
+import title_manifest
+
+#: Bumped only when the emitted macro contract changes. ``src/rt/title_config.c``
+#: refuses to compile against a different value, so a stale generated header is a
+#: build failure rather than a silently wrong runtime.
+#: 8 splits the single profile macro into a diagnostic one and an honest
+#: compatibility-debt one (#363). Version 9 removes host libfont readiness
+#: injection from the generated runtime contract. Version 11 removes the display
+#: bring-up, runtime-sync and frame-latch bindings (#363). Version 12 removes the
+#: forced-completion collection (#363).
+GENERATED_SCHEMA_VERSION = 12
+
+#: Emitted field -> the C validity bit that gates it. Fields sharing a bit are a
+#: configured-together group; the manifest validator already enforces the pairing.
+FIELD_BITS: dict[str, str] = {
+    "fallback_entry": "SR_TITLE_CFG_FALLBACK_ENTRY",
+    "worker_thread_entry": "SR_TITLE_CFG_WORKER_ENTRY",
+    "launcher_thread_entry": "SR_TITLE_CFG_LAUNCHER_ENTRY",
+}
+
+#: Emitted count -> the C validity bit that gates it. Zero is disabled.
+COUNT_BITS: dict[str, str] = {
+    "expected_data_file_count": "SR_TITLE_CFG_EXPECTED_DATA_FILE_COUNT",
+}
+
+#: Emitted collection -> the C validity bit that gates it. A collection counts as
+#: configured exactly when the manifest supplied a non-empty one; the validator
+#: rejects an empty array, so a set bit always means at least one entry.
+COLLECTION_BITS: dict[str, str] = {
+    "dispatch_aliases": "SR_TITLE_CFG_DISPATCH_ALIASES",
+}
+
+#: Emitted object -> the C validity bit that gates it. An object is atomic:
+#: either fully configured or absent.
+OBJECT_BITS: dict[str, str] = {}
+
+GENERIC_SOURCE_ID = "none"
+
+#: Suffix that continues a C macro definition onto the next line.
+CONT = " " + chr(92)
+
+
+class TitleRuntimeConfigError(ValueError):
+    """Fail-closed generation error."""
+
+
+def bindings_from_manifest(manifest: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the normalized binding set for a manifest (or the generic empty set)."""
+    if manifest is None:
+        return {
+            "source_id": GENERIC_SOURCE_ID,
+            "codegen_profile": "none",
+            "bindings": {},
+            "guest_modules": [],
+        }
+    normalized = title_manifest.validate_manifest(manifest)
+    block = dict(normalized.get("runtime_bindings") or {})
+    block.pop("schema_version", None)
+    unknown = sorted(set(block) - set(FIELD_BITS) - set(COLLECTION_BITS) - set(OBJECT_BITS) - set(COUNT_BITS))
+    if unknown:
+        # Unreachable through the validator; a fail-closed guard against a future
+        # manifest field silently reaching the runtime without a C binding.
+        raise TitleRuntimeConfigError(
+            "runtime binding(s) have no runtime representation: " + ", ".join(unknown)
+        )
+    # Second gate on the required-family contract. The validator already enforces
+    # it, so reaching this is either a hand-built manifest dict that bypassed
+    # validation or a future regression in it -- and this is the last point
+    # before a required family becomes a header full of zero macros.
+    required = normalized.get("required_runtime_bindings") or []
+    missing = [name for name in required if name not in block]
+    if missing:
+        raise TitleRuntimeConfigError(
+            "refusing to generate: title requires binding families it does not configure: "
+            + ", ".join(missing)
+        )
+    return {
+        "source_id": normalized["id"],
+        "codegen_profile": normalized.get("codegen_profile", "none"),
+        "bindings": block,
+        # Guest PRX modules: a fixed module is laid out at its manifest load_address by
+        # BOTH the recompiler (GAME_EXTRA_ELFS) and the runtime loader; a runtime-placed
+        # module has no address and is placed by the guest allocator when the game loads
+        # it. This is the runtime half of that single source.
+        "guest_modules": [
+            {"name": m["name"], "load_address": m.get("load_address", 0),
+             "guest_path": m.get("guest_path", ""),
+             "required": bool(m["required"]),
+             "placement": m.get("placement", "fixed")}
+            for m in normalized.get("modules", [])
+            if m["role"] in ("guest-prx", "optional-guest-prx")
+        ],
+    }
+
+
+def config_digest(config: dict[str, Any]) -> str:
+    """Deterministic identity of the emitted configuration.
+
+    The build binds this into the runtime profile hash, so changing a title binding
+    invalidates every stale runtime object rather than relinking one silently.
+    """
+    payload = {
+        "generated_schema_version": GENERATED_SCHEMA_VERSION,
+        "source_id": config["source_id"],
+        "codegen_profile": config.get("codegen_profile", "none"),
+        "bindings": config["bindings"],
+        "guest_modules": config.get("guest_modules", []),
+    }
+    rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def binding_summary(config: dict[str, Any]) -> str:
+    """Human-readable count of what the effective configuration actually binds."""
+    bindings: dict[str, Any] = config["bindings"]
+    parts = [f"{sum(1 for name in bindings if name in FIELD_BITS)} binding(s)"]
+    for name in COLLECTION_BITS:
+        entries = bindings.get(name, [])
+        if entries:
+            parts.append(f"{len(entries)} {name.replace('_', ' ')}")
+    for name in COUNT_BITS:
+        if name in bindings:
+            parts.append(f"{name}={bindings[name]}")
+    return ", ".join(parts)
+
+
+def render_header(config: dict[str, Any]) -> str:
+    bindings: dict[str, Any] = config["bindings"]
+    # Fail closed on a binding with no C representation rather than filtering it out: a
+    # silently dropped field would reach neither the header nor an error, and the build
+    # would look successful while the binding did nothing.
+    unrepresentable = sorted(set(bindings) - set(FIELD_BITS) - set(COLLECTION_BITS) - set(OBJECT_BITS) - set(COUNT_BITS))
+    if unrepresentable:
+        raise TitleRuntimeConfigError(
+            "runtime binding(s) have no runtime representation: " + ", ".join(unrepresentable)
+        )
+    valid = sorted({FIELD_BITS[name] for name in bindings if name in FIELD_BITS} |
+                   {COLLECTION_BITS[name] for name in bindings if name in COLLECTION_BITS} |
+                   {OBJECT_BITS[name] for name in bindings if name in OBJECT_BITS} |
+                   {COUNT_BITS[name] for name in bindings if name in COUNT_BITS})
+    valid_text = " | ".join(valid) if valid else "0u"
+    source_id = config["source_id"]
+    codegen_profile = config.get("codegen_profile", "none")
+    if codegen_profile not in {"none", "hst"}:
+        raise TitleRuntimeConfigError(
+            f"unsupported codegen profile: {codegen_profile!r}"
+        )
+    if '"' in source_id or "\\" in source_id:
+        raise TitleRuntimeConfigError("title id is not representable as a C string literal")
+    profile = 1 if codegen_profile == "hst" else 0
+    lines = [
+        "/* SPDX-License-Identifier: GPL-3.0-or-later */",
+        "/* Copyright (C) 2026 the Nakagawa Recomp authors */",
+        "/* GENERATED by tools/title_runtime_config.py -- do not edit.",
+        " * Derived from validated title configuration only; contains no analysis product",
+        " * and no guest bytes. A build with no title configuration emits every optional",
+        " * binding disabled. */",
+        "#ifndef SR_TITLE_CONFIG_GENERATED_H",
+        "#define SR_TITLE_CONFIG_GENERATED_H",
+        "",
+        f"#define SR_TITLE_CONFIG_SCHEMA_VERSION {GENERATED_SCHEMA_VERSION}",
+        f'#define SR_TITLE_CONFIG_SOURCE_ID "{source_id}"',
+        f'#define SR_TITLE_CONFIG_DIGEST "{config_digest(config)}"',
+        f"#define SR_TITLE_CONFIG_VALID ({valid_text})",
+        # Two profile macros, one validated source (#363). DIAGNOSTICS_PROFILE names
+        # the operator opt-in for title-scoped diagnostic reads, which additionally
+        # require SR_HLE_DIAGNOSTICS at runtime. COMPAT_PROFILE names the gates that
+        # change LIVE runtime behavior as temporary compatibility debt, so that gate is
+        # no longer labelled a diagnostic. Both carry the same value: this splits the
+        # label, it does not move behavior.
+        f"#define SR_TITLE_CONFIG_DIAGNOSTICS_PROFILE {profile}",
+        f"#define SR_TITLE_CONFIG_COMPAT_PROFILE {profile}",
+        "",
+    ]
+    for name in FIELD_BITS:
+        macro = "SR_TITLE_CONFIG_" + name.upper()
+        value = bindings.get(name, 0)
+        lines.append(f"#define {macro} 0x{value:08x}u")
+
+    # Collections are emitted as X-macro lists so title_config.c owns the C type and
+    # the generated artifact stays a pure data statement. An unconfigured collection
+    # emits a zero count and an empty list, which is what a generic build compiles.
+    aliases: list[dict[str, int]] = bindings.get('dispatch_aliases', [])
+    lines += ['', f'#define SR_TITLE_CONFIG_DISPATCH_ALIAS_COUNT {len(aliases)}',
+              '#define SR_TITLE_CONFIG_DISPATCH_ALIAS_LIST' + (CONT if aliases else '')]
+    for index, alias in enumerate(aliases):
+        tail = CONT if index + 1 < len(aliases) else ''
+        lines.append(
+            f"    SR_TITLE_CFG_ALIAS(0x{alias['from']:08x}u, 0x{alias['to']:08x}u){tail}")
+
+    # Expected data file count: scalar typed census, 0 = disabled.
+    for name in COUNT_BITS:
+        macro = "SR_TITLE_CONFIG_" + name.upper()
+        value = bindings.get(name, 0)
+        lines.append(f"#define {macro} {value}u")
+
+    modules: list[dict[str, Any]] = config.get('guest_modules', [])
+    lines += ['', f'#define SR_TITLE_CONFIG_GUEST_MODULE_COUNT {len(modules)}',
+              '#define SR_TITLE_CONFIG_GUEST_MODULE_LIST' + (CONT if modules else '')]
+    for index, module in enumerate(modules):
+        tail = CONT if index + 1 < len(modules) else ''
+        for field in ('name', 'guest_path'):
+            if '"' in module[field] or chr(92) in module[field]:
+                raise TitleRuntimeConfigError(f"guest module {field} cannot be embedded in C: {module[field]!r}")
+        placement = 1 if module.get("placement", "fixed") == "runtime" else 0
+        lines.append(f'    SR_TITLE_CFG_GUEST_MODULE("{module["name"]}", "{module["guest_path"]}", '
+                     f"0x{module['load_address']:08x}u, {1 if module['required'] else 0}u, "
+                     f"{placement}u){tail}")
+
+    lines += ["", "#endif /* SR_TITLE_CONFIG_GENERATED_H */", ""]
+    return "\n".join(lines)
+
+
+def write_if_changed(path: Path, rendered: str) -> bool:
+    """Write atomically, leaving an identical file (and its mtime) untouched."""
+    if path.is_symlink():
+        raise TitleRuntimeConfigError(f"{path}: refusing to replace a symbolic link")
+    if path.is_file() and path.read_text(encoding="utf-8") == rendered:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(rendered)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def load_config(manifest_path: Path | None) -> dict[str, Any]:
+    manifest = None
+    if manifest_path is not None:
+        manifest = title_manifest.load_manifest(manifest_path)
+    return bindings_from_manifest(manifest)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        help="validated title manifest; omit for the generic no-title configuration",
+    )
+    parser.add_argument("--output", type=Path, help="generated header path")
+    parser.add_argument(
+        "--print-digest",
+        action="store_true",
+        help="print the configuration digest and exit (no header is written)",
+    )
+    args = parser.parse_args(argv)
+    try:
+        config = load_config(args.manifest)
+        if args.print_digest:
+            print(config_digest(config))
+            return 0
+        if args.output is None:
+            parser.error("--output is required unless --print-digest is given")
+        changed = write_if_changed(args.output, render_header(config))
+        print(
+            f"title runtime config: {config['source_id']} "
+            f"({binding_summary(config)}, {'written' if changed else 'unchanged'})"
+        )
+        return 0
+    except (title_manifest.TitleManifestError, TitleRuntimeConfigError, OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

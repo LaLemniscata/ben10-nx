@@ -1,0 +1,648 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 the Nakagawa Recomp authors */
+
+#ifndef NK_INPUT_PROFILE_H
+#define NK_INPUT_PROFILE_H
+
+#include "nk_types.h"
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Schema 1 was the single global mapping written to <config>/input_profile.json.
+ * Schema 2 adds the optional per_title map keyed by disc ID, so one session can
+ * give two discs different host mappings without editing a global file (#520).
+ * A schema 1 file still loads: it migrates in memory to schema 2 with no
+ * per-title entries, so the global mapping keeps working unchanged.
+ * Schema 3 adds the optional keyboard_bindings list to every mapping (#1299). A
+ * schema 1 or 2 file still loads, with the default keyboard keys, and cannot
+ * carry keyboard_bindings: an older build would ignore them silently.
+ * Schema 4 adds the analog stick's four directions to keyboard_bindings
+ * (controls stick_up, stick_down, stick_left, stick_right). A schema 3 file still
+ * loads, with the default stick keys (a default a button key of the file already
+ * uses is left unbound), and cannot carry stick entries. */
+#define NK_INPUT_PROFILE_SCHEMA_VERSION 4
+#define NK_INPUT_PROFILE_MIN_SCHEMA_VERSION 1
+/* The schema that introduced each optional member. */
+#define NK_INPUT_PROFILE_PER_TITLE_SCHEMA_VERSION 2
+#define NK_INPUT_PROFILE_KEYBOARD_SCHEMA_VERSION 3
+#define NK_INPUT_PROFILE_STICK_KEYS_SCHEMA_VERSION 4 /* first version with stick keys */
+/* The largest profile file the loader reads. A newer schema_version than this
+ * build's is refused with NK_ERROR_NEWER_SCHEMA and the save path will not
+ * replace it; an older file is kept as <file>.v<n>.bak by the first save. */
+#define NK_INPUT_PROFILE_MAX_FILE_BYTES (1024 * 1024)
+#define NK_INPUT_GUID_MAX_LEN 64
+#define NK_INPUT_NAME_HINT_MAX_LEN 128
+#define NK_INPUT_DIAGNOSTIC_MAX_LEN 256
+/* Per-title entries a single profile document may carry. Beyond this the
+ * document is refused rather than silently dropping a disc's mapping. */
+#define NK_INPUT_MAX_PER_TITLE 8
+
+/* Default calibration values matching current runtime (src/rt/gpu_sdl3vk/sdl3vk.c) */
+#define NK_INPUT_DEFAULT_DEADZONE_INNER 7849
+#define NK_INPUT_DEFAULT_DEADZONE_OUTER 0
+#define NK_INPUT_DEFAULT_TRIGGER_THRESHOLD 8192
+
+/**
+ * Standard PSP digital buttons (14 total).
+ * Bits in SceCtrlData.Buttons, as published to the guest by every producer of pad
+ * state in this runtime: both host front-ends (src/rt/gui.c read_keys and
+ * src/rt/gpu_sdl3vk/sdl3vk.c) and the scripted-input route language in
+ * src/rt/hle.c. One table, because a producer that disagrees with a consumer by one
+ * bit does not fail -- it hands the guest a button the screen ignores, which is
+ * indistinguishable from a game that has frozen.
+ */
+#define NK_PSP_BTN_SELECT_BIT    0x000001u
+#define NK_PSP_BTN_START_BIT     0x000008u
+#define NK_PSP_BTN_UP_BIT        0x000010u
+#define NK_PSP_BTN_RIGHT_BIT     0x000020u
+#define NK_PSP_BTN_DOWN_BIT      0x000040u
+#define NK_PSP_BTN_LEFT_BIT      0x000080u
+#define NK_PSP_BTN_LTRIGGER_BIT  0x000100u
+#define NK_PSP_BTN_RTRIGGER_BIT  0x000200u
+#define NK_PSP_BTN_TRIANGLE_BIT  0x001000u
+#define NK_PSP_BTN_CIRCLE_BIT    0x002000u
+#define NK_PSP_BTN_CROSS_BIT     0x004000u
+#define NK_PSP_BTN_SQUARE_BIT    0x008000u
+#define NK_PSP_BTN_HOME_BIT      0x010000u
+#define NK_PSP_BTN_HOLD_BIT      0x020000u
+
+typedef enum {
+    NK_PSP_BTN_SELECT = 0,
+    NK_PSP_BTN_START,
+    NK_PSP_BTN_UP,
+    NK_PSP_BTN_RIGHT,
+    NK_PSP_BTN_DOWN,
+    NK_PSP_BTN_LEFT,
+    NK_PSP_BTN_LTRIGGER,
+    NK_PSP_BTN_RTRIGGER,
+    NK_PSP_BTN_TRIANGLE,
+    NK_PSP_BTN_CIRCLE,
+    NK_PSP_BTN_CROSS,
+    NK_PSP_BTN_SQUARE,
+    NK_PSP_BTN_HOME,
+    NK_PSP_BTN_HOLD,
+    NK_PSP_BTN_COUNT /* 14 */
+} NkPspButton;
+
+/**
+ * The four directions of the analog stick, as keyboard controls. Each is bound to
+ * host keys in NkInputProfile.stick_keys, separately from the 14 digital buttons.
+ */
+typedef enum {
+    NK_PSP_STICK_UP = 0,
+    NK_PSP_STICK_DOWN,
+    NK_PSP_STICK_LEFT,
+    NK_PSP_STICK_RIGHT,
+    NK_PSP_STICK_DIR_COUNT /* 4 */
+} NkPspStickDir;
+
+/**
+ * Standard PSP analog stick axes (2 total).
+ */
+typedef enum {
+    NK_PSP_AXIS_ANALOG_X = 0,
+    NK_PSP_AXIS_ANALOG_Y,
+    NK_PSP_AXIS_COUNT /* 2 */
+} NkPspAxis;
+
+/**
+ * Host SDL Gamepad buttons.
+ * Values match SDL_GamepadButton enum values in SDL3/SDL2 exactly.
+ */
+typedef enum {
+    NK_HOST_BUTTON_INVALID = -1,
+    NK_HOST_BUTTON_SOUTH = 0,
+    NK_HOST_BUTTON_EAST = 1,
+    NK_HOST_BUTTON_WEST = 2,
+    NK_HOST_BUTTON_NORTH = 3,
+    NK_HOST_BUTTON_BACK = 4,
+    NK_HOST_BUTTON_GUIDE = 5,
+    NK_HOST_BUTTON_START = 6,
+    NK_HOST_BUTTON_LEFT_STICK = 7,
+    NK_HOST_BUTTON_RIGHT_STICK = 8,
+    NK_HOST_BUTTON_LEFT_SHOULDER = 9,
+    NK_HOST_BUTTON_RIGHT_SHOULDER = 10,
+    NK_HOST_BUTTON_DPAD_UP = 11,
+    NK_HOST_BUTTON_DPAD_DOWN = 12,
+    NK_HOST_BUTTON_DPAD_LEFT = 13,
+    NK_HOST_BUTTON_DPAD_RIGHT = 14,
+    NK_HOST_BUTTON_MISC1 = 15,
+    NK_HOST_BUTTON_RIGHT_PADDLE1 = 16,
+    NK_HOST_BUTTON_LEFT_PADDLE1 = 17,
+    NK_HOST_BUTTON_RIGHT_PADDLE2 = 18,
+    NK_HOST_BUTTON_LEFT_PADDLE2 = 19,
+    NK_HOST_BUTTON_TOUCHPAD = 20,
+    NK_HOST_BUTTON_COUNT
+} NkHostGamepadButton;
+
+/**
+ * Host SDL Gamepad axes.
+ * Values match SDL_GamepadAxis enum values in SDL3/SDL2 exactly.
+ */
+typedef enum {
+    NK_HOST_AXIS_INVALID = -1,
+    NK_HOST_AXIS_LEFTX = 0,
+    NK_HOST_AXIS_LEFTY = 1,
+    NK_HOST_AXIS_RIGHTX = 2,
+    NK_HOST_AXIS_RIGHTY = 3,
+    NK_HOST_AXIS_LEFT_TRIGGER = 4,
+    NK_HOST_AXIS_RIGHT_TRIGGER = 5,
+    NK_HOST_AXIS_COUNT
+} NkHostGamepadAxis;
+
+/**
+ * Host binding source type for digital presses.
+ */
+typedef enum {
+    NK_BINDING_NONE = 0,
+    NK_BINDING_HOST_BUTTON,      /* Host gamepad button pressed */
+    NK_BINDING_HOST_TRIGGER,     /* Host trigger axis > trigger_threshold */
+    NK_BINDING_HOST_AXIS_POS,    /* Host axis positive half > deadzone_inner */
+    NK_BINDING_HOST_AXIS_NEG     /* Host axis negative half < -deadzone_inner */
+} NkBindingSourceType;
+
+/**
+ * A single host binding specification.
+ */
+typedef struct {
+    NkBindingSourceType type;
+    int index; /* NkHostGamepadButton or NkHostGamepadAxis */
+    /* A stick direction's own threshold (1-32767), or 0 for the profile's
+     * trigger_threshold. Written "+rightx@20000"; #1791's second-stick and mouse
+     * sources take the same "@threshold" form ("mouse:+x@4" is reserved for it and
+     * refused until it is supported). */
+    int16_t threshold;
+} NkBindingSource;
+
+/**
+ * Binding for a digital action (e.g. PSP button or navigation action).
+ * Supports primary binding and optional secondary binding.
+ */
+typedef struct {
+    NkBindingSource primary;
+    NkBindingSource secondary;
+} NkDigitalBinding;
+
+/**
+ * Host keyboard keys, identified by their USB HID keyboard usage ID: the physical
+ * key position, independent of the keyboard layout. SDL_Scancode uses the same
+ * values, which src/rt/gpu_sdl3vk/sdl3vk.c checks. Only the keys
+ * named in the profile's key table can be bound; Escape and the function keys are
+ * left out because the runtime keeps them for the pause and its own overlays.
+ */
+#define NK_HOST_KEY_NONE 0
+#define NK_HOST_KEY_LIMIT 512 /* every bindable key code is below this */
+
+/**
+ * Keyboard binding for one PSP button or stick direction: up to two host keys,
+ * NK_HOST_KEY_NONE when a slot is unbound.
+ */
+typedef struct {
+    int primary;
+    int secondary;
+} NkKeyBinding;
+
+/**
+ * Per-axis calibration for analog sticks.
+ */
+typedef struct {
+    NkHostGamepadAxis host_axis; /* Which host axis drives this PSP axis */
+    int16_t deadzone_inner;      /* Inner deadzone (neutral deadband), range [0, 32766] */
+    int16_t deadzone_outer;      /* Outer deadzone (edge saturation), range [0, 32766] */
+    bool inverted;               /* Invert axis direction */
+    int16_t rest;                /* Rest / center offset (default 0) */
+    int16_t min_val;             /* Minimum extreme value (default -32768) */
+    int16_t max_val;             /* Maximum extreme value (default 32767) */
+} NkAxisCalibration;
+
+/**
+ * Player navigation actions (for menus, library, settings).
+ */
+typedef enum {
+    NK_NAV_ACTION_CONFIRM = 0,   /* Activate / Select */
+    NK_NAV_ACTION_CANCEL,        /* Back / Return */
+    NK_NAV_ACTION_UP,            /* Focus up */
+    NK_NAV_ACTION_DOWN,          /* Focus down */
+    NK_NAV_ACTION_LEFT,          /* Focus left / previous card */
+    NK_NAV_ACTION_RIGHT,         /* Focus right / next card */
+    NK_NAV_ACTION_PAGE_PREV,     /* Page back in library */
+    NK_NAV_ACTION_PAGE_NEXT,     /* Page forward in library */
+    NK_NAV_ACTION_MENU,          /* Toggle settings / menu */
+    NK_NAV_ACTION_COUNT /* 9 */
+} NkNavAction;
+
+/**
+ * Versioned host input profile.
+ */
+typedef struct {
+    int schema_version;
+    char guid[NK_INPUT_GUID_MAX_LEN];
+    char name_hint[NK_INPUT_NAME_HINT_MAX_LEN];
+
+    int16_t trigger_threshold; /* Threshold for trigger axes to act as digital press */
+    int16_t trigger_rest;      /* Resting value when unpressed (default 0) */
+    int16_t trigger_extreme;   /* Extreme value when fully pressed (default 32767) */
+
+    NkAxisCalibration axes[NK_PSP_AXIS_COUNT];
+    NkDigitalBinding psp_buttons[NK_PSP_BTN_COUNT];
+    NkDigitalBinding nav_bindings[NK_NAV_ACTION_COUNT];
+    NkKeyBinding psp_keys[NK_PSP_BTN_COUNT]; /* host keyboard keys per PSP button (schema 3) */
+    NkKeyBinding stick_keys[NK_PSP_STICK_DIR_COUNT]; /* host keys that push the analog stick (schema 4) */
+} NkInputProfile;
+
+/**
+ * A whole versioned input profile document: the global mapping every disc uses
+ * unless it names its own, plus the optional per-title map keyed by disc ID
+ * (#520). An NkInputProfile stays the "one effective mapping" value type that
+ * the runtime, the player UI and the pad evaluation helpers already consume, so
+ * adding per-title support does not change what any of them take.
+ */
+typedef struct {
+    int schema_version; /* always the current version once loaded or saved */
+    NkInputProfile global;
+    char title_disc_id[NK_INPUT_MAX_PER_TITLE][NK_MAX_DISC_ID_LEN];
+    NkInputProfile title[NK_INPUT_MAX_PER_TITLE];
+    int title_count;
+} NkInputProfileFile;
+
+/**
+ * @brief Transform raw host SDL axis value to PSP analog byte (0..255, centre 128).
+ *
+ * Mapping Formula:
+ * 1. Inversion:
+ *      if inverted:
+ *          val = -raw_axis (clamped: -32768 becomes 32767)
+ *      else:
+ *          val = raw_axis
+ *
+ * 2. Inner Deadzone:
+ *      if |val| <= deadzone_inner:
+ *          return 128 (PSP neutral / center)
+ *
+ * 3. Outer Deadzone:
+ *      if deadzone_outer > 0:
+ *          outer_threshold = 32767 - deadzone_outer
+ *          if val >= outer_threshold:
+ *              val = 32767
+ *          else if val <= -outer_threshold:
+ *              val = -32768
+ *
+ * 4. PSP Byte Mapping:
+ *      byte = (uint8_t)(((int32_t)val + 32768) * 255 / 65535)
+ *
+ * In the default profile (deadzone_inner = 7849, deadzone_outer = 0, inverted = false),
+ * this yields 128 for |raw| <= 7849 and ((raw + 32768) * 255 / 65535) for |raw| > 7849,
+ * reproducing the runtime's src/rt/gpu_sdl3vk/sdl3vk.c exactly.
+ */
+uint8_t nk_input_profile_transform_axis(
+    int16_t raw_axis,
+    int16_t deadzone_inner,
+    int16_t deadzone_outer,
+    bool inverted
+);
+
+/**
+ * @brief Transform raw host axis to PSP byte using resting center and measured extremes.
+ */
+uint8_t nk_input_profile_transform_axis_calibrated(
+    int16_t raw_axis,
+    int16_t deadzone_inner,
+    int16_t deadzone_outer,
+    bool inverted,
+    int16_t rest,
+    int16_t min_val,
+    int16_t max_val
+);
+
+/**
+ * @brief Test whether a raw trigger axis value satisfies the trigger threshold.
+ *
+ * Formula:
+ *      pressed = (raw_trigger > trigger_threshold)
+ *
+ * With the default threshold of 8192 (matching sdl3vk.c), pulls > 8192 return true.
+ */
+bool nk_input_profile_eval_trigger(int16_t raw_trigger, int16_t trigger_threshold);
+
+/**
+ * @brief Test whether a raw trigger satisfies threshold calibrated against resting/extreme pull.
+ */
+bool nk_input_profile_eval_trigger_calibrated(
+    int16_t raw_trigger,
+    int16_t trigger_threshold,
+    int16_t trigger_rest,
+    int16_t trigger_extreme
+);
+
+/**
+ * @brief Return standard PSP button bitmask for an enum button.
+ */
+uint32_t nk_psp_button_bitmask(NkPspButton btn);
+
+/**
+ * @brief String names for controls and actions.
+ */
+const char *nk_psp_button_name(NkPspButton btn);
+NkPspButton nk_psp_button_from_name(const char *name);
+
+/* "stick_up", "stick_down", "stick_left", "stick_right"; "unknown" otherwise. */
+const char *nk_psp_stick_dir_name(NkPspStickDir dir);
+/* Case-insensitive; (NkPspStickDir)-1 when `name` is not a stick direction. */
+NkPspStickDir nk_psp_stick_dir_from_name(const char *name);
+
+const char *nk_psp_axis_name(NkPspAxis axis);
+NkPspAxis nk_psp_axis_from_name(const char *name);
+
+const char *nk_host_button_name(NkHostGamepadButton btn);
+NkHostGamepadButton nk_host_button_from_name(const char *name);
+
+const char *nk_host_axis_name(NkHostGamepadAxis axis);
+NkHostGamepadAxis nk_host_axis_from_name(const char *name);
+
+const char *nk_nav_action_name(NkNavAction action);
+NkNavAction nk_nav_action_from_name(const char *name);
+
+/* Name of a bindable host key, or NULL when `key` is not one. */
+const char *nk_host_key_name(int key);
+/* A bindable host key in plain words, as people see it on the keyboard ("Enter",
+   "Left Shift", "Up Arrow", "A"); "None" when `key` is not one. Truncates to buf_sz. */
+void nk_host_key_words(int key, char *buf, size_t buf_sz);
+/* Key code for a bindable host key name, or NK_HOST_KEY_NONE when unknown. */
+int nk_host_key_from_name(const char *name);
+
+/**
+ * @brief Initialize profile to standard safe defaults matching current runtime.
+ */
+void nk_input_profile_init_default(NkInputProfile *profile);
+
+/**
+ * @brief Validate an input profile for range errors, duplicates, and conflicts.
+ *
+ * @param profile Profile to validate.
+ * @param diag_buf Optional diagnostic message buffer.
+ * @param diag_buf_sz Size of diag_buf.
+ * @return NK_OK (0) if valid, or NK_ERROR_* (<0) on validation error.
+ */
+NkResult nk_input_profile_validate(
+    const NkInputProfile *profile,
+    char *diag_buf,
+    size_t diag_buf_sz
+);
+
+/**
+ * @brief Strictly load an input profile from disk.
+ *
+ * Fails to safe defaults on unknown version, out-of-range value, duplicate or
+ * conflicting binding, or malformed JSON. A future version is never downgraded.
+ * A schema 1 file migrates to the current version; any invalid per-title entry
+ * refuses the whole document, so a half-applied mapping is never reachable.
+ */
+NkResult nk_input_profile_load(
+    NkInputProfile *out_profile,
+    const char *file_path,
+    char *diag_buf,
+    size_t diag_buf_sz
+);
+
+/**
+ * @brief Strictly parse an input profile from in-memory JSON text.
+ */
+NkResult nk_input_profile_parse_json(
+    NkInputProfile *out_profile,
+    const char *json_str,
+    size_t json_len,
+    char *diag_buf,
+    size_t diag_buf_sz
+);
+
+/**
+ * @brief Save input profile to disk atomically (write to .tmp then rename).
+ */
+NkResult nk_input_profile_save(
+    const NkInputProfile *profile,
+    const char *file_path,
+    char *diag_buf,
+    size_t diag_buf_sz
+);
+
+/**
+ * @brief Initialize a whole profile document to the global default mapping.
+ */
+void nk_input_profile_file_init_default(NkInputProfileFile *doc);
+
+/**
+ * @brief Strictly load a whole profile document, per-title map included.
+ *
+ * Any invalid global mapping or invalid per-title entry refuses the document:
+ * the caller receives safe defaults and a diagnostic naming the offending entry,
+ * never a partially applied mapping.
+ */
+NkResult nk_input_profile_file_load(
+    NkInputProfileFile *doc,
+    const char *file_path,
+    char *diag_buf,
+    size_t diag_buf_sz
+);
+
+/**
+ * @brief Strictly parse a whole profile document from in-memory JSON text.
+ */
+NkResult nk_input_profile_file_parse_json(
+    NkInputProfileFile *doc,
+    const char *json_str,
+    size_t json_len,
+    char *diag_buf,
+    size_t diag_buf_sz
+);
+
+/**
+ * @brief Save a whole profile document atomically (write to .tmp then rename).
+ *
+ * Every global mapping and per-title entry is validated first, so a refused
+ * document never replaces the file already on disk.
+ */
+NkResult nk_input_profile_file_save(
+    const NkInputProfileFile *doc,
+    const char *file_path,
+    char *diag_buf,
+    size_t diag_buf_sz
+);
+
+/**
+ * @brief Index of the per-title entry for `disc_id`, or -1 when there is none.
+ * Matching is case-insensitive on ASCII, like every other name lookup here.
+ */
+int nk_input_profile_file_find_title(const NkInputProfileFile *doc, const char *disc_id);
+
+/**
+ * @brief Effective mapping for `disc_id`: its own entry, else the global one.
+ *
+ * An entry that fails validation is reported through `diag_buf` and the global
+ * mapping is returned instead, because a partially applied per-title mapping
+ * would hand the guest buttons the screen does not show.
+ */
+const NkInputProfile *nk_input_profile_file_resolve(
+    const NkInputProfileFile *doc,
+    const char *disc_id,
+    char *diag_buf,
+    size_t diag_buf_sz
+);
+
+/**
+ * @brief Store `mapping` as the per-title entry for `disc_id`, creating it when
+ * the disc has none. The mapping is validated first and a full document, an
+ * unsafe disc ID or an invalid mapping is refused without touching the document.
+ */
+NkResult nk_input_profile_file_set_title(
+    NkInputProfileFile *doc,
+    const char *disc_id,
+    const NkInputProfile *mapping,
+    char *diag_buf,
+    size_t diag_buf_sz
+);
+
+/**
+ * @brief Drop the per-title entry for `disc_id` so the disc uses the global map.
+ * @return true when an entry was removed.
+ */
+bool nk_input_profile_file_remove_title(NkInputProfileFile *doc, const char *disc_id);
+
+/**
+ * @brief True when `disc_id` is safe to use as a per-title profile file name.
+ *
+ * Only ASCII letters, digits, '-', '_' and '.' are accepted, so a disc ID read
+ * from an image can never traverse out of the profile directory.
+ */
+bool nk_input_profile_disc_id_safe(const char *disc_id);
+
+/**
+ * @brief Resolve the active input profile file path.
+ *
+ * Checks NK_INPUT_PROFILE and SR_INPUT_PROFILE environment variables.
+ * If unset or empty, resolves <config_dir>/input_profile.json via nk_platform_get_path.
+ *
+ * @param out_path Buffer to receive resolved null-terminated path.
+ * @param out_path_sz Capacity of out_path.
+ * @return NK_OK (0) on success, or NK_ERROR_* (<0) on failure.
+ */
+NkResult nk_input_profile_resolve_path(char *out_path, size_t out_path_sz);
+
+/**
+ * @brief Check whether automated deterministic script input is active.
+ *
+ * When SR_PADSCRIPT is set and non-empty, scripted input takes precedence
+ * and host input profiles must not override default input mappings.
+ */
+bool nk_input_profile_padscript_active(void);
+
+/**
+ * @brief Evaluate the 14 PSP digital buttons from host gamepad state.
+ */
+uint32_t nk_input_profile_eval_buttons(
+    const NkInputProfile *profile,
+    const bool host_buttons[NK_HOST_BUTTON_COUNT],
+    const int16_t host_axes[NK_HOST_AXIS_COUNT]
+);
+
+/**
+ * @brief Evaluate PSP analog stick (lx, ly) from host gamepad state.
+ */
+void nk_input_profile_eval_analog(
+    const NkInputProfile *profile,
+    const int16_t host_axes[NK_HOST_AXIS_COUNT],
+    uint8_t *out_lx,
+    uint8_t *out_ly
+);
+
+/**
+ * @brief Evaluate the PSP digital buttons held on the host keyboard.
+ *
+ * `key_down[k]` is true while host key code `k` is held; codes at or beyond
+ * `key_count` read as released.
+ */
+uint32_t nk_input_profile_eval_keys(
+    const NkInputProfile *profile,
+    const bool *key_down,
+    int key_count
+);
+
+/**
+ * @brief PSP button bits bound to one host key, for a key-down event.
+ *
+ * Stick keys are not buttons: they never appear in the bits this returns, nor in
+ * nk_input_profile_eval_keys.
+ */
+uint32_t nk_input_profile_key_buttons(const NkInputProfile *profile, int key);
+
+/**
+ * @brief The analog stick from the keyboard.
+ *
+ * For each axis, when exactly one of its two directions has a key held, that axis
+ * goes to full deflection (up and left 0, down and right 255). With neither or both
+ * held the axis keeps the value passed in, so a controller's stick still works.
+ * `key_down`/`key_count` are as for nk_input_profile_eval_keys: codes at or beyond
+ * `key_count` read as released.
+ *
+ * A NULL `lx` or `ly` is skipped. A NULL profile or `key_down`, or a `key_count`
+ * of zero or less, changes nothing and returns false.
+ *
+ * @return true when a stick key moved an axis.
+ */
+bool nk_input_profile_eval_key_analog(
+    const NkInputProfile *profile,
+    const bool *key_down,
+    int key_count,
+    uint8_t *lx,
+    uint8_t *ly
+);
+
+/**
+ * @brief Evaluate player navigation actions from host gamepad state.
+ */
+uint32_t nk_input_profile_eval_navigation(
+    const NkInputProfile *profile,
+    const bool host_buttons[NK_HOST_BUTTON_COUNT],
+    const int16_t host_axes[NK_HOST_AXIS_COUNT]
+);
+
+/* -----------------------------------------------------------------------------
+ * Overlay input gate (#1159)
+ *
+ * The in-game overlay claims host input while it has focus: the game then
+ * reads every button released and the stick centred. When the claim ends,
+ * every button still held and a stick still pushed away from the centre stay
+ * hidden from the game until they are let go, so the press that closed the
+ * overlay never reaches the game and no button sticks. A hidden button shows
+ * again after a release, or after a press event the host saw once the claim
+ * ended (only a released button can be pressed again).
+ *
+ * Buttons are PSP bits (NK_PSP_BTN_*_BIT). `pressed` is the button-down events
+ * since the game last sampled, which a host keeps so a press and release
+ * between two samples is not lost.
+ * -------------------------------------------------------------------------- */
+
+typedef struct {
+    bool claimed;
+    uint32_t hidden;       /* buttons held when the claim ended, hidden until let go */
+    bool stick_hidden;     /* stick off centre when the claim ended, centred until it returns */
+} NkInputGate;
+
+void nk_input_gate_init(NkInputGate *gate);
+void nk_input_gate_claim(NkInputGate *gate);
+/* Ends the claim. `held`, `lx` and `ly` are the host state at that moment. */
+void nk_input_gate_release(NkInputGate *gate, uint32_t held, uint8_t lx, uint8_t ly);
+/* Filters one host sample in place: what the game may see of it. Any pointer
+ * may be NULL; a NULL `held` skips the button update. */
+void nk_input_gate_apply(NkInputGate *gate, uint32_t *held, uint32_t *pressed,
+                         uint8_t *lx, uint8_t *ly);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* NK_INPUT_PROFILE_H */

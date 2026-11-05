@@ -1,0 +1,1135 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 the Nakagawa Recomp authors */
+
+#include "input_settings.h"
+#include "nk_platform.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static const char *kControlDisplayNames[INPUT_CONTROL_TOTAL_COUNT] = {
+    "Select",
+    "Start",
+    "D-Pad Up",
+    "D-Pad Right",
+    "D-Pad Down",
+    "D-Pad Left",
+    "L Trigger (L1)",
+    "R Trigger (R1)",
+    "Triangle",
+    "Circle",
+    "Cross",
+    "Square",
+    "Home",
+    "Hold",
+    "Analog Stick",
+    "Stick Up",
+    "Stick Down",
+    "Stick Left",
+    "Stick Right"
+};
+
+const char *input_settings_control_name(int control_idx) {
+    if (control_idx >= 0 && control_idx < INPUT_CONTROL_TOTAL_COUNT) {
+        return kControlDisplayNames[control_idx];
+    }
+    return "Unknown Control";
+}
+
+bool input_settings_control_has_keys(int control_idx) {
+    return (control_idx >= 0 && control_idx < INPUT_CONTROL_DIGITAL_COUNT) ||
+           (control_idx >= INPUT_CONTROL_STICK_UP && control_idx <= INPUT_CONTROL_STICK_RIGHT);
+}
+
+bool input_settings_control_bindable(const InputSettingsState *state, int control_idx) {
+    if (!state) return false;
+    if (state->device == INPUT_DEVICE_KEYBOARD) return input_settings_control_has_keys(control_idx);
+    return control_idx >= 0 && control_idx < INPUT_CONTROL_DIGITAL_COUNT;
+}
+
+/* The keyboard keys of a control that has them: a PSP button's, or a stick
+   direction's (InputControlIndex keeps NkPspStickDir's order). */
+static NkKeyBinding *control_keys(NkInputProfile *profile, int control_idx) {
+    if (!input_settings_control_has_keys(control_idx)) return NULL;
+    if (control_idx < INPUT_CONTROL_DIGITAL_COUNT) return &profile->psp_keys[control_idx];
+    return &profile->stick_keys[control_idx - INPUT_CONTROL_STICK_UP];
+}
+
+static const NkKeyBinding *control_keys_const(const NkInputProfile *profile, int control_idx) {
+    return control_keys((NkInputProfile *)profile, control_idx);
+}
+
+/* A host input by the label a pad prints on it, with its other common name in brackets
+   (the PlayStation-style label for a face button or shoulder): short enough that a
+   control's two inputs together fit its button on the Controls page
+   (INPUT_SETTINGS_BINDING_TEXT_MAX). */
+static const char *friendly_host_button_name(NkHostGamepadButton btn) {
+    switch (btn) {
+    case NK_HOST_BUTTON_SOUTH:          return "A (Cross)";
+    case NK_HOST_BUTTON_EAST:           return "B (Circle)";
+    case NK_HOST_BUTTON_WEST:           return "X (Square)";
+    case NK_HOST_BUTTON_NORTH:          return "Y (Triangle)";
+    case NK_HOST_BUTTON_BACK:           return "Back (Select)";
+    case NK_HOST_BUTTON_START:          return "Start";
+    case NK_HOST_BUTTON_LEFT_STICK:     return "Left Stick Click";
+    case NK_HOST_BUTTON_RIGHT_STICK:    return "Right Stick Click";
+    case NK_HOST_BUTTON_LEFT_SHOULDER:  return "LB (L1)";
+    case NK_HOST_BUTTON_RIGHT_SHOULDER: return "RB (R1)";
+    case NK_HOST_BUTTON_DPAD_UP:        return "D-Pad Up";
+    case NK_HOST_BUTTON_DPAD_DOWN:      return "D-Pad Down";
+    case NK_HOST_BUTTON_DPAD_LEFT:      return "D-Pad Left";
+    case NK_HOST_BUTTON_DPAD_RIGHT:     return "D-Pad Right";
+    case NK_HOST_BUTTON_GUIDE:          return "Guide (Home)";
+    case NK_HOST_BUTTON_MISC1:          return "Misc Button";
+    case NK_HOST_BUTTON_TOUCHPAD:       return "Touchpad";
+    default:                            return nk_host_button_name(btn);
+    }
+}
+
+static const char *friendly_host_axis_name(NkHostGamepadAxis axis) {
+    switch (axis) {
+    case NK_HOST_AXIS_LEFTX:         return "Left Stick X";
+    case NK_HOST_AXIS_LEFTY:         return "Left Stick Y";
+    case NK_HOST_AXIS_RIGHTX:        return "Right Stick X";
+    case NK_HOST_AXIS_RIGHTY:        return "Right Stick Y";
+    case NK_HOST_AXIS_LEFT_TRIGGER:  return "LT (L2)";
+    case NK_HOST_AXIS_RIGHT_TRIGGER: return "RT (R2)";
+    default:                         return nk_host_axis_name(axis);
+    }
+}
+
+static void format_single_source(const NkBindingSource *src, char *buf, size_t buf_sz) {
+    if (!buf || buf_sz == 0) return;
+    buf[0] = '\0';
+    if (!src || src->type == NK_BINDING_NONE) {
+        snprintf(buf, buf_sz, "None (Unbound)");
+        return;
+    }
+    switch (src->type) {
+    case NK_BINDING_HOST_BUTTON:
+        snprintf(buf, buf_sz, "%s", friendly_host_button_name((NkHostGamepadButton)src->index));
+        break;
+    case NK_BINDING_HOST_TRIGGER:
+        snprintf(buf, buf_sz, "%s", friendly_host_axis_name((NkHostGamepadAxis)src->index));
+        break;
+    case NK_BINDING_HOST_AXIS_POS:
+        snprintf(buf, buf_sz, "%s +", friendly_host_axis_name((NkHostGamepadAxis)src->index));
+        break;
+    case NK_BINDING_HOST_AXIS_NEG:
+        snprintf(buf, buf_sz, "%s -", friendly_host_axis_name((NkHostGamepadAxis)src->index));
+        break;
+    default:
+        snprintf(buf, buf_sz, "Unknown");
+        break;
+    }
+}
+
+void input_settings_format_binding(const InputSettingsState *state, int control_idx, char *buf, size_t buf_sz) {
+    if (!buf || buf_sz == 0) return;
+    buf[0] = '\0';
+    if (!state || control_idx < 0 || control_idx >= INPUT_CONTROL_TOTAL_COUNT) {
+        snprintf(buf, buf_sz, "None");
+        return;
+    }
+
+    if (control_idx == INPUT_CONTROL_ANALOG_STICK) {
+        int dz_x = state->profile.axes[NK_PSP_AXIS_ANALOG_X].deadzone_inner;
+        bool inv_x = state->profile.axes[NK_PSP_AXIS_ANALOG_X].inverted;
+        bool inv_y = state->profile.axes[NK_PSP_AXIS_ANALOG_Y].inverted;
+        snprintf(buf, buf_sz, "Left Stick (DZ: %d%s%s)",
+                 dz_x,
+                 inv_x ? ", Invert X" : "",
+                 inv_y ? ", Invert Y" : "");
+        return;
+    }
+
+    const NkDigitalBinding *bind = &state->profile.psp_buttons[control_idx];
+    char primary_str[96] = {0};
+    format_single_source(&bind->primary, primary_str, sizeof(primary_str));
+
+    if (bind->secondary.type != NK_BINDING_NONE) {
+        char sec_str[96] = {0};
+        format_single_source(&bind->secondary, sec_str, sizeof(sec_str));
+        snprintf(buf, buf_sz, "%s / %s", primary_str, sec_str);
+    } else {
+        snprintf(buf, buf_sz, "%s", primary_str);
+    }
+}
+
+void input_settings_format_key(int key, char *buf, size_t buf_sz) {
+    nk_host_key_words(key, buf, buf_sz);
+}
+
+/* A left-right pair of one modifier (Left Shift and Right Shift) reads as the modifier alone:
+   either key works, and the binding stays short enough for its button. */
+static const char *input_settings_key_pair_word(int a, int b) {
+    static const struct {
+        const char *left;
+        const char *right;
+        const char *word;
+    } kPairs[] = {
+        { "lshift", "rshift", "Shift" }, { "lctrl", "rctrl", "Ctrl" }, { "lalt", "ralt", "Alt" }
+    };
+    const char *first = nk_host_key_name(a);
+    const char *second = nk_host_key_name(b);
+    if (!first || !second) return NULL;
+    for (size_t i = 0; i < sizeof(kPairs) / sizeof(kPairs[0]); i++) {
+        if ((strcmp(first, kPairs[i].left) == 0 && strcmp(second, kPairs[i].right) == 0) ||
+            (strcmp(first, kPairs[i].right) == 0 && strcmp(second, kPairs[i].left) == 0)) {
+            return kPairs[i].word;
+        }
+    }
+    return NULL;
+}
+
+void input_settings_format_key_binding(const InputSettingsState *state, int control_idx,
+                                       char *buf, size_t buf_sz) {
+    char primary[32];
+    char secondary[32];
+    if (!buf || buf_sz == 0) return;
+    const NkKeyBinding *keys = state ? control_keys_const(&state->profile, control_idx) : NULL;
+    if (!keys) {
+        snprintf(buf, buf_sz, "None");
+        return;
+    }
+    const char *pair = input_settings_key_pair_word(keys->primary, keys->secondary);
+    if (pair) {
+        snprintf(buf, buf_sz, "%s", pair);
+        return;
+    }
+    input_settings_format_key(keys->primary, primary, sizeof(primary));
+    if (keys->secondary != NK_HOST_KEY_NONE && keys->secondary != keys->primary) {
+        input_settings_format_key(keys->secondary, secondary, sizeof(secondary));
+        if (keys->primary == NK_HOST_KEY_NONE) {
+            snprintf(buf, buf_sz, "%s", secondary);
+        } else {
+            snprintf(buf, buf_sz, "%s / %s", primary, secondary);
+        }
+    } else {
+        snprintf(buf, buf_sz, "%s", primary);
+    }
+}
+
+/* Keycap legends where a key's name in words is longer than what its key prints. */
+static const struct {
+    const char *words;
+    const char *legend;
+} kKeyLegends[] = {
+    { "Left Shift", "SHIFT" }, { "Right Shift", "SHIFT" }, { "Left Ctrl", "CTRL" },
+    { "Right Ctrl", "CTRL" },  { "Left Alt", "ALT" },      { "Right Alt", "ALT" },
+    { "Backspace", "BKSP" },   { "Insert", "INS" },        { "Delete", "DEL" },
+    { "Page Up", "PG UP" },    { "Page Down", "PG DN" }
+};
+
+/* The pills of the pad inputs with no glyph of their own, per InputPadNames. */
+enum { PILL_BACK, PILL_GUIDE, PILL_LEFT_STICK, PILL_RIGHT_STICK, PILL_LEFT_TILT,
+       PILL_RIGHT_TILT, PILL_LEFT_TRIGGER, PILL_RIGHT_TRIGGER, PILL_COUNT };
+static const char *const kPadPills[PILL_COUNT][INPUT_PAD_NAMES_COUNT] = {
+    /* neutral   A south   A east   shapes */
+    { "BACK",    "VIEW",   "-",     "CREATE" },
+    { "HOME",    "GUIDE",  "HOME",  "HOME" },
+    { "LS",      "LS",     "LS",    "L3" },   /* a stick pressed in */
+    { "RS",      "RS",     "RS",    "R3" },
+    { "LS",      "LS",     "LS",    "LS" },   /* a stick pushed one way */
+    { "RS",      "RS",     "RS",    "RS" },
+    { "LT",      "LT",     "ZL",    "L2" },
+    { "RT",      "RT",     "ZR",    "R2" }
+};
+
+static void glyph_set_legend(InputBindingGlyph *out, InputGlyphKind kind, const char *text) {
+    size_t i;
+    out->kind = kind;
+    for (i = 0; text[i] != '\0' && i + 1u < sizeof(out->legend); i++) {
+        char c = text[i];
+        out->legend[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+    }
+    out->legend[i] = '\0';
+}
+
+void input_settings_key_glyph(const InputSettingsState *state, int control_idx,
+                              InputBindingGlyph *out) {
+    char words[32];
+    const char *text = words;
+    const char *name;
+    int key;
+    const NkKeyBinding *keys;
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    keys = state ? control_keys_const(&state->profile, control_idx) : NULL;
+    if (!keys) return;
+    key = keys->primary;
+    if (key == NK_HOST_KEY_NONE) key = keys->secondary;
+    name = nk_host_key_name(key);
+    if (!name) return;
+    if (strcmp(name, "up") == 0 || strcmp(name, "down") == 0 || strcmp(name, "left") == 0 ||
+        strcmp(name, "right") == 0) {
+        out->kind = INPUT_GLYPH_ARROW_KEY;
+        return;
+    }
+    input_settings_format_key(key, words, sizeof(words));
+    /* A keypad key prints what its copy on the main keys prints. */
+    if (strncmp(text, "Keypad ", 7) == 0) text += 7;
+    for (size_t i = 0; i < sizeof(kKeyLegends) / sizeof(kKeyLegends[0]); i++) {
+        if (strcmp(text, kKeyLegends[i].words) == 0) {
+            text = kKeyLegends[i].legend;
+            break;
+        }
+    }
+    glyph_set_legend(out, INPUT_GLYPH_KEY, text);
+}
+
+/* A trigger or stick axis, as its pill. */
+static int axis_pill(int axis) {
+    switch (axis) {
+    case NK_HOST_AXIS_LEFTX:
+    case NK_HOST_AXIS_LEFTY:         return PILL_LEFT_TILT;
+    case NK_HOST_AXIS_RIGHTX:
+    case NK_HOST_AXIS_RIGHTY:        return PILL_RIGHT_TILT;
+    case NK_HOST_AXIS_LEFT_TRIGGER:  return PILL_LEFT_TRIGGER;
+    case NK_HOST_AXIS_RIGHT_TRIGGER: return PILL_RIGHT_TRIGGER;
+    default:                         return -1;
+    }
+}
+
+void input_settings_pad_glyph(const InputSettingsState *state, int control_idx,
+                              InputPadNames names, InputBindingGlyph *out) {
+    const NkBindingSource *src;
+    const char *extra = NULL;
+    int pill = -1;
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!state || control_idx < 0 || control_idx >= INPUT_CONTROL_DIGITAL_COUNT) return;
+    if ((unsigned)names >= (unsigned)INPUT_PAD_NAMES_COUNT) names = INPUT_PAD_NAMES_NEUTRAL;
+    src = &state->profile.psp_buttons[control_idx].primary;
+    if (src->type == NK_BINDING_NONE) src = &state->profile.psp_buttons[control_idx].secondary;
+    switch (src->type) {
+    case NK_BINDING_HOST_BUTTON:
+        switch (src->index) {
+        case NK_HOST_BUTTON_SOUTH:          out->kind = INPUT_GLYPH_FACE_SOUTH; return;
+        case NK_HOST_BUTTON_EAST:           out->kind = INPUT_GLYPH_FACE_EAST; return;
+        case NK_HOST_BUTTON_WEST:           out->kind = INPUT_GLYPH_FACE_WEST; return;
+        case NK_HOST_BUTTON_NORTH:          out->kind = INPUT_GLYPH_FACE_NORTH; return;
+        case NK_HOST_BUTTON_LEFT_SHOULDER:  out->kind = INPUT_GLYPH_SHOULDER_LEFT; return;
+        case NK_HOST_BUTTON_RIGHT_SHOULDER: out->kind = INPUT_GLYPH_SHOULDER_RIGHT; return;
+        case NK_HOST_BUTTON_START:          out->kind = INPUT_GLYPH_PAD_START; return;
+        case NK_HOST_BUTTON_DPAD_UP:
+        case NK_HOST_BUTTON_DPAD_DOWN:
+        case NK_HOST_BUTTON_DPAD_LEFT:
+        case NK_HOST_BUTTON_DPAD_RIGHT:     out->kind = INPUT_GLYPH_DPAD; return;
+        case NK_HOST_BUTTON_BACK:           pill = PILL_BACK; break;
+        case NK_HOST_BUTTON_GUIDE:          pill = PILL_GUIDE; break;
+        case NK_HOST_BUTTON_LEFT_STICK:     pill = PILL_LEFT_STICK; break;
+        case NK_HOST_BUTTON_RIGHT_STICK:    pill = PILL_RIGHT_STICK; break;
+        /* The extra buttons have one name on every pad: the paddles are numbered
+           as SDL describes them. */
+        case NK_HOST_BUTTON_MISC1:          extra = "EXTRA"; break;
+        case NK_HOST_BUTTON_RIGHT_PADDLE1:  extra = "P1"; break;
+        case NK_HOST_BUTTON_RIGHT_PADDLE2:  extra = "P2"; break;
+        case NK_HOST_BUTTON_LEFT_PADDLE1:   extra = "P3"; break;
+        case NK_HOST_BUTTON_LEFT_PADDLE2:   extra = "P4"; break;
+        case NK_HOST_BUTTON_TOUCHPAD:       extra = "TOUCH"; break;
+        default:                            return;
+        }
+        break;
+    case NK_BINDING_HOST_TRIGGER:
+    case NK_BINDING_HOST_AXIS_POS:
+    case NK_BINDING_HOST_AXIS_NEG:
+        pill = axis_pill(src->index);
+        break;
+    default:
+        return;
+    }
+    if (pill >= 0) extra = kPadPills[pill][names];
+    if (extra) glyph_set_legend(out, INPUT_GLYPH_PAD_LEGEND, extra);
+}
+
+void input_settings_init(InputSettingsState *state) {
+    if (!state) return;
+    memset(state, 0, sizeof(*state));
+    nk_input_profile_file_init_default(&state->file);
+    state->profile = state->file.global;
+    state->profile_path[0] = '\0';
+    nk_input_profile_resolve_path(state->profile_path, sizeof(state->profile_path));
+    state->capture_control = -1;
+    state->capture_timeout_ms = INPUT_SETTINGS_CAPTURE_TIMEOUT_MS;
+    state->note_control = -1;
+    input_settings_refresh_conflicts(state);
+}
+
+static void clear_note(InputSettingsState *state) {
+    state->note[0] = '\0';
+    state->note_error = false;
+    state->note_control = -1;
+}
+
+/* Copy the mapping being edited back into the document slot it belongs to, so a
+ * save writes the user's edits to the right mapping and leaves the others be. */
+static bool store_current_scope(InputSettingsState *state) {
+    if (!state) return false;
+    if (!state->editing_disc_id[0]) {
+        state->file.global = state->profile;
+        return true;
+    }
+    /* A per-title entry the document refuses is not stored, so a save would write
+       the old one: say so, and keep it unsaved, rather than report it saved. */
+    if (nk_input_profile_file_set_title(&state->file, state->editing_disc_id, &state->profile,
+                                        state->save_diagnostic,
+                                        sizeof(state->save_diagnostic)) != NK_OK) {
+        state->has_save_diagnostic = true;
+        state->unsaved = true;
+        return false;
+    }
+    return true;
+}
+
+void input_settings_reset_to_defaults(InputSettingsState *state) {
+    if (!state) return;
+    nk_input_profile_init_default(&state->profile);
+    state->capturing = false;
+    state->capture_control = -1;
+    state->capture_elapsed_ms = 0;
+    clear_note(state);
+    state->save_diagnostic[0] = '\0';
+    state->has_save_diagnostic = false;
+    (void)store_current_scope(state);
+    input_settings_refresh_conflicts(state);
+    state->dirty = true;
+}
+
+void input_settings_reset_device_to_defaults(InputSettingsState *state) {
+    if (!state) return;
+    if (state->device == INPUT_DEVICE_KEYBOARD) {
+        NkInputProfile defaults;
+        nk_input_profile_init_default(&defaults);
+        memcpy(state->profile.psp_keys, defaults.psp_keys, sizeof(state->profile.psp_keys));
+        memcpy(state->profile.stick_keys, defaults.stick_keys,
+               sizeof(state->profile.stick_keys));
+        input_settings_cancel_capture(state);
+        state->save_diagnostic[0] = '\0';
+        state->has_save_diagnostic = false;
+        (void)store_current_scope(state);
+        state->dirty = true;
+        return;
+    }
+    /* The controller's defaults leave the keyboard keys as the user set them. */
+    NkKeyBinding keys[NK_PSP_BTN_COUNT];
+    NkKeyBinding stick[NK_PSP_STICK_DIR_COUNT];
+    memcpy(keys, state->profile.psp_keys, sizeof(keys));
+    memcpy(stick, state->profile.stick_keys, sizeof(stick));
+    input_settings_reset_to_defaults(state);
+    memcpy(state->profile.psp_keys, keys, sizeof(keys));
+    memcpy(state->profile.stick_keys, stick, sizeof(stick));
+    (void)store_current_scope(state);
+}
+
+void input_settings_set_stick(InputSettingsState *state, bool right) {
+    if (!state) return;
+    state->profile.axes[NK_PSP_AXIS_ANALOG_X].host_axis = right ? NK_HOST_AXIS_RIGHTX
+                                                                : NK_HOST_AXIS_LEFTX;
+    state->profile.axes[NK_PSP_AXIS_ANALOG_Y].host_axis = right ? NK_HOST_AXIS_RIGHTY
+                                                                : NK_HOST_AXIS_LEFTY;
+    (void)store_current_scope(state);
+    state->dirty = true;
+}
+
+bool input_settings_stick_is_right(const InputSettingsState *state) {
+    return state && state->profile.axes[NK_PSP_AXIS_ANALOG_X].host_axis == NK_HOST_AXIS_RIGHTX &&
+           state->profile.axes[NK_PSP_AXIS_ANALOG_Y].host_axis == NK_HOST_AXIS_RIGHTY;
+}
+
+void input_settings_set_device(InputSettingsState *state, InputSettingsDevice device) {
+    if (!state) return;
+    if (device != INPUT_DEVICE_KEYBOARD) device = INPUT_DEVICE_CONTROLLER;
+    input_settings_cancel_capture(state);
+    state->device = device;
+}
+
+/* What the other control was left with after a binding took its input: "X was
+   Circle's. Circle now uses Z." (it took this control's input), "... Circle keeps
+   Left Shift." (this control had none to give, and it has another), or "... Circle
+   has no key now: choose one." A control left with nothing is the one thing to fix,
+   so that note reads as an error. */
+static void note_moved(InputSettingsState *state, const char *taken, int other,
+                       const char *given, const char *kept, const char *nothing) {
+    const char *name = input_settings_control_name(other);
+    state->note_error = false;
+    if (given) {
+        snprintf(state->note, sizeof(state->note), "%s was %s's. %s now uses %s.", taken, name,
+                 name, given);
+    } else if (kept) {
+        snprintf(state->note, sizeof(state->note), "%s was %s's. %s keeps %s.", taken, name,
+                 name, kept);
+    } else {
+        snprintf(state->note, sizeof(state->note), "%s was %s's. %s has %s now: choose one.",
+                 taken, name, name, nothing);
+        state->note_error = true;
+    }
+    state->note_control = other;
+}
+
+bool input_settings_assign_key(InputSettingsState *state, int control_idx, int key) {
+    char words[32];
+    char left_with[32];
+    NkKeyBinding *keys;
+    if (!state) return false;
+    keys = control_keys(&state->profile, control_idx);
+    if (!keys) return false;
+    clear_note(state);
+    if (key <= NK_HOST_KEY_NONE || key >= NK_HOST_KEY_LIMIT || !nk_host_key_name(key)) {
+        snprintf(state->note, sizeof(state->note),
+                 "That key can't be used for a PSP control. Choose another key.");
+        state->note_error = true;
+        return false;
+    }
+    if (keys->primary == key) return true;
+    int previous = keys->primary;
+    input_settings_format_key(key, words, sizeof(words));
+    for (int i = 0; i < INPUT_CONTROL_TOTAL_COUNT; i++) {
+        NkKeyBinding *other = i == control_idx ? NULL : control_keys(&state->profile, i);
+        if (!other || (other->primary != key && other->secondary != key)) continue;
+        /* The other control takes this one's key in the slot the key leaves; a
+           control may list one key in both slots, and then both leave. */
+        if (other->primary == key) {
+            other->primary = previous;
+            if (other->secondary == key) other->secondary = NK_HOST_KEY_NONE;
+        } else {
+            other->secondary = previous;
+        }
+        int kept = other->primary != NK_HOST_KEY_NONE ? other->primary : other->secondary;
+        if (previous != NK_HOST_KEY_NONE) {
+            input_settings_format_key(previous, left_with, sizeof(left_with));
+            note_moved(state, words, i, left_with, NULL, "no key");
+        } else if (kept != NK_HOST_KEY_NONE) {
+            input_settings_format_key(kept, left_with, sizeof(left_with));
+            note_moved(state, words, i, NULL, left_with, "no key");
+        } else {
+            note_moved(state, words, i, NULL, NULL, "no key");
+        }
+        break;
+    }
+    /* A key that was this control's second key swaps with its first. */
+    if (keys->secondary == key) keys->secondary = previous;
+    keys->primary = key;
+    (void)store_current_scope(state);
+    state->dirty = true;
+    return true;
+}
+
+bool input_settings_feed_capture_key(InputSettingsState *state, int key) {
+    if (!state || !state->capturing || state->device != INPUT_DEVICE_KEYBOARD) return false;
+    int c = state->capture_control;
+    input_settings_cancel_capture(state);
+    return input_settings_assign_key(state, c, key);
+}
+
+bool input_settings_is_title_scope(const InputSettingsState *state) {
+    return state && state->editing_disc_id[0] != '\0';
+}
+
+bool input_settings_has_title_mapping(const InputSettingsState *state, const char *disc_id) {
+    if (!state || !disc_id || !disc_id[0]) return false;
+    return nk_input_profile_file_find_title(&state->file, disc_id) >= 0;
+}
+
+const char *input_settings_scope_label(const InputSettingsState *state) {
+    if (!state) return "Global mapping";
+    if (!state->editing_disc_id[0]) return "Global mapping";
+    return state->editing_disc_id;
+}
+
+const NkInputProfile *input_settings_resolve_for_disc(
+    const InputSettingsState *state,
+    const char *disc_id,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (!state) {
+        if (diag_buf && diag_buf_sz > 0) diag_buf[0] = '\0';
+        return NULL;
+    }
+    return nk_input_profile_file_resolve(&state->file, disc_id, diag_buf, diag_buf_sz);
+}
+
+bool input_settings_set_scope(InputSettingsState *state, const char *disc_id) {
+    if (!state) return false;
+    /* Edits made in the scope being left are kept, so switching back and forth
+     * between the global mapping and a disc's own mapping never loses work. */
+    (void)store_current_scope(state);
+    if (!disc_id || !disc_id[0]) {
+        state->profile = state->file.global;
+        state->editing_disc_id[0] = '\0';
+        input_settings_cancel_capture(state);
+        input_settings_cancel_calibration(state);
+        input_settings_refresh_conflicts(state);
+        return true;
+    }
+
+    if (!nk_input_profile_disc_id_safe(disc_id)) return false;
+
+    /* A disc that has no entry yet starts from a copy of the global mapping, so
+     * the first edit in a per-title scope changes only what the user changed. */
+    if (nk_input_profile_file_find_title(&state->file, disc_id) < 0) {
+        char diag[NK_INPUT_DIAGNOSTIC_MAX_LEN];
+        if (nk_input_profile_file_set_title(&state->file, disc_id, &state->file.global,
+                                            diag, sizeof(diag)) != NK_OK) {
+            return false;
+        }
+    }
+    int idx = nk_input_profile_file_find_title(&state->file, disc_id);
+    if (idx < 0) return false;
+    state->profile = state->file.title[idx];
+    snprintf(state->editing_disc_id, sizeof(state->editing_disc_id), "%s", disc_id);
+    input_settings_cancel_capture(state);
+    input_settings_cancel_calibration(state);
+    input_settings_refresh_conflicts(state);
+    return true;
+}
+
+bool input_settings_toggle_scope(InputSettingsState *state, const char *disc_id) {
+    if (!state) return false;
+    if (input_settings_is_title_scope(state)) {
+        /* Choosing the global mapping for this disc drops its own entry, so the
+         * next launch really does run the global profile instead of a custom
+         * mapping the user just said they no longer want. */
+        char leaving[NK_MAX_DISC_ID_LEN];
+        snprintf(leaving, sizeof(leaving), "%s", state->editing_disc_id);
+        if (!input_settings_set_scope(state, NULL)) return false;
+        if (!nk_input_profile_file_remove_title(&state->file, leaving)) return false;
+        state->dirty = true;
+        return true;
+    }
+    if (!input_settings_set_scope(state, disc_id)) return false;
+    /* A disc that had no entry has one now, seeded from the global mapping. */
+    state->dirty = true;
+    return true;
+}
+
+NkResult input_settings_write_disc_profile(
+    const InputSettingsState *state,
+    const char *disc_id,
+    char *out_path,
+    size_t out_path_sz,
+    char *diag_buf,
+    size_t diag_buf_sz
+) {
+    if (diag_buf && diag_buf_sz > 0) diag_buf[0] = '\0';
+    if (out_path && out_path_sz > 0) out_path[0] = '\0';
+    if (!state || !out_path || out_path_sz == 0) return NK_ERROR_GENERIC;
+    if (!nk_input_profile_disc_id_safe(disc_id)) {
+        snprintf(diag_buf, diag_buf_sz,
+                 "disc ID '%s' cannot name a per-title profile file",
+                 disc_id ? disc_id : "");
+        return NK_ERROR_GENERIC;
+    }
+
+    const NkInputProfile *effective =
+        nk_input_profile_file_resolve(&state->file, disc_id, diag_buf, diag_buf_sz);
+    if (!effective) {
+        snprintf(diag_buf, diag_buf_sz, "no input profile document is loaded");
+        return NK_ERROR_GENERIC;
+    }
+
+    char config_dir[1024] = {0};
+    if (!nk_platform_get_path(NK_PATH_CONFIG, config_dir, sizeof(config_dir))) {
+        snprintf(diag_buf, diag_buf_sz, "per-user config directory is unavailable");
+        return NK_ERROR_IO;
+    }
+    char sep = nk_platform_path_separator();
+    char dir[sizeof(config_dir) + 32];
+    int written = snprintf(dir, sizeof(dir), "%s%c%s", config_dir, sep, "input_profiles");
+    if (written <= 0 || (size_t)written >= sizeof(dir)) {
+        snprintf(diag_buf, diag_buf_sz, "per-title profile path is too long");
+        return NK_ERROR_IO;
+    }
+    if (!nk_platform_dir_exists(dir) && !nk_platform_mkdir_p(dir)) {
+        snprintf(diag_buf, diag_buf_sz, "could not create '%s'", dir);
+        return NK_ERROR_IO;
+    }
+
+    written = snprintf(out_path, out_path_sz, "%s%c%s.json", dir, sep, disc_id);
+    if (written <= 0 || (size_t)written >= out_path_sz) {
+        out_path[0] = '\0';
+        snprintf(diag_buf, diag_buf_sz, "per-title profile path is too long");
+        return NK_ERROR_IO;
+    }
+
+    return nk_input_profile_save(effective, out_path, diag_buf, diag_buf_sz);
+}
+
+static bool sources_equal(const NkBindingSource *a, const NkBindingSource *b) {
+    if (!a || !b) return false;
+    if (a->type == NK_BINDING_NONE || b->type == NK_BINDING_NONE) return false;
+    return (a->type == b->type && a->index == b->index);
+}
+
+void input_settings_refresh_conflicts(InputSettingsState *state) {
+    if (!state) return;
+    state->conflict_count = 0;
+
+    for (int i = 0; i < INPUT_CONTROL_DIGITAL_COUNT; i++) {
+        for (int j = i + 1; j < INPUT_CONTROL_DIGITAL_COUNT; j++) {
+            const NkDigitalBinding *b_i = &state->profile.psp_buttons[i];
+            const NkDigitalBinding *b_j = &state->profile.psp_buttons[j];
+
+            /* Check primary vs primary */
+            if (sources_equal(&b_i->primary, &b_j->primary)) {
+                if (state->conflict_count < INPUT_SETTINGS_MAX_CONFLICTS) {
+                    InputBindingConflict *c = &state->conflicts[state->conflict_count++];
+                    c->control_a = i;
+                    c->control_b = j;
+                    c->source = b_i->primary;
+                    char src_name[96] = {0};
+                    format_single_source(&b_i->primary, src_name, sizeof(src_name));
+                    snprintf(c->description, sizeof(c->description),
+                             "Conflict: %s bound to both %s and %s",
+                             src_name,
+                             input_settings_control_name(i),
+                             input_settings_control_name(j));
+                }
+            }
+
+            /* Check secondary conflicts if present */
+            if (sources_equal(&b_i->secondary, &b_j->primary) ||
+                sources_equal(&b_i->secondary, &b_j->secondary)) {
+                if (state->conflict_count < INPUT_SETTINGS_MAX_CONFLICTS) {
+                    InputBindingConflict *c = &state->conflicts[state->conflict_count++];
+                    c->control_a = i;
+                    c->control_b = j;
+                    c->source = b_i->secondary;
+                    char src_name[96] = {0};
+                    format_single_source(&b_i->secondary, src_name, sizeof(src_name));
+                    snprintf(c->description, sizeof(c->description),
+                             "Conflict: %s bound to both %s and %s",
+                             src_name,
+                             input_settings_control_name(i),
+                             input_settings_control_name(j));
+                }
+            }
+        }
+    }
+}
+
+bool input_settings_has_conflicts(const InputSettingsState *state) {
+    return state && state->conflict_count > 0;
+}
+
+int input_settings_get_conflict_count(const InputSettingsState *state) {
+    return state ? state->conflict_count : 0;
+}
+
+const InputBindingConflict *input_settings_get_conflict(const InputSettingsState *state, int index) {
+    if (!state || index < 0 || index >= state->conflict_count) return NULL;
+    return &state->conflicts[index];
+}
+
+bool input_settings_is_control_conflicted(const InputSettingsState *state, int control_idx) {
+    if (!state || control_idx < 0 || control_idx >= INPUT_CONTROL_DIGITAL_COUNT) return false;
+    for (int i = 0; i < state->conflict_count; i++) {
+        if (state->conflicts[i].control_a == control_idx || state->conflicts[i].control_b == control_idx) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *input_settings_get_conflict_summary(const InputSettingsState *state) {
+    if (!state || state->conflict_count == 0) return "";
+    return state->conflicts[0].description;
+}
+
+NkResult input_settings_load(InputSettingsState *state, const char *custom_path) {
+    if (!state) return NK_ERROR_GENERIC;
+    input_settings_init(state);
+
+    const char *load_path = custom_path;
+    if (!load_path || !load_path[0]) {
+        if (nk_input_profile_resolve_path(state->profile_path, sizeof(state->profile_path)) != NK_OK) {
+            return NK_OK;
+        }
+        load_path = state->profile_path;
+    } else {
+        strncpy(state->profile_path, load_path, sizeof(state->profile_path) - 1);
+        state->profile_path[sizeof(state->profile_path) - 1] = '\0';
+    }
+
+    if (!nk_platform_file_exists(load_path)) {
+        state->loaded_from_file = false;
+        state->has_load_diagnostic = false;
+        state->load_diagnostic[0] = '\0';
+        input_settings_refresh_conflicts(state);
+        return NK_OK;
+    }
+
+    state->loaded_from_file = true;
+    NkResult res = nk_input_profile_file_load(&state->file, load_path,
+                                              state->load_diagnostic,
+                                              sizeof(state->load_diagnostic));
+    if (res != NK_OK) {
+        nk_input_profile_file_init_default(&state->file);
+        state->has_load_diagnostic = true;
+    } else {
+        state->has_load_diagnostic = false;
+    }
+    /* A load returns editing to the global mapping: the document it just read
+     * is the authority for what exists, and the per-title scopes are reachable
+     * again through input_settings_set_scope. */
+    state->editing_disc_id[0] = '\0';
+    state->profile = state->file.global;
+    input_settings_refresh_conflicts(state);
+    return res;
+}
+
+NkResult input_settings_save(InputSettingsState *state, const char *custom_path) {
+    if (!state) return NK_ERROR_GENERIC;
+    const char *save_path = custom_path;
+    if (!save_path || !save_path[0]) {
+        if (!state->profile_path[0]) {
+            if (nk_input_profile_resolve_path(state->profile_path, sizeof(state->profile_path)) != NK_OK) {
+                snprintf(state->save_diagnostic, sizeof(state->save_diagnostic), "unable to resolve profile save path");
+                state->has_save_diagnostic = true;
+                return NK_ERROR_GENERIC;
+            }
+        }
+        save_path = state->profile_path;
+    }
+
+    state->save_diagnostic[0] = '\0';
+    state->has_save_diagnostic = false;
+
+    /* The whole document is written, so entries for other discs are preserved. A
+       mapping the document refuses is not written over the old one as if saved. */
+    if (!store_current_scope(state)) {
+        state->dirty = false;
+        state->leave_unsaved = false;
+        return NK_ERROR_GENERIC;
+    }
+    NkResult res = nk_input_profile_file_save(&state->file, save_path,
+                                              state->save_diagnostic,
+                                              sizeof(state->save_diagnostic));
+    if (res != NK_OK) {
+        state->has_save_diagnostic = true;
+    }
+    /* Written, or refused with its reason shown: a refusal is not retried every
+       frame, but the next change, leaving the page or closing writes again. */
+    state->dirty = false;
+    state->unsaved = res != NK_OK;
+    state->leave_unsaved = false;
+    return res;
+}
+
+NkResult input_settings_flush(InputSettingsState *state) {
+    if (!state) return NK_ERROR_GENERIC;
+    if (state->capturing) input_settings_cancel_capture(state);
+    if (input_settings_is_calibrating(state)) input_settings_cancel_calibration(state);
+    if (!state->dirty && !state->unsaved) return NK_OK;
+    return input_settings_save(state, NULL);
+}
+
+NkResult input_settings_save_if_dirty(InputSettingsState *state) {
+    if (!state || !state->dirty) return NK_OK;
+    /* A capture or a calibration still running may change the mapping again. */
+    if (state->capturing || input_settings_is_calibrating(state)) return NK_OK;
+    return input_settings_save(state, NULL);
+}
+
+bool input_settings_start_capture(InputSettingsState *state, int control_idx) {
+    if (!input_settings_control_bindable(state, control_idx)) return false;
+    state->capturing = true;
+    state->capture_control = control_idx;
+    state->capture_elapsed_ms = 0;
+    state->capture_timeout_ms = INPUT_SETTINGS_CAPTURE_TIMEOUT_MS;
+    clear_note(state);
+    return true;
+}
+
+void input_settings_cancel_capture(InputSettingsState *state) {
+    if (!state) return;
+    state->capturing = false;
+    state->capture_control = -1;
+    state->capture_elapsed_ms = 0;
+    clear_note(state);
+}
+
+bool input_settings_is_capturing(const InputSettingsState *state) {
+    return state && state->capturing;
+}
+
+int input_settings_get_capture_control(const InputSettingsState *state) {
+    return (state && state->capturing) ? state->capture_control : -1;
+}
+
+int input_settings_get_capture_remaining_ms(const InputSettingsState *state) {
+    if (!state || !state->capturing) return 0;
+    int rem = state->capture_timeout_ms - state->capture_elapsed_ms;
+    return (rem > 0) ? rem : 0;
+}
+
+bool input_settings_update_capture(InputSettingsState *state, int delta_ms) {
+    if (!state || !state->capturing) return false;
+    state->capture_elapsed_ms += delta_ms;
+    if (state->capture_elapsed_ms >= state->capture_timeout_ms) {
+        state->capturing = false;
+        state->capture_control = -1;
+        state->capture_elapsed_ms = 0;
+        return false;
+    }
+    return true;
+}
+
+bool input_settings_feed_capture_source(InputSettingsState *state, NkBindingSource source) {
+    /* A key capture waits for a key; a controller input is not one. */
+    if (!state || !state->capturing || state->device != INPUT_DEVICE_CONTROLLER) return false;
+    int c = state->capture_control;
+    state->capturing = false;
+    state->capture_control = -1;
+    state->capture_elapsed_ms = 0;
+    return input_settings_assign_binding(state, c, source);
+}
+
+bool input_settings_assign_binding(InputSettingsState *state, int control_idx, NkBindingSource source) {
+    char words[96];
+    char left_with[96];
+    if (!state || control_idx < 0 || control_idx >= INPUT_CONTROL_DIGITAL_COUNT) return false;
+    NkDigitalBinding *bind = &state->profile.psp_buttons[control_idx];
+    clear_note(state);
+    if (source.type != NK_BINDING_NONE && sources_equal(&bind->primary, &source)) return true;
+    NkBindingSource previous = bind->primary;
+    if (source.type != NK_BINDING_NONE) {
+        format_single_source(&source, words, sizeof(words));
+        for (int i = 0; i < INPUT_CONTROL_DIGITAL_COUNT; i++) {
+            NkDigitalBinding *other = &state->profile.psp_buttons[i];
+            if (i == control_idx ||
+                (!sources_equal(&other->primary, &source) &&
+                 !sources_equal(&other->secondary, &source))) {
+                continue;
+            }
+            /* The other button takes this one's input in the slot the input leaves;
+               an input listed in both its slots leaves both. */
+            if (sources_equal(&other->primary, &source)) {
+                other->primary = previous;
+                if (sources_equal(&other->secondary, &source)) {
+                    other->secondary.type = NK_BINDING_NONE;
+                    other->secondary.index = 0;
+                }
+            } else {
+                other->secondary = previous;
+            }
+            const NkBindingSource *kept = other->primary.type != NK_BINDING_NONE
+                ? &other->primary : &other->secondary;
+            if (previous.type != NK_BINDING_NONE) {
+                format_single_source(&previous, left_with, sizeof(left_with));
+                note_moved(state, words, i, left_with, NULL, "no button");
+            } else if (kept->type != NK_BINDING_NONE) {
+                format_single_source(kept, left_with, sizeof(left_with));
+                note_moved(state, words, i, NULL, left_with, "no button");
+            } else {
+                note_moved(state, words, i, NULL, NULL, "no button");
+            }
+            break;
+        }
+        /* An input that was this button's second one swaps with its first. */
+        if (sources_equal(&bind->secondary, &source)) bind->secondary = previous;
+    }
+    bind->primary = source;
+    input_settings_refresh_conflicts(state);
+    (void)store_current_scope(state);
+    state->dirty = true;
+    return true;
+}
+
+bool input_settings_adjust_deadzone(InputSettingsState *state, int axis_idx, int32_t delta) {
+    if (!state) return false;
+    int start = (axis_idx < 0) ? 0 : axis_idx;
+    int end = (axis_idx < 0) ? NK_PSP_AXIS_COUNT - 1 : axis_idx;
+    if (start < 0 || end >= NK_PSP_AXIS_COUNT) return false;
+
+    for (int i = start; i <= end; i++) {
+        int32_t val = (int32_t)state->profile.axes[i].deadzone_inner + delta;
+        int32_t max_allowed = 32766 - state->profile.axes[i].deadzone_outer;
+        if (max_allowed < 0) max_allowed = 0;
+        if (val < 0) val = 0;
+        if (val > max_allowed) val = max_allowed;
+        state->profile.axes[i].deadzone_inner = (int16_t)val;
+    }
+    state->dirty = true;
+    return true;
+}
+
+bool input_settings_set_deadzone(InputSettingsState *state, int axis_idx, int32_t value) {
+    if (!state) return false;
+    int start = (axis_idx < 0) ? 0 : axis_idx;
+    int end = (axis_idx < 0) ? NK_PSP_AXIS_COUNT - 1 : axis_idx;
+    if (start < 0 || end >= NK_PSP_AXIS_COUNT) return false;
+
+    for (int i = start; i <= end; i++) {
+        int32_t val = value;
+        int32_t max_allowed = 32766 - state->profile.axes[i].deadzone_outer;
+        if (max_allowed < 0) max_allowed = 0;
+        if (val < 0) val = 0;
+        if (val > max_allowed) val = max_allowed;
+        state->profile.axes[i].deadzone_inner = (int16_t)val;
+    }
+    state->dirty = true;
+    return true;
+}
+
+bool input_settings_adjust_trigger_threshold(InputSettingsState *state, int32_t delta) {
+    if (!state) return false;
+    int32_t val = (int32_t)state->profile.trigger_threshold + delta;
+    if (val < 0) val = 0;
+    if (val > 32767) val = 32767;
+    state->profile.trigger_threshold = (int16_t)val;
+    state->dirty = true;
+    return true;
+}
+
+bool input_settings_set_trigger_threshold(InputSettingsState *state, int32_t value) {
+    if (!state) return false;
+    int32_t val = value;
+    if (val < 0) val = 0;
+    if (val > 32767) val = 32767;
+    state->profile.trigger_threshold = (int16_t)val;
+    state->dirty = true;
+    return true;
+}
+
+bool input_settings_toggle_axis_inversion(InputSettingsState *state, int axis_idx) {
+    if (!state) return false;
+    if (axis_idx < 0 || axis_idx >= NK_PSP_AXIS_COUNT) return false;
+    state->profile.axes[axis_idx].inverted = !state->profile.axes[axis_idx].inverted;
+    state->dirty = true;
+    return true;
+}
+
+bool input_settings_start_calibration(InputSettingsState *state) {
+    if (!state) return false;
+    memset(&state->calib, 0, sizeof(state->calib));
+    state->calib.stage = CALIBRATION_STAGE_REST;
+    state->calib.duration_ms = 1000;
+    return true;
+}
+
+void input_settings_cancel_calibration(InputSettingsState *state) {
+    if (!state) return;
+    memset(&state->calib, 0, sizeof(state->calib));
+    state->calib.stage = CALIBRATION_STAGE_INACTIVE;
+}
+
+bool input_settings_is_calibrating(const InputSettingsState *state) {
+    return state && state->calib.stage != CALIBRATION_STAGE_INACTIVE;
+}
+
+GuidedCalibrationStage input_settings_get_calibration_stage(const InputSettingsState *state) {
+    return state ? state->calib.stage : CALIBRATION_STAGE_INACTIVE;
+}
+
+bool input_settings_update_calibration(InputSettingsState *state, int delta_ms, const int16_t host_axes[NK_HOST_AXIS_COUNT]) {
+    if (!state || state->calib.stage == CALIBRATION_STAGE_INACTIVE) return false;
+
+    int ax_x = state->profile.axes[NK_PSP_AXIS_ANALOG_X].host_axis;
+    int ax_y = state->profile.axes[NK_PSP_AXIS_ANALOG_Y].host_axis;
+    int16_t cur_x = (host_axes && ax_x >= 0 && ax_x < NK_HOST_AXIS_COUNT) ? host_axes[ax_x] : 0;
+    int16_t cur_y = (host_axes && ax_y >= 0 && ax_y < NK_HOST_AXIS_COUNT) ? host_axes[ax_y] : 0;
+    int16_t cur_lt = (host_axes && NK_HOST_AXIS_LEFT_TRIGGER < NK_HOST_AXIS_COUNT) ? host_axes[NK_HOST_AXIS_LEFT_TRIGGER] : 0;
+    int16_t cur_rt = (host_axes && NK_HOST_AXIS_RIGHT_TRIGGER < NK_HOST_AXIS_COUNT) ? host_axes[NK_HOST_AXIS_RIGHT_TRIGGER] : 0;
+
+    if (state->calib.stage == CALIBRATION_STAGE_REST) {
+        state->calib.rest_x_acc += cur_x;
+        state->calib.rest_y_acc += cur_y;
+        state->calib.rest_lt_acc += cur_lt;
+        state->calib.rest_rt_acc += cur_rt;
+        state->calib.sample_count++;
+        state->calib.elapsed_ms += delta_ms;
+
+        if (state->calib.elapsed_ms >= state->calib.duration_ms) {
+            if (state->calib.sample_count > 0) {
+                state->calib.sampled_rest_x = (int16_t)(state->calib.rest_x_acc / state->calib.sample_count);
+                state->calib.sampled_rest_y = (int16_t)(state->calib.rest_y_acc / state->calib.sample_count);
+                state->calib.sampled_rest_lt = (int16_t)(state->calib.rest_lt_acc / state->calib.sample_count);
+                state->calib.sampled_rest_rt = (int16_t)(state->calib.rest_rt_acc / state->calib.sample_count);
+            } else {
+                state->calib.sampled_rest_x = cur_x;
+                state->calib.sampled_rest_y = cur_y;
+                state->calib.sampled_rest_lt = cur_lt;
+                state->calib.sampled_rest_rt = cur_rt;
+            }
+
+            state->calib.sampled_min_x = state->calib.sampled_rest_x;
+            state->calib.sampled_max_x = state->calib.sampled_rest_x;
+            state->calib.sampled_min_y = state->calib.sampled_rest_y;
+            state->calib.sampled_max_y = state->calib.sampled_rest_y;
+            state->calib.sampled_max_lt = state->calib.sampled_rest_lt;
+            state->calib.sampled_max_rt = state->calib.sampled_rest_rt;
+
+            state->calib.stage = CALIBRATION_STAGE_EXTREMES;
+            state->calib.elapsed_ms = 0;
+        }
+        return true;
+    }
+
+    if (state->calib.stage == CALIBRATION_STAGE_EXTREMES) {
+        state->calib.elapsed_ms += delta_ms;
+        if (cur_x < state->calib.sampled_min_x) state->calib.sampled_min_x = cur_x;
+        if (cur_x > state->calib.sampled_max_x) state->calib.sampled_max_x = cur_x;
+        if (cur_y < state->calib.sampled_min_y) state->calib.sampled_min_y = cur_y;
+        if (cur_y > state->calib.sampled_max_y) state->calib.sampled_max_y = cur_y;
+        if (cur_lt > state->calib.sampled_max_lt) state->calib.sampled_max_lt = cur_lt;
+        if (cur_rt > state->calib.sampled_max_rt) state->calib.sampled_max_rt = cur_rt;
+        return true;
+    }
+
+    return true;
+}
+
+bool input_settings_finish_calibration_extremes(InputSettingsState *state) {
+    if (!state || state->calib.stage != CALIBRATION_STAGE_EXTREMES) return false;
+
+    state->calib.result_rest_x = state->calib.sampled_rest_x;
+    state->calib.result_min_x = (state->calib.sampled_min_x < state->calib.result_rest_x - 4000)
+                                ? state->calib.sampled_min_x : -32768;
+    state->calib.result_max_x = (state->calib.sampled_max_x > state->calib.result_rest_x + 4000)
+                                ? state->calib.sampled_max_x : 32767;
+
+    state->calib.result_rest_y = state->calib.sampled_rest_y;
+    state->calib.result_min_y = (state->calib.sampled_min_y < state->calib.result_rest_y - 4000)
+                                ? state->calib.sampled_min_y : -32768;
+    state->calib.result_max_y = (state->calib.sampled_max_y > state->calib.result_rest_y + 4000)
+                                ? state->calib.sampled_max_y : 32767;
+
+    int16_t rest_trig = (state->calib.sampled_rest_lt > state->calib.sampled_rest_rt)
+                        ? state->calib.sampled_rest_lt : state->calib.sampled_rest_rt;
+    int16_t ext_trig = (state->calib.sampled_max_lt > state->calib.sampled_max_rt)
+                       ? state->calib.sampled_max_lt : state->calib.sampled_max_rt;
+
+    if (ext_trig <= rest_trig + 1000) {
+        ext_trig = 32767;
+        if (rest_trig >= ext_trig) rest_trig = 0;
+    }
+
+    state->calib.result_trigger_rest = rest_trig;
+    state->calib.result_trigger_extreme = ext_trig;
+
+    state->calib.stage = CALIBRATION_STAGE_RESULT;
+    return true;
+}
+
+bool input_settings_accept_calibration(InputSettingsState *state) {
+    if (!state || state->calib.stage != CALIBRATION_STAGE_RESULT) return false;
+
+    state->profile.axes[NK_PSP_AXIS_ANALOG_X].rest = state->calib.result_rest_x;
+    state->profile.axes[NK_PSP_AXIS_ANALOG_X].min_val = state->calib.result_min_x;
+    state->profile.axes[NK_PSP_AXIS_ANALOG_X].max_val = state->calib.result_max_x;
+
+    state->profile.axes[NK_PSP_AXIS_ANALOG_Y].rest = state->calib.result_rest_y;
+    state->profile.axes[NK_PSP_AXIS_ANALOG_Y].min_val = state->calib.result_min_y;
+    state->profile.axes[NK_PSP_AXIS_ANALOG_Y].max_val = state->calib.result_max_y;
+
+    state->profile.trigger_rest = state->calib.result_trigger_rest;
+    state->profile.trigger_extreme = state->calib.result_trigger_extreme;
+
+    memset(&state->calib, 0, sizeof(state->calib));
+    state->calib.stage = CALIBRATION_STAGE_INACTIVE;
+    state->dirty = true;
+    return true;
+}

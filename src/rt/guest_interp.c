@@ -1,0 +1,1768 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 the Nakagawa Recomp authors
+
+#include "guest_interp.h"
+
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Installed by the scheduler (sched.c) when it owns the guest fibers; see recomp.h. */
+int (*sr_dispatch_host_stack_remaining)(size_t *remaining_out) = NULL;
+int (*sr_dispatch_host_stack_top)(uintptr_t *top_out) = NULL;
+/* The direct-call host-stack window (#855; see SR_HOST_STACK_CHECK in recomp.h). */
+SrHostStackWindow sr_host_stack_window;
+
+/* The TAIL transfer slot and its drain (#855; see recomp.h). They live here because every
+ * build that links generated code or the dispatcher links this file. */
+SrTailTransfer sr_tail_transfer;
+
+void sr_tail_fatal(const char *what, uint32_t target) {
+    fprintf(stderr, "TAIL_TRANSFER_FAULT: %s target=0x%08" PRIx32 "\n", what, target);
+    sr_flight_fatal(SR_FLIGHT_KIND_FATAL_DISPATCH, target, 0u, 0u);
+    fflush(stderr);
+    exit(1);
+}
+
+/* Inlined into both drains so a drain is one native frame at every CALL site (#855). */
+static inline __attribute__((always_inline)) void sr_tail_drain_run(CpuState *s, int segment) {
+    uint32_t chain_sp = 0u;
+    int chain_restores = 0;
+    while (sr_tail_transfer.pending) {
+        if (segment && !sr_tail_transfer.fn) {
+            /* The next computed transfer belongs to the enclosing drain. Its target runs at
+             * the live SP, as it did nested; the segment's outermost restore travels with it
+             * so the enclosing chain still applies the outermost restore it owes. */
+            if (chain_restores) {
+                sr_tail_transfer.restore_sp = chain_sp;
+                sr_tail_transfer.has_restore = 1u;
+            }
+            return;
+        }
+        const SrTailTransfer next = sr_tail_transfer;
+        memset(&sr_tail_transfer, 0, sizeof sr_tail_transfer);
+        if (next.state != s) sr_tail_fatal("tail-transfer-foreign-state", next.target);
+        /* The nested returns restored each callable body's entry SP in turn, innermost
+         * first, with no guest instruction in between; only the outermost survived. */
+        if (next.has_restore && !chain_restores) {
+            chain_sp = next.restore_sp;
+            chain_restores = 1;
+        }
+        if (next.fn) {
+            next.fn(s);
+        } else {
+            dispatch_tail_step(s, next.target);
+        }
+        /* A body leaves either through a transfer or through exception flow, never both. */
+        if (s->flow_kind != SR_FLOW_NONE && sr_tail_transfer.pending)
+            sr_tail_fatal("tail-transfer-with-pending-flow", sr_tail_transfer.target);
+    }
+    /* The native pieces of a frame handed on live were entered below the outermost body's
+     * entry SP and returned there; the restore gives that frame back. A chain that ends
+     * above it left through a longjmp or an unwind, and the guest's SP stands (#1935). */
+    if (chain_restores && s->r[29] < chain_sp) s->r[29] = chain_sp;
+}
+
+void sr_tail_drain(CpuState *s) {
+    sr_tail_drain_run(s, 0);
+}
+
+void sr_tail_drain_segment(CpuState *s) {
+    sr_tail_drain_run(s, 1);
+}
+
+typedef struct SrExecSpan {
+    uint32_t start;
+    uint32_t end;
+} SrExecSpan;
+
+static SrExecSpan *s_exec_spans;
+static size_t s_exec_span_count;
+static size_t s_exec_span_capacity;
+
+/* Two distinct qualifications keep guest control flow lawful:
+ *
+ * 1. EXECUTABLE AUTHORITY -- membership in an analyzer-owned, end-exclusive
+ *    span registered below. Codegen derives these spans from the primary image
+ *    and every extra module it actually translated. Authority is structural:
+ *    alignment and a complete four-byte fetch slot. It deliberately does NOT
+ *    require the flat interpreter arena to back the bytes: extra modules are
+ *    translated at build time from their own files and are never copied into
+ *    guest RAM, so their addresses (e.g. 0x32200000-class load slots) are
+ *    owned here while being unreachable through SR_PHYS/SR_HOST.
+ * 2. INTERPRETER FETCH BACKING -- sr_guest_span_readable() over the actual
+ *    instruction word. Only interpreting bytes needs this; entering an already
+ *    translated native body does not.
+ *
+ * Mapped RAM alone grants neither tier, and native registration alone grants
+ * neither tier. */
+void sr_exec_span_reset(void) {
+    free(s_exec_spans);
+    s_exec_spans = NULL;
+    s_exec_span_count = 0;
+    s_exec_span_capacity = 0;
+}
+
+int sr_exec_span_register(uint32_t start, uint32_t end) {
+    if ((start & 3u) != 0u || end <= start) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < s_exec_span_count; i++) {
+        if (s_exec_spans[i].start == start && s_exec_spans[i].end == end) {
+            return 1;
+        }
+    }
+
+    if (s_exec_span_count == s_exec_span_capacity) {
+        size_t next_capacity = s_exec_span_capacity == 0u ? 4u : s_exec_span_capacity * 2u;
+        if (next_capacity < s_exec_span_capacity ||
+            next_capacity > SIZE_MAX / sizeof(*s_exec_spans)) {
+            return 0;
+        }
+        SrExecSpan *next = realloc(s_exec_spans, next_capacity * sizeof(*next));
+        if (!next) {
+            return 0;
+        }
+        s_exec_spans = next;
+        s_exec_span_capacity = next_capacity;
+    }
+
+    s_exec_spans[s_exec_span_count].start = start;
+    s_exec_spans[s_exec_span_count].end = end;
+    s_exec_span_count++;
+    return 1;
+}
+
+static _Atomic(uint32_t) s_module_bound_count;
+
+/* Authority tier: the PC is 4-byte aligned and one registered span covers its
+ * complete fetch slot. This is the predicate sr_lookup() applies before
+ * entering a native body; whether the arena can actually supply those bytes
+ * matters only when the interpreter itself must fetch them.
+ *
+ * A bound runtime-placed module (below) is the only authority for its own
+ * image range: a static span that happens to cover those addresses (another
+ * module translated at a fixed base that is not loaded) grants nothing there. */
+int sr_exec_span_owns_fetch(uint32_t pc) {
+    if ((pc & 3u) != 0u) {
+        return 0;
+    }
+    /* Fast path: bypass runtime module authority query when no modules are bound. */
+    if (atomic_load_explicit(&s_module_bound_count, memory_order_acquire) != 0u) {
+        int module_authority = sr_module_code_fetch_authority(pc);
+        if (module_authority >= 0) {
+            return module_authority;
+        }
+    }
+    /* Fast path: single registered span check (common case for recompiled titles). */
+    if (s_exec_span_count == 1u) {
+        const SrExecSpan *span = &s_exec_spans[0];
+        return (pc >= span->start && pc < span->end && (span->end - pc) >= 4u) ? 1 : 0;
+    }
+    for (size_t i = 0; i < s_exec_span_count; i++) {
+        const SrExecSpan *span = &s_exec_spans[i];
+        if (pc >= span->start && pc < span->end && span->end - pc >= 4u) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- Runtime-placed guest modules (issue #704) ------------------------------
+ *
+ * Executable authority for a module the game loads at run time. The generated
+ * program registers one SrModuleCode descriptor per runtime-placed module at
+ * startup (sr_register_all); the descriptor owns no guest addresses until the
+ * module loader, having checked the file's identity and laid the image out,
+ * binds it at the base the guest allocator chose. A binding makes
+ * [base + link_low, base + link_high) dispatch to the module's translated bodies
+ * and grants fetch authority to its analyzer-owned spans; unbinding withdraws
+ * both and forgets the module's stale-code expectations, so a different module
+ * later placed at the same addresses never meets this one's translations.
+ *
+ * Bindings are published with release stores and read with acquire loads, the
+ * contract src/rt/dispatch_table.h uses for its own lock-free readers; binding
+ * and unbinding themselves happen one at a time from the module loader. */
+
+static const SrModuleCode **s_module_codes;
+static size_t s_module_code_count;
+static size_t s_module_code_capacity;
+
+typedef struct SrModuleBinding {
+    const SrModuleCode *code;
+    uint32_t base;
+    uint32_t start;   /* guest image range [start, end) */
+    uint32_t end;
+} SrModuleBinding;
+
+static SrModuleBinding s_module_bindings[SR_MODULE_CODE_MAX_BOUND];
+static _Atomic(uint32_t) s_module_binding_live[SR_MODULE_CODE_MAX_BOUND];
+
+static int module_name_equal(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
+        if (x != y) return 0;
+    }
+    return *a == *b;
+}
+
+void sr_module_code_register(const SrModuleCode *code) {
+    if (!code || !code->name || !code->name[0] || !code->base) {
+        fprintf(stderr, "sr_module_code_register: malformed generated module descriptor\n");
+        abort();
+    }
+    for (size_t i = 0; i < s_module_code_count; i++) {
+        if (s_module_codes[i] == code) return;
+        if (module_name_equal(s_module_codes[i]->name, code->name)) {
+            fprintf(stderr, "sr_module_code_register: two translated modules are named %s\n",
+                    code->name);
+            abort();
+        }
+    }
+    if (s_module_code_count == s_module_code_capacity) {
+        size_t next = s_module_code_capacity ? s_module_code_capacity * 2u : 8u;
+        const SrModuleCode **grown = realloc((void *)s_module_codes, next * sizeof(*grown));
+        if (!grown) {
+            fprintf(stderr, "sr_module_code_register: out of memory\n");
+            abort();
+        }
+        s_module_codes = grown;
+        s_module_code_capacity = next;
+    }
+    s_module_codes[s_module_code_count++] = code;
+}
+
+const SrModuleCode *sr_module_code_find(const char *name) {
+    if (!name) return NULL;
+    for (size_t i = 0; i < s_module_code_count; i++) {
+        if (module_name_equal(s_module_codes[i]->name, name)) return s_module_codes[i];
+    }
+    return NULL;
+}
+
+unsigned sr_module_code_count(void) { return (unsigned)s_module_code_count; }
+
+const SrModuleCode *sr_module_code_at(unsigned index) {
+    return index < s_module_code_count ? s_module_codes[index] : NULL;
+}
+
+/* FNV-1a over bytes, 64-bit. tools/codegen.py records the same digest of an overlay's
+ * leading bytes; the shared vectors are pinned by both test suites. */
+uint64_t sr_module_code_fnv1a64(const void *bytes, size_t size) {
+    const unsigned char *p = (const unsigned char *)bytes;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < size; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+const char *sr_module_bind_result_name(SrModuleBindResult result) {
+    switch (result) {
+    case SR_MODULE_BIND_OK: return "bound";
+    case SR_MODULE_BIND_UNSUPPORTED: return "translation-unavailable";
+    case SR_MODULE_BIND_ALREADY_BOUND: return "second-instance";
+    case SR_MODULE_BIND_BAD_BASE: return "invalid-base";
+    case SR_MODULE_BIND_OVERLAP: return "image-overlap";
+    case SR_MODULE_BIND_IMAGE_UNREADABLE: return "image-not-guest-memory";
+    case SR_MODULE_BIND_TABLE_FULL: return "binding-table-full";
+    default: return "unknown";
+    }
+}
+
+static int module_binding_slot(const SrModuleCode *code) {
+    for (unsigned i = 0; i < SR_MODULE_CODE_MAX_BOUND; i++) {
+        if (atomic_load_explicit(&s_module_binding_live[i], memory_order_acquire) &&
+            s_module_bindings[i].code == code) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static uint32_t module_live_word(uint32_t address) {
+    return sr_r32(address);
+}
+
+SrModuleBindResult sr_module_code_bind(const SrModuleCode *code, uint32_t base,
+                                       SrModuleBindDetail *detail) {
+    SrModuleBindDetail scratch;
+    if (!detail) detail = &scratch;
+    memset(detail, 0, sizeof(*detail));
+    if (!code || code->unsupported_reason) return SR_MODULE_BIND_UNSUPPORTED;
+    if (module_binding_slot(code) >= 0) return SR_MODULE_BIND_ALREADY_BOUND;
+    if (!code->relocatable && base != 0u) {
+        detail->address = base;
+        return SR_MODULE_BIND_BAD_BASE;
+    }
+    uint64_t start = (uint64_t)base + code->link_low;
+    uint64_t end = (uint64_t)base + code->link_high;
+    if (code->link_high <= code->link_low || end > 0x100000000ull) {
+        detail->address = base;
+        return SR_MODULE_BIND_BAD_BASE;
+    }
+    if (!sr_guest_span_readable_current((uint32_t)start, (uint32_t)(end - start))) {
+        detail->address = (uint32_t)start;
+        return SR_MODULE_BIND_IMAGE_UNREADABLE;
+    }
+    int free_slot = -1;
+    for (unsigned i = 0; i < SR_MODULE_CODE_MAX_BOUND; i++) {
+        if (!atomic_load_explicit(&s_module_binding_live[i], memory_order_acquire)) {
+            if (free_slot < 0) free_slot = (int)i;
+            continue;
+        }
+        const SrModuleBinding *other = &s_module_bindings[i];
+        if (start < other->end && other->start < end) {
+            detail->address = other->start;
+            return SR_MODULE_BIND_OVERLAP;
+        }
+    }
+    if (free_slot < 0) return SR_MODULE_BIND_TABLE_FULL;
+
+    *code->base = base;
+    SrModuleBinding *binding = &s_module_bindings[free_slot];
+    binding->code = code;
+    binding->base = base;
+    binding->start = (uint32_t)start;
+    binding->end = (uint32_t)end;
+    /* The translation now names exactly these guest words. Under SR_STALE_DETECT,
+     * record each translated run as it was loaded, so a later overwrite of this
+     * module's code is detected at cache maintenance like the primary image's. */
+    if (sr_stale_enabled()) {
+        for (uint32_t i = 0; i < code->nfuncs; i++) {
+            const SrModuleFunc *f = &code->funcs[i];
+            uint64_t f_end = (uint64_t)f->offset + (uint64_t)f->nwords * 4u;
+            if (f->nwords == 0u || f->offset < code->link_low || f_end > code->link_high)
+                continue;
+            uint32_t at = base + f->offset;
+            uint32_t *words = (uint32_t *)malloc((size_t)f->nwords * sizeof(uint32_t));
+            if (!words) break;
+            for (uint32_t w = 0; w < f->nwords; w++) words[w] = module_live_word(at + 4u * w);
+            sr_stale_register_block(at, f->nwords, sr_stale_fnv1a(words, f->nwords));
+            free(words);
+        }
+    }
+    atomic_store_explicit(&s_module_binding_live[free_slot], 1u, memory_order_release);
+    atomic_fetch_add_explicit(&s_module_bound_count, 1u, memory_order_release);
+    return SR_MODULE_BIND_OK;
+}
+
+void sr_module_code_unbind(const SrModuleCode *code) {
+    int slot = module_binding_slot(code);
+    if (slot < 0) return;
+    SrModuleBinding binding = s_module_bindings[slot];
+    atomic_store_explicit(&s_module_binding_live[slot], 0u, memory_order_release);
+    atomic_fetch_sub_explicit(&s_module_bound_count, 1u, memory_order_release);
+    sr_stale_forget_range(binding.start, binding.end - binding.start);
+    memset(&s_module_bindings[slot], 0, sizeof(s_module_bindings[slot]));
+}
+
+int sr_module_code_is_bound(const SrModuleCode *code, uint32_t *base_out) {
+    int slot = module_binding_slot(code);
+    if (slot < 0) return 0;
+    if (base_out) *base_out = s_module_bindings[slot].base;
+    return 1;
+}
+
+static const SrModuleBinding *module_binding_for(uint32_t pc) {
+    if (atomic_load_explicit(&s_module_bound_count, memory_order_acquire) == 0u) return NULL;
+    for (unsigned i = 0; i < SR_MODULE_CODE_MAX_BOUND; i++) {
+        if (!atomic_load_explicit(&s_module_binding_live[i], memory_order_acquire)) continue;
+        const SrModuleBinding *binding = &s_module_bindings[i];
+        if (pc >= binding->start && pc < binding->end) return binding;
+    }
+    return NULL;
+}
+
+static int module_span_owns(const SrModuleCode *code, uint32_t link_pc) {
+    for (uint32_t i = 0; i < code->nspans; i++) {
+        const SrModuleSpan *span = &code->spans[i];
+        if (link_pc >= span->start && link_pc < span->end && span->end - link_pc >= 4u)
+            return 1;
+    }
+    return 0;
+}
+
+RecompFn sr_module_code_lookup(uint32_t pc, int *in_bound_image) {
+    const SrModuleBinding *binding = module_binding_for(pc);
+    if (in_bound_image) *in_bound_image = binding != NULL;
+    if (!binding || (pc & 3u) != 0u) return NULL;
+    const SrModuleCode *code = binding->code;
+    uint32_t link_pc = pc - binding->base;
+    if (!module_span_owns(code, link_pc)) return NULL;
+    uint32_t lo = 0, hi = code->nfuncs;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2u;
+        if (code->funcs[mid].offset < link_pc) lo = mid + 1u;
+        else hi = mid;
+    }
+    return lo < code->nfuncs && code->funcs[lo].offset == link_pc ? code->funcs[lo].fn : NULL;
+}
+
+static uint64_t overlay_hash_words(uint64_t h, uint32_t address, uint32_t nwords) {
+    for (uint32_t i = 0; i < nwords; i++) {
+        uint32_t word = sr_r32(address + 4u * i);
+        for (unsigned b = 0; b < 4u; b++) {
+            h ^= (word >> (8u * b)) & 0xffu;
+            h *= 0x100000001b3ull;
+        }
+    }
+    return h;
+}
+
+/* Whether guest memory holds the words of a code overlay's check ranges
+ * (overlay_check_spans), which add up to overlay_check_len bytes. */
+static int overlay_spans_resident(const SrModuleCode *code) {
+    uint64_t total = 0, h = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < code->noverlay_check_spans; i++) {
+        const SrModuleSpan *span = &code->overlay_check_spans[i];
+        if (span->end <= span->start || ((span->start | span->end) & 3u) != 0u ||
+            span->start < code->link_low || span->end > code->link_high ||
+            !sr_guest_span_readable_current(span->start, span->end - span->start))
+            return 0;
+        h = overlay_hash_words(h, span->start, (span->end - span->start) / 4u);
+        total += span->end - span->start;
+    }
+    return total != 0u && total == code->overlay_check_len && h == code->overlay_check_fnv1a64;
+}
+
+/* Whether guest memory holds a code overlay's identifying bytes at its link address. The
+ * length is whole words (a header of 0x40 bytes plus word-aligned text). */
+static int overlay_resident(const SrModuleCode *code) {
+    if (code->overlay_check_spans) return overlay_spans_resident(code);
+    uint64_t end = (uint64_t)code->link_low + code->overlay_check_len;
+    if ((code->overlay_check_len & 3u) != 0u || end > code->link_high ||
+        !sr_guest_span_readable_current(code->link_low, code->overlay_check_len))
+        return 0;
+    return overlay_hash_words(0xcbf29ce484222325ull, code->link_low,
+                              code->overlay_check_len / 4u) == code->overlay_check_fnv1a64;
+}
+
+uint32_t sr_module_code_sync_overlays(uint32_t lo, uint32_t hi) {
+    uint32_t changed = 0;
+    /* Unbind first, so the overlay now in memory can take the range the old one held. */
+    for (size_t i = 0; i < s_module_code_count; i++) {
+        const SrModuleCode *code = s_module_codes[i];
+        if (!code->overlay_check_len || code->link_high <= lo || code->link_low >= hi) continue;
+        if (module_binding_slot(code) >= 0 && !overlay_resident(code)) {
+            sr_module_code_unbind(code);
+            fprintf(stderr, "CODE_OVERLAY_UNBOUND: %s [0x%08" PRIx32 ",0x%08" PRIx32 ")\n",
+                    code->name, code->link_low, code->link_high);
+            changed++;
+        }
+    }
+    for (size_t i = 0; i < s_module_code_count; i++) {
+        const SrModuleCode *code = s_module_codes[i];
+        if (!code->overlay_check_len || code->link_high <= lo || code->link_low >= hi) continue;
+        if (module_binding_slot(code) >= 0 || !overlay_resident(code)) continue;
+        SrModuleBindDetail detail;
+        SrModuleBindResult result = sr_module_code_bind(code, 0u, &detail);
+        if (result == SR_MODULE_BIND_OK) {
+            fprintf(stderr, "CODE_OVERLAY_BOUND: %s [0x%08" PRIx32 ",0x%08" PRIx32 ")\n",
+                    code->name, code->link_low, code->link_high);
+            changed++;
+        } else {
+            /* Left unbound: a call into its range misses and stops by name. */
+            fprintf(stderr, "CODE_OVERLAY_BIND_FAILED: %s: %s at 0x%08" PRIx32 "\n", code->name,
+                    sr_module_bind_result_name(result), detail.address);
+        }
+    }
+    return changed;
+}
+
+int sr_module_code_fetch_authority(uint32_t pc) {
+    const SrModuleBinding *binding = module_binding_for(pc);
+    if (!binding) return -1;
+    if ((pc & 3u) != 0u) return 0;
+    return module_span_owns(binding->code, pc - binding->base);
+}
+
+void sr_module_code_reset(void) {
+    for (unsigned i = 0; i < SR_MODULE_CODE_MAX_BOUND; i++) {
+        if (atomic_load_explicit(&s_module_binding_live[i], memory_order_acquire)) {
+            const SrModuleBinding *binding = &s_module_bindings[i];
+            sr_stale_forget_range(binding->start, binding->end - binding->start);
+        }
+        atomic_store_explicit(&s_module_binding_live[i], 0u, memory_order_release);
+        memset(&s_module_bindings[i], 0, sizeof(s_module_bindings[i]));
+    }
+    atomic_store_explicit(&s_module_bound_count, 0u, memory_order_release);
+    free((void *)s_module_codes);
+    s_module_codes = NULL;
+    s_module_code_count = 0;
+    s_module_code_capacity = 0;
+}
+
+static void set_fault(
+    SrGuestInterpFault *fault,
+    uint32_t pc,
+    uint32_t opcode,
+    uint32_t address,
+    int opcode_valid) {
+    if (!fault) {
+        return;
+    }
+    fault->pc = pc;
+    fault->opcode = opcode;
+    fault->address = address;
+    fault->opcode_valid = opcode_valid;
+}
+
+/* Translate a cpu_lle helper return (<0, flow metadata set) into an
+ * interpreter result. Only called when the helper reported a transfer. */
+static SrGuestInterpResult map_flow_result(
+    CpuState *s,
+    int helper_rc,
+    SrGuestInterpFault *fault,
+    uint32_t pc,
+    uint32_t opcode) {
+    (void)helper_rc;
+    switch (s->flow_kind) {
+    case SR_FLOW_EXCEPTION:
+        return SR_GUEST_INTERP_EXCEPTION;
+    case SR_FLOW_ERET:
+        return SR_GUEST_INTERP_ERET;
+    default:
+        set_fault(fault, pc, opcode, s->flow_target, 1);
+        return SR_GUEST_INTERP_FLOW_FATAL;
+    }
+}
+
+/* Fetch tier: interpretation needs the actual instruction word, so this is the
+ * only place that couples executable authority with arena-backed readability.
+ * An owned but unbacked PC fails closed here as a precise memory fault instead
+ * of reading fabricated or out-of-arena bytes. */
+static SrGuestInterpResult fetch_instruction(
+    uint32_t pc,
+    uint32_t *opcode,
+    SrGuestInterpFault *fault) {
+    if ((pc & 3u) != 0u) {
+        set_fault(fault, pc, 0u, pc, 0);
+        return SR_GUEST_INTERP_MISALIGNED_PC;
+    }
+
+    /* A bound runtime-placed module is the only authority for its own image range, for
+     * the interpreter as for sr_lookup (sr_exec_span_owns_fetch): its translated spans are
+     * analyzer-owned code, so an entry the analysis missed there is interpreted. */
+    if (atomic_load_explicit(&s_module_bound_count, memory_order_acquire) != 0u) {
+        int module_authority = sr_module_code_fetch_authority(pc);
+        if (module_authority == 1) {
+            if (!sr_inrange_n(pc, 4u)) {
+                set_fault(fault, pc, 0u, pc, 0);
+                return SR_GUEST_INTERP_MEMORY_FAULT;
+            }
+            *opcode = MEM_R32(pc);
+            return SR_GUEST_INTERP_AOT_HANDOFF;
+        }
+        if (module_authority == 0) {
+            set_fault(fault, pc, 0u, pc, 0);
+            return SR_GUEST_INTERP_NOT_EXECUTABLE;
+        }
+    }
+
+    int touches_span_boundary = 0;
+    for (size_t i = 0; i < s_exec_span_count; i++) {
+        const SrExecSpan *span = &s_exec_spans[i];
+        if (pc < span->start || pc > span->end) {
+            continue;
+        }
+        touches_span_boundary = 1;
+        if (pc < span->end && span->end - pc >= 4u) {
+            if (!sr_inrange_n(pc, 4u)) {
+                set_fault(fault, pc, 0u, pc, 0);
+                return SR_GUEST_INTERP_MEMORY_FAULT;
+            }
+            *opcode = MEM_R32(pc);
+            return SR_GUEST_INTERP_AOT_HANDOFF;
+        }
+    }
+
+    set_fault(fault, pc, 0u, pc, 0);
+    return touches_span_boundary ? SR_GUEST_INTERP_FETCH_BOUNDARY
+                                 : SR_GUEST_INTERP_NOT_EXECUTABLE;
+}
+
+static uint32_t read_gpr(const CpuState *s, uint32_t index) {
+    return index == 0u ? 0u : s->r[index];
+}
+
+static void write_gpr(CpuState *s, uint32_t index, uint32_t value) {
+    if (index != 0u) {
+        s->r[index] = value;
+    }
+}
+
+static uint32_t sign_extend_16(uint32_t opcode) {
+    uint32_t value = opcode & 0xffffu;
+    return (value & 0x8000u) != 0u ? value | 0xffff0000u : value;
+}
+
+/* Every control-transfer encoding this file recognises, plus every control
+ * encoding it deliberately does NOT implement.
+ *
+ * Both sets matter. The first drives the branch machinery below; the second
+ * keeps an unimplemented transfer OUT of the straight-line executor, where its
+ * bit fields would otherwise be decoded as some unrelated arithmetic form. A
+ * control instruction is never "an opcode we happen not to know" -- misreading
+ * one silently rewrites the program's shape. */
+static int is_control_opcode(uint32_t opcode) {
+    const uint32_t primary = opcode >> 26;
+    if (primary == 0u) {
+        const uint32_t funct = opcode & 0x3fu;
+        /* syscall/break trap without a delay slot; they still classify as
+         * control so the straight-line executor cannot misread them as
+         * arithmetic (spec 3.5). eret is recognized by its exact encoding. */
+        return funct == 0x08u || funct == 0x09u ||
+               funct == 0x0cu || funct == 0x0du;
+    }
+    if (opcode == SR_OPCODE_ERET) {
+        return 1;
+    }
+    switch (primary) {
+    case 0x01u:                                     /* REGIMM b*z / b*zal */
+    case 0x02u: case 0x03u:                         /* j, jal */
+    case 0x04u: case 0x05u: case 0x06u: case 0x07u: /* beq, bne, blez, bgtz */
+    case 0x14u: case 0x15u: case 0x16u: case 0x17u: /* the *l likely forms */
+        return 1;
+    case 0x11u: case 0x12u:                         /* the COP1/COP2 branch group */
+        return ((opcode >> 21) & 31u) == 8u;
+    default:
+        return 0;
+    }
+}
+
+/* Bounded guest memory access.
+ *
+ * Alignment is checked before the bounds test and both are checked before any
+ * architectural effect, so a rejected access leaves CpuState and guest memory
+ * exactly as they were. Sub-word widths use the same rule as the word forms
+ * that already existed here: this layer is strictly more fail-closed than the
+ * MEM_* accessors the generated code uses, which absorb an out-of-range access
+ * through sr_oor() instead of stopping. */
+static int aligned_for(uint32_t address, unsigned width) {
+    return (address & (width - 1u)) == 0u;
+}
+
+/* Execute one non-control instruction.
+ *
+ * `store_address`/`store_size` report the instruction's guest store so the
+ * caller can hand it to sr_end() -- the same (address, size) pair the generated
+ * code passes -- keeping both execution lanes' instruction traces in the one
+ * canonical format. */
+static SrGuestInterpResult execute_noncontrol(
+    CpuState *s,
+    uint32_t pc,
+    uint32_t opcode,
+    uint32_t *store_address,
+    int *store_size,
+    SrGuestInterpFault *fault) {
+    const uint32_t primary = opcode >> 26;
+    const uint32_t rs = (opcode >> 21) & 31u;
+    const uint32_t rt = (opcode >> 16) & 31u;
+    const uint32_t rd = (opcode >> 11) & 31u;
+    const uint32_t shift = (opcode >> 6) & 31u;
+
+    *store_address = 0u;
+    *store_size = 0;
+
+    /* A transfer reaching the straight-line executor -- a branch in a delay
+     * slot, or a form this file does not implement -- is rejected as itself,
+     * never decoded as arithmetic. The two trap forms are exempt: they are
+     * classified as control for fetch ordering, but a delay-slot occurrence
+     * still executes here under the caller's delay context (spec 3.5). */
+    if (is_control_opcode(opcode) &&
+        !(primary == 0x00u &&
+          (((opcode & 0x3fu) == 0x0cu) || ((opcode & 0x3fu) == 0x0du)))) {
+        set_fault(fault, pc, opcode, pc, 1);
+        return SR_GUEST_INTERP_UNSUPPORTED;
+    }
+
+    if (primary == 0x00u) { /* SPECIAL */
+        const uint32_t funct = opcode & 0x3fu;
+        if (funct == 0x0cu || funct == 0x0du) {
+            /* Delay-slot trap (straight-line traps classify as control and
+             * never arrive here). EPC/BD come from the delay context the
+             * branch path installed; with the LLE gate off this keeps the
+             * historical UNSUPPORTED result. */
+            if (!sr_cpu_lle_enabled()) {
+                set_fault(fault, pc, opcode, pc, 1);
+                return SR_GUEST_INTERP_UNSUPPORTED;
+            }
+            {
+                uint32_t exception_pc = s->in_delay_slot != 0u ? s->next_pc : pc;
+                unsigned delay = s->in_delay_slot != 0u ? 1u : 0u;
+                unsigned code = funct == 0x0cu ? SR_EXC_SYS : SR_EXC_BP;
+                int rc = sr_cpu_raise_exception(
+                    s, code, pc, exception_pc, 0u, delay, 0u);
+                return map_flow_result(s, rc, fault, pc, opcode);
+            }
+        }
+        switch (funct) {
+        case 0x00u: write_gpr(s, rd, read_gpr(s, rt) << shift); break;   /* sll */
+        case 0x02u: /* srl; Allegrex rs=1 is the rotate rotr, other rs values are reserved */
+            if (rs == 1u) {
+                const uint32_t v = read_gpr(s, rt);
+                write_gpr(s, rd, shift == 0u ? v : (v >> shift) | (v << (32u - shift)));
+            } else if (rs == 0u) {
+                write_gpr(s, rd, read_gpr(s, rt) >> shift);
+            } else {
+                set_fault(fault, pc, opcode, pc, 1);
+                return SR_GUEST_INTERP_UNSUPPORTED;
+            }
+            break;
+        case 0x03u: /* sra */
+            write_gpr(s, rd, (uint32_t)(sr_u32_as_s32(read_gpr(s, rt)) >> shift));
+            break;
+        case 0x04u: /* sllv */
+            write_gpr(s, rd, read_gpr(s, rt) << (read_gpr(s, rs) & 31u));
+            break;
+        case 0x06u: { /* srlv; Allegrex sa=1 is the rotate rotrv, other sa values are reserved */
+            const uint32_t v = read_gpr(s, rt);
+            const uint32_t amount = read_gpr(s, rs) & 31u;
+            if (shift == 1u) {
+                write_gpr(s, rd, amount == 0u ? v : (v >> amount) | (v << (32u - amount)));
+            } else if (shift == 0u) {
+                write_gpr(s, rd, v >> amount);
+            } else {
+                set_fault(fault, pc, opcode, pc, 1);
+                return SR_GUEST_INTERP_UNSUPPORTED;
+            }
+            break;
+        }
+        case 0x07u: /* srav */
+            write_gpr(s, rd, (uint32_t)(sr_u32_as_s32(read_gpr(s, rt)) >>
+                                        (read_gpr(s, rs) & 31u)));
+            break;
+        case 0x0au: /* movz rd, rs, rt */
+            if (read_gpr(s, rt) == 0u) write_gpr(s, rd, read_gpr(s, rs));
+            break;
+        case 0x0bu: /* movn rd, rs, rt */
+            if (read_gpr(s, rt) != 0u) write_gpr(s, rd, read_gpr(s, rs));
+            break;
+        case 0x10u: write_gpr(s, rd, s->hi); break;                      /* mfhi */
+        case 0x11u: s->hi = read_gpr(s, rs); break;                      /* mthi */
+        case 0x12u: write_gpr(s, rd, s->lo); break;                      /* mflo */
+        case 0x13u: s->lo = read_gpr(s, rs); break;                      /* mtlo */
+        case 0x16u: { /* clz (Allegrex) */
+            const uint32_t v = read_gpr(s, rs);
+            uint32_t count = 0u;
+            while (count < 32u && (v & (UINT32_C(0x80000000) >> count)) == 0u) count++;
+            write_gpr(s, rd, count);
+            break;
+        }
+        case 0x17u: { /* clo (Allegrex) */
+            const uint32_t v = read_gpr(s, rs);
+            uint32_t count = 0u;
+            while (count < 32u && (v & (UINT32_C(0x80000000) >> count)) != 0u) count++;
+            write_gpr(s, rd, count);
+            break;
+        }
+        case 0x18u: { /* mult */
+            const int64_t product = (int64_t)sr_u32_as_s32(read_gpr(s, rs)) *
+                                    (int64_t)sr_u32_as_s32(read_gpr(s, rt));
+            s->lo = (uint32_t)((uint64_t)product & 0xffffffffu);
+            s->hi = (uint32_t)((uint64_t)product >> 32);
+            break;
+        }
+        case 0x19u: { /* multu */
+            const uint64_t product = (uint64_t)read_gpr(s, rs) * (uint64_t)read_gpr(s, rt);
+            s->lo = (uint32_t)(product & 0xffffffffu);
+            s->hi = (uint32_t)(product >> 32);
+            break;
+        }
+        case 0x1au: { /* div: the PSP's results for overflow and a zero divisor */
+            const int32_t a = sr_u32_as_s32(read_gpr(s, rs));
+            const int32_t b = sr_u32_as_s32(read_gpr(s, rt));
+            if (a == INT32_MIN && b == -1) {
+                s->lo = 0x80000000u;
+                s->hi = 0xffffffffu;
+            } else if (b != 0) {
+                s->lo = (uint32_t)(a / b);
+                s->hi = (uint32_t)(a % b);
+            } else {
+                s->lo = a < 0 ? 1u : 0xffffffffu;
+                s->hi = (uint32_t)a;
+            }
+            break;
+        }
+        case 0x1bu: { /* divu */
+            const uint32_t a = read_gpr(s, rs);
+            const uint32_t b = read_gpr(s, rt);
+            if (b != 0u) {
+                s->lo = a / b;
+                s->hi = a % b;
+            } else {
+                s->lo = a <= 0xffffu ? 0xffffu : 0xffffffffu;
+                s->hi = a;
+            }
+            break;
+        }
+        case 0x1cu: case 0x1du: case 0x2eu: case 0x2fu: {
+            /* madd / maddu / msub / msubu (Allegrex, in the SPECIAL table) */
+            uint64_t acc = ((uint64_t)s->hi << 32) | s->lo;
+            const uint64_t product = (funct == 0x1cu || funct == 0x2eu)
+                ? (uint64_t)((int64_t)sr_u32_as_s32(read_gpr(s, rs)) *
+                             (int64_t)sr_u32_as_s32(read_gpr(s, rt)))
+                : (uint64_t)read_gpr(s, rs) * (uint64_t)read_gpr(s, rt);
+            acc = funct <= 0x1du ? acc + product : acc - product;
+            s->lo = (uint32_t)acc;
+            s->hi = (uint32_t)(acc >> 32);
+            break;
+        }
+        case 0x20u: /* add: the PSP's add does not trap on overflow */
+        case 0x21u: write_gpr(s, rd, read_gpr(s, rs) + read_gpr(s, rt)); break;  /* addu */
+        case 0x22u: /* sub: likewise */
+        case 0x23u: write_gpr(s, rd, read_gpr(s, rs) - read_gpr(s, rt)); break;  /* subu */
+        case 0x24u: write_gpr(s, rd, read_gpr(s, rs) & read_gpr(s, rt)); break;  /* and */
+        case 0x25u: write_gpr(s, rd, read_gpr(s, rs) | read_gpr(s, rt)); break;  /* or */
+        case 0x26u: write_gpr(s, rd, read_gpr(s, rs) ^ read_gpr(s, rt)); break;  /* xor */
+        case 0x27u: write_gpr(s, rd, ~(read_gpr(s, rs) | read_gpr(s, rt))); break;  /* nor */
+        case 0x2au: /* slt */
+            write_gpr(s, rd,
+                      sr_u32_as_s32(read_gpr(s, rs)) < sr_u32_as_s32(read_gpr(s, rt))
+                          ? 1u : 0u);
+            break;
+        case 0x2bu: /* sltu */
+            write_gpr(s, rd, read_gpr(s, rs) < read_gpr(s, rt) ? 1u : 0u);
+            break;
+        case 0x2cu: { /* max (Allegrex) */
+            const int32_t a = sr_u32_as_s32(read_gpr(s, rs));
+            const int32_t b = sr_u32_as_s32(read_gpr(s, rt));
+            write_gpr(s, rd, (uint32_t)(a > b ? a : b));
+            break;
+        }
+        case 0x2du: { /* min (Allegrex) */
+            const int32_t a = sr_u32_as_s32(read_gpr(s, rs));
+            const int32_t b = sr_u32_as_s32(read_gpr(s, rt));
+            write_gpr(s, rd, (uint32_t)(a < b ? a : b));
+            break;
+        }
+        default:
+            set_fault(fault, pc, opcode, pc, 1);
+            return SR_GUEST_INTERP_UNSUPPORTED;
+        }
+        s->r[0] = 0u;
+        return SR_GUEST_INTERP_AOT_HANDOFF;
+    }
+
+    if (primary == 0x1fu) { /* SPECIAL3: Allegrex ext/ins/seb/seh */
+        const uint32_t funct = opcode & 0x3fu;
+        if (funct == 0x00u) { /* ext: rd encodes size-1, sa encodes pos */
+            const uint32_t pos = shift;
+            const uint32_t size = rd + 1u;
+            if (pos + size > 32u) {
+                set_fault(fault, pc, opcode, pc, 1);
+                return SR_GUEST_INTERP_UNSUPPORTED;
+            }
+            const uint32_t value_mask = size == 32u
+                ? UINT32_MAX : (UINT32_C(1) << size) - 1u;
+            write_gpr(s, rt, (read_gpr(s, rs) >> pos) & value_mask);
+        } else if (funct == 0x04u) { /* ins: rd encodes msb, sa encodes pos */
+            const uint32_t pos = shift;
+            const uint32_t msb = rd;
+            if (msb < pos) {
+                set_fault(fault, pc, opcode, pc, 1);
+                return SR_GUEST_INTERP_UNSUPPORTED;
+            }
+            const uint32_t size = msb - pos + 1u;
+            const uint32_t value_mask = size == 32u
+                ? UINT32_MAX : (UINT32_C(1) << size) - 1u;
+            const uint32_t field_mask = value_mask << pos;
+            const uint32_t old_value = read_gpr(s, rt);
+            const uint32_t inserted = (read_gpr(s, rs) << pos) & field_mask;
+            write_gpr(s, rt, (old_value & ~field_mask) | inserted);
+        } else if (funct == 0x20u && rs == 0u &&
+                   (shift == 0x02u || shift == 0x03u || shift == 0x10u ||
+                    shift == 0x14u || shift == 0x18u)) {
+            const uint32_t value = read_gpr(s, rt);
+            if (shift == 0x02u) { /* wsbh */
+                write_gpr(s, rd, ((value & 0x00ff00ffu) << 8) | ((value >> 8) & 0x00ff00ffu));
+            } else if (shift == 0x03u) { /* wsbw */
+                write_gpr(s, rd, (value << 24) | ((value & 0x0000ff00u) << 8) |
+                                 ((value >> 8) & 0x0000ff00u) | (value >> 24));
+            } else if (shift == 0x14u) { /* bitrev (Allegrex) */
+                uint32_t reversed = 0u;
+                for (unsigned bit = 0u; bit < 32u; bit++)
+                    reversed |= ((value >> bit) & 1u) << (31u - bit);
+                write_gpr(s, rd, reversed);
+            } else if (shift == 0x10u) { /* seb */
+                const uint32_t byte = value & 0xffu;
+                write_gpr(s, rd, (byte & 0x80u) != 0u ? byte | 0xffffff00u : byte);
+            } else { /* seh */
+                const uint32_t half = value & 0xffffu;
+                write_gpr(s, rd, (half & 0x8000u) != 0u ? half | 0xffff0000u : half);
+            }
+        } else {
+            set_fault(fault, pc, opcode, pc, 1);
+            return SR_GUEST_INTERP_UNSUPPORTED;
+        }
+        s->r[0] = 0u;
+        return SR_GUEST_INTERP_AOT_HANDOFF;
+    }
+
+    if (primary == 0x10u) { /* COP0 (spec 3.5) */
+        /* With the LLE gate off every COP0 shape keeps the historical
+         * UNSUPPORTED result. ERET never executes here: it classifies as
+         * control, so reaching this path means a delay-slot occurrence,
+         * which is unpredictable on MIPS hardware and fails closed. */
+        if (!sr_cpu_lle_enabled() || opcode == SR_OPCODE_ERET) {
+            set_fault(fault, pc, opcode, pc, 1);
+            return SR_GUEST_INTERP_UNSUPPORTED;
+        }
+        {
+            const uint32_t cop_rs = (opcode >> 21) & 31u;
+            const uint32_t cop_rt = (opcode >> 16) & 31u;
+            const uint32_t cop_rd = (opcode >> 11) & 31u;
+            const uint32_t sel = opcode & 7u;
+            int rc;
+            /* Like the COP1 move-shape check above, MFC0/MTC0 require their
+             * reserved bits (10:3) to be zero; anything else is not a move. */
+            if ((cop_rs != 0x00u && cop_rs != 0x04u) ||
+                (opcode & 0x000007F8u) != 0u) {
+                set_fault(fault, pc, opcode, pc, 1);
+                return SR_GUEST_INTERP_UNSUPPORTED;
+            }
+            if (cop_rs == 0x00u) {
+                rc = sr_cp0_mfc0(s, cop_rt, cop_rd, sel, pc);
+            } else {
+                rc = sr_cp0_mtc0(s, cop_rt, cop_rd, sel, pc);
+            }
+            if (rc == 0) {
+                s->r[0] = 0u;
+                return SR_GUEST_INTERP_AOT_HANDOFF;
+            }
+            return map_flow_result(s, rc, fault, pc, opcode);
+        }
+    }
+
+    if (primary == 0x11u) { /* COP1 -- scalar FPU */
+        const uint32_t fmt = rs;
+        const uint32_t ft = rt;
+        const uint32_t fs = rd;
+        const uint32_t fd = shift;
+        const uint32_t funct = opcode & 0x3fu;
+        /* mfc1/mtc1 carry no function field: bits 10:0 are defined zero. Testing
+         * `fmt` alone would decode every reserved COP1 encoding that happens to
+         * share the fmt as a register move -- the precise "misreading one
+         * silently rewrites the program" failure this file refuses elsewhere.
+         * Found by the interpreter form census in fixtures/cosim. */
+        const int move_shape = (opcode & 0x7ffu) == 0u;
+        if (fmt == 0x00u && move_shape) {         /* mfc1 rt, fs */
+            write_gpr(s, ft, s->fi[fs]);
+        } else if (fmt == 0x02u && move_shape) {  /* cfc1 */
+            write_gpr(s, ft, fs == 31u ? s->fcr31 : (fs == 0u ? 0x00003351u : 0u));
+        } else if (fmt == 0x06u && move_shape) {  /* ctc1 */
+            if (fs == 31u) {
+                s->fcr31 = read_gpr(s, ft) & ~0xfe000000u;
+                s->fpcond = (s->fcr31 >> 23) & 1u;
+            }
+        } else if (fmt == 0x04u && move_shape) {  /* mtc1 rt, fs */
+            s->fi[fs] = read_gpr(s, ft);
+        } else if (fmt == 0x10u && funct == 0x06u && ft == 0u) { /* mov.s fd,fs */
+            /* MOV.S is a non-arithmetic register copy.  Preserve every bit,
+             * including signaling NaN payloads and denormals, independently
+             * of FCR31.FS and the host floating-point environment. */
+            s->fi[fd] = s->fi[fs];
+        } else if (fmt == 0x10u && funct == 0x00u) {   /* add.s */
+            SR_NAN_TRAP_STORE_F2(pc, "add.s", fd, fs, ft,
+                                 sr_fpu_add_s(s->f[fs], s->f[ft], s->fcr31));
+        } else if (fmt == 0x10u && funct == 0x01u) {   /* sub.s */
+            SR_NAN_TRAP_STORE_F2(pc, "sub.s", fd, fs, ft,
+                                 sr_fpu_sub_s(s->f[fs], s->f[ft], s->fcr31));
+        } else if (fmt == 0x10u && funct == 0x03u) {   /* div.s */
+            SR_NAN_TRAP_STORE_F2(pc, "div.s", fd, fs, ft,
+                                 sr_fpu_div_s(s->f[fs], s->f[ft], s->fcr31));
+        } else if (fmt == 0x10u && funct == 0x04u) {   /* sqrt.s */
+            SR_NAN_TRAP_STORE_F1(pc, "sqrt.s", fd, fs, sqrtf(s->f[fs]));
+        } else if (fmt == 0x10u && funct == 0x05u) {   /* abs.s */
+            SR_NAN_TRAP_STORE_F1(pc, "abs.s", fd, fs, fabsf(s->f[fs]));
+        } else if (fmt == 0x10u && funct == 0x07u) {   /* neg.s */
+            SR_NAN_TRAP_STORE_F1(pc, "neg.s", fd, fs, -s->f[fs]);
+        } else if (fmt == 0x10u && funct == 0x02u) {   /* mul.s */
+            /* Classify the inf*0 case from RAW bits, exactly as the generated
+             * code does: a floating precheck would itself be a guest-sensitive
+             * comparison outside the scoped FP window (see fp_convert.h). */
+            const uint32_t a_bits = s->fi[fs];
+            const uint32_t b_bits = s->fi[ft];
+            if (((a_bits & 0x7fffffffu) == 0x7f800000u && (b_bits & 0x7fffffffu) == 0u) ||
+                ((b_bits & 0x7fffffffu) == 0x7f800000u && (a_bits & 0x7fffffffu) == 0u)) {
+                /* Hardware-mandated inf*0 NaN, and one of the operands is not
+                 * finite, so SR_NAN_TRAP correctly stays silent about it. */
+                s->fi[fd] = 0x7fc00000u;
+            } else {
+                SR_NAN_TRAP_STORE_F2(pc, "mul.s", fd, fs, ft,
+                                     sr_fpu_mul_s(s->f[fs], s->f[ft], s->fcr31));
+            }
+        } else if (fmt == 0x10u && (funct == 0x24u || (funct >= 0x0cu && funct <= 0x0fu))) { /* word conversions */
+            s->fi[fd] = sr_fpu_to_word(s->f[fs], funct, s->fcr31);
+        } else if (fmt == 0x10u && funct >= 0x30u) {   /* c.cond.s */
+            s->fpcond = sr_fpu_condition_s(funct & 0x0fu, s->fi[fs], s->fi[ft]);
+            /* Allegrex exposes FCC0; PSP-FPU-CC-001 measured that condition
+             * code selectors alias this bit for both compare and branch. */
+            s->fcr31 = (s->fcr31 & ~0x00800000u) | (s->fpcond << 23);
+        } else if (fmt == 0x14u && funct == 0x20u) {   /* cvt.s.w */
+            s->f[fd] = sr_fpu_cvt_s_w(sr_u32_as_s32(s->fi[fs]), s->fcr31);
+        } else {
+            set_fault(fault, pc, opcode, pc, 1);
+            return SR_GUEST_INTERP_UNSUPPORTED;
+        }
+        s->r[0] = 0u;
+        return SR_GUEST_INTERP_AOT_HANDOFF;
+    }
+
+    /* Immediate ALU. */
+    if (primary == 0x08u) {        /* addi: the PSP's addi does not trap on overflow */
+        write_gpr(s, rt, read_gpr(s, rs) + sign_extend_16(opcode));
+        s->r[0] = 0u;
+        return SR_GUEST_INTERP_AOT_HANDOFF;
+    }
+    if (primary == 0x0au) {        /* slti rt, rs, immediate */
+        write_gpr(s, rt, sr_u32_as_s32(read_gpr(s, rs)) <
+                             sr_u32_as_s32(sign_extend_16(opcode)) ? 1u : 0u);
+        s->r[0] = 0u;
+        return SR_GUEST_INTERP_AOT_HANDOFF;
+    }
+    if (primary == 0x0bu) {        /* sltiu: an unsigned compare with the sign-extended immediate */
+        write_gpr(s, rt, read_gpr(s, rs) < sign_extend_16(opcode) ? 1u : 0u);
+        s->r[0] = 0u;
+        return SR_GUEST_INTERP_AOT_HANDOFF;
+    }
+    if (primary == 0x0cu) {        /* andi rt, rs, immediate (zero extended) */
+        write_gpr(s, rt, read_gpr(s, rs) & (opcode & 0xffffu));
+        s->r[0] = 0u;
+        return SR_GUEST_INTERP_AOT_HANDOFF;
+    }
+    if (primary == 0x0eu) {        /* xori rt, rs, immediate (zero extended) */
+        write_gpr(s, rt, read_gpr(s, rs) ^ (opcode & 0xffffu));
+        s->r[0] = 0u;
+        return SR_GUEST_INTERP_AOT_HANDOFF;
+    }
+    if (primary == 0x09u) {        /* addiu rt, rs, immediate */
+        write_gpr(s, rt, read_gpr(s, rs) + sign_extend_16(opcode));
+        s->r[0] = 0u;
+        return SR_GUEST_INTERP_AOT_HANDOFF;
+    }
+    if (primary == 0x0du) {        /* ori rt, rs, immediate (zero extended) */
+        write_gpr(s, rt, read_gpr(s, rs) | (opcode & 0xffffu));
+        s->r[0] = 0u;
+        return SR_GUEST_INTERP_AOT_HANDOFF;
+    }
+    if (primary == 0x0fu) {        /* lui rt, immediate */
+        write_gpr(s, rt, (opcode & 0xffffu) << 16);
+        s->r[0] = 0u;
+        return SR_GUEST_INTERP_AOT_HANDOFF;
+    }
+
+    /* Loads and stores. Width, signedness and the FPU register file are all
+     * selected here so one bounds/alignment contract covers every form. */
+    {
+        unsigned width = 0u;
+        int is_store = 0;
+        switch (primary) {
+        case 0x20u: case 0x24u: case 0x28u: width = 1u; is_store = primary == 0x28u; break;
+        case 0x21u: case 0x25u: case 0x29u: width = 2u; is_store = primary == 0x29u; break;
+        case 0x23u: case 0x2bu: case 0x31u: case 0x39u:
+        case 0x30u: case 0x38u:    /* ll / sc: word access plus the MIPS32 LLbit */
+            width = 4u;
+            is_store = primary == 0x2bu || primary == 0x39u || primary == 0x38u;
+            break;
+        default: break;
+        }
+        if (width != 0u) {
+            const uint32_t address = read_gpr(s, rs) + sign_extend_16(opcode);
+            /* With the LLE gate on, an address error is the guest's to handle:
+             * it enters the exception vector with BadVAddr set, exactly as the
+             * hardware oracle measured (PSP-A3-01). With the gate off this stays
+             * the historical fail-closed abort, so default behaviour is
+             * unchanged. The gate also covers user-mode kernel-segment access,
+             * which the range check below cannot see: sr_inrange_n() masks the
+             * address into RAM and would accept it. */
+            if (sr_cpu_lle_enabled()) {
+                const unsigned access_fault =
+                    sr_cpu_data_access_fault(s, address, width, is_store);
+                if (access_fault != 0u) {
+                    int rc;
+                    sr_begin(s, pc, opcode);
+                    rc = sr_cpu_raise_data_fault(s, access_fault, address, pc);
+                    if (rc == 0) {
+                        /* An address error always transfers; a zero return
+                         * would mean the load or store completed inline. */
+                        set_fault(fault, pc, opcode, address, 1);
+                        return SR_GUEST_INTERP_UNSUPPORTED;
+                    }
+                    sr_end(s, 0u, 0);
+                    return map_flow_result(s, rc, fault, pc, opcode);
+                }
+            }
+            if (!aligned_for(address, width)) {
+                set_fault(fault, pc, opcode, address, 1);
+                return SR_GUEST_INTERP_MISALIGNED_DATA;
+            }
+            if (is_store) {
+                if (!sr_inrange_n(address, width)) {
+                    set_fault(fault, pc, opcode, address, 1);
+                    return SR_GUEST_INTERP_MEMORY_FAULT;
+                }
+                if (primary == 0x38u) {
+                    /* sc: store and report 1 only while the link is set, else
+                     * store nothing and report 0. The address checks above ran
+                     * first, as for every store, so they do not depend on the
+                     * link. LLbit itself is left as found; only the events
+                     * that end an atomic window clear it (sr_cpu_link_clear). */
+                    const uint32_t linked = s->llbit != 0u ? 1u : 0u;
+                    if (linked) {
+                        MEM_W32_PC(address, read_gpr(s, rt), pc);
+                        *store_address = address;
+                        *store_size = (int)width;
+                    }
+                    write_gpr(s, rt, linked);
+                    s->r[0] = 0u;
+                    return SR_GUEST_INTERP_AOT_HANDOFF;
+                }
+                switch (primary) {
+                case 0x28u: MEM_W8_PC(address, read_gpr(s, rt), pc); break;
+                case 0x29u: MEM_W16_PC(address, read_gpr(s, rt), pc); break;
+                case 0x2bu: MEM_W32_PC(address, read_gpr(s, rt), pc); break;
+                default:    MEM_W32_PC(address, s->fi[rt], pc); break;  /* swc1 */
+                }
+                *store_address = address;
+                *store_size = (int)width;
+            } else {
+                if (!sr_inrange_n(address, width)) {
+                    set_fault(fault, pc, opcode, address, 1);
+                    return SR_GUEST_INTERP_MEMORY_FAULT;
+                }
+                switch (primary) {
+                case 0x20u: /* lb -- sign extended */
+                    write_gpr(s, rt, (uint32_t)(int32_t)(int8_t)MEM_R8(address));
+                    break;
+                case 0x24u: /* lbu */
+                    write_gpr(s, rt, MEM_R8(address));
+                    break;
+                case 0x21u: /* lh -- sign extended */
+                    write_gpr(s, rt, (uint32_t)(int32_t)(int16_t)MEM_R16(address));
+                    break;
+                case 0x25u: /* lhu */
+                    write_gpr(s, rt, MEM_R16(address));
+                    break;
+                case 0x23u: /* lw */
+                    write_gpr(s, rt, MEM_R32(address));
+                    break;
+                case 0x30u: /* ll: load the word and set the link */
+                    write_gpr(s, rt, MEM_R32(address));
+                    s->llbit = 1u;
+                    break;
+                default:    /* lwc1 */
+                    s->fi[rt] = MEM_R32(address);
+                    break;
+                }
+            }
+            s->r[0] = 0u;
+            return SR_GUEST_INTERP_AOT_HANDOFF;
+        }
+    }
+
+    /* The left/right word forms merge bytes within the aligned containing
+     * word.  Reuse the runtime accessors so their byte selection, aliasing and
+     * write instrumentation stay identical to generated code.  Stores are
+     * read-modify-write operations, so require the complete word to be both
+     * readable and writable before either accessor runs. */
+    if (primary == 0x22u || primary == 0x26u ||
+        primary == 0x2Au || primary == 0x2Eu) {
+        const uint32_t address = read_gpr(s, rs) + sign_extend_16(opcode);
+        const uint32_t word_address = address & ~3u;
+        const int is_store = primary == 0x2Au || primary == 0x2Eu;
+        if (is_store) {
+            if (!sr_inrange_n(word_address, 4u)) {
+                set_fault(fault, pc, opcode, word_address, 1);
+                return SR_GUEST_INTERP_MEMORY_FAULT;
+            }
+            if (primary == 0x2Au) {
+                sr_swl_pc(address, read_gpr(s, rt), pc);
+            } else {
+                sr_swr_pc(address, read_gpr(s, rt), pc);
+            }
+            *store_address = word_address;
+            *store_size = 4;
+        } else {
+            if (!sr_inrange_n(word_address, 4u)) {
+                set_fault(fault, pc, opcode, word_address, 1);
+                return SR_GUEST_INTERP_MEMORY_FAULT;
+            }
+            if (primary == 0x22u) {
+                write_gpr(s, rt, sr_lwl(read_gpr(s, rt), address));
+            } else {
+                write_gpr(s, rt, sr_lwr(read_gpr(s, rt), address));
+            }
+        }
+        s->r[0] = 0u;
+        return SR_GUEST_INTERP_AOT_HANDOFF;
+    }
+
+    /* VFPU loads and stores under --lle-cpu (runs PSP-A3-08..15). Widths mirror
+     * the codegen guard: lv.s/sv.s width 4, lv.q/sv.q width 16, lvl/lvr/svl/svr
+     * width 0 (never guarded, like lwl/lwr/swl/swr). With the gate off this
+     * stays the historical UNSUPPORTED so default behaviour and the cosim form
+     * census are unchanged. With the gate on, a faulting access enters the
+     * exception vector exactly like a scalar fault; otherwise the authoritative
+     * sr_vfpu_interp performs the access at the same point the scalar lane
+     * performs its MEM_* access. PSP-A3-12 (sv.s+2 AdES), PSP-A3-13 (sv.q+8
+     * AdES), PSP-A3-14 (lv.q in a delay slot: BD 1, EPC = branch) and PSP-A3-15
+     * (lvl.q at odd completes) confirm this guard; no VFPU alignment cell
+     * remains synthetic. */
+    {
+        int is_vfpu_mem = 0;
+        unsigned vfpu_width = 0u;
+        int vfpu_is_store = 0;
+        switch (primary) {
+        case 0x32u: vfpu_width = 4u; vfpu_is_store = 0; is_vfpu_mem = 1; break;
+        case 0x3au: vfpu_width = 4u; vfpu_is_store = 1; is_vfpu_mem = 1; break;
+        case 0x36u: vfpu_width = 16u; vfpu_is_store = 0; is_vfpu_mem = 1; break;
+        case 0x3eu: vfpu_width = 16u; vfpu_is_store = 1; is_vfpu_mem = 1; break;
+        case 0x35u: case 0x3du: is_vfpu_mem = 1; vfpu_width = 0u; break;
+        default: break;
+        }
+        if (is_vfpu_mem) {
+            if (!sr_cpu_lle_enabled()) {
+                set_fault(fault, pc, opcode, pc, 1);
+                return SR_GUEST_INTERP_UNSUPPORTED;
+            }
+            if (vfpu_width != 0u) {
+                const uint32_t vfpu_address =
+                    read_gpr(s, rs) + sign_extend_16(opcode & 0xFFFCu);
+                const unsigned vfpu_fault =
+                    sr_cpu_data_access_fault(s, vfpu_address, vfpu_width, vfpu_is_store);
+                if (vfpu_fault != 0u) {
+                    int rc;
+                    sr_begin(s, pc, opcode);
+                    rc = sr_cpu_raise_data_fault(s, vfpu_fault, vfpu_address, pc);
+                    if (rc == 0) {
+                        set_fault(fault, pc, opcode, vfpu_address, 1);
+                        return SR_GUEST_INTERP_UNSUPPORTED;
+                    }
+                    sr_end(s, 0u, 0);
+                    return map_flow_result(s, rc, fault, pc, opcode);
+                }
+            }
+            {
+                uint32_t saved_pc = s->pc;
+                int vfpu_rc;
+                s->pc = pc;
+                uint64_t perf_started = sr_perf_now_ns();
+                vfpu_rc = sr_vfpu_interp(s, opcode);
+                if (perf_started) sr_perf_vfpu(opcode, perf_started, vfpu_rc);
+                if (s->flow_kind != 0u) {
+                    int rc = -1;
+                    return map_flow_result(s, rc, fault, pc, opcode);
+                }
+                s->pc = saved_pc;
+                if (vfpu_rc == SR_VFPU_OTHER) {
+                    set_fault(fault, pc, opcode, pc, 1);
+                    return SR_GUEST_INTERP_UNSUPPORTED;
+                }
+                if (primary == 0x3au) {
+                    *store_address = read_gpr(s, rs) + sign_extend_16(opcode & 0xFFFCu);
+                    *store_size = 4;
+                } else if (primary == 0x3eu || primary == 0x3du) {
+                    *store_address = read_gpr(s, rs) + sign_extend_16(opcode & 0xFFFCu);
+                    *store_size = 16;
+                } else {
+                    *store_address = 0u;
+                    *store_size = 0;
+                }
+                s->r[0] = 0u;
+                return SR_GUEST_INTERP_AOT_HANDOFF;
+            }
+        }
+    }
+
+    set_fault(fault, pc, opcode, pc, 1);
+    return SR_GUEST_INTERP_UNSUPPORTED;
+}
+
+/* One decoded control transfer.
+ *
+ * `taken` is resolved from the register file AS IT STANDS AT THE BRANCH, before
+ * the link write and before the delay slot runs. `target` is likewise read at
+ * the branch: a delay slot that overwrites a jr/jalr target register must not
+ * change where control goes. Both are architectural requirements, and both are
+ * only expressible by decoding the transfer before its slot -- which is why
+ * this is a separate step rather than part of the executor above. */
+typedef struct SrGuestInterpTransfer {
+    uint32_t target;
+    int link_register;   /* -1 when the form does not link */
+    int taken;
+    int likely;          /* annul the delay slot when not taken */
+    int computed;        /* jr/jalr: the target is a code pointer read from a register */
+    unsigned exc_code;   /* valid only for SR_CTL_EXCEPTION */
+} SrGuestInterpTransfer;
+
+typedef enum SrGuestInterpCtl {
+    SR_CTL_NONE     = 0,   /* straight-line instruction */
+    SR_CTL_TRANSFER = 1,   /* decoded, with or without the branch taken */
+    SR_CTL_REJECT   = 2,   /* a control form this file does not implement */
+    SR_CTL_EXCEPTION = 3,  /* trap: raises without a delay slot (spec 3.5) */
+    SR_CTL_ERET     = 4,   /* eret: returns without a delay slot (spec 3.5) */
+} SrGuestInterpCtl;
+
+static SrGuestInterpCtl classify_control(
+    const CpuState *s,
+    uint32_t pc,
+    uint32_t opcode,
+    SrGuestInterpTransfer *out) {
+    const uint32_t primary = opcode >> 26;
+    const uint32_t rs = (opcode >> 21) & 31u;
+    const uint32_t rt = (opcode >> 16) & 31u;
+    const uint32_t rd = (opcode >> 11) & 31u;
+
+    out->target = 0u;
+    out->link_register = -1;
+    out->taken = 0;
+    out->likely = 0;
+    out->computed = 0;
+    out->exc_code = 0u;
+
+    if (!is_control_opcode(opcode)) {
+        return SR_CTL_NONE;
+    }
+
+    /* LLE traps (spec 3.5). With the gate off they stay rejected, preserving
+     * the historical UNSUPPORTED result and the cosim form census. Traps
+     * have no delay slot: the run loop raises before fetching pc+4. */
+    if (primary == 0x00u && ((opcode & 0x3fu) == 0x0cu || (opcode & 0x3fu) == 0x0du)) {
+        if (!sr_cpu_lle_enabled()) {
+            return SR_CTL_REJECT;
+        }
+        out->exc_code = ((opcode & 0x3fu) == 0x0cu) ? SR_EXC_SYS : SR_EXC_BP;
+        out->taken = 1;
+        return SR_CTL_EXCEPTION;
+    }
+    if (opcode == SR_OPCODE_ERET) {
+        if (!sr_cpu_lle_enabled()) {
+            return SR_CTL_REJECT;
+        }
+        out->taken = 1;
+        return SR_CTL_ERET;
+    }
+
+    if (primary == 0x00u) {
+        const uint32_t funct = opcode & 0x3fu;
+        if (funct == 0x08u && (opcode & 0x001fffc0u) == 0u) {  /* jr rs */
+            out->target = read_gpr(s, rs);
+            out->taken = 1;
+            out->computed = 1;
+            return SR_CTL_TRANSFER;
+        }
+        if (funct == 0x09u && (opcode & 0x001f07c0u) == 0u) {  /* jalr rd, rs */
+            out->target = read_gpr(s, rs);
+            out->computed = 1;
+            /* rd == 0 links nowhere; the generated code omits the write for the
+             * same encoding, so the two lanes agree by construction. */
+            out->link_register = rd == 0u ? -1 : (int)rd;
+            out->taken = 1;
+            return SR_CTL_TRANSFER;
+        }
+        return SR_CTL_REJECT;
+    }
+
+    if (primary == 0x02u || primary == 0x03u) {  /* j / jal */
+        out->target = ((pc + 4u) & 0xf0000000u) | ((opcode & 0x03ffffffu) << 2);
+        out->link_register = primary == 0x03u ? 31 : -1;
+        out->taken = 1;
+        return SR_CTL_TRANSFER;
+    }
+
+    if (primary == 0x04u || primary == 0x05u ||
+        primary == 0x14u || primary == 0x15u) {  /* beq/bne and likely forms */
+        const uint32_t left = read_gpr(s, rs);
+        const uint32_t right = read_gpr(s, rt);
+        out->target = pc + 4u + (sign_extend_16(opcode) << 2);
+        out->taken = (primary == 0x04u || primary == 0x14u)
+            ? (left == right) : (left != right);
+        out->likely = primary == 0x14u || primary == 0x15u;
+        return SR_CTL_TRANSFER;
+    }
+
+    if (primary == 0x06u || primary == 0x07u) {  /* blez/bgtz */
+        if (rt != 0u) return SR_CTL_REJECT;
+        const int32_t value = sr_u32_as_s32(read_gpr(s, rs));
+        out->target = pc + 4u + (sign_extend_16(opcode) << 2);
+        out->taken = primary == 0x06u ? value <= 0 : value > 0;
+        return SR_CTL_TRANSFER;
+    }
+
+    if (primary == 0x01u && (rt == 0u || rt == 1u || rt == 0x10u || rt == 0x11u)) {
+        /* bltz / bgez, and bltzal / bgezal, which link $ra = pc + 8 whether or not
+         * they are taken, exactly as generated code writes it. */
+        const int32_t value = sr_u32_as_s32(read_gpr(s, rs));
+        out->target = pc + 4u + (sign_extend_16(opcode) << 2);
+        out->taken = (rt & 1u) == 0u ? value < 0 : value >= 0;
+        out->link_register = rt >= 0x10u ? 31 : -1;
+        return SR_CTL_TRANSFER;
+    }
+
+    if (primary == 0x16u || primary == 0x17u) {  /* blezl/bgtzl */
+        if (rt != 0u) return SR_CTL_REJECT;
+        const int32_t value = sr_u32_as_s32(read_gpr(s, rs));
+        out->target = pc + 4u + (sign_extend_16(opcode) << 2);
+        out->taken = primary == 0x16u
+            ? value <= 0 : value > 0;
+        out->likely = 1;
+        return SR_CTL_TRANSFER;
+    }
+
+    if (primary == 0x01u && (rt == 2u || rt == 3u)) { /* bltzl / bgezl */
+        const int32_t value = sr_u32_as_s32(read_gpr(s, rs));
+        out->target = pc + 4u + (sign_extend_16(opcode) << 2);
+        out->taken = rt == 2u ? value < 0 : value >= 0;
+        out->likely = 1;
+        return SR_CTL_TRANSFER;
+    }
+
+    if (primary == 0x11u && rs == 8u) { /* bc1f/t and branch-likely forms */
+        const uint32_t tf = (opcode >> 16) & 1u;
+        const uint32_t condition = s->fpcond != 0u;
+        out->target = pc + 4u + (sign_extend_16(opcode) << 2);
+        out->taken = tf != 0u ? condition : !condition;
+        out->likely = ((opcode >> 17) & 1u) != 0u;
+        return SR_CTL_TRANSFER;
+    }
+
+    return SR_CTL_REJECT;
+}
+
+/* A load of $sp that keeps it within the stack a call allocated, between where $sp was and
+ * where the caller left it, frees only that call's own space, as an alloca free does. Any
+ * other load of $sp moves to another frame: a longjmp or a context switch (#1935). */
+static int sp_load_leaves_frame(uint32_t opcode, uint32_t before, uint32_t after,
+                                const SrGuestInterpCallBoundary *boundary) {
+    if ((opcode >> 26) != 0x23u || ((opcode >> 16) & 31u) != 29u) return 0;
+    return boundary == NULL || after < before || after >= boundary->entry_sp;
+}
+
+static SrGuestInterpResult sr_guest_interp_run_internal(
+    CpuState *s,
+    uint32_t entry,
+    const SrGuestInterpCallBoundary *boundary,
+    SrGuestInterpFault *fault) {
+    uint32_t pc = entry;
+    unsigned long long instruction_count = 0u;
+    const int log_dispatch = getenv("SR_DISPLOG") != NULL;
+    /* Whether this run has loaded $sp out of the stack its call allocated (#1935). */
+    int loaded_sp = 0;
+    set_fault(fault, entry, 0u, entry, 0);
+    /* Establish the COP0 delay-slot contract (spec 3.5): straight-line code
+     * runs with in_delay_slot clear; the branch path below sets it around
+     * the slot. Seeded states already hold zero, so this is a no-op there. */
+    s->in_delay_slot = 0u;
+
+    if (boundary && (boundary->resume_pc & 3u) != 0u) {
+        set_fault(fault, boundary->resume_pc, 0u, boundary->resume_pc, 0);
+        return SR_GUEST_INTERP_MISALIGNED_PC;
+    }
+
+    if (log_dispatch) {
+        fprintf(stderr,
+                "GUEST_INTERP_ENTER entry=0x%08" PRIx32 " caller_pc=0x%08" PRIx32 " ra=0x%08" PRIx32 "\n",
+                entry, s->pc, s->r[31]);
+    }
+
+    for (;;) {
+        /* A CALL boundary is an explicit execution contract, not an inference from
+         * the live $ra.  Check it before AOT lookup/fetch so a continuation that is
+         * itself registered is handed back to the still-live native caller rather
+         * than entered a second time.  The instruction count guard keeps a malformed
+         * self-call from returning before its callee executes any instruction. */
+        if (boundary && instruction_count != 0u && pc == boundary->resume_pc) {
+            s->pc = pc;
+            if (log_dispatch) {
+                fprintf(stderr,
+                        "GUEST_INTERP_CALL_RETURN pc=0x%08" PRIx32 " instructions=%llu\n",
+                        pc, instruction_count);
+            }
+            return SR_GUEST_INTERP_CALL_RETURN;
+        }
+        /* Without a boundary of its own (a TAIL step out of a native body), a transfer to the
+         * resume PC of the innermost live native linked call is that call's return, the host
+         * entry's SR_HOST_RETURN_PC included (#1375): the native caller runs the continuation. */
+        if (!boundary && instruction_count != 0u &&
+            sr_aot_return_boundary_capture_resume(s, pc)) {
+            s->pc = pc;
+            if (log_dispatch) {
+                fprintf(stderr,
+                        "GUEST_INTERP_NATIVE_RETURN pc=0x%08" PRIx32 " instructions=%llu\n",
+                        pc, instruction_count);
+            }
+            return SR_GUEST_INTERP_CALL_RETURN;
+        }
+
+        if ((pc & 3u) != 0u) {
+            set_fault(fault, pc, 0u, pc, 0);
+            return SR_GUEST_INTERP_MISALIGNED_PC;
+        }
+
+        /* Safe-point poll (spec 3.5): before each instruction, never between
+         * a branch and its delay slot (the slot below runs without polling).
+         * The Phase 1 poll never reports an interrupt; the call and its flow
+         * propagation stay so later phases cannot skip the site. */
+        if (sr_cpu_poll(s, pc) < 0) {
+            return map_flow_result(s, -1, fault, pc, 0u);
+        }
+
+        /* Tier selection precedes byte fetching. sr_lookup() requires complete
+         * executable ownership, so a registered native body may be entered even
+         * when no arena bytes back the PC: the translation itself embodies those
+         * instructions (build-time-translated modules). Only the interpreted tier
+         * below needs readable bytes.
+         *
+         * TD-27 stale redirect (see src/rt/stale_code.h "Dispatch hook"): a
+         * block the guest has overwritten since translation keeps interpreting
+         * instead of handing its stale pc back to dispatch, which would
+         * redirect here again and recurse. Gate off, the query is one
+         * cached-flag branch returning 0, so this stays exactly on the
+         * current path. */
+        if (sr_lookup(pc) && !sr_stale_block_is_stale(pc)) {
+            s->pc = pc;
+            if (log_dispatch) {
+                fprintf(stderr,
+                        "GUEST_INTERP_AOT_HANDOFF pc=0x%08" PRIx32 " instructions=%llu\n",
+                        pc, instruction_count);
+            }
+            if (boundary == NULL) {
+                dispatch(s, pc);
+                return SR_GUEST_INTERP_AOT_HANDOFF;
+            }
+            /* A called body that hands its live frame on by a TAIL owes its caller the $sp
+             * it was called with once the chain completes, as a native body records it
+             * (sr_tail_record); the native body it hands to was entered at a lowered $sp and
+             * owes nobody. One that loaded $sp out of that stack (sp_load_leaves_frame), a
+             * longjmp or a context switch, leaves it to the guest, and so does a chain whose
+             * return went elsewhere: a longjmp in native code (#1935). */
+            const int owes = boundary->owes_entry_sp && !loaded_sp &&
+                             s->r[29] != boundary->entry_sp;
+            const uint32_t entry_sp = owes ? boundary->entry_sp : 0u;
+            const int returned_elsewhere = dispatch_call_continue(s, pc, boundary);
+            if (owes && !returned_elsewhere) s->r[29] = entry_sp;
+            return SR_GUEST_INTERP_AOT_HANDOFF;
+        }
+
+        uint32_t opcode = 0u;
+        SrGuestInterpResult fetch_result = fetch_instruction(pc, &opcode, fault);
+        if (fetch_result < 0) {
+            return fetch_result;
+        }
+
+        SrGuestInterpTransfer transfer;
+        const SrGuestInterpCtl control = classify_control(s, pc, opcode, &transfer);
+        if (control == SR_CTL_REJECT) {
+            set_fault(fault, pc, opcode, pc, 1);
+            return SR_GUEST_INTERP_UNSUPPORTED;
+        }
+
+        if (control == SR_CTL_EXCEPTION || control == SR_CTL_ERET) {
+            /* Traps and eret have no delay slot: transfer at once. The
+             * helpers own EPC/Cause/flow updates; the loop only maps the
+             * resulting flow to a result (spec 3.5). */
+            int rc;
+            sr_begin(s, pc, opcode);
+            if (control == SR_CTL_EXCEPTION) {
+                rc = sr_cpu_raise_exception(
+                    s, transfer.exc_code, pc, pc, 0u, 0u, 0u);
+            } else {
+                rc = sr_cpu_eret(s, pc);
+            }
+            if (rc == 0) {
+                /* Helpers always transfer; a zero return would mean the
+                 * instruction completed inline, which traps never do. */
+                set_fault(fault, pc, opcode, pc, 1);
+                return SR_GUEST_INTERP_UNSUPPORTED;
+            }
+            sr_end(s, 0u, 0);
+            return map_flow_result(s, rc, fault, pc, opcode);
+        }
+
+        if (control == SR_CTL_TRANSFER) {
+            /* The branch owns its delay slot: the AOT tier is NOT reconsulted at
+             * pc+4, and a handoff is permitted only once the slot has completed.
+             * A control transfer inside the slot is rejected by the executor
+             * before any effect is applied. */
+            if (transfer.taken && (transfer.target & 3u) != 0u) {
+                set_fault(fault, pc, opcode, transfer.target, 1);
+                return SR_GUEST_INTERP_MISALIGNED_PC;
+            }
+            /* A code pointer of 0 is null (#1375). A static j/jal or branch to offset 0
+             * of a zero-based image is an ordinary transfer and is not refused here. */
+            if (transfer.taken && transfer.computed && transfer.target == 0u) {
+                set_fault(fault, pc, opcode, 0u, 1);
+                return SR_GUEST_INTERP_NULL_CODE_POINTER;
+            }
+            if (pc > UINT32_MAX - 8u) {
+                set_fault(fault, pc, opcode, pc, 1);
+                return SR_GUEST_INTERP_FETCH_BOUNDARY;
+            }
+
+            if (transfer.likely && !transfer.taken) {
+                /* A not-taken branch-likely nullifies pc+4 completely: do not
+                 * fetch it, trace it, or apply any store/register/FPU effect. */
+                sr_begin(s, pc, opcode);
+                sr_end(s, 0u, 0);
+                instruction_count++;
+                if (sr_perf_enabled) sr_perf_interp_instruction();
+                sr_exec_interp_instructions++;
+                pc += 8u;
+                s->pc = pc;
+                continue;
+            }
+
+            uint32_t delay_opcode = 0u;
+            SrGuestInterpResult delay_fetch =
+                fetch_instruction(pc + 4u, &delay_opcode, fault);
+            if (delay_fetch < 0) {
+                return delay_fetch;
+            }
+
+            /* Emission order matches the generated code exactly -- the branch
+             * reports (with its link write) before its delay slot -- so the two
+             * lanes produce byte-comparable instruction traces. */
+            sr_begin(s, pc, opcode);
+            if (transfer.link_register >= 0) {
+                write_gpr(s, (uint32_t)transfer.link_register, pc + 8u);
+                s->r[0] = 0u;
+            }
+            sr_end(s, 0u, 0);
+
+            uint32_t delay_store_address = 0u;
+            int delay_store_size = 0;
+            sr_begin(s, pc + 4u, delay_opcode);
+            /* Delay context for COP0/trap faults: EPC names this branch on a
+             * slot fault (spec 3.3). Both fields are restored once the slot
+             * completes or unwinds: they are a calling convention into the
+             * fault helpers, not lane state the AOT side maintains. */
+            uint32_t saved_next_pc = s->next_pc;
+            s->in_delay_slot = 1u;
+            s->next_pc = pc;
+            const uint32_t delay_sp = s->r[29];
+            SrGuestInterpResult delay_result = execute_noncontrol(
+                s, pc + 4u, delay_opcode, &delay_store_address, &delay_store_size, fault);
+            if (sp_load_leaves_frame(delay_opcode, delay_sp, s->r[29], boundary)) loaded_sp = 1;
+            s->in_delay_slot = 0u;
+            s->next_pc = saved_next_pc;
+            if (delay_result != SR_GUEST_INTERP_AOT_HANDOFF) {
+                if (delay_result == SR_GUEST_INTERP_EXCEPTION ||
+                    delay_result == SR_GUEST_INTERP_ERET) {
+                    sr_end(s, delay_store_address, delay_store_size);
+                }
+                return delay_result;
+            }
+            sr_end(s, delay_store_address, delay_store_size);
+
+            instruction_count += 2u;
+            if (sr_perf_enabled) sr_perf_interp_instruction();
+            if (sr_perf_enabled) sr_perf_interp_instruction();
+            sr_exec_interp_instructions += 2u;
+            /* A linked transfer into a registered native body is a CALL, exactly as
+             * generated code treats `jal`/`jalr`: the callee runs as a nested native
+             * frame and this interpreted caller resumes at its link address. Handing
+             * off through the loop-top AOT check below would return AOT_HANDOFF once
+             * the callee returned and silently drop the rest of the interpreted
+             * caller. An unlinked transfer keeps the TAIL handoff. */
+            if (transfer.taken && transfer.link_register >= 0 &&
+                sr_lookup(transfer.target) &&
+                !sr_stale_block_is_stale(transfer.target)) {
+                const uint32_t resume_pc = pc + 8u;
+                s->pc = transfer.target;
+                if (log_dispatch) {
+                    fprintf(stderr,
+                            "GUEST_INTERP_AOT_CALL target=0x%08" PRIx32
+                            " resume=0x%08" PRIx32 "\n",
+                            transfer.target, resume_pc);
+                }
+                dispatch_call(s, transfer.target, resume_pc);
+                pc = resume_pc;
+                s->pc = pc;
+                continue;
+            }
+            pc = transfer.taken ? transfer.target : pc + 8u;
+            s->pc = pc;
+            continue;
+        }
+
+        uint32_t store_address = 0u;
+        int store_size = 0;
+        sr_begin(s, pc, opcode);
+        const uint32_t sp_before = s->r[29];
+        SrGuestInterpResult result = execute_noncontrol(
+            s, pc, opcode, &store_address, &store_size, fault);
+        if (sp_load_leaves_frame(opcode, sp_before, s->r[29], boundary)) loaded_sp = 1;
+        if (result != SR_GUEST_INTERP_AOT_HANDOFF) {
+            if (result == SR_GUEST_INTERP_EXCEPTION ||
+                result == SR_GUEST_INTERP_ERET) {
+                sr_end(s, store_address, store_size);
+            }
+            return result;
+        }
+        sr_end(s, store_address, store_size);
+        instruction_count++;
+        if (sr_perf_enabled) sr_perf_interp_instruction();
+        sr_exec_interp_instructions++;
+        pc += 4u;
+        s->pc = pc;
+    }
+}
+
+SrGuestInterpResult sr_guest_interp_run(
+    CpuState *s,
+    uint32_t entry,
+    SrGuestInterpFault *fault) {
+    int exec_previous = sr_exec_enter(SR_EXEC_TIER_INTERP);
+    sr_exec_interp_entry(entry);
+    if (sr_perf_enabled) sr_perf_interp_begin(entry);
+    SrGuestInterpResult result = sr_guest_interp_run_internal(s, entry, NULL, fault);
+    if (sr_perf_enabled) sr_perf_interp_end(s->pc, (int)result);
+    sr_exec_interp_exit(result == SR_GUEST_INTERP_AOT_HANDOFF || result == SR_GUEST_INTERP_CALL_RETURN,
+                        result == SR_GUEST_INTERP_CALL_RETURN);
+    sr_exec_leave(exec_previous);
+    return result;
+}
+
+SrGuestInterpResult sr_guest_interp_run_with_boundary(
+    CpuState *s,
+    uint32_t entry,
+    const SrGuestInterpCallBoundary *boundary,
+    SrGuestInterpFault *fault) {
+    int exec_previous = sr_exec_enter(SR_EXEC_TIER_INTERP);
+    sr_exec_interp_entry(entry);
+    if (sr_perf_enabled) sr_perf_interp_begin(entry);
+    SrGuestInterpResult result = sr_guest_interp_run_internal(s, entry, boundary, fault);
+    if (sr_perf_enabled) sr_perf_interp_end(s->pc, (int)result);
+    sr_exec_interp_exit(result == SR_GUEST_INTERP_AOT_HANDOFF || result == SR_GUEST_INTERP_CALL_RETURN,
+                        result == SR_GUEST_INTERP_CALL_RETURN);
+    sr_exec_leave(exec_previous);
+    return result;
+}
+
+const char *sr_guest_interp_result_name(SrGuestInterpResult result) {
+    switch (result) {
+    case SR_GUEST_INTERP_AOT_HANDOFF: return "aot-handoff";
+    case SR_GUEST_INTERP_CALL_RETURN: return "call-return";
+    case SR_GUEST_INTERP_EXCEPTION: return "exception";
+    case SR_GUEST_INTERP_ERET: return "eret";
+    case SR_GUEST_INTERP_NOT_EXECUTABLE: return "not-executable";
+    case SR_GUEST_INTERP_MISALIGNED_PC: return "misaligned-pc";
+    case SR_GUEST_INTERP_FETCH_BOUNDARY: return "fetch-boundary";
+    case SR_GUEST_INTERP_UNSUPPORTED: return "unsupported-opcode";
+    case SR_GUEST_INTERP_MEMORY_FAULT: return "memory-fault";
+    case SR_GUEST_INTERP_MISALIGNED_DATA: return "misaligned-data";
+    case SR_GUEST_INTERP_FLOW_FATAL: return "flow-fatal";
+    case SR_GUEST_INTERP_HOST_STACK_EXHAUSTED: return "host-stack-exhausted";
+    case SR_GUEST_INTERP_HOST_STACK_BOUNDS_UNAVAILABLE:
+        return "host-stack-bounds-unavailable";
+    case SR_GUEST_INTERP_NULL_CODE_POINTER: return "null-code-pointer";
+    default: return "unknown";
+    }
+}

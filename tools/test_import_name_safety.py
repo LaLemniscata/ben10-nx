@@ -1,0 +1,914 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+"""Synthetic regressions for untrusted PSP import-library metadata."""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+TOOLS = ROOT / "tools"
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+
+import tomllib  # noqa: E402
+import analyze as analyze_tool  # noqa: E402
+import imports as imports_tool  # noqa: E402
+
+
+CC = shutil.which("gcc") or shutil.which("cc") or shutil.which("clang")
+
+
+def build_synthetic_import_prx(name: bytes, base: int) -> tuple[bytes, int]:
+    """Build a minimal ET_SCE_PRX with one real import stub and no relocations."""
+    data_off = 0x100
+    text_off = 0x00
+    module_off = 0x40
+    stub_off = 0x80
+    name_off = 0x90
+    nid_off = (name_off + len(name) + 1 + 3) & ~3
+    entry_off = nid_off + 4
+    segment = bytearray(entry_off + 20)
+
+    # jr $ra; nop -- enough executable input for the real analyzer/codegen path.
+    struct.pack_into("<2I", segment, text_off, 0x03E00008, 0)
+    struct.pack_into("<2I", segment, stub_off, 0x03E00008, 0)
+    segment[name_off:name_off + len(name)] = name
+    segment[name_off + len(name)] = 0
+    struct.pack_into("<I", segment, nid_off, 0x12345678)
+    struct.pack_into(
+        "<IHHBBHII",
+        segment,
+        entry_off,
+        base + name_off,
+        0x0101,
+        0x0009,
+        5,
+        0,
+        1,
+        base + nid_off,
+        base + stub_off,
+    )
+    struct.pack_into(
+        "<2I", segment, module_off + 44, base + entry_off, base + entry_off + 20
+    )
+
+    names = b"\0.text\0.rodata.sceModuleInfo\0.sceStub.text\0.lib.stub\0.shstrtab\0"
+    name_offsets = {
+        part: names.index(part.encode("ascii"))
+        for part in (
+            ".text",
+            ".rodata.sceModuleInfo",
+            ".sceStub.text",
+            ".lib.stub",
+            ".shstrtab",
+        )
+    }
+    shstr_off = data_off + len(segment)
+    shoff = (shstr_off + len(names) + 3) & ~3
+    ident = b"\x7fELF" + bytes([1, 1, 1, 0]) + b"\0" * 8
+    header = ident + struct.pack(
+        "<HHIIIIIHHHHHH",
+        0xFFA0,
+        8,
+        1,
+        text_off,
+        52,
+        shoff,
+        0,
+        52,
+        32,
+        1,
+        40,
+        6,
+        5,
+    )
+    phdr = struct.pack(
+        "<8I", 1, data_off, 0, 0, len(segment), len(segment), 7, 0x1000
+    )
+    prefix = header + phdr + b"\0" * (data_off - len(header) - len(phdr))
+    padding = b"\0" * (shoff - shstr_off - len(names))
+
+    def section(name: str, flags: int, addr: int, off: int, size: int, align: int):
+        return struct.pack(
+            "<10I", name_offsets[name], 1, flags, addr, off, size, 0, 0, align, 0
+        )
+
+    sections = [struct.pack("<10I", *([0] * 10))]
+    sections.append(section(".text", 6, text_off, data_off + text_off, 8, 4))
+    sections.append(
+        section(
+            ".rodata.sceModuleInfo", 2, module_off, data_off + module_off, 52, 4
+        )
+    )
+    sections.append(
+        section(".sceStub.text", 6, stub_off, data_off + stub_off, 8, 4)
+    )
+    sections.append(
+        section(".lib.stub", 2, entry_off, data_off + entry_off, 20, 4)
+    )
+    sections.append(
+        struct.pack(
+            "<10I", name_offsets[".shstrtab"], 3, 0, 0, shstr_off, len(names), 0, 0, 1, 0
+        )
+    )
+    return prefix + bytes(segment) + names + padding + b"".join(sections), base + stub_off
+
+
+class FakeElf:
+    """Small mapped guest image containing one PSP import stub."""
+
+    BASE = 0x1000
+    MODULE = 0x1000
+    STUB = 0x1100
+    NAME = 0x1200
+    NIDS = 0x1300
+    FIRST_SYM = 0x1400
+
+    def __init__(self, name: bytes, *, terminate: bool = True, size: int = 0x1000):
+        self.mem = bytearray(size)
+        struct.pack_into("<2I", self.mem, self.MODULE - self.BASE + 44,
+                         self.STUB, self.STUB + 28)
+        struct.pack_into(
+            "<IHHBBHII",
+            self.mem,
+            self.STUB - self.BASE,
+            self.NAME,
+            0,
+            0,
+            7,       # entry size in 32-bit words => 28 bytes
+            0,       # numVars
+            1,       # numFuncs
+            self.NIDS,
+            self.FIRST_SYM,
+        )
+        struct.pack_into("<I", self.mem, self.NIDS - self.BASE, 0x12345678)
+        start = self.NAME - self.BASE
+        end = start + len(name)
+        if end > len(self.mem):
+            raise ValueError("test fixture name does not fit")
+        self.mem[start:end] = name
+        if terminate:
+            if end >= len(self.mem):
+                raise ValueError("test fixture terminator does not fit")
+            self.mem[end] = 0
+
+    def sec(self, name: str):
+        if name == ".rodata.sceModuleInfo":
+            return {"addr": self.MODULE}
+        return None
+
+    def read_at_vaddr(self, addr: int, n: int):
+        off = addr - self.BASE
+        if off < 0 or n < 0 or off + n > len(self.mem):
+            return None
+        return bytes(self.mem[off:off + n])
+
+
+class TestImportNameSafety(unittest.TestCase):
+    def test_missing_module_info_section_is_valueerror_not_systemexit(self):
+        # Found by tools/test_parse_fuzz.py: a PRX without .rodata.sceModuleInfo
+        # used to raise SystemExit from the library path, killing any host
+        # process that consumed parse_imports (analyze.py/codegen.py).
+        class NoModuleInfoElf:
+            base = 0
+
+            def sec(self, name):  # noqa: ARG002
+                return None
+
+            def read_at_vaddr(self, addr, n):  # noqa: ARG002
+                return None
+
+        with self.assertRaisesRegex(ValueError, "no .rodata.sceModuleInfo"):
+            imports_tool.parse_imports(NoModuleInfoElf())
+
+    def test_normal_library_name_is_unchanged(self):
+        parsed = imports_tool.parse_imports(FakeElf(b"sceDisplay"))
+        self.assertEqual(parsed[FakeElf.FIRST_SYM], ("sceDisplay", 0x12345678))
+
+    def test_null_nid_pointer_has_a_named_analyzer_boundary(self):
+        elf = FakeElf(b"sceDisplay")
+        struct.pack_into("<I", elf.mem, FakeElf.STUB - FakeElf.BASE + 12, 0)
+
+        with self.assertRaises(imports_tool.ImportTableError) as raised:
+            imports_tool.parse_imports(elf)
+
+        self.assertEqual(raised.exception.code, "ANALYZER_IMPORT_NID_TABLE_MISSING")
+
+    VSTUB_TABLE = 0x1500
+
+    def _variable_entry(self, *, num_vars=1, num_funcs=0, size=7, vstub_table=VSTUB_TABLE):
+        elf = FakeElf(b"sceDisplay")
+        entry = FakeElf.STUB - FakeElf.BASE
+        struct.pack_into("<B", elf.mem, entry + 8, size)
+        struct.pack_into("<B", elf.mem, entry + 9, num_vars)
+        struct.pack_into("<H", elf.mem, entry + 10, num_funcs)
+        # SceLibraryStubTable.vstubtable follows the function-stub pointer.
+        struct.pack_into("<I", elf.mem, entry + 20, vstub_table)
+        return elf
+
+    def test_variable_only_imports_add_no_function_stub(self):
+        # A window that imports only variables names no function stub: its variables are
+        # linked at run time (variable_imports), not refused.
+        elf = self._variable_entry()
+
+        self.assertEqual(imports_tool.parse_imports(elf), {})
+        _stubs, _findings, tables = imports_tool.function_import_model(elf)
+        self.assertEqual(
+            tables,
+            (imports_tool.VariableImportTable("sceDisplay", 1, FakeElf.STUB, self.VSTUB_TABLE),),
+        )
+
+    REFS = 0x1600
+
+    def _variable_with_references(self, words, nid=0x0ABC1234):
+        elf = self._variable_entry()
+        struct.pack_into("<II", elf.mem, self.VSTUB_TABLE - FakeElf.BASE, self.REFS, nid)
+        for index, word in enumerate([*words, 0]):
+            struct.pack_into("<I", elf.mem, self.REFS - FakeElf.BASE + 4 * index, word)
+        return elf
+
+    def test_variable_import_references_name_each_patched_word(self):
+        # A lui/addiu pair at 0x1800/0x1804 and a data word at 0x1900: types 5, 6 and 2
+        # over word addresses divided by four (uOFW aVariableLinkApply).
+        elf = self._variable_with_references(
+            [(5 << 26) | (0x1800 >> 2), (6 << 26) | (0x1804 >> 2), (2 << 26) | (0x1900 >> 2)])
+
+        self.assertEqual(
+            imports_tool.variable_imports(elf),
+            (imports_tool.VariableImport(
+                "sceDisplay", 0x0ABC1234,
+                (("hi16", 0x1800), ("lo16", 0x1804), ("word32", 0x1900))),),
+        )
+        # The table imports: codegen reads these sites from memory and the runtime links them.
+        self.assertEqual(imports_tool.parse_imports(elf), {})
+
+    def test_variable_import_reference_of_another_type_is_refused(self):
+        elf = self._variable_with_references([(4 << 26) | (0x1800 >> 2)])
+
+        with self.assertRaises(imports_tool.ImportTableError) as raised:
+            imports_tool.variable_imports(elf)
+
+        self.assertEqual(raised.exception.code, "ANALYZER_IMPORT_TABLE_INVALID")
+        self.assertIn("reference type 4", str(raised.exception))
+
+    def test_variable_import_reference_site_must_be_mapped(self):
+        elf = self._variable_with_references([(5 << 26) | (0x9000 >> 2)])
+
+        with self.assertRaises(imports_tool.ImportTableError) as raised:
+            imports_tool.variable_imports(elf)
+
+        self.assertIn("reference site 0x00009000 leaves mapped input", str(raised.exception))
+
+    def test_variable_exports_list_each_named_library_variable_with_its_address(self):
+        # .lib.ent: the nameless lifecycle entry (no linkable variables), then a library with
+        # one function and two variables; its entry table holds 3 NIDs then 3 addresses.
+        class ExportImage:
+            def __init__(self):
+                self.mem = bytearray(0x400)
+                head = struct.pack("<IHHBBHI", 0, 0, 0x8000, 4, 1, 1, 0x1100)
+                named = struct.pack("<IHHBBHI", 0x1200, 1, 1, 4, 2, 1, 0x1140)
+                self.mem[0x000:0x020] = head + named
+                struct.pack_into("<II", self.mem, 0x100, 0xD632ACDB, 0x0F7C276C)
+                struct.pack_into("<6I", self.mem, 0x140, 0xAAAA0001, 0xBBBB0001, 0xBBBB0002,
+                                 0x1300, 0x1310, 0x1320)
+                self.mem[0x200:0x208] = b"VarLib\x00\x00"
+
+            def sec(self, name):
+                return {"addr": 0x1000, "size": 0x20} if name == ".lib.ent" else None
+
+            def read_at_vaddr(self, address, size):
+                start = address - 0x1000
+                return bytes(self.mem[start:start + size]) if 0 <= start <= len(self.mem) - size else None
+
+        self.assertEqual(imports_tool.variable_exports(ExportImage()), (
+            imports_tool.VariableExport("VarLib", 0xBBBB0001, 0x1310),
+            imports_tool.VariableExport("VarLib", 0xBBBB0002, 0x1320),
+        ))
+
+    class FunctionExportImage:
+        """.lib.ent: the nameless lifecycle entry, then two libraries with `second` as the
+        NID and address of the function the second one exports beside its variable."""
+
+        def __init__(self, second):
+            self.mem = bytearray(0x400)
+            head = struct.pack("<IHHBBHI", 0, 0, 0x8000, 4, 1, 1, 0x1100)
+            first = struct.pack("<IHHBBHI", 0x1200, 1, 1, 4, 0, 2, 0x1140)
+            other = struct.pack("<IHHBBHI", 0x1208, 1, 1, 4, 1, 1, 0x1160)
+            self.mem[0x000:0x030] = head + first + other
+            struct.pack_into("<II", self.mem, 0x100, 0xD632ACDB, 0x0F7C276C)
+            struct.pack_into("<4I", self.mem, 0x140, 0xCCCC0002, 0xCCCC0001, 0x1340, 0x1350)
+            struct.pack_into("<4I", self.mem, 0x160, second[0], 0xBBBB0001, second[1], 0x1370)
+            self.mem[0x200:0x20e] = b"First\x00\x00\x00Other\x00"
+
+        def sec(self, name):
+            return {"addr": 0x1000, "size": 0x30} if name == ".lib.ent" else None
+
+        def read_at_vaddr(self, address, size):
+            start = address - 0x1000
+            return bytes(self.mem[start:start + size]) if 0 <= start <= len(self.mem) - size else None
+
+    def test_function_exports_are_every_named_library_function_sorted_by_nid(self):
+        self.assertEqual(
+            imports_tool.function_exports(self.FunctionExportImage((0xCCCC0000, 0x1360)), {}),
+            ((0xCCCC0000, 0x1360), (0xCCCC0001, 0x1350), (0xCCCC0002, 0x1340)))
+
+    def test_function_exports_keep_a_nid_two_libraries_export_at_one_address(self):
+        self.assertEqual(
+            imports_tool.function_exports(self.FunctionExportImage((0xCCCC0001, 0x1350)), {}),
+            ((0xCCCC0001, 0x1350), (0xCCCC0002, 0x1340)))
+
+    def test_function_exports_leave_out_the_images_own_stub_for_that_nid(self):
+        # Linked, the stub would call the same NID and so call itself until the stack ran out.
+        image = self.FunctionExportImage((0xCCCC0000, 0x1360))
+        self.assertEqual(
+            imports_tool.function_exports(image, {0x1360: ("sceRtc", 0xCCCC0000)}),
+            ((0xCCCC0001, 0x1350), (0xCCCC0002, 0x1340)))
+
+    def test_function_exports_keep_a_stub_exported_under_another_nid(self):
+        image = self.FunctionExportImage((0xCCCC0000, 0x1360))
+        self.assertIn(
+            (0xCCCC0000, 0x1360),
+            imports_tool.function_exports(image, {0x1360: ("sceRtc", 0xDDDD0000)}))
+
+    def test_function_exports_refuse_a_nid_with_two_addresses(self):
+        with self.assertRaises(imports_tool.ImportTableError) as raised:
+            imports_tool.function_exports(self.FunctionExportImage((0xCCCC0001, 0x1360)), {})
+
+        self.assertIn("exports 0xcccc0001", str(raised.exception))
+
+    def test_variable_import_reference_list_must_be_mapped(self):
+        elf = self._variable_entry()
+        struct.pack_into("<II", elf.mem, self.VSTUB_TABLE - FakeElf.BASE, 0x9000, 0x0ABC1234)
+
+        with self.assertRaises(imports_tool.ImportTableError) as raised:
+            imports_tool.variable_imports(elf)
+
+        self.assertIn("reference list at 0x00009000 leaves mapped input", str(raised.exception))
+
+    def test_variable_import_reference_list_is_bounded(self):
+        elf = self._variable_with_references([(2 << 26) | (0x1900 >> 2)] * 3)
+
+        with mock.patch.object(imports_tool, "MAX_VARIABLE_REFERENCES", 2):
+            with self.assertRaises(imports_tool.ImportTableError) as raised:
+                imports_tool.variable_imports(elf)
+
+        self.assertIn("more than 2 references", str(raised.exception))
+
+    def test_variable_stub_pair_must_be_mapped(self):
+        # The table's first word is mapped; its (references, NID) pair runs past the image.
+        elf = self._variable_entry(vstub_table=0x1FFC)
+
+        with self.assertRaises(imports_tool.ImportTableError) as raised:
+            imports_tool.variable_imports(elf)
+
+        self.assertIn("variable stub 0 of sceDisplay at 0x00001ffc leaves mapped input",
+                      str(raised.exception))
+
+    def test_variable_imports_beside_functions_keep_the_function_stub(self):
+        elf = self._variable_entry(num_vars=2, num_funcs=1)
+
+        self.assertEqual(imports_tool.parse_imports(elf),
+                         {FakeElf.FIRST_SYM: ("sceDisplay", 0x12345678)})
+        _stubs, _findings, tables = imports_tool.function_import_model(elf)
+        self.assertEqual([(table.library, table.count) for table in tables], [("sceDisplay", 2)])
+
+    def test_variable_import_library_name_must_be_mapped(self):
+        elf = self._variable_entry()
+        struct.pack_into("<I", elf.mem, FakeElf.STUB - FakeElf.BASE, 0)
+
+        with self.assertRaises(imports_tool.ImportTableError) as raised:
+            imports_tool.parse_imports(elf)
+
+        self.assertEqual(raised.exception.code, "ANALYZER_IMPORT_LIBRARY_NAME_UNMAPPED")
+
+    def test_variable_imports_need_the_variable_stub_table_word(self):
+        # A five-word entry ends at the function-stub pointer, so it cannot
+        # name a variable-stub table: the declaration is malformed.
+        elf = self._variable_entry(size=5)
+
+        with self.assertRaises(imports_tool.ImportTableError) as raised:
+            imports_tool.parse_imports(elf)
+
+        self.assertEqual(raised.exception.code, "ANALYZER_IMPORT_TABLE_INVALID")
+        self.assertIn("has no variable-stub table", str(raised.exception))
+
+    def test_variable_imports_with_a_null_or_unmapped_table_are_invalid(self):
+        for vstub_table, reason in ((0, "null or misaligned"), (0x1502, "null or misaligned"),
+                                    (0x9000, "leaves mapped input")):
+            with self.subTest(vstub_table=hex(vstub_table)):
+                elf = self._variable_entry(vstub_table=vstub_table)
+
+                with self.assertRaises(imports_tool.ImportTableError) as raised:
+                    imports_tool.parse_imports(elf)
+
+                self.assertEqual(raised.exception.code, "ANALYZER_IMPORT_TABLE_INVALID")
+                self.assertIn(reason, str(raised.exception))
+
+    def test_misaligned_import_regions_have_a_named_boundary(self):
+        class MismatchedRegionElf(FakeElf):
+            def sec(self, name: str):
+                if name == ".sceStub.text":
+                    return {"addr": self.FIRST_SYM - 8, "size": 16}
+                if name == ".rodata.sceNid":
+                    return {"addr": self.NIDS, "size": 4}
+                return super().sec(name)
+
+        with self.assertRaises(imports_tool.ImportTableError) as raised:
+            imports_tool.parse_imports(MismatchedRegionElf(b"sceDisplay"))
+
+        self.assertEqual(raised.exception.code, "ANALYZER_IMPORT_REGIONS_MISMATCH")
+
+    def test_analyzer_does_not_swallow_a_named_import_boundary(self):
+        base = 0x08804000
+        blob, _stub = build_synthetic_import_prx(b"sceSynthetic", base)
+        elf = imports_tool.Elf(bytes(blob), base=base)
+        import_section = elf.sec(".lib.stub")
+        self.assertIsNotNone(import_section)
+        malformed = bytearray(blob)
+        struct.pack_into("<I", malformed, import_section["off"] + 12, 0)
+        malformed_elf = imports_tool.Elf(bytes(malformed), base=base)
+
+        with self.assertRaises(imports_tool.ImportTableError) as raised:
+            analyze_tool.analyze(malformed_elf)
+
+        self.assertEqual(raised.exception.code, "ANALYZER_IMPORT_NID_TABLE_MISSING")
+
+    def test_prepatch_sce_stub_return_placeholder_remains_an_import_entry(self):
+        base = 0x08804000
+        blob, stub = build_synthetic_import_prx(b"sceSynthetic", base)
+        self.assertEqual(struct.unpack_from("<2I", blob, 0x100 + 0x80),
+                         (0x03E00008, 0))  # jr ra; nop before NID patching
+        elf = imports_tool.Elf(bytes(blob), base=base)
+        starts, ranges = analyze_tool.analyze(elf)
+        self.assertIn(stub, starts)
+        self.assertTrue(analyze_tool.in_ranges(stub, ranges))
+        self.assertTrue(analyze_tool.in_ranges(stub + 4, ranges))
+
+        import codegen
+        with tempfile.TemporaryDirectory(prefix="prepatch-sce-stub-") as temp:
+            path = Path(temp) / "synthetic.elf"
+            out = Path(temp) / "synthetic.c"
+            path.write_bytes(blob)
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                status = codegen.main([
+                    "codegen.py", os.fspath(path), os.fspath(out),
+                    f"--base={base:08x}", "--profile=none",
+                ])
+            self.assertEqual(status, 0)
+            emitted = "\n".join(
+                candidate.read_text(encoding="ascii")
+                for candidate in sorted(Path(temp).glob("synthetic*.c"))
+            )
+        self.assertRegex(
+            emitted,
+            rf"void f_{stub:08x}\(CpuState \*s\) \{{  /\* import: sceSynthetic nid 0x12345678 \*/",
+        )
+
+    def test_analyzer_checks_import_metadata_when_section_names_are_missing(self):
+        base = 0x08804000
+        blob, _stub = build_synthetic_import_prx(b"sceSynthetic", base)
+        image = bytearray(blob)
+        # Match a stripped retail ELF: segment addresses are absolute, but the
+        # section-name table no longer identifies .sceStub.text.
+        struct.pack_into("<H", image, 16, 2)
+        struct.pack_into("<I", image, 24, base)
+        phoff = struct.unpack_from("<I", image, 28)[0]
+        struct.pack_into("<II", image, phoff + 8, base, base)
+        module_info = 0x100 + 0x40
+        image[module_info + 4:module_info + 13] = b"Synthetic"
+        struct.pack_into("<I", image, module_info + 32, 4)
+        elf = imports_tool.Elf(bytes(image), base=base)
+        import_section = elf.sec(".lib.stub")
+        self.assertIsNotNone(import_section)
+        struct.pack_into("<I", image, import_section["off"] + 12, 0)
+        struct.pack_into("<H", image, 50, 0)
+        shoff = struct.unpack_from("<I", image, 32)[0]
+        shentsize, shnum = struct.unpack_from("<HH", image, 46)
+        for index in range(shnum):
+            struct.pack_into("<I", image, shoff + index * shentsize, 0)
+        stripped_elf = imports_tool.Elf(bytes(image), base=base)
+        self.assertIsNone(stripped_elf.sec(".sceStub.text"))
+        self.assertIsNotNone(stripped_elf.sec(".rodata.sceModuleInfo"))
+
+        with self.assertRaises(imports_tool.ImportTableError) as raised:
+            analyze_tool.analyze(stripped_elf)
+
+        self.assertEqual(raised.exception.code, "ANALYZER_IMPORT_NID_TABLE_MISSING")
+
+    def test_analyzer_cli_names_unsupported_import_layout(self):
+        base = 0x08804000
+        blob, _stub = build_synthetic_import_prx(b"sceSynthetic", base)
+        elf = imports_tool.Elf(bytes(blob), base=base)
+        import_section = elf.sec(".lib.stub")
+        malformed = bytearray(blob)
+        struct.pack_into("<I", malformed, import_section["off"] + 12, 0)
+
+        with tempfile.TemporaryDirectory(prefix="analyzer-import-boundary-") as temp:
+            path = Path(temp) / "synthetic.elf"
+            path.write_bytes(malformed)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = analyze_tool.main([
+                    "analyze.py", os.fspath(path), f"--base={base:08x}", "--quiet"
+                ])
+
+        self.assertEqual(status, 1)
+        self.assertIn("ANALYZER_IMPORT_NID_TABLE_MISSING", stderr.getvalue())
+        self.assertIn("not supported yet", stderr.getvalue())
+
+    def test_analyzer_rejects_unaligned_and_out_of_range_import_stubs(self):
+        base = 0x08804000
+        blob, stub = build_synthetic_import_prx(b"sceSynthetic", base)
+        elf = imports_tool.Elf(bytes(blob), base=base)
+
+        out_of_range_stub = 0x09000000
+        unaligned_stub = base + 0x201
+        valid_stub = stub
+
+        hostile_impmap = {
+            out_of_range_stub: ("sceSynthetic", 0x11111111),
+            unaligned_stub: ("sceSynthetic", 0x22222222),
+            valid_stub: ("sceSynthetic", 0x33333333),
+        }
+
+        with mock.patch("imports.parse_imports", return_value=hostile_impmap):
+            starts, ranges = analyze_tool.analyze(elf)
+
+        self.assertIn(valid_stub, starts)
+        self.assertNotIn(out_of_range_stub, starts)
+        self.assertNotIn(unaligned_stub, starts)
+
+    def test_codegen_traps_named_analyzer_import_boundary(self):
+        import codegen
+        base = 0x08804000
+        blob, _stub = build_synthetic_import_prx(b"sceSynthetic", base)
+        elf = imports_tool.Elf(bytes(blob), base=base)
+        import_section = elf.sec(".lib.stub")
+        self.assertIsNotNone(import_section)
+        malformed = bytearray(blob)
+        struct.pack_into("<I", malformed, import_section["off"] + 12, 0)
+
+        with tempfile.TemporaryDirectory(prefix="codegen-import-boundary-") as temp:
+            path = Path(temp) / "synthetic.elf"
+            path.write_bytes(malformed)
+            out_c = Path(temp) / "out.c"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = codegen.main([
+                    "codegen.py", os.fspath(path), os.fspath(out_c), f"--base={base:08x}",
+                ])
+
+        self.assertEqual(status, 1)
+        self.assertIn("ANALYZER_IMPORT_NID_TABLE_MISSING", stderr.getvalue())
+
+    def test_codegen_extra_module_named_analyzer_import_boundary_names_failing_module(self):
+        import codegen
+        base = 0x08804000
+        extra_bad_base = 0x08900000
+        extra_good_base = 0x08a00000
+        main_blob, _ = build_synthetic_import_prx(b"sceSynthetic", base)
+        bad_blob, _ = build_synthetic_import_prx(b"sceSynthetic", extra_bad_base)
+        good_blob, _ = build_synthetic_import_prx(b"sceSynthetic", extra_good_base)
+
+        elf = imports_tool.Elf(bytes(bad_blob), base=extra_bad_base)
+        import_section = elf.sec(".lib.stub")
+        self.assertIsNotNone(import_section)
+        malformed = bytearray(bad_blob)
+        struct.pack_into("<I", malformed, import_section["off"] + 12, 0)
+
+        with tempfile.TemporaryDirectory(prefix="codegen-extra-boundary-") as temp:
+            main_path = Path(temp) / "main.elf"
+            main_path.write_bytes(main_blob)
+            extra_bad = Path(temp) / "extra_failing.elf"
+            extra_bad.write_bytes(malformed)
+            extra_good = Path(temp) / "extra_valid.elf"
+            extra_good.write_bytes(good_blob)
+
+            out_c = Path(temp) / "out.c"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = codegen.main([
+                    "codegen.py",
+                    os.fspath(main_path),
+                    os.fspath(out_c),
+                    f"--base={base:08x}",
+                    f"--extra-elf={os.fspath(extra_bad)}@{extra_bad_base:08x}",
+                    f"--extra-elf={os.fspath(extra_good)}@{extra_good_base:08x}",
+                ])
+
+        self.assertEqual(status, 1)
+        err = stderr.getvalue()
+        self.assertIn("ANALYZER_IMPORT_NID_TABLE_MISSING", err)
+        self.assertIn(os.fspath(extra_bad), err)
+        self.assertNotIn(os.fspath(extra_good), err)
+
+    def test_import_table_error_format_boundary(self):
+        err = imports_tool.ImportTableError("ANALYZER_TEST_CODE", "test error message")
+        self.assertEqual(
+            err.format_boundary(),
+            "ANALYZER_TEST_CODE: test error message",
+        )
+        self.assertEqual(
+            err.format_boundary("module.prx"),
+            "ANALYZER_TEST_CODE: module.prx: test error message",
+        )
+        self.assertEqual(
+            imports_tool.format_boundary(err),
+            "ANALYZER_TEST_CODE: test error message",
+        )
+        self.assertEqual(
+            imports_tool.format_boundary(err, "extra.elf"),
+            "ANALYZER_TEST_CODE: extra.elf: test error message",
+        )
+
+    def test_decompme_export_traps_named_analyzer_import_boundary(self):
+        import decompme_export
+        base = 0x08804000
+        blob, _stub = build_synthetic_import_prx(b"sceSynthetic", base)
+        elf = imports_tool.Elf(bytes(blob), base=base)
+        import_section = elf.sec(".lib.stub")
+        self.assertIsNotNone(import_section)
+        malformed = bytearray(blob)
+        struct.pack_into("<I", malformed, import_section["off"] + 12, 0)
+
+        with tempfile.TemporaryDirectory(prefix="decompme-import-boundary-") as temp:
+            path = Path(temp) / "synthetic.elf"
+            path.write_bytes(malformed)
+            with self.assertRaises(SystemExit) as raised:
+                decompme_export.export_function(os.fspath(path), base, base + 0x10, temp, "func")
+            self.assertTrue(str(raised.exception).startswith("ANALYZER_"))
+
+    def test_entry_frame_balance_traps_named_analyzer_import_boundary(self):
+        import entry_frame_balance
+        base = 0x08804000
+        blob, _stub = build_synthetic_import_prx(b"sceSynthetic", base)
+        elf = imports_tool.Elf(bytes(blob), base=base)
+        import_section = elf.sec(".lib.stub")
+        self.assertIsNotNone(import_section)
+        malformed = bytearray(blob)
+        struct.pack_into("<I", malformed, import_section["off"] + 12, 0)
+
+        with tempfile.TemporaryDirectory(prefix="efb-import-boundary-") as temp:
+            path = Path(temp) / "synthetic.elf"
+            path.write_bytes(malformed)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = entry_frame_balance.main([
+                    "entry_frame_balance.py", os.fspath(path), f"--base=0x{base:08x}",
+                ])
+            self.assertEqual(status, 1)
+            self.assertIn("ANALYZER_IMPORT_NID_TABLE_MISSING", stderr.getvalue())
+
+    def test_ghidra_crosscheck_traps_named_analyzer_import_boundary(self):
+        import ghidra_crosscheck
+        base = 0x08804000
+        blob, _stub = build_synthetic_import_prx(b"sceSynthetic", base)
+        elf = imports_tool.Elf(bytes(blob), base=base)
+        import_section = elf.sec(".lib.stub")
+        self.assertIsNotNone(import_section)
+        malformed = bytearray(blob)
+        struct.pack_into("<I", malformed, import_section["off"] + 12, 0)
+
+        with tempfile.TemporaryDirectory(prefix="ghidra-import-boundary-") as temp:
+            path = Path(temp) / "synthetic.elf"
+            path.write_bytes(malformed)
+            csv_path = Path(temp) / "dummy.csv"
+            csv_path.write_text("# imageBase=0x08804000\nentry,size,name,thunk\n0x08804000,16,func,0\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = ghidra_crosscheck.main([
+                    "ghidra_crosscheck.py", "--elf", os.fspath(path), "--csv", os.fspath(csv_path),
+                ])
+            self.assertEqual(status, 1)
+            self.assertTrue(stderr.getvalue().startswith("ANALYZER_"))
+
+    def test_psp_import_table_is_reconstructed_when_section_names_are_missing(self):
+        base = 0x08804000
+        image, _stub = build_synthetic_import_prx(b"sceSynthetic", base)
+        image = bytearray(image)
+        struct.pack_into("<H", image, 16, 2)
+        struct.pack_into("<I", image, 24, base)
+        phoff = struct.unpack_from("<I", image, 28)[0]
+        struct.pack_into("<II", image, phoff + 8, base, base)
+        struct.pack_into("<I", image, phoff + 28, 0x100)
+        struct.pack_into("<H", image, 50, 0)  # valid section table without a name table
+        shoff = struct.unpack_from("<I", image, 32)[0]
+        shentsize, shnum = struct.unpack_from("<HH", image, 46)
+        for index in range(shnum):
+            struct.pack_into("<I", image, shoff + index * shentsize, 0)
+        module_info = 0x100 + 0x40
+        module_name = b"Synthetic"
+        image[module_info + 4:module_info + 4 + len(module_name)] = module_name
+        struct.pack_into("<I", image, module_info + 32, 4)  # nonzero GP metadata
+
+        elf = imports_tool.Elf(bytes(image))
+        parsed = imports_tool.parse_imports(elf)
+
+        self.assertIsNotNone(elf.sec(".text"))
+        self.assertIsNotNone(elf.sec(".rodata.sceModuleInfo"))
+        self.assertEqual(list(parsed.values()), [("sceSynthetic", 0x12345678)])
+
+    def test_comment_and_control_bytes_are_percent_encoded(self):
+        hostile = b'evil*/\n"\\\xff'
+        parsed = imports_tool.parse_imports(FakeElf(hostile))
+        lib, nid = parsed[FakeElf.FIRST_SYM]
+        self.assertEqual(nid, 0x12345678)
+        self.assertEqual(lib, "evil%2A%2F%0A%22%5C%FF")
+        self.assertNotIn("*/", lib)
+        self.assertNotIn("\n", lib)
+        self.assertNotIn('"', lib)
+        self.assertTrue(lib.isascii())
+        self.assertTrue(all(c.isalnum() or c in "_.-%" for c in lib))
+
+    def test_percent_is_encoded_so_representation_is_reversible(self):
+        self.assertEqual(imports_tool._encode_import_library_name(b"A%2FB"), "A%252FB")
+
+    def test_toml_basic_string_never_emits_raw_syntax_from_encoded_name(self):
+        encoded = imports_tool._encode_import_library_name(b'a"\n\\\xff')
+        literal = imports_tool._toml_basic_string(encoded)
+        self.assertEqual(literal, '"a%22%0A%5C%FF"')
+        self.assertNotIn("\n", literal)
+
+    def test_overlong_unterminated_library_name_is_rejected(self):
+        limit = imports_tool.MAX_IMPORT_LIBRARY_NAME_BYTES
+        elf = FakeElf(b"A" * (limit + 1), terminate=False, size=0x2000)
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            imports_tool.parse_imports(elf)
+
+    def test_library_name_leaving_mapped_input_is_rejected(self):
+        # Move the name pointer to the final byte and make it non-NUL so the next read is unmapped.
+        elf = FakeElf(b"ok")
+        last_addr = elf.BASE + len(elf.mem) - 1
+        struct.pack_into("<I", elf.mem, elf.STUB - elf.BASE, last_addr)
+        elf.mem[-1] = ord("X")
+        with self.assertRaises(imports_tool.ImportTableError) as raised:
+            imports_tool.parse_imports(elf)
+        self.assertEqual(raised.exception.code, "ANALYZER_IMPORT_LIBRARY_NAME_UNMAPPED")
+        self.assertIn("leaves mapped input", str(raised.exception))
+
+    def test_truncated_module_info_is_rejected(self):
+        elf = FakeElf(b"sceDisplay")
+        original = elf.read_at_vaddr
+
+        def truncated(addr: int, n: int):
+            if addr == elf.MODULE and n == 52:
+                return b"\0" * 12
+            return original(addr, n)
+
+        elf.read_at_vaddr = truncated
+        with self.assertRaisesRegex(ValueError, "truncated .rodata.sceModuleInfo"):
+            imports_tool.parse_imports(elf)
+
+    def test_import_address_arithmetic_overflow_is_rejected(self):
+        elf = FakeElf(b"sceDisplay")
+        # Two functions make the second stub address exceed UINT32_MAX.
+        off = elf.STUB - elf.BASE
+        struct.pack_into("<H", elf.mem, off + 10, 2)  # numFuncs
+        struct.pack_into("<I", elf.mem, off + 16, 0xFFFFFFFC)  # firstSym
+        with self.assertRaisesRegex(ValueError, "address arithmetic"):
+            imports_tool.parse_imports(elf)
+
+    @unittest.skipUnless(CC, "no C compiler on PATH")
+    def test_malicious_prx_cli_codegen_and_compiler_integration(self):
+        assert CC is not None
+        primary_base = 0x08804000
+        extra_base = 0x08904000
+        payload = b'evil*/\n#define IMPORT_NAME_INJECTED 1\r\n"\\%\x01\xff'
+        encoded = imports_tool._encode_import_library_name(payload)
+
+        with tempfile.TemporaryDirectory(prefix="import_name_integration_") as td:
+            tmp = Path(td)
+            hostile = tmp / "hostile.prx"
+            ordinary = tmp / "ordinary.prx"
+            hostile_blob, hostile_stub = build_synthetic_import_prx(
+                payload, primary_base
+            )
+            ordinary_blob, _ = build_synthetic_import_prx(
+                b"sceDisplay", primary_base
+            )
+            hostile.write_bytes(hostile_blob)
+            ordinary.write_bytes(ordinary_blob)
+
+            toml_path = tmp / "hostile.toml"
+            imports_result = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(TOOLS / "imports.py"),
+                    os.fspath(hostile),
+                    f"{primary_base:x}",
+                    f"--toml={toml_path}",
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                imports_result.returncode,
+                0,
+                imports_result.stdout + imports_result.stderr,
+            )
+            parsed_toml = tomllib.loads(toml_path.read_text(encoding="ascii"))
+            self.assertEqual(
+                parsed_toml["import"],
+                [{"stub": hostile_stub, "lib": encoded, "nid": 0x12345678}],
+            )
+
+            def generate_and_compile(
+                stem: str, main_prx: Path, extra_prx: Path | None = None
+            ) -> str:
+                out_c = tmp / f"{stem}.c"
+                command = [
+                    sys.executable,
+                    os.fspath(TOOLS / "codegen.py"),
+                    os.fspath(main_prx),
+                    os.fspath(out_c),
+                    f"--base={primary_base:x}",
+                    "--funcs-per-chunk=2000",
+                ]
+                if extra_prx is not None:
+                    command.append(f"--extra-elf={extra_prx}@{extra_base:x}")
+                env = os.environ.copy()
+                env["GAME_BASE"] = hex(primary_base)
+                generated = subprocess.run(
+                    command, cwd=ROOT, env=env, capture_output=True, text=True
+                )
+                self.assertEqual(
+                    generated.returncode, 0, generated.stdout + generated.stderr
+                )
+
+                chunks = sorted(tmp.glob(f"{stem}_[0-9]*.c"))
+                self.assertTrue(chunks, "codegen emitted no compilable chunk")
+                combined = "\n".join(
+                    chunk.read_text(encoding="ascii") for chunk in chunks
+                )
+                self.assertIn(f"import: {encoded} nid 0x12345678", combined)
+                for chunk in chunks:
+                    obj = chunk.with_suffix(".o")
+                    build = subprocess.run(
+                        [
+                            CC,
+                            "-std=c11",
+                            "-Wall",
+                            "-Wextra",
+                            "-Werror",
+                            "-Wno-unused-function",
+                            f"-I{tmp}",
+                            f"-I{ROOT / 'src' / 'rt'}",
+                            "-c",
+                            os.fspath(chunk),
+                            "-o",
+                            os.fspath(obj),
+                        ],
+                        cwd=ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+                    preprocessed = subprocess.run(
+                        [
+                            CC,
+                            "-dM",
+                            "-E",
+                            f"-I{tmp}",
+                            f"-I{ROOT / 'src' / 'rt'}",
+                            os.fspath(chunk),
+                        ],
+                        cwd=ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(
+                        preprocessed.returncode,
+                        0,
+                        preprocessed.stdout + preprocessed.stderr,
+                    )
+                    self.assertNotIn("IMPORT_NAME_INJECTED", preprocessed.stdout)
+                return combined
+
+            normal = generate_and_compile("normal", hostile)
+            self.assertEqual(normal.count(f"import: {encoded}"), 1)
+
+            extra_hostile = tmp / "extra-hostile.prx"
+            extra_blob, _ = build_synthetic_import_prx(payload, extra_base)
+            extra_hostile.write_bytes(extra_blob)
+            extra = generate_and_compile("extra", ordinary, extra_hostile)
+            self.assertIn("import: sceDisplay nid 0x12345678", extra)
+            self.assertEqual(extra.count(f"import: {encoded}"), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

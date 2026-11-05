@@ -1,0 +1,2489 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Nakagawa Recomp authors
+
+"""Regression tests for analyzer executable-span ownership.
+
+An extra executable span (a code range that lives outside the section table) is
+*title configuration*. The analyzer therefore applies one only when a caller hands
+it over explicitly; there is no built-in default, and ambient process state cannot
+reach a library call. The environment seam is read at CLI entry points only, and
+only for the primary image, so a rebased extra guest module analyzed in the same
+process can never inherit the primary module's span.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import random
+import shutil
+from contextlib import redirect_stderr
+from pathlib import Path
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parent.parent
+TOOLS = ROOT / "tools"
+sys.path.insert(0, str(TOOLS))
+
+import analyze  # noqa: E402
+import codegen  # noqa: E402
+import scratch_dir  # noqa: E402
+from nk_core import package_cache  # noqa: E402
+from makefile_text import read_makefile  # noqa: E402
+
+# A wholly synthetic span standing in for "some other title's configuration". It is
+# deliberately NOT any real title's address range: these tests prove isolation and
+# ownership, which no real address is needed to demonstrate, and reusing one would
+# spread a title-specific constant into generic test surfaces.
+FOREIGN_SPAN = (0x00420000, 0x00420400)
+FOREIGN_SPAN_TEXT = "0x00420000,0x00420400"
+# A second, distinct synthetic span for the cases that need two values to disagree.
+RIVAL_SPAN_TEXT = "0x00400000,0x00400100"
+PRIMARY_BASE = 0x1000
+REBASED_BASE = 0x09ebfc00
+CC = shutil.which("gcc")
+
+
+def write_elf(path: Path, *, load_addr: int = PRIMARY_BASE, words=(0x03E00008, 0x00000000)) -> None:
+    """Fabricate a minimal little-endian ET_EXEC with one executable PT_LOAD.
+
+    `words` are placed at `load_addr` and the entry point is the segment start. No
+    section headers are emitted, so the loader reconstructs the executable range from
+    the segment exactly like a stripped PRX image would.
+    """
+    payload_off = 52 + 32
+    filesz = len(words) * 4
+    blob = bytearray(payload_off + filesz)
+    blob[:8] = b"\x7fELF\x01\x01\x01\x00"
+    struct.pack_into(
+        "<HHIIIIIHHHHHH", blob, 16,
+        2, 8, 1, load_addr, 52, 0, 0, 52, 32, 1, 0, 0, 0,
+    )
+    struct.pack_into(
+        "<8I", blob, 52,
+        1, payload_off, load_addr, load_addr, filesz, filesz, 5, 4,
+    )
+    for index, word in enumerate(words):
+        struct.pack_into("<I", blob, payload_off + index * 4, word & 0xFFFFFFFF)
+    path.write_bytes(blob)
+
+
+def write_direct_call_chain_elf(path: Path, function_count: int) -> None:
+    """Fabricate a source-owned ELF whose functions form one direct-call chain."""
+    base = PRIMARY_BASE
+    words = []
+    for index in range(function_count):
+        target = base + ((index + 1) % function_count) * 20
+        words.extend((
+            0x27BDFFF0,  # addiu $sp, $sp, -16
+            0x0C000000 | ((target >> 2) & 0x03FFFFFF),  # jal next function
+            0x00000000,  # delay slot
+            0x03E00008,  # jr $ra
+            0x00000000,  # delay slot
+        ))
+    payload = struct.pack(f"<{len(words)}I", *words)
+    payload_off = 52 + 32
+    blob = bytearray(payload_off + len(payload))
+    blob[:8] = b"\x7fELF\x01\x01\x01\x00"
+    struct.pack_into(
+        "<HHIIIIIHHHHHH", blob, 16,
+        2, 8, 1, base, 52, 0, 0, 52, 32, 1, 0, 0, 0,
+    )
+    struct.pack_into(
+        "<8I", blob, 52,
+        1, payload_off, base, base, len(payload), len(payload), 5, 4,
+    )
+    blob[payload_off:] = payload
+    path.write_bytes(blob)
+
+
+def write_elf_with_called_code_outside_text(path: Path) -> int:
+    """Fabricate executable bytes beyond a deliberately narrow named .text section."""
+    base = 0x1000
+    target = base + 0x20
+    words = [
+        0x0C000000 | ((target >> 2) & 0x03FFFFFF),  # jal target
+        0x00000000,                                # delay slot
+        0x03E00008,                                # jr $ra
+        0x00000000,                                # delay slot
+        0x00000000,
+        0x00000000,
+        0x00000000,
+        0x00000000,
+        0x03E00008,                                # hidden leaf: jr $ra
+        0x00000000,                                # delay slot
+        0x00000000,
+        0x00000000,
+        0x00000000,
+        0x00000000,
+        0x00000000,
+        0x00000000,
+    ]
+    payload_off = 52 + 32
+    filesz = len(words) * 4
+    shstr = b"\x00.text\x00.shstrtab\x00"
+    shstr_off = payload_off + filesz
+    shoff = shstr_off + len(shstr)
+    blob = bytearray(shoff + 3 * 40)
+    blob[:8] = b"\x7fELF\x01\x01\x01\x00"
+    struct.pack_into(
+        "<HHIIIIIHHHHHH", blob, 16,
+        2, 8, 1, base, 52, shoff, 0, 52, 32, 1, 40, 3, 2,
+    )
+    struct.pack_into(
+        "<8I", blob, 52,
+        1, payload_off, base, base, filesz, filesz, 5, 4,
+    )
+    for index, word in enumerate(words):
+        struct.pack_into("<I", blob, payload_off + index * 4, word)
+    blob[shstr_off:shstr_off + len(shstr)] = shstr
+    struct.pack_into("<10I", blob, shoff + 40, 1, 1, 6, base, payload_off, 16, 0, 0, 4, 0)
+    struct.pack_into(
+        "<10I", blob, shoff + 80,
+        7, 3, 0, 0, shstr_off, len(shstr), 0, 0, 1, 0,
+    )
+    path.write_bytes(blob)
+    return target
+
+
+def write_elf_with_entry_outside_text(path: Path) -> int:
+    """Place the ELF entry in an executable PT_LOAD prefix before named .text."""
+    base = 0x1000
+    text_addr = base + 0x20
+    words = [
+        0x03E00008,  # entry: jr $ra
+        0x00000000,  # delay slot
+        *([0x00000000] * 6),  # executable, file-backed gap before .text
+        0x03E00008,  # .text function
+        0x00000000,
+        0x00000000,
+        0x00000000,
+    ]
+    payload_off = 52 + 32
+    filesz = len(words) * 4
+    shstr = b"\x00.text\x00.shstrtab\x00"
+    shstr_off = payload_off + filesz
+    shoff = shstr_off + len(shstr)
+    blob = bytearray(shoff + 3 * 40)
+    blob[:8] = b"\x7fELF\x01\x01\x01\x00"
+    struct.pack_into(
+        "<HHIIIIIHHHHHH", blob, 16,
+        2, 8, 1, base, 52, shoff, 0, 52, 32, 1, 40, 3, 2,
+    )
+    struct.pack_into(
+        "<8I", blob, 52,
+        1, payload_off, base, base, filesz, filesz, 5, 4,
+    )
+    for index, word in enumerate(words):
+        struct.pack_into("<I", blob, payload_off + index * 4, word)
+    blob[shstr_off:shstr_off + len(shstr)] = shstr
+    struct.pack_into(
+        "<10I", blob, shoff + 40,
+        1, 1, 6, text_addr, payload_off + text_addr - base, 16, 0, 0, 4, 0,
+    )
+    struct.pack_into(
+        "<10I", blob, shoff + 80,
+        7, 3, 0, 0, shstr_off, len(shstr), 0, 0, 1, 0,
+    )
+    path.write_bytes(blob)
+    return base
+
+
+def write_elf_with_segment_start_trampoline(path: Path) -> int:
+    """Place a framed trampoline at PT_LOAD start while ELF entry is in .text."""
+    base = 0x2000
+    text_addr = base + 0x20
+    words = [
+        0x27BDFFF0,  # addiu $sp, $sp, -16
+        0x03E00008,  # jr $ra
+        0x00000000,  # delay slot
+        *([0x00000000] * 5),  # executable, file-backed gap before .text
+        0x03E00008,  # .text function / ELF entry
+        0x00000000,
+        0x00000000,
+        0x00000000,
+    ]
+    payload_off = 52 + 32
+    filesz = len(words) * 4
+    shstr = b"\x00.text\x00.shstrtab\x00"
+    shstr_off = payload_off + filesz
+    shoff = shstr_off + len(shstr)
+    blob = bytearray(shoff + 3 * 40)
+    blob[:8] = b"\x7fELF\x01\x01\x01\x00"
+    struct.pack_into(
+        "<HHIIIIIHHHHHH", blob, 16,
+        2, 8, 1, text_addr, 52, shoff, 0, 52, 32, 1, 40, 3, 2,
+    )
+    struct.pack_into(
+        "<8I", blob, 52,
+        1, payload_off, base, base, filesz, filesz, 5, 4,
+    )
+    for index, word in enumerate(words):
+        struct.pack_into("<I", blob, payload_off + index * 4, word)
+    blob[shstr_off:shstr_off + len(shstr)] = shstr
+    struct.pack_into(
+        "<10I", blob, shoff + 40,
+        1, 1, 6, text_addr, payload_off + text_addr - base, 16, 0, 0, 4, 0,
+    )
+    struct.pack_into(
+        "<10I", blob, shoff + 80,
+        7, 3, 0, 0, shstr_off, len(shstr), 0, 0, 1, 0,
+    )
+    path.write_bytes(blob)
+    return base
+
+
+def write_elf_with_unusual_section_code_pointer(path: Path) -> int:
+    """Point to out-of-.text code from a linker-specific data section."""
+    base = 0x3000
+    text_addr = base + 0x20
+    target = base + 0x40
+    pointer_addr = base + 0x48
+    words = [0x00000000] * 19
+    words[8] = 0x03E00008  # ELF entry in .text
+    words[16] = 0x03E00008  # address-taken leaf outside .text
+    words[18] = target  # callback pointer in .callback_refs
+    payload_off = 52 + 32
+    filesz = len(words) * 4
+    shstr = b"\x00.text\x00.callback_refs\x00.shstrtab\x00"
+    shstr_off = payload_off + filesz
+    shoff = shstr_off + len(shstr)
+    blob = bytearray(shoff + 4 * 40)
+    blob[:8] = b"\x7fELF\x01\x01\x01\x00"
+    struct.pack_into(
+        "<HHIIIIIHHHHHH", blob, 16,
+        2, 8, 1, text_addr, 52, shoff, 0, 52, 32, 1, 40, 4, 3,
+    )
+    struct.pack_into(
+        "<8I", blob, 52,
+        1, payload_off, base, base, filesz, filesz, 5, 4,
+    )
+    for index, word in enumerate(words):
+        struct.pack_into("<I", blob, payload_off + index * 4, word)
+    blob[shstr_off:shstr_off + len(shstr)] = shstr
+    struct.pack_into(
+        "<10I", blob, shoff + 40,
+        1, 1, 6, text_addr, payload_off + text_addr - base, 8, 0, 0, 4, 0,
+    )
+    struct.pack_into(
+        "<10I", blob, shoff + 80,
+        7, 1, 2, pointer_addr, payload_off + pointer_addr - base, 4, 0, 0, 4, 0,
+    )
+    struct.pack_into(
+        "<10I", blob, shoff + 120,
+        22, 3, 0, 0, shstr_off, len(shstr), 0, 0, 1, 0,
+    )
+    path.write_bytes(blob)
+    return target
+
+
+def write_elf_with_data_jal_in_text_to_rodata(path: Path) -> int:
+    """Place a data word in .text that decodes as a JAL into same-segment .rodata."""
+    base = 0x1000
+    text_addr = base + 0x20
+    target = base + 0x40
+    payload_off = 52 + 32
+    filesz = 0x44
+    shstr = b"\x00.text\x00.rodata\x00.shstrtab\x00"
+    shstr_off = payload_off + filesz
+    shoff = shstr_off + len(shstr)
+    blob = bytearray(shoff + 4 * 40)
+    blob[:8] = b"\x7fELF\x01\x01\x01\x00"
+    struct.pack_into(
+        "<HHIIIIIHHHHHH", blob, 16,
+        2, 8, 1, base, 52, shoff, 0, 52, 32, 1, 40, 4, 3,
+    )
+    struct.pack_into(
+        "<8I", blob, 52,
+        1, payload_off, base, base, filesz, filesz, 5, 4,
+    )
+    struct.pack_into("<II", blob, payload_off, 0x03E00008, 0x00000000)
+    jal = 0x0C000000 | ((target >> 2) & 0x03FFFFFF)
+    struct.pack_into("<I", blob, payload_off + text_addr - base, jal)
+    struct.pack_into("<I", blob, payload_off + target - base, 0x03E00008)
+    blob[shstr_off:shstr_off + len(shstr)] = shstr
+    struct.pack_into(
+        "<10I", blob, shoff + 40,
+        1, 1, 6, text_addr, payload_off + text_addr - base, 4, 0, 0, 4, 0,
+    )
+    struct.pack_into(
+        "<10I", blob, shoff + 80,
+        7, 1, 2, target, payload_off + target - base, 4, 0, 0, 4, 0,
+    )
+    struct.pack_into(
+        "<10I", blob, shoff + 120,
+        15, 3, 0, 0, shstr_off, len(shstr), 0, 0, 1, 0,
+    )
+    path.write_bytes(blob)
+    return target
+
+
+def write_zero_based_module(path: Path, *, relocatable: bool = True,
+                            unrelocated_call: int = 0x0C000005, data_pointer: int = 0x28) -> None:
+    """A zero-based PSP module (ET_SCE_PRX) whose loader relocations name its addresses.
+
+    .text holds three functions: 0x00 (the entry) calls 0x20 through a relocated jal and
+    makes an unrelocated jal whose target field reads 0x14, the shape a module linked
+    against its executable uses for a call into it; 0x20 is a leaf; 0x28 is a leaf reached
+    only through the relocated pointer in .data. .data also holds the integer 8, equal to
+    the text offset of a delay slot inside 0x00, with no relocation. `relocatable=False`
+    writes the same bytes as an ET_EXEC with no relocation section. `unrelocated_call`
+    and `data_pointer` replace the unrelocated jal word and the relocated pointer.
+    """
+    text = [
+        0x27BDFFF0,  # 0x00 addiu sp, sp, -16
+        0x0C000008,  # 0x04 jal 0x20 (R_MIPS_26)
+        0x00000000,  # 0x08 nop
+        unrelocated_call,  # 0x0c jal 0x14 (no relocation: outside the module)
+        0x00000000,  # 0x10 nop
+        0x27BD0010,  # 0x14 addiu sp, sp, 16
+        0x03E00008,  # 0x18 jr ra
+        0x00000000,  # 0x1c nop
+        0x03E00008,  # 0x20 jr ra
+        0x00000000,  # 0x24 nop
+        0x03E00008,  # 0x28 jr ra
+        0x00000000,  # 0x2c nop
+    ]
+    data = [data_pointer, 0x00000008]  # 0x40: relocated pointer; 0x44: unrelocated integer
+    relocations = [(0x04, 4), (0x40, 2)]  # type-A (offset, info): R_MIPS_26, R_MIPS_32
+    payload_off = 52 + 32
+    image = bytearray(0x48)
+    for index, word in enumerate(text):
+        struct.pack_into("<I", image, index * 4, word)
+    for index, word in enumerate(data):
+        struct.pack_into("<I", image, 0x40 + index * 4, word)
+    rel_off = payload_off + len(image)
+    rel = b"".join(struct.pack("<II", offset, info) for offset, info in relocations)
+    if not relocatable:
+        rel = b""
+    shstr = b"\x00.text\x00.data\x00.rel.text\x00.shstrtab\x00"
+    shstr_off = rel_off + len(rel)
+    shoff = shstr_off + len(shstr)
+    sections = 5 if relocatable else 4
+    blob = bytearray(shoff + 40 * sections)
+    blob[:8] = b"\x7fELF\x01\x01\x01\x00"
+    struct.pack_into(
+        "<HHIIIIIHHHHHH", blob, 16,
+        0xFFA0 if relocatable else 2, 8, 1, 0, 52, shoff, 0, 52, 32, 1, 40,
+        sections, sections - 1,
+    )
+    struct.pack_into("<8I", blob, 52, 1, payload_off, 0, 0, len(image), len(image), 7, 16)
+    blob[payload_off:payload_off + len(image)] = image
+    blob[rel_off:rel_off + len(rel)] = rel
+    blob[shstr_off:shstr_off + len(shstr)] = shstr
+    struct.pack_into("<10I", blob, shoff + 40, 1, 1, 6, 0, payload_off, 0x30, 0, 0, 4, 0)
+    struct.pack_into("<10I", blob, shoff + 80, 7, 1, 3, 0x40, payload_off + 0x40, 8, 0, 0, 4, 0)
+    if relocatable:
+        struct.pack_into("<10I", blob, shoff + 120,
+                         13, 0x700000A0, 0, 0, rel_off, len(rel), 0, 0, 4, 8)
+    struct.pack_into("<10I", blob, shoff + 40 * (sections - 1),
+                     23, 3, 0, 0, shstr_off, len(shstr), 0, 0, 1, 0)
+    path.write_bytes(blob)
+
+
+class AnalyzerSpanScopeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._saved_environ = os.environ.copy()
+        for name in ("TITLE_EXTRA_SPANS", "HST_EXTRA_SPANS", "GAME_BASE"):
+            os.environ.pop(name, None)
+        self.temp = scratch_dir.TemporaryDirectory(prefix="nakagawa-span-scope-")
+        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(self._restore_environ)
+        self.root = Path(self.temp.name)
+        self.elf = self.root / "primary.elf"
+        write_elf(self.elf)
+
+    def _restore_environ(self) -> None:
+        os.environ.clear()
+        os.environ.update(self._saved_environ)
+
+    def _clean_env(self, **overrides: str) -> dict[str, str]:
+        env = os.environ.copy()
+        env.pop("TITLE_EXTRA_SPANS", None)
+        env.pop("HST_EXTRA_SPANS", None)
+        env.update(overrides)
+        return env
+
+    # --- no hidden default ------------------------------------------------
+
+    def test_base_zero_image_gets_no_title_specific_span(self) -> None:
+        loaded = analyze.Elf(str(self.elf), base=0)
+        self.assertEqual(analyze.exec_ranges(loaded), [(PRIMARY_BASE, PRIMARY_BASE + 8)])
+        starts, ranges = analyze.analyze(loaded)
+        self.assertEqual(ranges, [(PRIMARY_BASE, PRIMARY_BASE + 8)])
+        self.assertIn(PRIMARY_BASE, starts)
+
+    def test_direct_call_frontier_does_not_rescan_prior_targets(self) -> None:
+        function_count = 128
+        chain_elf = self.root / "direct-call-chain.elf"
+        write_direct_call_chain_elf(chain_elf, function_count)
+        image = analyze.Elf(str(chain_elf), base=0)
+
+        builtin_set = set
+        tracked_calls = [None]
+        scanned_entries = 0
+
+        class CountingSet(builtin_set):
+            def __iter__(self):
+                nonlocal scanned_entries
+                if self is tracked_calls[0]:
+                    scanned_entries += len(self)
+                return super().__iter__()
+
+        def counted_set(*args):
+            return CountingSet(*args)
+
+        original_trace = analyze.trace_function
+
+        def trace_and_record_calls(elf, start, ranges, covered, calls, hc, walked=None):
+            if tracked_calls[0] is None:
+                tracked_calls[0] = calls
+            return original_trace(elf, start, ranges, covered, calls, hc, walked=walked)
+
+        with redirect_stderr(io.StringIO()), \
+             mock.patch.object(analyze, "set", counted_set, create=True), \
+             mock.patch.object(analyze, "trace_function", trace_and_record_calls):
+            starts, _ranges = analyze.analyze(image)
+
+        self.assertEqual(len(starts), function_count)
+        self.assertLessEqual(
+            scanned_entries, function_count * 2,
+            "call discovery must process newly found targets without rescanning the full set",
+        )
+
+    def test_direct_call_owns_only_reachable_code_outside_named_text(self) -> None:
+        called_elf = self.root / "called-outside-text.elf"
+        target = write_elf_with_called_code_outside_text(called_elf)
+        loaded = analyze.Elf(str(called_elf), base=0)
+
+        starts, ranges = analyze.analyze(loaded)
+
+        self.assertIn(target, starts)
+        self.assertIn((target, target + 8), ranges)
+        self.assertFalse(analyze.in_ranges(target + 8, ranges))
+
+    def test_entry_outside_named_text_owns_only_its_reachable_instructions(self) -> None:
+        entry_elf = self.root / "entry-outside-text.elf"
+        entry = write_elf_with_entry_outside_text(entry_elf)
+        loaded = analyze.Elf(str(entry_elf), base=0)
+
+        starts, ranges = analyze.analyze(loaded)
+
+        self.assertIn(entry, starts)
+        self.assertIn((entry, entry + 8), ranges)
+        self.assertFalse(analyze.in_ranges(entry + 8, ranges))
+        self.assertIn((entry + 0x20, entry + 0x30), ranges)
+
+    def test_segment_start_trampoline_is_owned_without_widening_the_gap(self) -> None:
+        trampoline_elf = self.root / "segment-start-trampoline.elf"
+        trampoline = write_elf_with_segment_start_trampoline(trampoline_elf)
+        loaded = analyze.Elf(str(trampoline_elf), base=0)
+
+        starts, ranges = analyze.analyze(loaded)
+
+        self.assertIn(trampoline, starts)
+        self.assertIn((trampoline, trampoline + 12), ranges)
+        self.assertFalse(analyze.in_ranges(trampoline + 12, ranges))
+        self.assertIn((trampoline + 0x20, trampoline + 0x30), ranges)
+
+    def test_unusual_section_pointer_owns_only_out_of_text_target(self) -> None:
+        pointer_elf = self.root / "unusual-section-code-pointer.elf"
+        target = write_elf_with_unusual_section_code_pointer(pointer_elf)
+        loaded = analyze.Elf(str(pointer_elf), base=0)
+
+        starts, ranges = analyze.analyze(loaded)
+
+        self.assertIn(target, starts)
+        self.assertIn((target, target + 8), ranges)
+        self.assertFalse(analyze.in_ranges(target + 8, ranges))
+
+    def test_linear_sweep_does_not_treat_jal_data_as_rodata_function(self) -> None:
+        data_elf = self.root / "data-jal-to-rodata.elf"
+        target = write_elf_with_data_jal_in_text_to_rodata(data_elf)
+        loaded = analyze.Elf(str(data_elf), base=0)
+
+        starts, _ = analyze.analyze(loaded)
+
+        self.assertNotIn(target, starts)
+
+    def test_relocatable_module_takes_code_addresses_only_from_relocated_words(self) -> None:
+        # A relocatable module can load anywhere, so a word its loader does not relocate is
+        # no address in it: the integer 8 in .data is not a pointer to 0x08, and the
+        # unrelocated jal's target field (0x14) names code outside the module. Both used to
+        # seed functions inside 0x00, splitting it at a delay slot and at its epilogue.
+        module = self.root / "zero-based-module.prx"
+        write_zero_based_module(module)
+        loaded = analyze.Elf(str(module), base=0)
+        self.assertEqual(loaded.relocated_words, {0x04: "jump26", 0x40: "word32"})
+
+        starts, _ = analyze.analyze(loaded)
+
+        self.assertEqual(sorted(starts), [0x00, 0x20, 0x28])
+        evidence = analyze.code_pointer_evidence(loaded, analyze.exec_ranges(loaded))
+        self.assertEqual(evidence["jal"], frozenset({0x20}))
+        self.assertEqual(evidence["data"], frozenset({0x28}))
+
+    def test_unrelocated_call_in_a_relocatable_module_still_continues(self) -> None:
+        # The call into the executable returns: the code after its delay slot is the same
+        # function's, and the module's own epilogue stays owned.
+        module = self.root / "zero-based-module.prx"
+        write_zero_based_module(module)
+        loaded = analyze.Elf(str(module), base=0)
+        covered, calls, found = set(), set(), set()
+
+        analyze.trace_function(loaded, 0x00, analyze.exec_ranges(loaded), covered, calls, {0x00},
+                               unrelocated=found)
+
+        self.assertEqual(found, {0x0C})
+        self.assertEqual(calls, {0x20})
+        self.assertTrue({0x14, 0x18, 0x1C} <= covered)
+
+    def test_a_module_placed_at_a_load_address_keeps_its_unrelocated_calls(self) -> None:
+        # A module placed at a load address whose own calls carry no relocation was linked
+        # for that address: the unrelocated jal runs to its face value, 0x28 in the module
+        # there, so it is an edge. The pointer that also reached 0x28 is dropped here.
+        module = self.root / "placed-module.prx"
+        base = 0x08A00000
+        write_zero_based_module(module, unrelocated_call=0x0C000000 | ((base + 0x28) >> 2),
+                                data_pointer=0)
+        loaded = analyze.Elf(str(module), base=base)
+        self.assertTrue(loaded.relocated_words)
+
+        with redirect_stderr(io.StringIO()):
+            starts, _ = analyze.analyze(loaded)
+
+        self.assertIn(base + 0x28, set(starts))
+
+    def test_a_fixed_address_image_keeps_every_word_as_address_evidence(self) -> None:
+        # The same bytes as a fixed-address executable: its words are its addresses as they
+        # stand, so the jal to 0x14 and the data word 8 still count (the legacy rule).
+        image = self.root / "fixed-image.elf"
+        write_zero_based_module(image, relocatable=False)
+        loaded = analyze.Elf(str(image), base=0)
+        self.assertIsNone(loaded.relocated_words)
+
+        starts, _ = analyze.analyze(loaded)
+
+        self.assertTrue({0x08, 0x14} <= set(starts))
+
+    def test_generic_analyzer_source_carries_no_title_constant(self) -> None:
+        source = (TOOLS / "analyze.py").read_text(encoding="utf-8")
+        self.assertNotIn("DEFAULT_HST_EXTRA_SPANS", source)
+
+    def test_ambient_environment_cannot_reach_a_library_call(self) -> None:
+        os.environ["TITLE_EXTRA_SPANS"] = FOREIGN_SPAN_TEXT
+        loaded = analyze.Elf(str(self.elf), base=0)
+        self.assertEqual(analyze.exec_ranges(loaded), [(PRIMARY_BASE, PRIMARY_BASE + 8)])
+        _, ranges = analyze.analyze(loaded)
+        self.assertEqual(ranges, [(PRIMARY_BASE, PRIMARY_BASE + 8)])
+        # Legacy HST must also not reach library (generic analyzer ignores HST entirely)
+        os.environ.pop("TITLE_EXTRA_SPANS", None)
+        os.environ["HST_EXTRA_SPANS"] = FOREIGN_SPAN_TEXT
+        self.assertEqual(analyze.exec_ranges(loaded), [(PRIMARY_BASE, PRIMARY_BASE + 8)])
+        _, ranges = analyze.analyze(loaded)
+        self.assertEqual(ranges, [(PRIMARY_BASE, PRIMARY_BASE + 8)])
+
+    # --- explicit spans ---------------------------------------------------
+
+    def test_explicit_span_is_applied_to_the_module_that_owns_it(self) -> None:
+        loaded = analyze.Elf(str(self.elf), base=0)
+        ranges = analyze.exec_ranges(loaded, extra_spans=[FOREIGN_SPAN])
+        self.assertEqual(ranges, [(PRIMARY_BASE, PRIMARY_BASE + 8), FOREIGN_SPAN])
+        _, from_analyze = analyze.analyze(loaded, extra_spans=[FOREIGN_SPAN])
+        self.assertEqual(ranges, from_analyze)
+
+    def test_two_modules_with_different_explicit_spans_stay_isolated(self) -> None:
+        other = self.root / "other.elf"
+        write_elf(other, load_addr=0x2000)
+        first = analyze.exec_ranges(
+            analyze.Elf(str(self.elf), base=0), extra_spans=[(0x00400000, 0x00400100)]
+        )
+        second = analyze.exec_ranges(
+            analyze.Elf(str(other), base=0), extra_spans=[(0x00500000, 0x00500100)]
+        )
+        self.assertIn((0x00400000, 0x00400100), first)
+        self.assertNotIn((0x00500000, 0x00500100), first)
+        self.assertIn((0x00500000, 0x00500100), second)
+        self.assertNotIn((0x00400000, 0x00400100), second)
+
+    def test_explicit_span_applies_to_a_fixed_address_image(self) -> None:
+        # The fixture is an ET_EXEC without relocations: a nonzero GAME_BASE leaves it at
+        # its own addresses, which are the guest addresses the span is written in.
+        fixed = analyze.Elf(str(self.elf), base=REBASED_BASE)
+        self.assertIsNone(fixed.reloc)
+        ranges = analyze.exec_ranges(fixed, extra_spans=[FOREIGN_SPAN])
+        self.assertIn((PRIMARY_BASE, PRIMARY_BASE + 8), ranges)
+        self.assertIn(FOREIGN_SPAN, ranges)
+        _, from_analyze = analyze.analyze(fixed, extra_spans=[FOREIGN_SPAN])
+        self.assertEqual(from_analyze, ranges)
+
+    def test_explicit_span_fails_closed_on_a_relocated_image(self) -> None:
+        # A PRX moved to GAME_BASE: a span could have been written against either the
+        # file or the relocated addresses, so the analyzer refuses it.
+        prx = self.root / "relocatable.prx"
+        write_elf(prx, load_addr=0)
+        blob = bytearray(prx.read_bytes())
+        struct.pack_into("<H", blob, 16, 0xFFA0)  # e_type ET_SCE_PRX
+        prx.write_bytes(blob)
+        relocated = analyze.Elf(str(prx), base=REBASED_BASE)
+        self.assertIsNotNone(relocated.reloc)
+        with self.assertRaisesRegex(RuntimeError, "relocated to GAME_BASE"):
+            analyze.exec_ranges(relocated, extra_spans=[FOREIGN_SPAN])
+        with self.assertRaisesRegex(RuntimeError, "relocated to GAME_BASE"):
+            analyze.analyze(relocated, extra_spans=[FOREIGN_SPAN])
+        self.assertNotEqual(analyze.exec_ranges(relocated), [(0, 0)])
+
+    # --- span parsing -----------------------------------------------------
+
+    def test_span_parsing_accepts_only_well_formed_ranges(self) -> None:
+        self.assertIsNone(analyze.parse_extra_spans(None))
+        self.assertIsNone(analyze.parse_extra_spans(""))
+        self.assertIsNone(analyze.parse_extra_spans("   "))
+        self.assertEqual(analyze.parse_extra_spans(FOREIGN_SPAN_TEXT), [FOREIGN_SPAN])
+        # Decimal and whitespace-padded forms name the same range.
+        decimal = f" {FOREIGN_SPAN[0]} , {FOREIGN_SPAN[1]} "
+        self.assertEqual(analyze.parse_extra_spans(decimal), [FOREIGN_SPAN])
+        for malformed, pattern in (
+            ("0x10", "look like 'lo,hi'"),
+            ("0x10,0x20,0x30", "look like 'lo,hi'"),
+            ("0x10,zzz", "numeric"),
+            ("-1,0x20", "negative"),
+            ("0x20,0x10", "hi > lo"),
+            ("0x10,0x10", "hi > lo"),
+            ("0,0x100000001", "32-bit"),
+        ):
+            with self.subTest(value=malformed):
+                with self.assertRaisesRegex(RuntimeError, pattern):
+                    analyze.parse_extra_spans(malformed)
+
+    def test_environment_and_option_must_agree(self) -> None:
+        env = {"TITLE_EXTRA_SPANS": FOREIGN_SPAN_TEXT}
+        self.assertEqual(analyze.analyzer_span_from_env(env), [FOREIGN_SPAN])
+        self.assertIsNone(analyze.analyzer_span_from_env({}))
+        # An explicit option wins over an equal environment value...
+        self.assertEqual(
+            analyze.resolve_extra_spans(FOREIGN_SPAN_TEXT, env), [FOREIGN_SPAN]
+        )
+        # ...and a disagreement fails closed instead of silently picking one.
+        with self.assertRaisesRegex(RuntimeError, "conflicts with"):
+            analyze.resolve_extra_spans(RIVAL_SPAN_TEXT, env)
+
+    # --- generic TITLE is sole authority: HST legacy does not leak --------------
+
+    def test_title_undefined_plus_stale_hst_yields_none_A3(self) -> None:
+        # A3 mandatory load-bearing: TITLE undefined + stale HST -> none
+        env = {"HST_EXTRA_SPANS": FOREIGN_SPAN_TEXT}
+        self.assertIsNone(analyze.analyzer_span_from_env(env))
+
+    def test_title_empty_plus_stale_hst_yields_none_A4(self) -> None:
+        env = {"TITLE_EXTRA_SPANS": "", "HST_EXTRA_SPANS": FOREIGN_SPAN_TEXT}
+        self.assertIsNone(analyze.analyzer_span_from_env(env))
+
+    def test_title_generic_value_yields_span_A2(self) -> None:
+        env = {"TITLE_EXTRA_SPANS": FOREIGN_SPAN_TEXT}
+        self.assertEqual(analyze.analyzer_span_from_env(env), [FOREIGN_SPAN])
+
+    def test_title_undefined_empty_yields_none_A1(self) -> None:
+        self.assertIsNone(analyze.analyzer_span_from_env({}))
+        self.assertIsNone(analyze.analyzer_span_from_env({"TITLE_EXTRA_SPANS": ""}))
+
+    def test_malformed_title_fails_closed_A5(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "look like"):
+            analyze.analyzer_span_from_env({"TITLE_EXTRA_SPANS": "bad"})
+        with self.assertRaisesRegex(RuntimeError, "numeric"):
+            analyze.analyzer_span_from_env({"TITLE_EXTRA_SPANS": "0x10,zzz"})
+
+    def test_unsupported_multi_span_fails_closed_A6(self) -> None:
+        # analyzer seam accepts at most one span; two comma-separated pairs is malformed grammar
+        with self.assertRaisesRegex(RuntimeError, "look like"):
+            analyze.parse_extra_spans("0x1000,0x2000,0x3000,0x4000")
+
+    def test_nonzero_base_plus_extra_span_uses_guest_addresses_A7(self) -> None:
+        loaded = analyze.Elf(str(self.elf), base=REBASED_BASE)
+        self.assertIn(
+            FOREIGN_SPAN,
+            analyze.exec_ranges(loaded, extra_spans=[FOREIGN_SPAN]),
+        )
+
+    def test_hst_legacy_translation_outside_analyzer_A8(self) -> None:
+        # A8: HST translation must happen before analyzer, not inside it.
+        # Simulate HST boundary: HST value translated to TITLE before calling analyzer.
+        hst_env = {"HST_EXTRA_SPANS": FOREIGN_SPAN_TEXT}
+        # Generic analyzer sees HST and returns None (no leak)
+        self.assertIsNone(analyze.analyzer_span_from_env(hst_env))
+        # HST boundary translates to TITLE
+        translated = {"TITLE_EXTRA_SPANS": hst_env["HST_EXTRA_SPANS"]}
+        self.assertEqual(analyze.analyzer_span_from_env(translated), [FOREIGN_SPAN])
+        # Analyzer source must not consult HST as implicit fallback (documentation mention allowed)
+        source = (TOOLS / "analyze.py").read_text(encoding="utf-8")
+        self.assertNotIn("LEGACY_EXTRA_SPAN_ENV", source)
+        # The generic helper must not read HST env var code-wise
+        self.assertNotIn('LEGACY_EXTRA_SPAN_ENV in environ', source)
+        self.assertNotIn('environ.get(LEGACY', source)
+
+    # --- CLI seams --------------------------------------------------------
+
+    def test_analyze_cli_runs_clean_without_an_explicit_span(self) -> None:
+        proc = subprocess.run(
+            [sys.executable, str(TOOLS / "analyze.py"), str(self.elf), "--base=0", "--quiet"],
+            cwd=ROOT, env=self._clean_env(), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_analyze_cli_refuses_an_unknown_option_or_an_extra_positional(self) -> None:
+        # A mistyped option used to be dropped silently, so the run went ahead without it.
+        for extra in ("--cfg-reprot=report.json", "second.elf"):
+            with self.subTest(extra=extra):
+                proc = subprocess.run(
+                    [sys.executable, str(TOOLS / "analyze.py"), str(self.elf), "--base=0", "--quiet",
+                     extra],
+                    cwd=ROOT, env=self._clean_env(), capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn(f"unrecognized arguments: {extra}", proc.stderr)
+
+    def test_codegen_cli_refuses_an_unknown_option_before_writing(self) -> None:
+        out_c = self.root / "refused.c"
+        proc = subprocess.run(
+            [sys.executable, str(TOOLS / "codegen.py"), str(self.elf), str(out_c),
+             "--base=0", "--profile=none", "--funcs-per-chunk=2000", "--lle-cpus"],
+            cwd=ROOT, env=self._clean_env(), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("unrecognized arguments: --lle-cpus", proc.stderr)
+        self.assertFalse(out_c.exists())
+        # In process, main() returns the status instead of raising SystemExit.
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            status = codegen.main(["codegen.py", str(self.elf), str(out_c), "--base=0", "--lle-cpus"])
+        self.assertEqual(status, 2)
+        self.assertIn("unrecognized arguments: --lle-cpus", stderr.getvalue())
+        self.assertFalse(out_c.exists())
+
+    def test_cfg_report_preserves_continuation_and_call_ownership(self) -> None:
+        target = PRIMARY_BASE + 0x10
+        tail_source = PRIMARY_BASE + 0x20
+        words = [
+            0x0C000000 | ((target >> 2) & 0x03FFFFFF),  # jal target
+            0x00000000,                                  # delay slot
+            0x03E00008,                                  # continuation entry
+            0x00000000,                                  # delay slot
+            0x00000000,
+            0x00000000,
+            0x03E00008,                                  # called entry
+            0x00000000,                                  # delay slot
+            0x08000000 | ((target >> 2) & 0x03FFFFFF),   # direct tail-call to target
+            0x00000000,                                  # delay slot
+        ]
+        elf_path = self.root / "cfg-owned.elf"
+        write_elf(elf_path, words=words)
+        image = analyze.Elf(str(elf_path), base=0)
+        report = analyze.canonical_cfg_report(
+            image,
+            ranges=[(PRIMARY_BASE, PRIMARY_BASE + len(words) * 4)],
+            entries=[PRIMARY_BASE, PRIMARY_BASE + 8, target, tail_source],
+        )
+
+        self.assertEqual(analyze.canonical_cfg_gate(report), [])
+        classified = {
+            (row["source"], row["target"], row["kind"]): row["classification"]
+            for row in report["successor_classifications"]
+        }
+        self.assertEqual(len(classified), len(report["edges"]))
+        self.assertEqual(
+            classified[(PRIMARY_BASE, PRIMARY_BASE + 4, "delay-slot")],
+            "same-region",
+        )
+        self.assertEqual(
+            classified[(PRIMARY_BASE, PRIMARY_BASE + 8, "fallthrough")],
+            "continuation-resume-entry",
+        )
+        self.assertEqual(
+            classified[(PRIMARY_BASE, target, "call")],
+            "inter-function-handoff-dispatch",
+        )
+        self.assertEqual(
+            classified[(tail_source, target, "tail-call")],
+            "inter-function-handoff-dispatch",
+        )
+        by_address = {row["address"]: row for row in report["instructions"]}
+        self.assertEqual(by_address[PRIMARY_BASE + 8]["classification"], "interior-entry")
+        self.assertTrue(
+            any(
+                edge["source"] == PRIMARY_BASE
+                and edge["target"] == PRIMARY_BASE + 8
+                for edge in report["continuation_edges"]
+            )
+        )
+        self.assertTrue(
+            any(
+                edge["source"] == PRIMARY_BASE
+                and edge["target"] == target
+                and edge["kind"] == "call"
+                for edge in report["call_edges"]
+            )
+        )
+
+    def test_cfg_gate_rejects_a_missing_successor_classification(self) -> None:
+        image = analyze.Elf(str(self.elf), base=0)
+        report = analyze.canonical_cfg_report(
+            image,
+            ranges=[(PRIMARY_BASE, PRIMARY_BASE + 8)],
+            entries=[PRIMARY_BASE],
+        )
+        report["successor_classifications"].pop()
+        findings = analyze.canonical_cfg_gate(report)
+        self.assertIn(
+            "successor-classification-coverage",
+            {finding["code"] for finding in findings},
+        )
+
+    def test_cfg_gate_records_unreached_executable_word(self) -> None:
+        # A nonzero word after an early return has no incoming known edge. Keep
+        # it visible as unowned instead of treating file adjacency as reachability.
+        words = [
+            0x03E00008,  # jr $ra
+            0x00000000,  # delay slot
+            0x3C020001,  # unreachable, non-padding instruction word
+            0x00000000,
+        ]
+        elf_path = self.root / "cfg-gap.elf"
+        write_elf(elf_path, words=words)
+        image = analyze.Elf(str(elf_path), base=0)
+        report = analyze.canonical_cfg_report(
+            image,
+            ranges=[(PRIMARY_BASE, PRIMARY_BASE + len(words) * 4)],
+            entries=[PRIMARY_BASE],
+        )
+
+        self.assertEqual(analyze.canonical_cfg_gate(report), [])
+        self.assertIn(PRIMARY_BASE + 8, report["unowned_executable"])
+
+    def test_cfg_gate_kills_owned_edge_into_unowned_callee(self) -> None:
+        # Simulate an analyzer regression that drops a direct-call entry from
+        # the seed set. The owned caller still has a precise in-image edge to
+        # the unowned callee, so the semantic gate must reject the report.
+        callee = PRIMARY_BASE + 16
+        words = [
+            0x0C000404,  # jal 0x00001010
+            0x00000000,  # delay slot
+            0x03E00008,  # caller return
+            0x00000000,  # delay slot
+            0x03E00008,  # unseeded callee
+            0x00000000,  # delay slot
+        ]
+        elf_path = self.root / "cfg-unowned-callee.elf"
+        write_elf(elf_path, words=words)
+        image = analyze.Elf(str(elf_path), base=0)
+        report = analyze.canonical_cfg_report(
+            image,
+            ranges=[(PRIMARY_BASE, PRIMARY_BASE + len(words) * 4)],
+            entries=[PRIMARY_BASE],
+        )
+
+        self.assertIn(callee, report["unowned_executable"])
+        findings = analyze.canonical_cfg_gate(report)
+        self.assertIn("ownership-gap", {finding["code"] for finding in findings})
+        self.assertTrue(any("0x00001010" in finding["message"] for finding in findings))
+
+    # --- #968: a linking branch to a callable is a call in discovery too -----------
+
+    #: Issue #968's program: the entry calls 0x1010, whose `bal` targets 0x1030, a leaf
+    #: placed after the caller's return, inside the caller's span.
+    ISSUE_968_WORDS = (
+        0x0C000404, 0x00000000, 0x03E00008, 0x03A01821,  # 0x1000 jal 0x1010; jr ra; addu v1, sp
+        0x27BDFFF0, 0xAFBF0000,                          # 0x1010 addiu sp, -16; sw ra, 0(sp)
+        0x04110005, 0x00000000,                          # 0x1018 bal 0x1030; nop
+        0x2442000A, 0x8FBF0000, 0x03E00008, 0x27BD0010,  # 0x1020 the continuation, return
+        0x24420001, 0x03E00008, 0x00000000,              # 0x1030 the callee
+    )
+    #: The entry calls a frameless body (0x1018) that only reads its PC with
+    #: `bal .+8` (0x101c -> 0x1024), and a framed one (0x1034) whose `bal`
+    #: (0x103c -> 0x1048) jumps over an inline data word into its own
+    #: frame-releasing tail. Neither branch is a call.
+    NOT_A_CALL_WORDS = (
+        0x0C000406, 0x00000000, 0x0C00040D, 0x00000000,  # 0x1000 jal 0x1018; jal 0x1034
+        0x03E00008, 0x00000000,                          # 0x1010 jr ra
+        0x03E04021,                                      # 0x1018 addu t0, ra, zero
+        0x04110001,                                      # 0x101c bal .+8 (0x1024)
+        0x24420064,                                      # 0x1020 addiu v0, v0, 100
+        0x03E02021,                                      # 0x1024 addu a0, ra, zero
+        0x0100F821, 0x03E00008, 0x2442000A,              # 0x1028 addu ra, t0; jr ra; slot
+        0x27BDFFF0, 0xAFBF0000,                          # 0x1034 addiu sp, -16; sw ra, 0(sp)
+        0x04110002,                                      # 0x103c bal 0x1048
+        0x24420064,                                      # 0x1040 addiu v0, v0, 100
+        0x24424000,                                      # 0x1044 inline data, never run
+        0x03E02021,                                      # 0x1048 addu a0, ra, zero
+        0x8FBF0000, 0x03E00008, 0x27BD0010,              # 0x104c lw ra; jr ra; addiu sp, 16
+    )
+
+    def _analyze_words(self, name: str, words) -> tuple[analyze.Elf, set, list]:
+        elf_path = self.root / f"{name}.elf"
+        write_elf(elf_path, words=words)
+        image = analyze.Elf(str(elf_path), base=0)
+        functions, ranges = analyze.analyze(image)
+        return image, set(functions), ranges
+
+    def test_in_body_linked_call_target_is_an_entry_not_the_callers_interior(self) -> None:
+        # Before: the caller's trace absorbed 0x1030 and nothing made it an entry.
+        image, functions, ranges = self._analyze_words("issue-968", self.ISSUE_968_WORDS)
+        self.assertIn(0x1030, functions, "the callee must be an analyzer-owned entry")
+        covered, calls = set(), set()
+        analyze.trace_function(image, 0x1010, ranges, covered, calls, set())
+        self.assertNotIn(0x1030, covered, "the callee is not the caller's interior")
+        self.assertIn(0x1030, calls)
+        self.assertTrue({0x1020, 0x1024, 0x1028, 0x102C} <= covered, "the link continues")
+
+    def test_read_the_pc_and_a_continuation_target_stay_interior(self) -> None:
+        image, functions, ranges = self._analyze_words("not-a-call", self.NOT_A_CALL_WORDS)
+        self.assertTrue({0x1018, 0x1034} <= functions, sorted(map(hex, functions)))
+        for caller, target in ((0x1018, 0x1024), (0x1034, 0x1048)):
+            with self.subTest(target=hex(target)):
+                self.assertNotIn(target, functions)
+                covered, calls = set(), set()
+                analyze.trace_function(image, caller, ranges, covered, calls, set())
+                self.assertIn(target, covered)
+                self.assertNotIn(target, calls)
+
+    def test_cfg_gate_owns_the_in_body_linked_call_target(self) -> None:
+        # The canonical CFG already models the link as a call edge; with the callee
+        # discovered as an entry, the opt-in gate owns it. Before: ownership-gap.
+        image, functions, ranges = self._analyze_words("issue-968-cfg", self.ISSUE_968_WORDS)
+        report = analyze.canonical_cfg_report(image, ranges=ranges, entries=sorted(functions))
+        self.assertEqual(analyze.canonical_cfg_gate(report), [])
+        elf_path = self.root / "issue-968-cfg.elf"
+        proc = subprocess.run(
+            [
+                sys.executable, str(TOOLS / "codegen.py"), str(elf_path),
+                str(self.root / "issue-968-cfg.c"),
+                "--base=0", "--profile=none", "--funcs-per-chunk=2000", "--cfg-gate",
+            ],
+            cwd=ROOT, env=self._clean_env(), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("CFG_GATE PASS", proc.stdout)
+
+    def test_codegen_gate_kills_analyzer_mutation_before_emission(self) -> None:
+        # Force the production codegen seam to lose the direct-call root. The
+        # independent CFG walk still sees the in-image call edge and must stop
+        # before any generated C is written.
+        elf_path = self.root / "cfg-missing-call-root.elf"
+        out_c = self.root / "cfg-missing-call-root.c"
+        words = (
+            0x0C000404, 0x00000000, 0x03E00008,
+            0x00000000, 0x03E00008, 0x00000000,
+        )
+        write_elf(elf_path, words=words)
+        stderr = io.StringIO()
+        with mock.patch.object(
+            codegen,
+            "analyze",
+            return_value=([PRIMARY_BASE], [(PRIMARY_BASE, PRIMARY_BASE + len(words) * 4)]),
+        ):
+            with mock.patch.dict(os.environ, self._clean_env(), clear=True):
+                with redirect_stderr(stderr):
+                    rc = codegen.main([
+                        "codegen.py", str(elf_path), str(out_c),
+                        "--base=0", "--profile=none", "--cfg-gate",
+                    ])
+
+        self.assertEqual(rc, 1, stderr.getvalue())
+        self.assertIn("CFG_GATE ownership-gap", stderr.getvalue())
+        self.assertIn("0x00001010", stderr.getvalue())
+        self.assertFalse(out_c.exists(), "ownership-gap failure must precede C emission")
+
+    def test_cfg_gate_kills_generated_sequential_fallthrough_gap_mutation(self) -> None:
+        # A mutant that stops ownership at sequential fallthrough silently
+        # leaves the next emitted word outside its callable region. The CFG
+        # gate must reject that edge before codegen writes C.
+        elf_path = self.root / "cfg-mutant-fallthrough.elf"
+        write_elf(elf_path, words=(0x24020001, 0x03E00008, 0x00000000))
+
+        mutant_tools = self.root / "fallthrough_mutant_tools"
+        mutant_tools.mkdir()
+        analyzer_source = (TOOLS / "analyze_cfg.py").read_text(encoding="utf-8")
+        mutation_anchor = (
+            '                if kind_id in {\n'
+            '                    _CFG_KIND_IDS["call"], _CFG_KIND_IDS["tail-call"],\n'
+            '                    _CFG_KIND_IDS["unresolved-indirect"],\n'
+            '                }:\n'
+        )
+        self.assertEqual(analyzer_source.count(mutation_anchor), 1)
+        mutant_analyzer = analyzer_source.replace(
+            mutation_anchor,
+            mutation_anchor.replace(
+                '_CFG_KIND_IDS["unresolved-indirect"],',
+                '_CFG_KIND_IDS["unresolved-indirect"],\n'
+                '                    _CFG_KIND_IDS["fallthrough"],',
+            ),
+            1,
+        )
+        (mutant_tools / "analyze_cfg.py").write_text(
+            mutant_analyzer,
+            encoding="utf-8",
+            newline="\n",
+        )
+        (mutant_tools / "codegen.py").write_text(
+            (TOOLS / "codegen.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        out_dir = self.root / "fallthrough_mutant_output"
+        out_dir.mkdir()
+        output_c = out_dir / "mutant.c"
+        report_path = out_dir / "mutant-cfg.json"
+        env = self._clean_env(
+            PYTHONPATH=os.pathsep.join((str(mutant_tools), str(TOOLS)))
+        )
+        result = subprocess.run(
+            [
+                sys.executable, str(mutant_tools / "codegen.py"),
+                str(elf_path), str(output_c), "--base=0", "--profile=none",
+                "--funcs-per-chunk=2000", "--cfg-gate",
+                f"--cfg-report={report_path}",
+            ],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("CFG_GATE ownership-gap", result.stderr)
+        self.assertIn("0x00001004", result.stderr)
+        self.assertFalse(output_c.exists())
+        report = package_cache.read_bounded_json(report_path)
+        gap = next(
+            row for row in report["successor_classifications"]
+            if row["source"] == PRIMARY_BASE and row["target"] == PRIMARY_BASE + 4
+        )
+        self.assertEqual(gap["kind"], "fallthrough")
+        self.assertEqual(gap["classification"], "invalid-unowned")
+
+    def test_post_jump_word_is_not_promoted_from_file_adjacency(self) -> None:
+        # This mirrors the cosim `jump` cell: the direct jump's delay slot is
+        # followed by a nonzero marker that has no incoming control-flow edge.
+        # File adjacency after an unconditional transfer is not callable evidence.
+        words = [
+            0x24020000,  # addiu v0, zero, 0
+            0x08000404,  # j 0x00001010
+            0x24420001,  # delay slot
+            0x24420400,  # unreachable marker at 0x100c
+            0x24420002,  # jump target
+            0x03E00008,  # jr $ra
+            0x24420010,  # return delay slot
+        ]
+        elf_path = self.root / "cfg-post-jump.elf"
+        write_elf(elf_path, words=words)
+        image = analyze.Elf(str(elf_path), base=0)
+        starts, ranges = analyze.analyze(image, cfg_gate=True)
+        self.assertIn(PRIMARY_BASE, starts)
+        self.assertNotIn(PRIMARY_BASE + 8, starts)
+        self.assertNotIn(PRIMARY_BASE + 12, starts)
+
+        report = analyze.canonical_cfg_report(image, ranges=ranges, entries=starts)
+        by_address = {row["address"]: row for row in report["instructions"]}
+        self.assertEqual(by_address[PRIMARY_BASE + 12]["owners"], [])
+        self.assertEqual(by_address[PRIMARY_BASE + 12]["classification"], "unowned-executable")
+
+    def test_branch_target_outside_authorized_code_fails_closed(self) -> None:
+        # A branch or jump target resolving outside authorized code fails closed.
+        # The target is never converted into a callable entry point, and the edge is
+        # classified as an out-of-range dispatch transfer.
+        out_of_range_target = 0x00800000
+        near_oor_target = PRIMARY_BASE + 0x1000
+        branch_offset = (near_oor_target - (PRIMARY_BASE + 0x14)) // 4
+        words = [
+            0x08000000 | ((out_of_range_target >> 2) & 0x03FFFFFF),  # j 0x00800000
+            0x00000000,
+            0x0C000000 | ((out_of_range_target >> 2) & 0x03FFFFFF),  # jal 0x00800000
+            0x00000000,
+            (0x04 << 26) | (branch_offset & 0xFFFF),                 # beq $0, $0, target 0x00002000
+            0x00000000,
+            0x03E00008,                                             # jr $ra
+            0x00000000,
+        ]
+        elf_path = self.root / "oor-branch-target.elf"
+        write_elf(elf_path, words=words)
+        image = analyze.Elf(str(elf_path), base=0)
+
+        starts, ranges = analyze.analyze(image)
+
+        self.assertNotIn(out_of_range_target, starts)
+        self.assertNotIn(near_oor_target, starts)
+
+        report = analyze.canonical_cfg_report(image, ranges=ranges, entries=starts)
+        self.assertEqual(analyze.canonical_cfg_gate(report), [])
+
+        classifications = {
+            (row["source"], row["target"], row["kind"]): row["classification"]
+            for row in report["successor_classifications"]
+        }
+        self.assertEqual(
+            classifications[(PRIMARY_BASE, out_of_range_target, "direct-jump")],
+            "inter-function-handoff-dispatch",
+        )
+        self.assertEqual(
+            classifications[(PRIMARY_BASE + 8, out_of_range_target, "call")],
+            "inter-function-handoff-dispatch",
+        )
+        self.assertEqual(
+            classifications[(PRIMARY_BASE + 16, near_oor_target, "direct-branch")],
+            "inter-function-handoff-dispatch",
+        )
+
+    @unittest.skipUnless(CC, "gcc is required for the analyzer semantic mutation proof")
+    def test_cfg_gate_kills_generated_direct_call_root_mutation(self) -> None:
+        words = (
+            0x0C000404, 0x00000000, 0x03E00008,
+            0x00000000, 0x03E00008, 0x00000000,
+        )
+        target = PRIMARY_BASE + 16
+        elf_path = self.root / "cfg-mutant-direct-call.elf"
+        write_elf(elf_path, words=words)
+        image = analyze.Elf(str(elf_path), base=0)
+        starts, _ = analyze.analyze(image)
+        self.assertIn(target, starts)
+
+        mutant_tools = self.root / "mutant_tools"
+        mutant_tools.mkdir()
+        analyzer_source = (TOOLS / "analyze.py").read_text(encoding="utf-8")
+        mutation_anchor = (
+            "                    if target not in calls:\n"
+            "                        calls.add(target)\n"
+            "                        new_calls.append(target)\n"
+            "                covered.add(pc + 4)"
+        )
+        self.assertEqual(analyzer_source.count(mutation_anchor), 1)
+        (mutant_tools / "analyze.py").write_text(
+            analyzer_source.replace(
+                mutation_anchor,
+                "                    pass\n                covered.add(pc + 4)",
+                1,
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        (mutant_tools / "codegen.py").write_text(
+            (TOOLS / "codegen.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        out_dir = self.root / "mutant_output"
+        out_dir.mkdir()
+        out_c = out_dir / "mutant.c"
+        env = self._clean_env(
+            PYTHONPATH=os.pathsep.join((str(mutant_tools), str(TOOLS)))
+        )
+        generated = subprocess.run(
+            [
+                sys.executable, str(mutant_tools / "codegen.py"),
+                str(elf_path), str(out_c), "--base=0", "--profile=none",
+                "--funcs-per-chunk=2000",
+            ],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(generated.returncode, 0, generated.stdout + generated.stderr)
+        self.assertTrue(out_c.is_file(), generated.stdout + generated.stderr)
+
+        gated_out = out_dir / "gated.c"
+        mutant_report_path = out_dir / "mutant-cfg.json"
+        gated = subprocess.run(
+            [
+                sys.executable, str(mutant_tools / "codegen.py"),
+                str(elf_path), str(gated_out), "--base=0", "--profile=none",
+                "--funcs-per-chunk=2000", "--cfg-gate",
+                f"--cfg-report={mutant_report_path}",
+            ],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(gated.returncode, 1, gated.stdout + gated.stderr)
+        self.assertIn("CFG_GATE ownership-gap", gated.stderr)
+        self.assertIn("0x00001010", gated.stderr)
+        self.assertFalse(gated_out.exists())
+        mutant_report = package_cache.read_bounded_json(mutant_report_path)
+        gap = next(
+            row for row in mutant_report["successor_classifications"]
+            if row["source"] == PRIMARY_BASE and row["target"] == target
+        )
+        self.assertEqual(gap["classification"], "invalid-unowned")
+
+        config = subprocess.run(
+            [
+                sys.executable, str(TOOLS / "title_runtime_config.py"),
+                "--output", str(self.root / "sr_title_config.h"),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(config.returncode, 0, config.stdout + config.stderr)
+
+        harness = self.root / "analyzer_mutation_harness.c"
+        harness.write_text(
+            "#define main embedded_dispatch_isolation_main\n"
+            "#include \"dispatch_isolation_selftest.c\"\n"
+            "#undef main\n"
+            "extern void sr_register_all(void);\n"
+            "int main(void) {\n"
+            "    sr_register_all();\n"
+            "    if (sr_lookup(0x00001010u) == NULL) {\n"
+            "        fprintf(stderr, \"ANALYZER_MUTANT_DROPPED_CALL_TARGET\\n\");\n"
+            "        return 17;\n"
+            "    }\n"
+            "    return 0;\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        exe = self.root / "analyzer_mutation_harness.exe"
+        compiled = subprocess.run(
+            [
+                CC, "-std=c11", "-O0", "-fno-strict-aliasing", "-Wall", "-Wextra",
+                "-DSR_SDL3VK", "-D_CRT_SECURE_NO_WARNINGS",
+                "-I", str(self.root), "-I", str(ROOT / "src" / "rt"), "-I", str(ROOT / "tests" / "native"),
+                str(harness), str(out_c), str(out_dir / "mutant_0.c"),
+                str(ROOT / "src" / "rt" / "guest_interp.c"),
+                str(ROOT / "src" / "rt" / "perf.c"),
+                str(ROOT / "src" / "rt" / "sr_coro.c"),
+                str(ROOT / "src" / "rt" / "cpu_lle.c"),
+                str(ROOT / "src" / "rt" / "domain_mode.c"),
+                str(ROOT / "src" / "rt" / "stale_code.c"),
+                str(ROOT / "src" / "rt" / "title_config.c"),
+                str(ROOT / "src" / "rt" / "vfpu_tables.c"),
+                "-lm", "-o", str(exe),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+        mutated_run = subprocess.run(
+            [str(exe)], cwd=ROOT, capture_output=True, text=True, check=False
+        )
+        self.assertEqual(mutated_run.returncode, 17, mutated_run.stdout + mutated_run.stderr)
+        self.assertIn("ANALYZER_MUTANT_DROPPED_CALL_TARGET", mutated_run.stderr)
+
+    def test_cfg_gate_treats_jalr_zero_as_tail_transfer(self) -> None:
+        # Codegen dispatches jalr with rd=$zero without a resume path. The
+        # following word is therefore not a callable fallthrough successor.
+        words = [
+            0x01000009,  # jalr $zero, $t0
+            0x00000000,  # delay slot
+            0x3C020001,  # unreachable marker after non-returning dispatch
+            0x00000000,
+        ]
+        elf_path = self.root / "cfg-jalr-zero-tail.elf"
+        write_elf(elf_path, words=words)
+        image = analyze.Elf(str(elf_path), base=0)
+        report = analyze.canonical_cfg_report(
+            image,
+            ranges=[(PRIMARY_BASE, PRIMARY_BASE + len(words) * 4)],
+            entries=[PRIMARY_BASE],
+        )
+
+        marker = next(
+            row for row in report["ownership_map"]
+            if row["address"] == PRIMARY_BASE + 8
+        )
+        self.assertEqual(marker["classification"], "unowned-executable")
+        self.assertIn(
+            {"source": PRIMARY_BASE, "target": None, "kind": "unresolved-indirect",
+             "detail": "computed-tail-transfer"},
+            report["edges"],
+        )
+        self.assertIn(
+            {
+                "source": PRIMARY_BASE,
+                "target": None,
+                "kind": "unresolved-indirect",
+                "classification": "interpreter-fail-closed-boundary",
+                "detail": "computed-tail-transfer",
+            },
+            report["successor_classifications"],
+        )
+        self.assertFalse(
+            any(
+                edge["source"] == PRIMARY_BASE
+                and edge["target"] == PRIMARY_BASE + 8
+                and edge["kind"] == "fallthrough"
+                for edge in report["edges"]
+            )
+        )
+        self.assertEqual(analyze.canonical_cfg_gate(report), [])
+
+    def test_codegen_cfg_gate_does_not_false_positive_on_direct_tail_call(self) -> None:
+        # Exercise the production CLI gate with a statically known tail transfer.
+        # The following unreachable word remains visible, while the transfer to
+        # the callable target must not be reported as an ownership gap.
+        words = (
+            0x08000404, 0x00000000,       # 0x1000 j 0x1010; delay slot
+            0x03E00008, 0x00000000,       # 0x1008 return anchor
+            0x24020007, 0x03E00008, 0x00000000,  # 0x1010 tail target
+        )
+        elf_path = self.root / "cfg-tail-call-cli.elf"
+        out_c = self.root / "cfg-tail-call-cli.c"
+        report_path = self.root / "cfg-tail-call-cli.json"
+        write_elf(elf_path, words=words)
+
+        result = subprocess.run(
+            [
+                sys.executable, str(TOOLS / "codegen.py"), str(elf_path), str(out_c),
+                "--base=0", "--profile=none", "--funcs-per-chunk=2000", "--cfg-gate",
+                f"--cfg-report={report_path}",
+            ],
+            cwd=ROOT,
+            env=self._clean_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("CFG_GATE PASS", result.stdout)
+        self.assertTrue(out_c.is_file(), result.stdout + result.stderr)
+        report = package_cache.read_bounded_json(report_path)
+        tail = next(
+            row for row in report["successor_classifications"]
+            if row["source"] == PRIMARY_BASE
+            and row["target"] == PRIMARY_BASE + 16
+            and row["kind"] == "tail-call"
+        )
+        self.assertEqual(tail["classification"], "inter-function-handoff-dispatch")
+
+        # Failing-before proof: a temporary gate mutant that flags this known
+        # tail-call as an ownership gap must fail through the same production
+        # CLI before C emission. The tracked analyzer and controls stay untouched.
+        mutant_tools = self.root / "tail_false_positive_mutant_tools"
+        mutant_tools.mkdir()
+        analyzer_source = (TOOLS / "analyze_cfg.py").read_text(encoding="utf-8")
+        mutation_anchor = (
+            '    for conflict in report.get("ownership_conflicts", ()):\n'
+        )
+        self.assertEqual(analyzer_source.count(mutation_anchor), 1)
+        mutant_analyzer = analyzer_source.replace(
+            mutation_anchor,
+            '    if any(\n'
+            '        isinstance(edge, dict) and edge.get("kind") == "tail-call"\n'
+            '        for edge in report.get("edges", ())\n'
+            '    ):\n'
+            '        findings.append({"code": "ownership-gap", "message": "false-positive tail-call mutant"})\n'
+            '    for conflict in report.get("ownership_conflicts", ()):\n',
+            1,
+        )
+        (mutant_tools / "analyze_cfg.py").write_text(
+            mutant_analyzer,
+            encoding="utf-8",
+            newline="\n",
+        )
+        (mutant_tools / "codegen.py").write_text(
+            (TOOLS / "codegen.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+            newline="\n",
+        )
+        mutant_out = self.root / "cfg-tail-call-mutant.c"
+        mutant_report = self.root / "cfg-tail-call-mutant.json"
+        env = self._clean_env(
+            PYTHONPATH=os.pathsep.join((str(mutant_tools), str(TOOLS)))
+        )
+        mutated = subprocess.run(
+            [
+                sys.executable, str(mutant_tools / "codegen.py"), str(elf_path), str(mutant_out),
+                "--base=0", "--profile=none", "--funcs-per-chunk=2000", "--cfg-gate",
+                f"--cfg-report={mutant_report}",
+            ],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(mutated.returncode, 1, mutated.stdout + mutated.stderr)
+        self.assertIn("CFG_GATE ownership-gap", mutated.stderr)
+        self.assertFalse(mutant_out.exists(), "the false-positive mutant must fail before C emission")
+
+    def test_codegen_cfg_gate_keeps_unreached_word_visible(self) -> None:
+        elf_path = self.root / "cfg-gap-cli.elf"
+        out_c = self.root / "cfg-gap-cli.c"
+        report_path = self.root / "cfg-gap-cli.json"
+        write_elf(
+            elf_path,
+            # A direct jump skips the nonzero word at 0x100c after its delay
+            # slot. The CFG retains it as unowned, without inventing a root.
+            words=(
+                0x24020000, 0x08000404, 0x24420001, 0x24420400,
+                0x24420002, 0x03E00008, 0x24420010,
+            ),
+        )
+        proc = subprocess.run(
+            [
+                sys.executable, str(TOOLS / "codegen.py"), str(elf_path), str(out_c),
+                "--base=0", "--profile=none", "--cfg-gate",
+                f"--cfg-report={report_path}",
+            ],
+            cwd=ROOT, env=self._clean_env(), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("CFG_GATE PASS", proc.stdout)
+        self.assertIn("unowned words recorded", proc.stdout)
+        self.assertTrue(out_c.exists())
+        self.assertIn(
+            PRIMARY_BASE + 12,
+            json.loads(report_path.read_text(encoding="ascii"))["unowned_executable"],
+        )
+
+    def test_analyze_cfg_report_alone_does_not_change_entry_inventory(self) -> None:
+        elf_path = self.root / "analyze-report-only.elf"
+        write_elf(
+            elf_path,
+            words=(0x08000404, 0, 0x03E00008, 0, 0, 0, 0x03E00008, 0),
+        )
+
+        def inventory(name: str, *flags: str) -> str:
+            toml_path = self.root / f"{name}.toml"
+            proc = subprocess.run(
+                [
+                    sys.executable, str(TOOLS / "analyze.py"), str(elf_path),
+                    "--base=0", f"--toml={toml_path}", *flags,
+                ],
+                cwd=ROOT, env=self._clean_env(), capture_output=True, text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return toml_path.read_text(encoding="utf-8")
+
+        default = inventory("analyze-default")
+        report_only = inventory(
+            "analyze-report-only", f"--cfg-report={self.root / 'analyze-report.json'}"
+        )
+        self.assertEqual(report_only, default)
+        self.assertNotEqual(inventory("analyze-gated", "--cfg-gate"), default)
+
+    def test_codegen_cfg_report_alone_does_not_change_generated_code(self) -> None:
+        elf_path = self.root / "cfg-report-only.elf"
+        # A direct jump followed by a `jr $ra`: the default lane seeds 0x1008 as
+        # an entry, the gate lane does not, so the two outputs differ.
+        write_elf(
+            elf_path,
+            words=(0x08000404, 0, 0x03E00008, 0, 0, 0, 0x03E00008, 0),
+        )
+
+        def generate(name: str, *flags: str) -> dict[str, bytes]:
+            out_dir = self.root / name
+            out_dir.mkdir()
+            proc = subprocess.run(
+                [
+                    sys.executable, str(TOOLS / "codegen.py"), str(elf_path),
+                    str(out_dir / "out.c"), "--base=0", "--profile=none",
+                    "--funcs-per-chunk=2000", *flags,
+                ],
+                cwd=ROOT, env=self._clean_env(), capture_output=True, text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return {path.name: path.read_bytes() for path in sorted(out_dir.glob("*.c"))}
+
+        default = generate("cfg-default")
+        report_path = self.root / "cfg-report-only.json"
+        report_only = generate("cfg-report-only", f"--cfg-report={report_path}")
+        gated_path = self.root / "cfg-gated-report.json"
+        gated = generate("cfg-gated", f"--cfg-report={gated_path}", "--cfg-gate")
+
+        self.assertEqual(report_only, default)
+        self.assertNotEqual(gated, default, "fixture must distinguish the gate lane")
+        # Both reports share the gate-mode CFG; their codegen ownership maps
+        # intentionally describe the different entry inventories actually emitted.
+        report_only_document = package_cache.read_bounded_json(report_path)
+        gated_document = package_cache.read_bounded_json(gated_path)
+        report_only_map = report_only_document.pop("emitted_ownership_map")
+        gated_map = gated_document.pop("emitted_ownership_map")
+        self.assertEqual(report_only_document, gated_document)
+        self.assertEqual(
+            report_only_map["source_cfg_schema_version"], analyze.CFG_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            gated_map["source_cfg_schema_version"], analyze.CFG_SCHEMA_VERSION,
+        )
+
+    def test_codegen_cfg_gate_records_unreached_extra_elf_word(self) -> None:
+        primary = self.root / "cfg-primary.elf"
+        extra = self.root / "cfg-extra-gap.elf"
+        out_c = self.root / "cfg-extra-gap.c"
+        write_elf(primary)
+        write_elf(
+            extra,
+            load_addr=0x2000,
+            words=(0x08000000, 0x00000000, 0x3C020001, 0x00000000),
+        )
+        proc = subprocess.run(
+            [
+                sys.executable, str(TOOLS / "codegen.py"), str(primary), str(out_c),
+                "--base=0", "--profile=none", "--cfg-gate",
+                f"--extra-elf={extra}@0x2000",
+            ],
+            cwd=ROOT, env=self._clean_env(), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("CFG_GATE PASS: extra module", proc.stdout)
+        self.assertTrue(out_c.exists())
+
+    def test_codegen_rejects_overlapping_primary_and_extra_exec_spans(self) -> None:
+        primary = self.root / "cfg-primary-overlap.elf"
+        extra = self.root / "cfg-extra-overlap.elf"
+        out_c = self.root / "cfg-overlap.c"
+        write_elf(primary)
+        write_elf(extra)
+        proc = subprocess.run(
+            [
+                sys.executable, str(TOOLS / "codegen.py"), str(primary), str(out_c),
+                "--base=0", "--profile=none", "--cfg-gate",
+                f"--extra-elf={extra}@0x1000",
+            ],
+            cwd=ROOT, env=self._clean_env(), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("CODEGEN_EXEC_SPAN_OVERLAP", proc.stderr)
+        self.assertFalse(out_c.exists(), "overlap must be rejected before C emission")
+
+    def test_cfg_cli_writes_machine_report_and_runs_gate(self) -> None:
+        report_path = self.root / "reports" / "cfg.json"
+        proc = subprocess.run(
+            [
+                sys.executable, str(TOOLS / "analyze.py"), str(self.elf),
+                "--base=0", f"--cfg-report={report_path}", "--cfg-gate",
+            ],
+            cwd=ROOT, env=self._clean_env(), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        report = json.loads(report_path.read_text(encoding="ascii"))
+        self.assertEqual(report["schema_version"], analyze.CFG_SCHEMA_VERSION)
+        self.assertEqual(
+            [row["address"] for row in report["ownership_map"]],
+            [row["address"] for row in report["instructions"]],
+        )
+        self.assertEqual(analyze.canonical_cfg_gate(report), [])
+        self.assertIn("CFG_GATE PASS", proc.stdout)
+
+    def test_codegen_cfg_gate_is_opt_in_and_writes_the_same_report(self) -> None:
+        out_c = self.root / "cfg-gated.c"
+        report_path = self.root / "reports" / "codegen-cfg.json"
+        proc = subprocess.run(
+            [
+                sys.executable, str(TOOLS / "codegen.py"), str(self.elf), str(out_c),
+                "--base=0", "--profile=none", "--funcs-per-chunk=2000",
+                f"--cfg-report={report_path}", "--cfg-gate",
+            ],
+            cwd=ROOT, env=self._clean_env(), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(out_c.is_file())
+        report = json.loads(report_path.read_text(encoding="ascii"))
+        self.assertEqual(analyze.canonical_cfg_gate(report), [])
+        self.assertIn("CFG_GATE PASS", proc.stdout)
+        bounded_report = package_cache.read_bounded_json(report_path)
+        emitted_map = bounded_report["emitted_ownership_map"]
+        self.assertEqual(emitted_map["schema_version"], codegen.EMITTED_OWNERSHIP_SCHEMA_VERSION)
+        regions = {row["start"]: row for row in emitted_map["regions"]}
+        self.assertEqual(regions[PRIMARY_BASE]["classification"], "callable")
+        self.assertTrue(regions[PRIMARY_BASE]["emitted"])
+        self.assertEqual(regions[PRIMARY_BASE + 4]["classification"], "interior")
+
+    def test_emitted_ownership_map_preserves_resume_owner(self) -> None:
+        report = {
+            "schema_version": analyze.CFG_SCHEMA_VERSION,
+            "ownership_map": [
+                {"address": PRIMARY_BASE, "classification": "owned", "owners": [PRIMARY_BASE]},
+                {"address": PRIMARY_BASE + 4, "classification": "owned", "owners": [PRIMARY_BASE]},
+                {"address": PRIMARY_BASE + 8, "classification": "interior-entry", "owners": [PRIMARY_BASE + 8]},
+            ],
+            "byte_classification": [
+                {"start": PRIMARY_BASE, "end": PRIMARY_BASE + 4, "classification": "owned"},
+                {"start": PRIMARY_BASE + 4, "end": PRIMARY_BASE + 8, "classification": "owned"},
+                {"start": PRIMARY_BASE + 8, "end": PRIMARY_BASE + 12, "classification": "interior-entry"},
+            ],
+        }
+        catalog = {
+            PRIMARY_BASE: codegen.EntryInfo(PRIMARY_BASE, True, False, None, frozenset()),
+            PRIMARY_BASE + 8: codegen.EntryInfo(
+                PRIMARY_BASE + 8, False, True, PRIMARY_BASE, frozenset(),
+            ),
+        }
+        emitted_map = codegen.build_emitted_ownership_map(
+            report, catalog, [PRIMARY_BASE, PRIMARY_BASE + 8],
+        )
+        regions = {row["start"]: row for row in emitted_map["regions"]}
+        self.assertEqual(regions[PRIMARY_BASE]["classification"], "callable")
+        self.assertEqual(regions[PRIMARY_BASE + 4]["classification"], "interior")
+        self.assertEqual(regions[PRIMARY_BASE + 8]["classification"], "resume")
+        self.assertEqual(regions[PRIMARY_BASE + 8]["owners"], [PRIMARY_BASE])
+        self.assertEqual(regions[PRIMARY_BASE + 8]["symbol"], "r_00001008")
+
+    def test_emitted_ownership_map_keeps_callable_conflicts_ambiguous(self) -> None:
+        report = {
+            "schema_version": analyze.CFG_SCHEMA_VERSION,
+            "ownership_map": [{
+                "address": PRIMARY_BASE,
+                "classification": "owner-conflict",
+                "owners": [PRIMARY_BASE, PRIMARY_BASE + 4],
+            }],
+            "byte_classification": [{
+                "start": PRIMARY_BASE,
+                "end": PRIMARY_BASE + 4,
+                "classification": "owner-conflict",
+            }],
+        }
+        catalog = {
+            PRIMARY_BASE: codegen.EntryInfo(
+                PRIMARY_BASE, True, False, None, frozenset(),
+            ),
+        }
+        emitted_map = codegen.build_emitted_ownership_map(
+            report, catalog, [PRIMARY_BASE],
+        )
+        region = emitted_map["regions"][0]
+        self.assertEqual(region["classification"], "ambiguous")
+        self.assertEqual(region["owners"], [PRIMARY_BASE, PRIMARY_BASE + 4])
+
+    def test_cfg_report_verifier_kills_missing_projection(self) -> None:
+        image = analyze.Elf(str(self.elf), base=0)
+        report = analyze.canonical_cfg_report(
+            image,
+            ranges=[(PRIMARY_BASE, PRIMARY_BASE + 8)],
+            entries=[PRIMARY_BASE],
+        )
+        report["byte_classification"].pop()
+        findings = analyze.canonical_cfg_gate(report)
+        self.assertTrue(any(item["code"] == "executable-coverage-gap" for item in findings))
+
+    def test_codegen_cli_scans_only_the_ranges_it_was_given(self) -> None:
+        # codegen reports the ranges it actually scanned, which is the externally
+        # visible statement of what the analyzer decided. Without a span it must be
+        # the segment alone; with one, exactly the segment plus that span.
+        out_c = self.root / "scan.c"
+        argv = [
+            sys.executable, str(TOOLS / "codegen.py"), str(self.elf), str(out_c),
+            "--base=0", "--profile=none", "--funcs-per-chunk=2000",
+        ]
+        bare = subprocess.run(
+            argv, cwd=ROOT, env=self._clean_env(), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(bare.returncode, 0, bare.stdout + bare.stderr)
+        self.assertIn(
+            f"SCANNING RANGES: [({PRIMARY_BASE}, {PRIMARY_BASE + 8})]",
+            bare.stdout + bare.stderr,
+        )
+        spanned = subprocess.run(
+            argv + [f"--extra-span={FOREIGN_SPAN_TEXT}"],
+            cwd=ROOT, env=self._clean_env(), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(spanned.returncode, 0, spanned.stdout + spanned.stderr)
+        self.assertIn(
+            f"SCANNING RANGES: [({PRIMARY_BASE}, {PRIMARY_BASE + 8}), "
+            f"({FOREIGN_SPAN[0]}, {FOREIGN_SPAN[1]})]",
+            spanned.stdout + spanned.stderr,
+        )
+
+    def test_codegen_primary_span_does_not_reach_a_rebased_extra_module(self) -> None:
+        # The manager exports the span across the make spawn. codegen must apply it to
+        # the primary image only: a rebased extra module must neither gain the span nor
+        # abort the build, which is what an ambient, per-ELF environment read did.
+        extra = self.root / "extra.prx"
+        write_elf(extra, load_addr=REBASED_BASE)
+        out_c = self.root / "out.c"
+        proc = subprocess.run(
+            [
+                sys.executable, str(TOOLS / "codegen.py"),
+                str(self.elf), str(out_c),
+                "--base=0", "--profile=none",
+                f"--extra-elf={extra}@0x{REBASED_BASE:08x}",
+                "--funcs-per-chunk=2000",
+            ],
+            cwd=ROOT,
+            env=self._clean_env(TITLE_EXTRA_SPANS=FOREIGN_SPAN_TEXT),
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("RuntimeError", proc.stderr)
+        self.assertTrue(out_c.is_file())
+
+    def test_codegen_extra_span_option_matches_the_environment_seam(self) -> None:
+        # The Make path passes --extra-span rather than a recipe environment prefix.
+        # Both routes must produce byte-identical generated code.
+        outputs = []
+        for label, argv, env in (
+            ("option", [f"--extra-span={FOREIGN_SPAN_TEXT}"], self._clean_env()),
+            ("environment", [], self._clean_env(TITLE_EXTRA_SPANS=FOREIGN_SPAN_TEXT)),
+        ):
+            # Same output *name* in different directories: the generated translation
+            # unit embeds its own basename, so differing names would mask a real diff.
+            out_dir = self.root / label
+            out_dir.mkdir()
+            out_c = out_dir / "out.c"
+            proc = subprocess.run(
+                [
+                    sys.executable, str(TOOLS / "codegen.py"),
+                    str(self.elf), str(out_c),
+                    "--base=0", "--profile=none", "--funcs-per-chunk=2000", *argv,
+                ],
+                cwd=ROOT, env=env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            outputs.append(out_c.read_bytes())
+        self.assertEqual(outputs[0], outputs[1])
+
+    def test_codegen_rejects_a_conflicting_ambient_span(self) -> None:
+        out_c = self.root / "conflict.c"
+        proc = subprocess.run(
+            [
+                sys.executable, str(TOOLS / "codegen.py"),
+                str(self.elf), str(out_c),
+                "--base=0", "--profile=none", "--funcs-per-chunk=2000",
+                f"--extra-span={RIVAL_SPAN_TEXT}",
+            ],
+            cwd=ROOT,
+            env=self._clean_env(TITLE_EXTRA_SPANS=FOREIGN_SPAN_TEXT),
+            capture_output=True, text=True, check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("conflicts with", proc.stderr)
+
+    def test_paths_with_spaces_and_shell_metacharacters_are_not_interpreted(self) -> None:
+        # codegen receives paths as argv entries, never through a shell. A directory
+        # whose name contains spaces and shell metacharacters must be treated as a
+        # literal path, and no part of it may be executed.
+        hostile = self.root / "a dir; echo pwned & $(id) `id`"
+        hostile.mkdir()
+        elf = hostile / "in put.elf"
+        write_elf(elf)
+        out_c = hostile / "out put.c"
+        proc = subprocess.run(
+            [
+                sys.executable, str(TOOLS / "codegen.py"),
+                str(elf), str(out_c),
+                "--base=0", "--profile=none", "--funcs-per-chunk=2000",
+            ],
+            cwd=ROOT, env=self._clean_env(), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        # The output landed at the exact literal path, and the tool reported that same
+        # literal path back: nothing was word-split, expanded, or executed.
+        self.assertTrue(out_c.is_file())
+        self.assertIn(str(out_c), proc.stdout)
+        self.assertFalse(any(self.root.glob("uid=*")))
+
+    # --- deterministic byte-budget chunking ------------------------------
+
+    @staticmethod
+    def _run_codegen(elf: Path, out_c: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable, str(TOOLS / "codegen.py"), str(elf), str(out_c),
+                "--base=0", "--profile=none", "--funcs-per-chunk=2000", *extra,
+            ],
+            cwd=ROOT, env=None, capture_output=True, text=True, check=False,
+        )
+
+    @staticmethod
+    def _chunk_names(root: Path, stem: str) -> list[list[str]]:
+        import re
+
+        chunks = sorted(root.glob(f"{stem}_[0-9]*.c"))
+        names = []
+        for chunk in chunks:
+            names.append(re.findall(r"void (f_[0-9a-f]{8})", chunk.read_text(encoding="ascii")))
+        return names
+
+    def test_byte_budget_splits_contiguously_in_order_without_duplicates(self) -> None:
+        # Six uniform reachable 8-byte functions. The byte budget must close a chunk
+        # only on a function boundary, preserve emission order, and never move or
+        # duplicate a function across chunks.
+        words: list[int] = []
+        for i in range(6):
+            words.append(0x0C000000 | (((0x1000 + (i + 1) * 8) >> 2) & 0x3FFFFFF) if i < 5 else 0x03E00008)
+            words.append(0x00000000)
+        elf = self.root / "budget.elf"
+        write_elf(elf, words=words)
+
+        legacy = self.root / "budget_legacy.c"
+        proc = self._run_codegen(elf, legacy)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        legacy_text = (self.root / "budget_legacy_0.c").read_text(encoding="ascii")
+        per_func = (len(legacy_text) - legacy_text.index("void f_")) // 6
+        self.assertEqual(
+            self._chunk_names(self.root, "budget_legacy"),
+            [[f"f_{0x1000 + i * 8:08x}" for i in range(6)]],
+        )
+
+        # A budget of three function emissions plus a little slack must yield 2
+        # contiguous chunks of exactly 3 functions each.
+        budget = per_func * 3 + 64
+        split = self.root / "budget_split.c"
+        proc = self._run_codegen(elf, split, f"--target-chunk-bytes={budget}")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            self._chunk_names(self.root, "budget_split"),
+            [
+                [f"f_{0x1000 + i * 8:08x}" for i in range(3)],
+                [f"f_{0x1000 + (i + 3) * 8:08x}" for i in range(3)],
+            ],
+        )
+
+    def test_byte_budget_still_respects_the_function_cap(self) -> None:
+        # A huge budget must not turn the cap off: the legacy count bound still
+        # applies, so 6 functions with a cap of 2 become 3 chunks of 2.
+        words: list[int] = []
+        for i in range(6):
+            words.append(0x0C000000 | (((0x1000 + (i + 1) * 8) >> 2) & 0x3FFFFFF) if i < 5 else 0x03E00008)
+            words.append(0x00000000)
+        elf = self.root / "cap.elf"
+        write_elf(elf, words=words)
+
+        out_c = self.root / "cap_split.c"
+        proc = self._run_codegen(elf, out_c, "--funcs-per-chunk=2", "--target-chunk-bytes=1073741824")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            self._chunk_names(self.root, "cap_split"),
+            [
+                [f"f_{0x1000 + i * 8:08x}" for i in range(2)],
+                [f"f_{0x1000 + (i + 2) * 8:08x}" for i in range(2)],
+                [f"f_{0x1000 + (i + 4) * 8:08x}" for i in range(2)],
+            ],
+        )
+
+    def test_absent_byte_budget_keeps_the_legacy_count_partition(self) -> None:
+        # Without the flag the emitted partition must stay purely count-based, so a
+        # cap of 2 still yields 3 chunks of 2 -- the byte budget must not leak into
+        # the default path.
+        words: list[int] = []
+        for i in range(6):
+            words.append(0x0C000000 | (((0x1000 + (i + 1) * 8) >> 2) & 0x3FFFFFF) if i < 5 else 0x03E00008)
+            words.append(0x00000000)
+        elf = self.root / "legacy.elf"
+        write_elf(elf, words=words)
+
+        out_c = self.root / "legacy_split.c"
+        proc = self._run_codegen(elf, out_c, "--funcs-per-chunk=2")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            self._chunk_names(self.root, "legacy_split"),
+            [
+                [f"f_{0x1000 + i * 8:08x}" for i in range(2)],
+                [f"f_{0x1000 + (i + 2) * 8:08x}" for i in range(2)],
+                [f"f_{0x1000 + (i + 4) * 8:08x}" for i in range(2)],
+            ],
+        )
+
+
+class MakefileSpanBindingTests(unittest.TestCase):
+    """The direct-Make path must bind a span explicitly, not rely on a default."""
+
+    def setUp(self) -> None:
+        self.makefile = read_makefile(ROOT)
+
+    def test_span_is_passed_as_an_argument_not_a_shell_environment_prefix(self) -> None:
+        # `VAR=value cmd` needs a POSIX shell; Make falls back to cmd.exe on Windows
+        # when sh is absent. The span therefore travels as an argv entry via
+        # EFFECTIVE_EXTRA_SPANS derived only from TITLE_EXTRA_SPANS (generic contract).
+        self.assertIn("--extra-span=$(strip $(EFFECTIVE_EXTRA_SPANS))", self.makefile)
+        self.assertIn("$(EXTRA_SPAN_ARG)", self.makefile)
+        self.assertNotIn("HST_EXTRA_SPANS=$(HST_EXTRA_SPANS) $(PYTHON)", self.makefile)
+
+    def test_span_is_empty_for_a_generic_title(self) -> None:
+        self.assertIn("TITLE_EXTRA_SPANS ?=\n", self.makefile)
+        self.assertNotIn("HST_EXTRA_SPANS", self.makefile)
+
+    def test_span_participates_in_the_codegen_profile_hash(self) -> None:
+        # Changing the span must invalidate previously generated code. The codegen
+        # profile's entries are NK_CODEGEN_PROFILE_ENTRIES; the span is one of them.
+        # Normal build parses hash the exported entries in a batch, with the
+        # individual profile_hash path retained for parses before the build directory
+        # is ready. The record recipe reads the same entries from its environment.
+        export_line = next(
+            line for line in self.makefile.splitlines()
+            if line.startswith("export NK_CODEGEN_PROFILE_ENTRIES :=")
+        )
+        self.assertIn("EXTRA_SPAN_ARG=$(EXTRA_SPAN_ARG)", export_line)
+        hash_lines = [
+            line for line in self.makefile.splitlines()
+            if line.startswith("CODEGEN_PROFILE_HASH :=")
+        ]
+        self.assertIn(
+            "CODEGEN_PROFILE_HASH := $(word 1,$(_PROFILE_HASHES))", hash_lines
+        )
+        self.assertTrue(any(
+            "$(call profile_hash,NK_CODEGEN_PROFILE_ENTRIES," in line
+            for line in hash_lines
+        ))
+        self.assertIn(
+            "$(file >$(BUILD_DIR)/.codegen-profile-entries,$(NK_CODEGEN_PROFILE_ENTRIES))",
+            self.makefile,
+        )
+        self.assertTrue(any(
+            "hash-profiles" in line
+            and '--codegen-entries-file "$(BUILD_DIR)/.codegen-profile-entries"' in line
+            for line in self.makefile.splitlines()
+        ))
+        record_line = next(
+            line for line in self.makefile.splitlines() if "--section codegen" in line
+        )
+        self.assertIn("--entries-env NK_CODEGEN_PROFILE_ENTRIES", record_line)
+
+
+MIPS_JR_RA = 0x03E00008
+MIPS_NOP = 0x00000000
+MIPS_ADDU_T0 = 0x01094021  # addu $t0, $t0, $t1
+MIPS_PROLOGUE = 0x27BDFFF0  # addiu $sp, $sp, -16
+RANDOM_CODE_IMAGES = 48
+
+
+def write_words_elf(path: Path, words, *, base: int = PRIMARY_BASE, entry: int | None = None,
+                    text_words: int | None = None) -> None:
+    """Fabricate a little-endian ET_EXEC whose one executable PT_LOAD holds `words`.
+
+    The section table names .text over the first `text_words` words only, so the words after
+    it are executable file bytes outside the named code section. That is the case which gives
+    a trace merged ranges.
+    """
+    if text_words is None:
+        text_words = len(words)
+    payload_off = 52 + 32
+    filesz = len(words) * 4
+    shstr = b"\x00.text\x00.shstrtab\x00"
+    shstr_off = payload_off + filesz
+    shoff = shstr_off + len(shstr)
+    blob = bytearray(shoff + 3 * 40)
+    blob[:8] = b"\x7fELF\x01\x01\x01\x00"
+    struct.pack_into(
+        "<HHIIIIIHHHHHH", blob, 16,
+        2, 8, 1, base if entry is None else entry, 52, shoff, 0, 52, 32, 1, 40, 3, 2,
+    )
+    struct.pack_into("<8I", blob, 52, 1, payload_off, base, base, filesz, filesz, 5, 4)
+    for index, word in enumerate(words):
+        struct.pack_into("<I", blob, payload_off + index * 4, word & 0xFFFFFFFF)
+    blob[shstr_off:shstr_off + len(shstr)] = shstr
+    struct.pack_into(
+        "<10I", blob, shoff + 40,
+        1, 1, 6, base, payload_off, text_words * 4, 0, 0, 4, 0,
+    )
+    struct.pack_into(
+        "<10I", blob, shoff + 80,
+        7, 3, 0, 0, shstr_off, len(shstr), 0, 0, 1, 0,
+    )
+    path.write_bytes(blob)
+
+
+def random_code_words(rng: random.Random, base: int, count: int) -> list[int]:
+    """Words drawn from the shapes the trace branches on, with targets around the image."""
+
+    def target() -> int:
+        # Mostly inside the image, sometimes just past it.
+        return base + 4 * rng.randrange(0, count + 16)
+
+    words: list[int] = []
+    while len(words) < count:
+        pick = rng.random()
+        if pick < 0.14:
+            words.append(0x0C000000 | ((target() >> 2) & 0x03FFFFFF))  # jal
+        elif pick < 0.24:
+            words.append(0x08000000 | ((target() >> 2) & 0x03FFFFFF))  # j
+        elif pick < 0.36:
+            if rng.random() < 0.25:
+                words.append(0x10000000 | (rng.randrange(-24, 25) & 0xFFFF))  # b
+            else:
+                op = rng.choice((0x04, 0x05, 0x06, 0x07))  # beq, bne, blez, bgtz
+                rs, rt = rng.randrange(4), rng.randrange(4)
+                words.append((op << 26) | (rs << 21) | (rt << 16)
+                             | (rng.randrange(-24, 25) & 0xFFFF))
+        elif pick < 0.40:
+            rt = rng.choice((0x00, 0x01, 0x10, 0x11))  # bltz, bgez, bltzal, bgezal
+            words.append((0x01 << 26) | (rt << 16) | (rng.randrange(-24, 25) & 0xFFFF))
+        elif pick < 0.50:
+            words.append(rng.choice((MIPS_JR_RA, 0x03200008, 0x0040F809)))  # jr $ra, jr $t9, jalr
+        elif pick < 0.62:
+            words.append(0x27BD0000 | ((-8 * rng.randrange(1, 17)) & 0xFFFF))  # addiu $sp, -N
+        elif pick < 0.70:
+            words.append(MIPS_NOP)
+        elif pick < 0.80:
+            reg = rng.randrange(1, 8)
+            address = target()
+            words.append(0x3C000000 | (reg << 16) | (address >> 16))  # lui
+            words.append(0x24000000 | (reg << 21) | (reg << 16) | (address & 0xFFFF))  # addiu
+        else:
+            words.append(rng.getrandbits(32))
+    return words[:count]
+
+
+class TraceMemoTests(unittest.TestCase):
+    """The memoized trace walk reproduces the uncached walk, and expands each word once."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="nakagawa-trace-memo-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def _walk(self, image_bytes: bytes, *, trace_memo: bool) -> dict:
+        """Every trace's start, owned ranges and call results, plus the analysis outputs."""
+        image = analyze.Elf(image_bytes, base=0)
+        steps = []
+        final: dict = {}
+        original = analyze.trace_function
+
+        def recording_trace(elf, start, ranges, covered, calls, hc, walked=None):
+            new_calls = original(elf, start, ranges, covered, calls, hc, walked=walked)
+            steps.append((start, tuple(ranges), tuple(new_calls)))
+            final["covered"] = covered
+            final["calls"] = calls
+            return new_calls
+
+        with redirect_stderr(io.StringIO()), \
+             mock.patch.object(analyze, "trace_function", recording_trace):
+            starts, ranges = analyze.analyze(image, trace_memo=trace_memo)
+        return {
+            "steps": steps,
+            "covered": sorted(final.get("covered", ())),
+            "calls": sorted(final.get("calls", ())),
+            "starts": sorted(starts),
+            "ranges": list(ranges),
+        }
+
+    def test_memoized_walk_matches_uncached_walk_on_fixtures(self) -> None:
+        for writer in (
+            write_elf_with_called_code_outside_text,
+            write_elf_with_entry_outside_text,
+            write_elf_with_segment_start_trampoline,
+            write_elf_with_unusual_section_code_pointer,
+            write_elf_with_data_jal_in_text_to_rodata,
+        ):
+            path = self.root / f"{writer.__name__}.elf"
+            writer(path)
+            image_bytes = path.read_bytes()
+            with self.subTest(fixture=writer.__name__):
+                self.assertEqual(
+                    self._walk(image_bytes, trace_memo=True),
+                    self._walk(image_bytes, trace_memo=False),
+                )
+
+    def test_memoized_walk_matches_uncached_walk_on_random_code(self) -> None:
+        merged_steps = 0
+        for seed in range(RANDOM_CODE_IMAGES):
+            rng = random.Random(seed)
+            count = rng.randrange(40, 129)
+            words = random_code_words(rng, PRIMARY_BASE, count)
+            path = self.root / f"random-{seed}.elf"
+            write_words_elf(path, words, text_words=rng.randrange(count // 2, count + 1))
+            image_bytes = path.read_bytes()
+            with self.subTest(seed=seed):
+                memoized = self._walk(image_bytes, trace_memo=True)
+                self.assertEqual(memoized, self._walk(image_bytes, trace_memo=False))
+                primary = tuple(analyze.exec_ranges(analyze.Elf(image_bytes, base=0)))
+                merged_steps += sum(1 for _start, ranges, _calls in memoized["steps"]
+                                    if ranges != primary)
+        # The corpus must exercise traces over merged ranges, not only the primary ones.
+        self.assertGreater(merged_steps, 0)
+
+    def test_shared_tail_is_expanded_once_across_starts(self) -> None:
+        """Every function jumps into one shared tail; the tail is walked once, not per function."""
+        shared_words = 256
+        functions = 32
+        shared = PRIMARY_BASE
+        words = [MIPS_ADDU_T0] * shared_words + [MIPS_JR_RA, MIPS_NOP]
+        function_starts = []
+        for _ in range(functions):
+            function_starts.append(PRIMARY_BASE + 4 * len(words))
+            words += [MIPS_PROLOGUE, 0x08000000 | ((shared >> 2) & 0x03FFFFFF), MIPS_NOP]
+        path = self.root / "shared-tail.elf"
+        write_words_elf(path, words, entry=function_starts[0])
+        image = analyze.Elf(str(path), base=0)
+        reads = 0
+        read_word = image.read_at_vaddr
+
+        def counting_read(vaddr, n):
+            nonlocal reads
+            reads += 1
+            return read_word(vaddr, n)
+
+        image.read_at_vaddr = counting_read
+        with redirect_stderr(io.StringIO()):
+            starts, _ranges = analyze.analyze(image)
+        for function_start in function_starts:
+            self.assertIn(function_start, starts)
+        self.assertLessEqual(
+            reads, 4 * (shared_words + 3 * functions) + 64,
+            "a shared tail must be expanded once, not once per function",
+        )
+
+
+class ScriptEntryTests(unittest.TestCase):
+    """analyze.py run as a script is one module with the copy its helpers import."""
+
+    def test_script_traces_a_linked_branch(self) -> None:
+        """A `bal` sends the trace through entry_frame_balance, which imports `analyze`. Run as a
+        script, that import used to load a second copy of this module whose in_ranges did not
+        recognise the script copy's _SpanIndex and failed with "'_SpanIndex' object is not
+        iterable"."""
+        with tempfile.TemporaryDirectory(prefix="nakagawa-analyze-script-") as temp:
+            elf_path = Path(temp) / "linked-branch.elf"
+            write_words_elf(elf_path, [
+                MIPS_PROLOGUE,
+                0x04110003,              # bal +3 (bgezal $zero): a linked call to the jr below
+                MIPS_NOP,
+                MIPS_JR_RA,
+                MIPS_NOP,
+                MIPS_JR_RA,              # the bal target
+                MIPS_NOP,
+            ])
+            result = subprocess.run(
+                [sys.executable, str(TOOLS / "analyze.py"), str(elf_path), "--quiet"],
+                capture_output=True, text=True, cwd=str(ROOT), timeout=120,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertNotIn("Traceback", result.stderr)
+
+
+class SpanIndexMembershipTests(unittest.TestCase):
+    """The trace's indexed membership answers exactly as the linear in_ranges scan."""
+
+    CASES = (
+        [],
+        [(0, 0)],
+        [(16, 16), (20, 12)],
+        [(0x100, 0x110)],
+        [(0x100, 0x110), (0x110, 0x120)],
+        [(0x100, 0x140), (0x120, 0x130), (0x200, 0x204)],
+        [(0x200, 0x204), (0x100, 0x110), (0x108, 0x104)],
+        [(0x100, 0x110), (0x100, 0x110)],
+        [(0x0, 0x8), (0x8, 0x10), (0x18, 0x20)],
+    )
+
+    def test_membership_matches_in_ranges_at_every_boundary(self) -> None:
+        for ranges in self.CASES:
+            index = analyze._SpanIndex(ranges)
+            probes = {-1, 0, 0xFFFFFFFF + 1}
+            for lo, hi in ranges:
+                probes.update({lo - 1, lo, lo + 1, hi - 1, hi, hi + 1})
+            for addr in sorted(probes):
+                with self.subTest(ranges=ranges, addr=addr):
+                    self.assertEqual(
+                        addr in index,
+                        analyze.in_ranges(addr, ranges),
+                    )
+
+    def test_in_ranges_accepts_an_index_as_its_range_set(self) -> None:
+        ranges = [(0x100, 0x110), (0x200, 0x204)]
+        index = analyze._SpanIndex(ranges)
+        for addr in (0xFF, 0x100, 0x10F, 0x110, 0x200, 0x204):
+            self.assertEqual(analyze.in_ranges(addr, index), analyze.in_ranges(addr, ranges))
+
+
+
+def overlapping_segments_elf() -> tuple[bytes, list[tuple[int, int, int, int]]]:
+    """An ET_EXEC whose program headers overlap, each with distinct file bytes.
+
+    Returns the image and its (type, off, vaddr, filesz) headers. A non-load header covers
+    the first load's addresses, a later load overlaps the first, and the last load is
+    shorter on file than in memory.
+    """
+    base = PRIMARY_BASE
+    headers = [
+        (4, 0, base, 0x40),             # PT_NOTE over the first load: never read
+        (1, 0, base, 0x40),             # first load
+        (1, 0, base + 0x20, 0x40),      # second load, overlapping the first's tail
+        (1, 0, base + 0x100, 0x10),     # third load, 0x10 bytes on file of 0x40 in memory
+    ]
+    payload_off = 52 + 32 * len(headers)
+    blob = bytearray(payload_off)
+    blob[:8] = b"\x7fELF\x01\x01\x01\x00"
+    struct.pack_into("<HHIIIIIHHHHHH", blob, 16, 2, 8, 1, base, 52, 0, 0, 52, 32,
+                     len(headers), 40, 0, 0)
+    placed = []
+    for index, (p_type, _off, vaddr, filesz) in enumerate(headers):
+        off = len(blob)
+        blob += bytes((index * 0x40 + k) & 0xFF for k in range(filesz))
+        memsz = 0x40 if index == 3 else filesz
+        struct.pack_into("<8I", blob, 52 + 32 * index, p_type, off, vaddr, vaddr, filesz,
+                         memsz, 5, 4)
+        placed.append((p_type, off, vaddr, filesz))
+    return bytes(blob), placed
+
+
+class ElfLoadSpanTests(unittest.TestCase):
+    """read_at_vaddr serves the first PT_LOAD in header order that holds the address on file."""
+
+    def test_reads_match_a_walk_over_the_program_headers(self) -> None:
+        image_bytes, headers = overlapping_segments_elf()
+        image = analyze.Elf(image_bytes, base=0)
+
+        def reference(vaddr: int, n: int):
+            for p_type, off, lo, filesz in headers:
+                if p_type == 1 and lo <= vaddr < lo + filesz:
+                    return image_bytes[off + vaddr - lo:off + vaddr - lo + n]
+            return None
+
+        probes = set()
+        for _type, _off, lo, _filesz in headers:
+            probes.update(range(lo - 8, lo + 0x48))
+        for vaddr in sorted(probes):
+            for n in (1, 4, 0x30):
+                with self.subTest(vaddr=hex(vaddr), n=n):
+                    self.assertEqual(image.read_at_vaddr(vaddr, n), reference(vaddr, n))
+        # The first load wins where the second overlaps it, and a non-load header never
+        # serves bytes.
+        first = headers[1]
+        self.assertEqual(image.read_at_vaddr(PRIMARY_BASE + 0x20, 1),
+                         image_bytes[first[1] + 0x20:first[1] + 0x21])
+        self.assertIsNone(image.read_at_vaddr(PRIMARY_BASE + 0x110, 4))
+
+    def test_in_ranges_matches_any_over_random_range_lists(self) -> None:
+        rng = random.Random(1296)
+        for _ in range(500):
+            ranges = [(lo, lo + rng.randrange(-4, 24))
+                      for lo in (rng.randrange(0, 96) for _ in range(rng.randrange(0, 6)))]
+            for addr in range(-2, 122):
+                self.assertEqual(analyze.in_ranges(addr, ranges),
+                                 any(lo <= addr < hi for lo, hi in ranges))
+
+
+def _sectioned_exec(sections, *, base=0x08804000, gap=b""):
+    """A fixed-address executable whose one R+X PT_LOAD maps every section in order.
+
+    ``sections`` is ``[(name, flags, payload)]``; ``gap`` is file-backed executable
+    bytes before the first section (outside every named section). Returns the blob
+    and each section's guest address.
+    """
+    image = bytearray(gap)
+    addresses = {}
+    for name, _flags, payload in sections:
+        addresses[name] = base + len(image)
+        image += payload
+    names = b"\x00" + b"".join(name.encode("ascii") + b"\x00" for name, _, _ in sections)
+    names += b".shstrtab\x00"
+    phoff, image_off = 52, 0x60
+    names_off = image_off + len(image)
+    shoff = (names_off + len(names) + 3) & ~3
+    shdrs = [bytes(40)]
+    cursor, name_cursor = len(gap), 1
+    for name, flags, payload in sections:
+        shdrs.append(struct.pack("<10I", name_cursor, 1, flags, base + cursor,
+                                 image_off + cursor, len(payload), 0, 0, 4, 0))
+        cursor += len(payload)
+        name_cursor += len(name) + 1
+    shdrs.append(struct.pack("<10I", name_cursor, 3, 0, 0, names_off, len(names), 0, 0, 1, 0))
+    blob = bytearray(shoff + 40 * len(shdrs))
+    blob[:8] = b"\x7fELF\x01\x01\x01\x00"
+    struct.pack_into("<HHIIIIIHHHHHH", blob, 16, 2, 8, 1, base, phoff, shoff, 0, 52, 32, 1,
+                     40, len(shdrs), len(shdrs) - 1)
+    struct.pack_into("<8I", blob, phoff, 1, image_off, base, base, len(image), len(image), 5, 16)
+    blob[image_off:image_off + len(image)] = image
+    blob[names_off:names_off + len(names)] = names
+    for index, shdr in enumerate(shdrs):
+        blob[shoff + 40 * index:shoff + 40 * (index + 1)] = shdr
+    return bytes(blob), addresses
+
+
+def _words(*words):
+    return b"".join(struct.pack("<I", word) for word in words)
+
+
+class DataSectionsInAnExecutableSegment(unittest.TestCase):
+    """A data section mapped by an executable PT_LOAD is data, not code.
+
+    A fixed-address executable commonly maps .text, .rodata and .data with a single
+    R+X segment. Pointers in .data to strings in .rodata were treated as code
+    pointers into "file-backed executable bytes", so every string became a function
+    entry and an interpreter-owned span; one such title produced 81,000 of them.
+    """
+
+    def build(self):
+        text = _words(
+            0x27BDFFF0, 0x03E00008, 0x27BD0010, 0x00000000,  # f: prologue, return
+        )
+        rodata = b"scenes/arcade\x00\x00\x00" + _words(0x27BDFFE0, 0x03E00008)
+        base = 0x08804000
+        gap = _words(0x27BDFFF8, 0x03E00008, 0x27BD0008, 0x00000000)  # module-start stub
+        text_at = base + len(gap)
+        rodata_at = text_at + len(text)
+        data = _words(text_at, rodata_at, rodata_at + 16)
+        blob, addresses = _sectioned_exec(
+            [(".text", 0x6, text), (".rodata", 0x2, rodata), (".data", 0x3, data)],
+            base=base, gap=gap)
+        return analyze.Elf(blob, base=base), addresses, base
+
+    def test_data_sections_are_not_file_backed_executable_bytes(self):
+        elf, addresses, base = self.build()
+        self.assertEqual(
+            analyze.file_backed_exec_ranges(elf),
+            [(base, addresses[".rodata"])],
+            "the executable bytes are the stub before .text and .text itself, not .rodata/.data",
+        )
+
+    def test_pointers_into_rodata_seed_no_function(self):
+        elf, addresses, base = self.build()
+        with redirect_stderr(io.StringIO()):
+            entries = set(analyze.analyze(elf)[0])
+        self.assertIn(addresses[".text"], entries, "the pointed-to .text function is an entry")
+        self.assertIn(base, entries, "the stub before .text keeps its executable authority")
+        for target in (addresses[".rodata"], addresses[".rodata"] + 16):
+            self.assertNotIn(target, entries,
+                             f"a .data pointer to .rodata 0x{target:08x} became a function")
+
+    def test_prx_style_executable_flags_do_not_make_rodata_code(self):
+        # PSP PRX images mark almost every section SHF_EXECINSTR; the name decides.
+        text = _words(0x27BDFFF0, 0x03E00008, 0x27BD0010, 0x00000000)
+        rodata = _words(0x27BDFFE0, 0x03E00008)
+        base = 0x08804000
+        data = _words(base + len(text))
+        blob, addresses = _sectioned_exec(
+            [(".text", 0x6, text), (".rodata", 0x6, rodata), (".data", 0x7, data)], base=base)
+        elf = analyze.Elf(blob, base=base)
+        self.assertEqual(analyze.file_backed_exec_ranges(elf), [(base, addresses[".rodata"])])
+        with redirect_stderr(io.StringIO()):
+            entries = set(analyze.analyze(elf)[0])
+        self.assertNotIn(addresses[".rodata"], entries)
+
+
+def _lui(rt, imm):
+    return (0x0F << 26) | (rt << 16) | (imm & 0xFFFF)
+
+
+def _addiu(rt, rs, imm):
+    return (0x09 << 26) | (rs << 21) | (rt << 16) | (imm & 0xFFFF)
+
+
+def _jal(target):
+    return (0x03 << 26) | ((target >> 2) & 0x3FFFFFF)
+
+
+#: `for (p = a0; p < a1; p++) (*p)();` as an optimising compiler lays it out: the cursor
+#: and the end in s0/s3, the first load hoisted, the back edge a branch-likely.
+OPTIMISED_WALKER = (
+    0x27BDFFE0, 0xAFBF001C, 0xAFB30018, 0xAFB0000C,  # frame; save ra, s3, s0
+    0x00A09821, 0x0093082B, 0x10200008, 0x00808021,  # s3 = a1; if !(a0 < s3) exit; s0 = a0
+    0x8E020000, 0x0040F809, 0x00000000,              # v0 = *s0; call v0
+    0x26100004, 0x0213102B, 0x5440FFFB, 0x8E020000,  # s0 += 4; loop while s0 < s3
+    0x8FBF001C, 0x8FB30018, 0x8FB0000C, 0x03E00008, 0x27BD0020,  # restore, return
+)
+#: The same loop unoptimised: the cursor and the end live in stack slots.
+UNOPTIMISED_WALKER = (
+    0x27BDFFC0, 0xAFBF000C, 0xAFA40020, 0xAFA50030,  # frame; slot32 = a0, slot48 = a1
+    0x1000000A, 0x00000000,                          # branch to the test
+    0x8FA20020, 0x8C420000, 0xAFA2001C, 0x8FA2001C,  # v0 = *slot32 (through slot28)
+    0x0040F809, 0x00000000,                          # call v0
+    0x8FA30020, 0x24630004, 0xAFA30020,              # slot32 += 4
+    0x8FA40020, 0x8FA30030, 0x0083182B, 0x1460FFF3, 0x00000000,  # loop while slot32 < slot48
+    0x8FBF000C, 0x27BD0040, 0x03E00008, 0x00000000,  # restore, return
+)
+#: A loop over the same array that sums its words and calls none of them.
+SUMMING_LOOP = (
+    0x00001821, 0x0085082B, 0x10200007, 0x00000000,  # v1 = 0; if !(a0 < a1) exit
+    0x8C820000, 0x00621821, 0x24840004, 0x0085082B,  # v1 += *a0; a0 += 4
+    0x1420FFFB, 0x00000000, 0x03E00008, 0x00601021,  # loop while a0 < a1; return v1
+)
+
+
+class CalledPointerArrays(unittest.TestCase):
+    """Start-up code calls every word of a function-pointer array: those words are entries.
+
+    C++ static constructors are reached only through such an array, which start-up code
+    hands to a loop that calls each word. Some retail section tables name everything
+    after the import tables `.data`, the constructors included, so the data-section rule
+    above would leave them with no owner and the first constructor call would stop the
+    run. The call through the array is the evidence; a `.data` word that merely points
+    at a prologue is still no function.
+    """
+
+    def build(self, walker, *, wrapper=False, table_extra=()):
+        base = 0x08804000
+        start_at = base
+        start_len = 10 * 4
+        wrapper_words = ()
+        wrapper_at = start_at + start_len
+        if wrapper:
+            wrapper_len = 12 * 4
+        else:
+            wrapper_len = 0
+        walker_at = wrapper_at + wrapper_len
+        text_len = start_len + wrapper_len + 4 * len(walker)
+        data_at = base + text_len
+        ctor_at, helper_at, decoy_at = data_at, data_at + 0x20, data_at + 0x28
+        table_at = data_at + 0x38
+        table_end = table_at + 4 * (1 + len(table_extra))
+        callee = wrapper_at if wrapper else walker_at
+        start = (
+            0x27BDFFF0, 0xAFBF000C,                                  # frame; save ra
+            _lui(4, (table_at + 0x8000) >> 16), _lui(5, (table_end + 0x8000) >> 16),
+            _addiu(4, 4, table_at), _jal(callee), _addiu(5, 5, table_end),
+            0x8FBF000C, 0x03E00008, 0x27BD0010,                      # restore, return
+        )
+        if wrapper:  # passes its own a0 and a1 on through stack slots
+            wrapper_words = (
+                0x27BDFFB0, 0xAFBF000C, 0xAFA40010, 0xAFA50020, 0x8FA40010, 0x8FA50020,
+                _jal(walker_at), 0x00000000, 0x8FBF000C, 0x27BD0050, 0x03E00008, 0x00000000,
+            )
+        text = _words(*start, *wrapper_words, *walker)
+        data = _words(
+            0x27BDFFF0, 0xAFBF000C, _jal(helper_at), 0x00000000,    # the constructor
+            0x8FBF000C, 0x03E00008, 0x27BD0010, 0x00000000,
+            0x03E00008, 0x00000000,                                  # a helper it calls
+            0x27BDFFE0, 0x03E00008, 0x27BD0020, 0x00000000,          # prologue-shaped data
+            ctor_at, *table_extra,                                   # the called array
+            decoy_at,                                                # a plain data pointer
+        )
+        blob, _ = _sectioned_exec([(".text", 0x6, text), (".data", 0x3, data)], base=base)
+        layout = {"ctor": ctor_at, "helper": helper_at, "decoy": decoy_at, "data": data_at}
+        return analyze.Elf(blob, base=base), layout
+
+    def analyze(self, elf):
+        with redirect_stderr(io.StringIO()):
+            entries, owned = analyze.analyze(elf)
+        return set(entries), owned
+
+    def assert_constructor_owned(self, elf, layout):
+        entries, owned = self.analyze(elf)
+        self.assertIn(layout["ctor"], entries, "the array's word is a function entry")
+        self.assertIn(layout["helper"], entries, "a function the constructor calls is an entry")
+        for address in (layout["ctor"], layout["ctor"] + 0x18, layout["helper"] + 4):
+            self.assertTrue(analyze.in_ranges(address, owned), f"0x{address:08x} is not owned")
+        self.assertNotIn(layout["decoy"], entries,
+                         "a .data pointer outside the called array became a function")
+        self.assertFalse(analyze.in_ranges(layout["decoy"], owned),
+                         "the bytes between the proven functions became executable")
+
+    def test_an_array_passed_to_a_walker_seeds_its_words_in_data(self):
+        elf, layout = self.build(OPTIMISED_WALKER)
+        self.assertEqual(analyze.file_backed_exec_ranges(elf), [(0x08804000, layout["data"])])
+        self.assert_constructor_owned(elf, layout)
+
+    def test_an_unoptimised_walker_behind_a_forwarding_wrapper_is_still_a_walker(self):
+        elf, layout = self.build(UNOPTIMISED_WALKER, wrapper=True)
+        self.assert_constructor_owned(elf, layout)
+
+    def test_an_array_with_a_word_outside_the_executable_segment_seeds_nothing(self):
+        elf, layout = self.build(OPTIMISED_WALKER, table_extra=(0x09000000,))
+        entries, owned = self.analyze(elf)
+        self.assertNotIn(layout["ctor"], entries)
+        self.assertFalse(analyze.in_ranges(layout["ctor"], owned))
+
+    def test_a_loop_that_does_not_call_the_words_is_no_walker(self):
+        elf, layout = self.build(SUMMING_LOOP)
+        entries, owned = self.analyze(elf)
+        self.assertNotIn(layout["ctor"], entries)
+        self.assertFalse(analyze.in_ranges(layout["ctor"], owned))
+
+
+if __name__ == "__main__":
+    unittest.main()

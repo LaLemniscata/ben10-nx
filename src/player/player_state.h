@@ -1,0 +1,2010 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 the Nakagawa Recomp authors */
+
+#ifndef NAKAGAWA_PLAYER_STATE_H
+#define NAKAGAWA_PLAYER_STATE_H
+
+#include "nk_types.h"
+#include "nk_platform.h"
+#include "nk_iso.h"
+#include "nk_disc_expand.h"
+#include "nk_library.h"
+#include "nk_disc_verify.h"
+#include "nk_launch.h"
+#include "nk_font.h"
+#include "input_settings.h"
+#include "package_builder.h"
+#include "update_check.h"
+#include "setup_staging.h"
+#include "nk_title_manifest.h"
+#include "generated/nk_title_catalog.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
+/* The most dropped disc images the player queues from one drop; the summary says when
+   more arrived. */
+#define PLAYER_DROP_QUEUE_MAX 16u
+
+
+#define MAX_LIBRARY_GAMES NK_MAX_GAMES
+#define MAX_TITLE_LEN NK_MAX_TITLE_LEN
+#define MAX_PATH_LEN NK_MAX_PATH
+#define MAX_DISC_ID_LEN NK_MAX_DISC_ID_LEN
+#define MAX_SHOWCASE_GAMES 8
+
+typedef enum {
+    VIEW_LIBRARY = 0,
+    VIEW_INSPECTING,
+    VIEW_SUPPORTED_TITLE,
+    VIEW_EXPERIMENTAL_TITLE,
+    VIEW_UNSUPPORTED_TITLE,
+    VIEW_SETTINGS,
+    VIEW_ERROR,
+    VIEW_SETUP_WIZARD,
+    /* Dedicated post-staging library state. It renders the normal library
+       card, but lets tests and the event loop distinguish a newly completed
+       setup transaction from an ordinary library visit. */
+    PLAYER_VIEW_READY_LIBRARY,
+    VIEW_CONTROLLER_SETTINGS,
+    VIEW_BUILDING_PACKAGE,
+    VIEW_PREREQ_CONSENT,
+    VIEW_PREREQ_PROGRESS,
+    VIEW_PREREQ_ABOUT,
+    VIEW_CONFIRM_REMOVE_TOOLS,
+    VIEW_ONLINE_SETTINGS,   /* Settings > Online and developer options */
+    VIEW_BUILD_CACHE,       /* Settings > Build tools and cache (#1306) */
+    VIEW_DEVELOPER_LOG,     /* the developer log panel (developer mode, F12) */
+    VIEW_PSP_FONTS,         /* Settings > PSP fonts: import your PSP's own fonts */
+    VIEW_UPDATES,           /* Settings > Updates: check for and fetch a newer version */
+    VIEW_CONFIRM_FACTORY_RESET, /* Settings > Factory reset: what moves aside */
+    VIEW_ACCESSIBILITY_SETTINGS, /* Settings > Accessibility: size, contrast, motion */
+    VIEW_ACE_SETTINGS,          /* Settings > Ace Mode (src/rt/ace.h) */
+    VIEW_PROBLEM_REPORT         /* Settings > Problem report (#1849); the last value */
+} PlayerView;
+
+typedef enum {
+    STATUS_UNIDENTIFIED = NK_STATUS_UNIDENTIFIED,
+    STATUS_IDENTIFIED = NK_STATUS_IDENTIFIED,
+    STATUS_SUPPORTED_PREPARATION = NK_STATUS_SUPPORTED_PREPARATION,
+    STATUS_PREPARED = NK_STATUS_PREPARED,
+    STATUS_BOOTS = NK_STATUS_BOOTS,
+    STATUS_PLAYABLE = NK_STATUS_PLAYABLE,
+    STATUS_VERIFIED = NK_STATUS_VERIFIED
+} GameSupportStatus;
+
+typedef enum {
+    STAGE_IDLE = 0,
+    STAGE_INSPECTING_ISO,
+    STAGE_EXTRACTING_CONTAINERS,
+    STAGE_DECRYPTING_MODULES,
+    STAGE_VALIDATING_ELFS,
+    STAGE_PREPARING_VFS,
+    STAGE_READY,
+    STAGE_FAILED,
+    STAGE_CANCELLED
+} PlayerPrepStage;
+
+typedef NkGameEntry GameRecord;
+
+/* Requested client-area geometry in SDL screen/window coordinate units. */
+typedef struct {
+    int x;
+    int y;
+    int width;
+    int height;
+} PlayerWindowRect;
+
+/* Window decoration sizes in the same coordinate units as PlayerWindowRect. */
+typedef struct {
+    int top;
+    int left;
+    int bottom;
+    int right;
+} PlayerWindowFrame;
+
+/* The launcher's design size, and the range of output pixels per layout unit
+   the UI (and its font rasteriser) is drawn at. */
+#define PLAYER_UI_DESIGN_WIDTH 1280
+#define PLAYER_UI_DESIGN_HEIGHT 720
+#define PLAYER_UI_MIN_SCALE 0.25f
+#define PLAYER_UI_MAX_SCALE 8.0f
+
+/* Where the launcher UI is laid out and how it reaches the output: `width` by
+   `height` layout units, each drawn as `scale` output pixels. */
+typedef struct {
+    int width;
+    int height;
+    float scale;
+} PlayerUiCanvas;
+
+typedef enum {
+    PLAYER_CLOSE_QUIT = 0,
+    PLAYER_CLOSE_CONFIRM_REQUIRED
+} PlayerCloseDecision;
+
+typedef struct {
+    bool status_valid;
+    bool identity_valid;
+    bool validation_pending;
+    bool validation_failed;
+    bool explicit_retry_pending;
+    bool runtime_available;
+    char disc_id[MAX_DISC_ID_LEN];
+    char title_id[64];
+    char selected_executable[MAX_PATH_LEN];
+    /* The package variant the status is for (GameRecord.enhancement_package_id):
+       the authentic package's status never answers for the enhanced build. */
+    char enhancement_package_id[NK_MAX_ENHANCEMENT_PACKAGE_ID];
+    char package_identity[65];
+    NkRuntimePackageStatus status;
+    uint64_t last_checked_ms;
+    /* Why the package is not usable, as the validator said it (may be empty). */
+    char reason[256];
+} PlayerRuntimePackageCacheEntry;
+
+/* A worker-create failure has no validator result to keep in the cache. Keep
+ * that unresolved state in a bounded, title-keyed side record so a successful
+ * validation of another title can invalidate the cache without making this
+ * title look like MISSING. The key includes the selected executable because a
+ * title may legitimately switch between EBOOT.BIN and a fallback. */
+typedef struct {
+    bool valid;
+    char disc_id[MAX_DISC_ID_LEN];
+    char title_id[64];
+    char selected_executable[MAX_PATH_LEN];
+    char enhancement_package_id[NK_MAX_ENHANCEMENT_PACKAGE_ID];
+    uint32_t failure_count;
+    uint64_t retry_after_ms;
+} PlayerRuntimePackageWorkerFailure;
+
+typedef struct {
+    PlayerPrepStage stage;
+    char operation[64];
+    char current_item[128];
+    int completed_items;
+    int total_items;
+    float percentage;
+    int elapsed_ms;
+    char status_message[256];
+    bool cancellable;
+} PreparationState;
+
+/* The player and runtime are offline by default (AGENTS.md section 5). Later
+ * opt-in modes ("lan", "online") get their own values; a value this build does
+ * not know always reads back as offline, never as something more permissive. */
+typedef enum {
+    NK_NETWORK_MODE_OFFLINE = 0
+} NkNetworkMode;
+
+/* An accessibility setting that follows the operating system's own preference
+ * until the user picks On or Off. Saved as "auto", "on" or "off". */
+typedef enum {
+    PLAYER_SYSTEM_CHOICE_AUTO = 0,
+    PLAYER_SYSTEM_CHOICE_ON,
+    PLAYER_SYSTEM_CHOICE_OFF
+} PlayerSystemChoice;
+
+/* The order of the library's grid. Saved as "played", "name" or "added". */
+typedef enum {
+    PLAYER_LIBRARY_SORT_PLAYED = 0,  /* most recently played first; never played last */
+    PLAYER_LIBRARY_SORT_NAME,        /* by name, A to Z */
+    PLAYER_LIBRARY_SORT_ADDED,       /* most recently added first */
+    PLAYER_LIBRARY_SORT_COUNT
+} PlayerLibrarySort;
+
+/* A PSP disc ID as the settings file keeps it: four letters, five digits, NUL. */
+#define PLAYER_DISC_ID_KEY_LEN 10
+
+/* A title's 60 FPS game-logic enhancement package (docs/ENHANCEMENT_CONTRACT.md
+ * section 9): <user data>/enhancements/<disc ID, lowercase>-60hz.json. */
+typedef struct {
+    /* The file parses, its id is a valid package name
+       (nk_title_manifest_enhancement_id_valid) and its target_title_id is the
+       title's own. */
+    bool available;
+    char package_id[NK_MAX_ENHANCEMENT_PACKAGE_ID];
+    /* Why a file that exists cannot be used; empty when there is no file or it
+       is usable. */
+    char problem[160];
+} PlayerTitleEnhancement;
+
+/* Ace Mode, the library-wide enhancement mode (docs/ENHANCEMENT_CONTRACT.md section 11,
+   src/rt/ace.h): one switch for every game, with a per-title choice on the title page. The
+   launcher resolves both into the one SR_ACE line a launch exports. */
+typedef enum {
+    PLAYER_ACE_TITLE_LIBRARY = 0,  /* follows the library's switch */
+    PLAYER_ACE_TITLE_ON,           /* on for this title, whatever the library's switch says */
+    PLAYER_ACE_TITLE_AUTHENTIC     /* everything off, 60 FPS game logic included */
+} PlayerAceTitleMode;
+
+/* The library's Ace Mode settings. The feature values are kept while the switch is off. */
+typedef struct {
+    bool enabled;   /* the master switch: off until the player turns it on */
+    int af;         /* texture filtering: 0, 2, 4, 8 or 16; 16 by default */
+    bool text;      /* crisp system text (the on-screen keyboard); on by default */
+    bool readout;   /* the speed readout; off by default */
+    bool notice;    /* the in-game badge at start; on by default */
+    int smooth;     /* smooth motion (#1272): 0 off (the default), 1 x2 */
+} PlayerAceSettings;
+
+/* One title's choice, saved only while it differs from the library: -1 follows the library. */
+typedef struct {
+    char key[PLAYER_DISC_ID_KEY_LEN];
+    PlayerAceTitleMode mode;
+    int af;         /* -1, or 0, 2, 4, 8, 16 */
+    int text;       /* -1, 0 or 1 */
+    int readout;
+    int notice;
+    int smooth;     /* -1 follows the library, 0 off, 1 x2 */
+} PlayerAceTitle;
+
+/* What a title launches with (player_ace_resolve). */
+typedef struct {
+    bool on;
+    PlayerAceTitleMode mode;   /* the title's own choice */
+    int af;
+    bool text;
+    bool readout;
+    bool notice;
+    int smooth;                /* 0 off, 1 x2; player_ace_apply_logic_60 forces 0 */
+} PlayerAceResolved;
+
+typedef struct {
+    int resolution_scale; /* 1 = Native 480x272, 2 = 2x Vita, 3 = 3x 720p, 4 = 4x 1080p */
+    int present_scaling;  /* NK_PRESENT_SCALING_*: how the game window scales its frames */
+    bool fullscreen;
+    bool launcher_fullscreen;
+    bool vsync;
+    int fps_cap;          /* -1 = PSP scanout, 0 = uncapped host presentation */
+    int master_volume;    /* 0..100 */
+    /* Launcher accessibility (Settings > Accessibility). Reduce motion holds the
+       waves still and turns pulses and sweeps into cuts; high-contrast focus
+       draws the white-and-black ring. Read them through player_app_reduce_motion
+       and player_app_high_contrast_focus, which resolve AUTO. */
+    PlayerSystemChoice reduce_motion_choice;
+    PlayerSystemChoice high_contrast_choice;
+    int interface_size_pct; /* 0 = automatic (the display's scale), or 100, 125, 150, 200 */
+    int text_size_pct;      /* 100 Standard, 125 Large, 150 Larger: the type only */
+    bool ui_sounds;       /* launcher move/confirm/back sounds; off by default */
+    PlayerLibrarySort library_sort;
+    bool launcher_window_maximized;
+    bool launcher_window_position_valid;
+    int launcher_window_x;
+    int launcher_window_y;
+    int launcher_window_width;
+    int launcher_window_height;
+    char controller_name[64];
+    bool controller_connected;
+    NkNetworkMode network_mode; /* reserved master switch; offline is the only mode today */
+    /* Online and developer options (docs/ONLINE_FEATURES.md). These are the
+       user's choices only: this build has no network feature, so online_mode
+       changes nothing yet and network_mode stays offline whatever it says. */
+    bool online_mode;      /* off by default; asked by the setup wizard */
+    bool online_news;      /* the news strip, when online mode ships */
+    bool online_reports;   /* user-sent reports, when online mode ships */
+    bool developer_mode;   /* shows the developer log panel (F12, Select + R) */
+    /* The discs whose 60 FPS game-logic enhancement is on, one disc ID each
+       (PLAYER_DISC_ID_KEY_LEN). Off for every title by default; a title in this
+       list launches its enhanced build, packages/<disc_id>-enhanced-<id>
+       (docs/ENHANCEMENT_CONTRACT.md section 9). Saved as
+       "enhancement_60hz_discs". */
+    char enhancement_60hz_discs[MAX_LIBRARY_GAMES][PLAYER_DISC_ID_KEY_LEN];
+    int enhancement_60hz_disc_count;
+    /* Ace Mode: "ace" and the sparse "ace_titles" in settings.json. Both are additions to
+       schema version 2, as text_size is: an older player reads the file and ignores them. */
+    PlayerAceSettings ace;
+    PlayerAceTitle ace_titles[MAX_LIBRARY_GAMES];
+    int ace_title_count;
+    /* Builds keep the compiled system libraries a disc carries in the data folder and
+       reuse them for other games with the same library (#1306). On by default; the
+       copies never leave this PC. */
+    bool share_system_libraries;
+    /* Ask GitHub for a newer version once each time the player starts. Off until
+       the user turns it on (AGENTS.md section 5; the button needs no switch). */
+    bool check_updates_at_start;
+    /* The folder the last file picker picked from (Add disc, PSP fonts), where
+       the next one opens. Empty on a first run: the pickers then open at the
+       Desktop (player_app_picker_start_folder). */
+    char picker_folder[MAX_PATH_LEN];
+    /* The player version whose "built by an older Nakagawa" prompt was shown
+       (Rebuild all or Later), so it shows once per update. Empty until then. */
+    char rebuild_prompt_version[32];
+    /* Save locations are not a setting: nk_launch_prepare_session resolves a
+       writable per-disc Memory Stick root at launch (SR_MEMSTICK). The settings
+       screen shows that real root instead of a configurable dead field. */
+} PlayerSettings;
+
+/* Check for updates (update_check.h). Each step runs on its own worker thread,
+   started by a click; nothing repeats on its own. */
+typedef enum {
+    PLAYER_UPDATE_IDLE = 0,
+    PLAYER_UPDATE_CHECKING,
+    PLAYER_UPDATE_CURRENT,       /* this is the newest version */
+    PLAYER_UPDATE_AVAILABLE,     /* a newer version is out */
+    PLAYER_UPDATE_DOWNLOADING,
+    PLAYER_UPDATE_DOWNLOADED,    /* the checked ZIP is in the downloads folder */
+    PLAYER_UPDATE_INSTALLING,
+    PLAYER_UPDATE_INSTALLED,     /* unpacked into its own folder */
+    PLAYER_UPDATE_FAILED
+} PlayerUpdatePhase;
+
+typedef struct {
+    PlayerUpdatePhase phase;
+    PlayerUpdatePhase failed_step;   /* CHECKING, DOWNLOADING or INSTALLING */
+    bool from_start;                 /* the check at start: a failure stays quiet */
+    bool notice;                     /* the library says a newer version is out */
+    bool can_verify;                 /* this build has an update-signing key to check with */
+    NkUpdateCheckResult check;
+    uint64_t received_bytes;
+    char zip_path[NK_MAX_PATH];
+    char install_dir[NK_MAX_PATH];
+    NkUpdateError error;
+} PlayerUpdateState;
+
+/* Settings > Problem report (#1849): `python tools/nk_cli.py report` writes a redacted
+   bundle on this PC. The page lists what it would contain, then writes it on a click.
+   Nothing is uploaded. */
+typedef enum {
+    PLAYER_REPORT_IDLE = 0,
+    PLAYER_REPORT_PREVIEWING,   /* listing the files */
+    PLAYER_REPORT_PREVIEWED,    /* the list is shown; Create is offered */
+    PLAYER_REPORT_CREATING,     /* writing the ZIP (runs the toolchain check) */
+    PLAYER_REPORT_DONE,         /* the ZIP is at path */
+    PLAYER_REPORT_FAILED,
+    PLAYER_REPORT_NO_PYTHON     /* no interpreter: the page gives the command to run */
+} PlayerReportPhase;
+
+#define PLAYER_REPORT_MAX_FILES 24
+#define PLAYER_REPORT_FILE_NAME 72
+
+typedef struct {
+    PlayerReportPhase phase;
+    char path[NK_MAX_PATH];     /* the written ZIP */
+    char message[480];          /* why it failed */
+    char command[160];          /* what to run by hand */
+    int file_count;
+    char file_names[PLAYER_REPORT_MAX_FILES][PLAYER_REPORT_FILE_NAME];
+    unsigned long long file_bytes[PLAYER_REPORT_MAX_FILES];
+} PlayerReportState;
+
+typedef enum {
+    PLAYER_PREREQ_IDLE = 0,
+    PLAYER_PREREQ_CONSENT,
+    PLAYER_PREREQ_BOOTSTRAP,
+    PLAYER_PREREQ_DOWNLOAD,
+    PLAYER_PREREQ_INSTALLED,
+    PLAYER_PREREQ_FAILED,
+    PLAYER_PREREQ_CANCELLED
+} PlayerPrerequisitePhase;
+
+typedef struct {
+    PlayerPrerequisitePhase phase;
+    PackagePrerequisiteList items;
+    int game_index;
+    int item_count;
+    uint64_t total_bytes;
+    uint64_t total_received_bytes;
+    uint64_t item_received_bytes;
+    uint64_t item_total_bytes;
+    char current_item[96];
+    char error_code[48];
+    char error_message[512];
+    bool cancel_requested;
+    bool bootstrap_python;
+    bool resume_build_pending;
+    /* The verified release bundle (#1285) the About screen listed, or empty
+       when it listed the per-user download; licence texts open from here. */
+    char bundle_root[NK_MAX_PATH];
+} PlayerPrerequisiteState;
+
+/* Room for a diagnostic that names up to three searched paths plus
+ * surrounding guidance (CLI_NOT_FOUND is the longest today). */
+#define PLAYER_ERROR_DETAILS_MAX (MAX_PATH_LEN * 3 + 512)
+
+/* The error card's second action, next to its recovery action. */
+typedef enum {
+    PLAYER_ERROR_RETRY_NONE = 0,
+    PLAYER_ERROR_RETRY_RESTART_GAME,  /* "Restart game": launch subject_disc_id again */
+    PLAYER_ERROR_RETRY_BUILD          /* "Try again": build subject_disc_id again */
+} PlayerErrorRetry;
+
+typedef struct {
+    char error_code[48]; /* PACKAGE_REBUILD_NOT_INCOMPATIBLE is 32 characters */
+    char title[128];
+    char message[512];
+    char details[PLAYER_ERROR_DETAILS_MAX];
+    char recovery_action_label[64];
+    PlayerView return_view;
+    char failed_stage[64];
+    char boundary_text[512];
+    char log_file_path[MAX_PATH_LEN];
+    /* The game the card is about, for its retry action; "" for none. */
+    char subject_disc_id[32];
+    PlayerErrorRetry retry;
+    /* Copy details has put this card's report on the clipboard. */
+    bool details_copied;
+    /* A game that ended on its own (player_app_set_game_stop_error): the named
+       stop boundary, [a-z0-9-] only, "" for none, and the child's exit code.
+       Report this game names them; they never hold a path. */
+    char stop_boundary[96];
+    int stop_exit_code;
+    bool stop_has_exit_code;
+} ErrorState;
+
+typedef enum {
+    WIZARD_STEP_WELCOME = 0,
+    WIZARD_STEP_ONLINE_OPTIONS, /* online mode and developer mode, both off unless chosen;
+                                   right after Welcome so every first run sees it */
+    WIZARD_STEP_SELECT_GAME,
+    WIZARD_STEP_INSPECT_VERIFY,
+    WIZARD_STEP_SYSTEM_FONTS,
+    WIZARD_STEP_READY_LAUNCH
+} WizardStep;
+
+typedef enum {
+    PREFLIGHT_OK = 0,
+    PREFLIGHT_MISSING,
+    PREFLIGHT_INCOMPATIBLE,
+    PREFLIGHT_STALE,
+    PREFLIGHT_UNSUPPORTED,
+    PREFLIGHT_IN_PROGRESS,
+    PREFLIGHT_INVALID,
+    /* Usable, but not the real thing: every PSP font is served, and at least one by a
+       stand-in (a project font or another imported size), not the user's own (#1300). */
+    PREFLIGHT_SYNTHETIC
+} PlayerPreflightStatus;
+
+typedef struct {
+    char code[32];
+    PlayerPreflightStatus status;
+    char message[2048];
+    /* The row's player sentence when it needs this check's own facts (a
+       folder to put a file in); empty uses the sentence for code and status. */
+    char plain[640];
+    unsigned int issue_numbers[2];
+    size_t issue_count;
+} PlayerPreflightCheck;
+
+/* One slot per code the player's builder can emit (DISC_SFO, EXECUTABLE,
+ * EXPERIMENTAL, GUEST_MODULES, RUNTIME_PACKAGE, SYSTEM_FONTS, AUDIO_OUTPUT: 7)
+ * plus headroom, so adding a check never silently displaces another. */
+#define PLAYER_PREFLIGHT_MAX_CHECKS 10
+
+/* What kind of program input a disc is (#308), so every card can say whether
+   Nakagawa can use it as it is, with files the user supplies, or not at all.
+   An encrypted program file is usable through the built-in decryption (#295)
+   or, when that stops, a decrypted copy the user puts in the title's folder. */
+typedef enum {
+    PLAYER_INPUT_UNCHECKED = 0,     /* no disc has been checked */
+    PLAYER_INPUT_PLAIN_ELF,         /* the disc's own program files are plain MIPS ELF */
+    PLAYER_INPUT_HOMEBREW,          /* plain, and catalogued as homebrew or project-made */
+    PLAYER_INPUT_DECRYPTED_RETAIL,  /* encrypted on the disc; every encrypted file has a
+                                       usable decrypted copy, built in or from the user */
+    PLAYER_INPUT_ENCRYPTED_RETAIL,  /* encrypted on the disc; built-in decryption stopped
+                                       and no usable copy was supplied, so Nakagawa cannot
+                                       prepare it yet */
+    PLAYER_INPUT_UNSUPPORTED        /* unreadable disc, or an empty, unknown or malformed
+                                       program or module tree */
+} PlayerInputClass;
+
+/* At most this many files are named on a card; the rest are counted. */
+#define PLAYER_INPUT_FILES_MAX 8
+/* player_module_name_is_safe() allows 128 characters. */
+#define PLAYER_INPUT_FILE_NAME_MAX 132
+#define PLAYER_INPUT_FILE_SOURCE_MAX 160
+
+typedef enum {
+    PLAYER_INPUT_FILE_NEEDED = 0,   /* not in the folder yet */
+    PLAYER_INPUT_FILE_UNUSABLE      /* in the folder, but not a usable plain ELF or PRX */
+} PlayerInputFileState;
+
+typedef struct {
+    char name[PLAYER_INPUT_FILE_NAME_MAX];      /* the file to put in the folder */
+    char source[PLAYER_INPUT_FILE_SOURCE_MAX];  /* the encrypted file on the disc */
+    PlayerInputFileState state;
+} PlayerInputFile;
+
+/* The program input of the checked disc: its class, the folder its decrypted
+   copies go in, and the first files still to supply, in disc order. */
+typedef struct {
+    PlayerInputClass input_class;
+    char folder[NK_MAX_PATH * 2];
+    PlayerInputFile files[PLAYER_INPUT_FILES_MAX];
+    size_t file_count;       /* entries in files[] */
+    size_t files_needed;     /* every file still to supply or replace, listed or not */
+    size_t encrypted_total;  /* encrypted program files on the disc */
+    size_t encrypted_ready;  /* of those, how many have a usable decrypted copy */
+} PlayerInputReport;
+
+/* A stable lower-case name for the developer log and tests ("encrypted-retail"). */
+const char *player_input_class_name(PlayerInputClass input_class);
+
+typedef struct {
+    PlayerPreflightCheck checks[PLAYER_PREFLIGHT_MAX_CHECKS];
+    size_t count;
+    PlayerInputReport input;
+} PlayerCompatibilityPreflight;
+
+/* The input check that must pass before the Library offers BUILD PACKAGE.
+   The complete checks are built for the wizard; the selected title keeps the
+   first blocking result and the identity it was checked against. */
+typedef struct {
+    bool checked;
+    bool passed;
+    bool is_experimental;
+    char disc_id[MAX_DISC_ID_LEN];
+    char title_id[64];
+    char iso_path[NK_MAX_PATH];
+    char runtime_root[NK_MAX_PATH];
+    char selected_executable[MAX_PATH_LEN];
+    char action_folder[NK_MAX_PATH];
+    int64_t source_size_bytes;
+    int64_t profile_size_bytes;
+    int64_t decrypted_executable_size_bytes;
+    PlayerPreflightCheck blocker;
+    /* The program input the last check found. The sizes of the files it still
+       asked for (-1: absent) are part of the cache key, so supplying one runs
+       the check again without the disc being added again. */
+    PlayerInputReport input;
+    int64_t input_file_sizes[PLAYER_INPUT_FILES_MAX];
+} PlayerPackageBuildPreflight;
+
+/* A preflight row in plain words for the cards (#1280, #1302): a name for what
+   was checked, a status word, and one player sentence. Every code and status has
+   its own sentence; the developer message stays in the log. */
+const char *player_preflight_label(const PlayerPreflightCheck *check);
+const char *player_preflight_status_word(const PlayerPreflightCheck *check);
+const char *player_preflight_plain_message(const PlayerPreflightCheck *check);
+/* True for a check that keeps the game out of the library in this version: an
+   unreadable disc or an executable Nakagawa cannot use. Only these rows read as
+   errors; the rest are steps for later, on a card that offers ADD TO LIBRARY. */
+bool player_preflight_check_blocks(const PlayerPreflightCheck *check);
+/* The first blocking check, or NULL when the game can be added. */
+const PlayerPreflightCheck *player_preflight_blocking_check(
+    const PlayerCompatibilityPreflight *preflight);
+
+#define PLAYER_DEV_LOG_LINES 256
+#define PLAYER_DEV_LOG_LINE_MAX 240
+
+typedef struct {
+    char lines[PLAYER_DEV_LOG_LINES][PLAYER_DEV_LOG_LINE_MAX];
+    size_t head;            /* index of the oldest line */
+    size_t count;
+    char notice[256];       /* the last copy or save result, redacted */
+    PlayerView return_view; /* where closing the panel goes */
+    bool inspect_layout;    /* Clay's layout inspector, on every launcher screen while
+                               developer mode lasts */
+} PlayerDevLog;
+
+/* What a one-line outcome says, which picks its colour on screen (the UI's
+   PlayerUiNoteKind, in the same order): nothing went wrong, it worked, there
+   is something to do, or it failed. */
+typedef enum {
+    PLAYER_NOTE_NEUTRAL = 0,
+    PLAYER_NOTE_DONE,
+    PLAYER_NOTE_WARNING,
+    PLAYER_NOTE_ERROR
+} PlayerNoteKind;
+
+typedef struct {
+    WizardStep step;
+    bool iso_selected;
+    bool font_confirmed;
+    char status_message[256];
+    int extraction_percent;
+    int files_extracted;
+    int total_files;
+    bool is_extracting;
+    bool extraction_complete;
+    bool extraction_failed;
+    bool extraction_requested;
+    bool extraction_cancel_requested;
+    NkResult extraction_result;
+    char extraction_current_file[MAX_PATH_LEN];
+    char extraction_error[256];
+    char staging_root[MAX_PATH_LEN];
+    PlayerCompatibilityPreflight preflight;
+    /* The Fonts & System step's status: one line per PSP font slot (imported, project, or
+       missing), refreshed from the cache, and the outcome of the last import or removal. */
+    char font_slot_detail[NK_FONT_SLOT_COUNT][NK_FONT_TEXT_MAX];
+    /* One explicit line per Latin registry index, including the exact file or fallback. */
+    char font_latin_index_detail[NK_FONT_LATIN_INDEX_COUNT][160];
+    char font_message[NK_FONT_TEXT_MAX];
+    PlayerNoteKind font_message_kind; /* what font_message says: done, a warning, ... */
+    /* How many of the eighteen PSP fonts are the user's own, in plain words, and that count. */
+    char font_summary[160];
+    int font_own_count;
+} SetupWizardState;
+
+/* A file the player turns into a private ISO once, on its conversion worker,
+ * and then imports exactly as a picked disc image:
+ *  - a PSN release of a UMD game (an EBOOT.PBP whose DATA.PSAR is an NPUMDIMG
+ *    image, #295 phase 2), converted into <data>/discs/<DISC_ID>/<DISC_ID>.iso;
+ *  - a compressed disc image (.cso, .zso, .chd; disc_format names which),
+ *    expanded into <data>/discs/<DISC_ID>/<DISC_ID>.<ext>.iso by
+ *    nk_disc_import (src/core/nk_disc_expand.h). */
+typedef struct {
+    char pbp_path[MAX_PATH_LEN]; /* the picked file: the package or the compressed image */
+    char iso_path[MAX_PATH_LEN];
+    char disc_id[MAX_DISC_ID_LEN];
+    char title[MAX_TITLE_LEN];
+    /* A checked conversion is already at iso_path. */
+    bool iso_ready;
+    /* NK_DISC_FORMAT_NONE for a PSN package; otherwise the compressed image's
+       format, and iso_path and disc_id are known once it is expanded. */
+    NkDiscFormat disc_format;
+} PlayerPsnPackage;
+
+typedef struct {
+    void (*on_progress)(uint64_t done_bytes, uint64_t total_bytes, void *userdata);
+    bool (*is_cancelled)(void *userdata);
+    void *userdata;
+} PlayerPsnConvertCallbacks;
+
+/* Games built by an older Nakagawa. A package
+ * records the Nakagawa that built it (NkPackageBuildIdentity in
+ * nk_title_manifest.h); one whose identity is not this player's is outdated.
+ * It still validates and launches: the player suggests a rebuild and never
+ * forces one. "Rebuild all" runs a queue in the background, one title at a
+ * time, through the same package builder as BUILD PACKAGE; the old package is
+ * replaced only once the new one is built and verified (tools/nk_cli.py), and
+ * saves are never touched. */
+#define PLAYER_OUTDATED_CARD_TEXT "Built by an older Nakagawa. Rebuild for the latest fixes."
+
+typedef struct {
+    char disc_id[MAX_DISC_ID_LEN];
+    bool disc_missing;      /* its source disc image is not where the library says */
+} PlayerOutdatedTitle;
+
+typedef struct {
+    /* A scan result is in. Until then nothing is called outdated. */
+    bool scanned;
+    /* main.c runs a scan: at start, after a library change, after the queue. */
+    bool scan_requested;
+    /* This player's own identity, from its source tree; read once a session. */
+    bool identity_known;
+    NkPackageBuildIdentity identity;
+    /* The outdated titles, sorted by disc ID. */
+    int count;
+    PlayerOutdatedTitle titles[MAX_LIBRARY_GAMES];
+    /* The once-per-update prompt, and the library banner after Later. Hiding
+       the banner lasts for this session only: it comes back at the next start
+       while outdated games remain. */
+    bool prompt_visible;
+    bool banner_dismissed;
+    char player_version[32];
+    /* The reminder a launch of an outdated game shows. Play anyway is kept
+       for the rest of the session, so the same game does not ask again. */
+    bool reminder_visible;
+    char reminder_disc_id[MAX_DISC_ID_LEN];
+    int played_anyway_count;
+    char played_anyway[64][MAX_DISC_ID_LEN];
+} PlayerOutdatedState;
+
+typedef enum {
+    PLAYER_REBUILD_PENDING = 0,
+    PLAYER_REBUILD_ACTIVE,      /* its build is starting or running */
+    PLAYER_REBUILD_DONE,
+    PLAYER_REBUILD_NO_DISC,     /* skipped: its disc image is missing */
+    PLAYER_REBUILD_FAILED       /* the build did not finish; the old package stays */
+} PlayerRebuildState;
+
+typedef struct {
+    char disc_id[MAX_DISC_ID_LEN];
+    PlayerRebuildState state;
+} PlayerRebuildEntry;
+
+/* The queue file, rebuild-queue.json beside settings.json:
+ *   {"format": "nakagawa-rebuild-queue", "schema_version": 1,
+ *    "titles": [{"disc_id": "TEST00006", "state": "pending"}, ...]}
+ * state is "pending", "done", "missing_disc" or "failed"; a title whose build
+ * was running when the player closed is saved as "pending" and starts again.
+ * A file with a newer schema_version, another format, or an unknown member is
+ * left alone and not resumed. The file goes once nothing is pending. */
+#define PLAYER_REBUILD_QUEUE_FORMAT "nakagawa-rebuild-queue"
+#define PLAYER_REBUILD_QUEUE_SCHEMA_VERSION 1
+#define PLAYER_REBUILD_QUEUE_FILE "rebuild-queue.json"
+
+typedef struct {
+    int count;
+    PlayerRebuildEntry entries[MAX_LIBRARY_GAMES];
+    /* Titles are pending or one is being built. */
+    bool active;
+    /* A build could not start for a reason outside its title (its card is up,
+       or the build tool download was cancelled); Rebuild all starts again. */
+    bool paused;
+    /* The build session the queue started, once the builder runs; 0 before. */
+    uint64_t build_generation;
+} PlayerRebuildQueue;
+
+/* Disc verification (src/core/nk_disc_verify.h): each image the player adds is
+   hashed once, after the add, on a worker main.c owns, and compared with the
+   disc list the user imported; the result goes into its library record. One
+   image at a time. The library's line shows the progress, and its Cancel stops
+   the check and the ones waiting (the games stay, unchecked). */
+#define PLAYER_DISC_CHECK_QUEUE 16
+
+typedef struct {
+    char disc_id[MAX_DISC_ID_LEN];
+    char iso_path[MAX_PATH_LEN];
+} PlayerDiscCheckItem;
+
+typedef struct {
+    /* The images waiting, in order; while running, the first is being hashed. */
+    PlayerDiscCheckItem queue[PLAYER_DISC_CHECK_QUEUE];
+    int count;
+    bool running;
+    bool cancel_requested;
+    int percent;
+    /* The line after a check that could not finish, until Hide; empty for none. */
+    char note[96];
+} PlayerDiscCheckState;
+
+/* Also forward-declared by ui/player_ui_nk.h; C99 allows one typedef of a name. */
+#ifndef NK_PLAYER_APP_TYPEDEF
+#define NK_PLAYER_APP_TYPEDEF
+typedef struct PlayerApp PlayerApp;
+#endif
+
+struct PlayerApp {
+    PlayerView active_view;
+    GameRecord games[MAX_LIBRARY_GAMES];
+    PlayerRuntimePackageCacheEntry runtime_package_cache[MAX_LIBRARY_GAMES];
+    PlayerRuntimePackageWorkerFailure runtime_package_worker_failures[MAX_LIBRARY_GAMES];
+    /* Each title's enhancement package, read when the library is synchronised;
+       index as games[] (player_app_refresh_title_enhancements). */
+    PlayerTitleEnhancement title_enhancements[MAX_LIBRARY_GAMES];
+    uint64_t runtime_package_cache_generation;
+    int game_count;
+    int selected_game_index;
+    GameRecord inspecting_game;
+    PreparationState prep_state;
+    PlayerSettings settings;
+    ErrorState last_error;
+    SetupWizardState wizard;
+    PlayerPackageBuildPreflight package_build_preflight;
+    PackageBuildSession build_session;
+    /* The build session whose failure or cancellation has been shown, so the
+       main loop shows it once and the user can leave the card (#1277). */
+    uint64_t build_outcome_handled_generation;
+    /* The build session the prerequisite fetcher ran in. Its outcome belongs
+       to the prerequisite card, not the package build card. */
+    uint64_t prerequisite_session_generation;
+    PlayerPrerequisiteState prerequisites;
+    PackageBootstrapSession bootstrap_session;
+    bool prerequisite_job_started;
+    bool prerequisite_fetcher_started;
+    bool prerequisite_bootstrap_ready;
+    bool prerequisite_cancel_sent;
+    bool request_open_folder;
+    char requested_open_path[NK_MAX_PATH];
+    PlayerUpdateState update;
+    PlayerReportState report;
+
+    /* Native core state */
+    NkLibrary library;
+    NkLaunchSession launch_session;
+    /* Optional repository/install root for runtime resolution. Empty means the
+       launcher's normal current-directory default. Keeping it on the app makes
+       demo and test launches use the same root as PLAY NOW. */
+    char runtime_root[MAX_PATH_LEN];
+    /* Validation report for refused user title profiles. Lines are keyed by
+       their declared disc ID so inspection and the CLI can explain the same
+       profile decision without treating it as a catalog entry. */
+    char title_manifest_report[2048];
+    /* Directory holding the player executable; the package builder finds
+       tools/nk_cli.py relative to it. Empty when unknown. */
+    char install_root[MAX_PATH_LEN];
+    /* Read-only package root beside the player executable. Bundled showcase
+       records are transient and never enter the user's persisted library. */
+    char showcase_root[MAX_PATH_LEN];
+    GameRecord showcase_games[MAX_SHOWCASE_GAMES];
+    int showcase_count;
+    bool is_game_running;
+    uint64_t launch_time_ms;
+    uint64_t boot_event_read_offset;
+    bool stalled_game_notice_visible;
+    bool stalled_game_notice_dismissed;
+    bool stalled_game_notice_raise_requested;
+    bool stalled_game_restore_game_front_requested;
+    uint32_t stalled_game_no_frame_vblanks;
+    /* The notice is for a game that keeps flipping dark frames (the runtime's
+       dark_picture observation), not one that stopped flipping (no_new_flip). */
+    bool stalled_game_dark_picture;
+    uint32_t stalled_game_seconds;
+    uint32_t stalled_game_ready;
+    uint32_t stalled_game_delay;
+    uint32_t stalled_game_wait;
+    uint32_t stalled_game_spin;
+    /* Keep the launcher UI headless. An explicit presented-frame acceptance
+       request may still open a window in the child runtime. */
+    bool launch_headless;
+    uint32_t headless_accept_presented_frames;
+    uint32_t headless_launch_timeout_ms;
+    /* Desktop bounds (x, y, w, h) of the display that holds the launcher window,
+       refreshed by main.c before each launch so the game window opens there.
+       A width of 0 means unknown (no window yet): the game uses the primary display. */
+    int launcher_display_bounds[4];
+
+    /* Set by the renderer when a control asks for the host file dialog. The
+       renderer has no SDL_Window and must stay free of platform dialog calls,
+       so it raises this and the event loop in main.c consumes it. */
+    bool request_file_picker;
+    /* The Fonts & System step requests the host folder dialog for PSP font import through
+       this flag; the event loop in main.c opens it. */
+    bool request_font_folder_picker;
+    /* The library card requests a package-status worker retry through this
+       flag; worker creation and queue ownership stay on the main event loop. */
+    bool request_package_status_retry;
+    /* A control asked to start game `request_launch_index`. The launch runs
+       on a worker the event loop in main.c owns (#1298), so renderers raise
+       this instead of starting the game from draw code. */
+    bool request_launch;
+    int request_launch_index;
+    /* Factory reset's Reset button asked for the reset. The event loop runs
+       it, because only it knows which background jobs are still working. */
+    bool request_factory_reset;
+    /* The reset moved the user data aside: the player quits without saving
+       anything and starts a fresh copy of itself, which opens on a first run. */
+    bool factory_reset_done;
+    /* A launch is checking the package or starting the process on that
+       worker; `launch_pending_disc_id` names the game. The UI keeps drawing
+       and shows the game as starting until the worker hands back. */
+    bool launch_pending;
+    char launch_pending_disc_id[NK_MAX_DISC_ID_LEN];
+
+    /* Index of the leftmost visible card in the library strip. The strip
+       lays cards out horizontally and a 1280-wide window fits about four, so
+       without this every entry past the fourth was drawn outside the window
+       with no way to reach it. */
+    int library_scroll_index;
+
+    /* Navigation & Focus */
+    int focus_index; /* current focused UI element index for gamepad/keyboard */
+    int active_tab;   /* for settings: 0=Display, 1=Audio, 2=Controller, 3=Logs */
+
+    /* Controller settings and live input monitor (#357) */
+    InputSettingsState input_settings;
+    bool host_buttons_live[NK_HOST_BUTTON_COUNT];
+    int16_t host_axes_live[NK_HOST_AXIS_COUNT];
+    /* Why the last launch could not hand the runtime the mapping this disc
+     * asked for, or an empty string. Drawn on the library card so a disc that
+     * silently launched on the global mapping is never a mystery. */
+    char input_profile_notice[192];
+
+    /* Settings persistence */
+    char settings_path[MAX_PATH_LEN];
+    /* --experimental-60hz on the command line: for this session every title that
+       has an enhancement package launches its enhanced build. Never saved with
+       the settings. */
+    bool experimental_60hz_session;
+    char settings_notice[128];
+    /* The operating system's display preferences, as player_app_read_system_preferences
+       last read them: what an AUTO accessibility choice follows. */
+    bool system_reduced_motion;
+    bool system_high_contrast;
+    /* settings.json was written by a newer player: it is kept as it is, this
+     * session runs on the defaults, and settings_notice says so on every
+     * Settings page (player_app_load_settings). */
+    bool settings_newer_schema;
+    /* Why the library shows no saved games although library.json exists (a newer
+     * player wrote it), or an empty string. Shown on the Library screen. */
+    char library_notice[192];
+
+    /* Files dropped on the window together (#2007): SDL sends them one event at a
+     * time between a begin and a complete. Several are gathered in a batch, the
+     * disc images among them wait in `drop_paths` to open one after another, and
+     * drop_notice is the one summary the library shows until the batch is done. */
+    char drop_paths[PLAYER_DROP_QUEUE_MAX][NK_MAX_PATH];
+    size_t drop_count;       /* queued disc images, in drop order */
+    size_t drop_next;        /* the next queued image to open */
+    size_t drop_seen;        /* every file this batch has seen */
+    bool drop_active;        /* between player_app_drop_begin and player_app_drop_finish */
+    char drop_notice[256];
+    bool drop_notice_visible; /* the library has shown it; leaving the library clears it */
+
+    /* Window & layout metrics */
+    int window_width;
+    int window_height;
+    float dpi_scale;
+    bool logical_ui;
+    bool enable_focus_handoff;
+    bool child_window_ready;
+    /* Start watch for the running launch (#1290): the first running check was
+       logged, the child wrote its first boot event, and the "still no boot
+       event" developer-log note was written. Cleared by each launch. */
+    bool launch_running_check_logged;
+    bool child_boot_event_seen;
+    bool child_boot_wait_noted;
+    bool close_confirmation_pending;
+    char boot_event_file_path[MAX_PATH_LEN];
+    bool should_quit;
+
+    /* The developer log: the player's own events, kept in memory on this PC
+       and shown only with developer mode on. Lines are redacted (profile path
+       and user name replaced) when they are added. */
+    PlayerDevLog dev_log;
+
+    /* A PSN package being converted to its disc image on a worker the event
+       loop in main.c owns. Progress and cancel use the setup wizard's panel;
+       return_view is where the picked disc continues once it is done. */
+    PlayerPsnPackage psn_package;
+    bool psn_conversion_active;
+    bool psn_conversion_requested;
+    PlayerView psn_conversion_return_view;
+
+    /* Games built by an older Nakagawa, and the Rebuild all queue. */
+    PlayerOutdatedState outdated;
+    PlayerRebuildQueue rebuild_queue;
+
+    /* The added images waiting for their disc check, and the one running. */
+    PlayerDiscCheckState disc_check;
+};
+
+/* State management API */
+void player_app_init(PlayerApp *app);
+/* Sets library_notice from what nk_library_load returned into app->library:
+ * a newer player's library.json is named and kept, never read as empty. */
+void player_app_note_library_load(PlayerApp *app, NkResult load_result);
+bool player_app_add_game(PlayerApp *app, const GameRecord *game);
+/* Re-adding a disc that is already in the library re-inspects it, which yields a
+ * record with no staging state. When `incoming` is the same disc as `existing`
+ * (disc ID, version and image size), carry over the staged-asset state, the
+ * prepared root and last-played time so re-adding never discards a completed
+ * extraction. Returns true when anything was carried over. */
+bool player_merge_readded_game(const GameRecord *existing, GameRecord *incoming);
+
+/* Disc verification (PlayerDiscCheckState). Queue the image of a game in the
+ * library for a check: a disc the user added (not a sample or a showcase demo)
+ * with an image path. False when it is not one, is waiting already, or the
+ * queue is full (logged, and the library's line says so). */
+bool player_app_disc_check_queue(PlayerApp *app, const GameRecord *game);
+/* The next image to hash, when none is being hashed and nothing a whole-image
+ * read would slow down is running (a game, a launch or a package build); it is
+ * then the running check. verified_elsewhere: a verified image in the library
+ * has its disc ID. */
+bool player_app_disc_check_take(PlayerApp *app, PlayerDiscCheckItem *out,
+                                bool *verified_elsewhere);
+void player_app_disc_check_progress(PlayerApp *app, int percent);
+/* The running check ended. A hashed image's record gets its hashes and tier,
+ * under the library lock; a cancel the library asked for ends the checks
+ * waiting too; anything else leaves the record unchecked and sets the note.
+ * The reason goes to the developer log either way. */
+void player_app_disc_check_finish(PlayerApp *app, const NkDiscVerification *check);
+void player_app_disc_check_cancel(PlayerApp *app);
+void player_app_disc_check_hide_note(PlayerApp *app);
+/* The library's line: the running check's progress, else the note. False when
+ * there is nothing to show; *offers_cancel says its button is Cancel, not Hide. */
+bool player_app_disc_check_line(const PlayerApp *app, char *out, size_t out_size,
+                                bool *offers_cancel);
+/* A checked image's card badge ("Verified retail", "Modified disc", "Unknown
+ * dump") and the title page's sentence about it; NULL when it is not checked. */
+const char *player_disc_tier_badge(uint32_t tier);
+const char *player_disc_tier_note(uint32_t tier);
+
+/* Display-only text rules. They change what is drawn, never a stored value.
+ *
+ * player_bitmap_glyph: one display unit of UTF-8 text for the bitmap font
+ * (SDL_RenderDebugText, ASCII only). Writes its replacement to out (NUL-terminated,
+ * at most two bytes) and returns the input bytes it covers (at least one). The
+ * trademark sign becomes "TM"; any other non-ASCII code point, and any malformed
+ * byte, becomes "?"; tabs and line breaks become spaces.
+ * player_text_for_bitmap_font: applies that to a whole string. The output never
+ * exceeds out_size and is cut at a whole glyph; returns its length. */
+size_t player_bitmap_glyph(const char *in, char out[3]);
+size_t player_text_for_bitmap_font(const char *in, char *out, size_t out_size);
+
+/* Privacy: the user's profile folder is shown as "~" wherever text is drawn, so
+ * a screenshot or screen share does not show the account name. Only whole path
+ * components match (the profile "name" does not match "name2"), Windows matching
+ * ignores case and accepts either separator, and the rewrite never grows the text.
+ * player_display_text_with_home takes the profile folder explicitly;
+ * player_display_text uses the current user's profile (USERPROFILE on Windows,
+ * HOME elsewhere). Stored paths never change. */
+size_t player_display_text_with_home(const char *in, const char *home,
+                                     char *out, size_t out_size);
+size_t player_display_text(const char *in, char *out, size_t out_size);
+
+bool player_app_remove_game(PlayerApp *app, int game_index);
+
+/* Remove from library (#1304). What Nakagawa built for one game, found from
+ * its disc ID under the player's own roots (never from a stored path): the
+ * built package, the build cache, and the disc files it extracted. The disc
+ * image on the user's PC is never part of it. Two groups are listed apart and
+ * go only when asked: the saves, and the disc copy (#2003): the decrypted
+ * files (titles/<ID>/decrypted, which may also hold files the user put there)
+ * and the disc image Nakagawa expanded or converted (<data>/discs/<ID>). */
+typedef enum {
+    PLAYER_REMOVAL_PACKAGE = 0,
+    PLAYER_REMOVAL_BUILD_CACHE,
+    PLAYER_REMOVAL_EXTRACTED,
+    PLAYER_REMOVAL_KIND_COUNT
+} PlayerRemovalKind;
+
+#define PLAYER_REMOVAL_PATH_CAP 16
+
+typedef struct {
+    char path[NK_MAX_PATH];
+    /* A top-level child kept when the folder is deleted (the saves inside
+       the extracted disc files), or empty. */
+    char keep_child[16];
+    PlayerRemovalKind kind;
+    bool saves;              /* this path is save data */
+    bool disc_copy;          /* this path is the opt-in disc copy and decrypted files */
+    uint64_t bytes;
+} PlayerRemovalPath;
+
+typedef struct {
+    char disc_id[NK_MAX_DISC_ID_LEN];
+    PlayerRemovalPath paths[PLAYER_REMOVAL_PATH_CAP];
+    size_t path_count;
+    uint64_t kind_bytes[PLAYER_REMOVAL_KIND_COUNT];
+    bool kind_present[PLAYER_REMOVAL_KIND_COUNT];
+    bool has_saves;
+    uint64_t saves_bytes;
+    bool has_disc_copy;
+    uint64_t disc_copy_bytes;
+    /* Another image in the library has this disc ID (a retail disc beside its
+       fan translation) and uses the same folders and saves, so only the
+       record goes and paths stays empty. */
+    bool files_shared;
+} PlayerRemovalPlan;
+
+/* Why a title cannot be removed now, or NULL when it can: a showcase demo,
+ * a game that starts or runs, a build or a disc copy in progress. */
+const char *player_app_removal_blocker(const PlayerApp *app, int game_index);
+/* Fills plan with what exists now for the title, with sizes. False when the
+ * title cannot be removed or its disc ID is not a plain folder name. */
+bool player_app_plan_game_removal(const PlayerApp *app, int game_index,
+                                  PlayerRemovalPlan *plan);
+/* The one logs folder (NK_PATH_LOGS, #2003), created if missing: the player's, the games'
+ * and the package builds' and build tools' logs, the folder Settings opens. */
+bool player_app_logs_dir(char *out, size_t out_size);
+
+/* What else goes with a removal: the saves, the disc copy and decrypted files. */
+#define PLAYER_REMOVE_ALSO_SAVES 1u
+#define PLAYER_REMOVE_ALSO_DISC_COPY 2u
+/* Removes the title from the library and deletes what the plan lists; the
+ * saves and the disc copy only when `also` names them (PLAYER_REMOVE_ALSO_*).
+ * Every folder is checked again just before it goes. On failure the library
+ * entry stays and error says what was left; the rest may already be deleted. */
+bool player_app_remove_game_and_data(PlayerApp *app, int game_index, unsigned also,
+                                     char *error, size_t error_size);
+void player_app_set_view(PlayerApp *app, PlayerView view);
+void player_app_set_error(PlayerApp *app, const char *code, const char *title, const char *msg, const char *recovery_label, PlayerView return_view);
+/* player_app_set_error, plus the technical text a plain card keeps in its
+   details box and in Copy details (a tool's own error line, a path). */
+void player_app_set_error_with_details(PlayerApp *app, const char *code, const char *title,
+                                       const char *msg, const char *details,
+                                       const char *recovery_label, PlayerView return_view);
+void player_app_set_cli_not_found_error(PlayerApp *app,
+                                        const char *recovery_label,
+                                        PlayerView return_view);
+/* The LAUNCHER_UNAVAILABLE text when the launcher cannot start (reason is the
+   launcher's own error). built_without_launcher is true when this build was
+   compiled without the SDL_Renderer or SDL3_ttf support the launcher needs, so
+   the fix is to build again with them, not to reinstall. Otherwise a file is
+   missing at run time: on Windows the release ZIP was extracted incompletely,
+   elsewhere SDL3_ttf or the installed assets are absent. */
+void player_launcher_unavailable_message(const char *reason, bool built_without_launcher,
+                                         char *out, size_t out_size);
+/* The same text for a named host (nk_platform_host_kind), so every host's words
+   can be tested on any host. */
+void player_launcher_unavailable_message_for_host(NkHostKind host, const char *reason,
+                                                  bool built_without_launcher,
+                                                  char *out, size_t out_size);
+/* The opening of every DATA_DIR_UNAVAILABLE card: what the host could not
+   resolve and which environment variables fix it (nk_platform_get_app_data_dir).
+   Plain words, no code (the card's details and Copy details carry it). Each
+   card adds its own closing words. */
+const char *player_data_dir_unavailable_text(NkHostKind host);
+/* The FOLDER_OPEN_FAILED card's sentence on how the host was asked to show a
+   folder: Windows' own shell, or xdg-open (through SDL) elsewhere. */
+const char *player_folder_open_failure_hint(NkHostKind host);
+/* FOLDER_OPEN_FAILED: the file manager could not be asked to show path (reason
+   is the host's error, or empty). The card names the folder so the user can
+   open it themselves, and returns to the view it was raised from. */
+void player_app_set_folder_open_error(PlayerApp *app, const char *path, const char *reason);
+/* Dropped files (#2007). player_app_drop_begin starts a batch, player_app_drop_add adds each
+   file, and player_app_drop_finish closes it. A lone file is returned as it is, whatever it
+   is: the caller runs the single-file path it always has. Of several, the disc images (.iso,
+   .cso, .zso, .chd, .pbp) are queued and the rest are skipped; drop_notice says which, once.
+   player_app_drop_take then hands the queued images out one at a time, oldest first, and
+   returns false when none is left. A queue is cleared with its summary when the library is
+   left with nothing queued. */
+void player_app_drop_begin(PlayerApp *app);
+void player_app_drop_add(PlayerApp *app, const char *path);
+void player_app_drop_finish(PlayerApp *app);
+bool player_app_drop_take(PlayerApp *app, char *out, size_t out_size);
+/* Ignores the files of a drop, queue and summary both, and logs why (the player cannot take
+   a new disc image while a worker owns the current game's files). */
+void player_app_drop_discard(PlayerApp *app, const char *reason);
+/* A .iso by its name, or a compressed disc image or PSN package by its contents. */
+bool player_path_looks_like_disc_image(const char *path);
+
+/* LIBRARY_WRITE_FAILED: a title could not be stored in the library file. */
+void player_app_set_library_write_error(PlayerApp *app);
+/* LINK_OPEN_FAILED: the browser could not be asked to open url (reason is the
+   host's error, or empty). The card puts the address in its details so the
+   user can paste it into a browser, and returns to the view it was raised
+   from (the library when raised from a card). */
+void player_app_set_link_open_error(PlayerApp *app, const char *url, const char *reason);
+/* The error card's words, shared by both launchers. The badge is a plain word
+   for the kind of problem; an unknown code gets "Problem", never the code. */
+const char *player_error_badge(const ErrorState *error);
+/* The card title for a picked file refused at a named format boundary
+   (IsoInspectResult.boundary_code): a compressed disc image, a disc image that
+   is not of a PSP game, or a file that is no disc image at all. */
+const char *player_disc_refusal_title(const char *boundary_code);
+/* True when the card leads with its plain message and shows boundary_text as
+   details; otherwise boundary_text is the message. */
+bool player_error_leads_with_message(const ErrorState *error);
+/* "Restart game", "Try again", or NULL when the card has no retry action. */
+const char *player_error_retry_label(const ErrorState *error);
+/* Run the card's retry action. False when it has none or its game is gone.
+   Restart game asks for the launch (player_app_request_launch); Try again
+   starts the build. */
+bool player_app_retry_from_error(PlayerApp *app);
+/* The report Copy details puts on the clipboard: version, problem, code, game,
+   disc ID and version, stage, details, log file, the system, the renderer,
+   the package check and the last runtime boot events. The user's profile
+   folder is shown as "~" and the user name as "<user>". Only
+   the clipboard sees it; nothing is sent anywhere. Returns its length. */
+size_t player_app_format_error_report(const PlayerApp *app, const char *version,
+                                      char *out, size_t out_size);
+/* The same report with the profile folder given explicitly: it is shown as
+   "~" (player_display_text_with_home) and the user name, wherever else it
+   appears, as "<user>" (player_dev_log_redact). */
+size_t player_app_format_error_report_for(const PlayerApp *app, const char *version,
+                                          const char *profile, const char *user,
+                                          char *out, size_t out_size);
+
+/* Report this game (docs/ONLINE_FEATURES.md "Reports"). These are links the user
+   opens in their own browser; the player makes no network call for them. */
+#define PLAYER_REPORT_REPO_URL "https://github.com/Jstar269/nakagawa-recomp"
+#define PLAYER_REPORT_CATEGORY "compatibility-reports"
+/* The longest report link. Windows hands a link to the browser through the
+   shell, whose limit is INTERNET_MAX_URL_LENGTH (2083 characters); GitHub's
+   own 414 limit is far above that. 2000 keeps clear of the shell's limit. */
+#define PLAYER_REPORT_URL_MAX 2000u
+/* What a report link carries, and nothing else: no path, log or setting. */
+typedef struct {
+    const char *title_name;
+    const char *disc_id;
+    const char *disc_version;
+    const char *version;      /* "v0.0.2-dev (commit 3efc890)" */
+    const char *platform;     /* player_platform_name() */
+    const char *problem;      /* the named boundary or stop code; "" from a title page */
+} PlayerReportFacts;
+/* "Windows (x86-64)", "Linux (arm64)", ...: the system the player was built for. */
+const char *player_platform_name(void);
+/* Percent-encodes UTF-8 text for a query value: RFC 3986's unreserved set
+   (A-Z a-z 0-9 - . _ ~) stays, every other byte becomes %XX. Appends to out
+   at *used and stops before a character whose encoding would pass `limit`
+   characters, so the cut is never inside an escape or a UTF-8 sequence.
+   Returns false when it had to stop. */
+bool player_url_encode_append(const char *in, char *out, size_t out_size, size_t *used,
+                              size_t limit);
+/* The new-discussion link in Compatibility reports, title and body filled in
+   (at most PLAYER_REPORT_URL_MAX characters). The text passes through the
+   same redaction as Copy details, with this profile folder and user name,
+   before it is encoded. Returns false when out is too small. */
+bool player_report_discussion_url(const PlayerReportFacts *facts, const char *profile,
+                                  const char *user, char *out, size_t out_size);
+/* The Compatibility reports search for a disc ID. */
+bool player_report_search_url(const char *disc_id, char *out, size_t out_size);
+/* An issue's page. */
+bool player_report_issue_url(unsigned int issue, char *out, size_t out_size);
+/* The open issue that tracks a named stop boundary, from the player's table of
+   known causes (player_state.c, k_known_causes); 0 when none does. */
+unsigned int player_known_issue_for_boundary(const char *boundary);
+unsigned int player_error_known_issue(const ErrorState *error);
+/* The card is about a game that stopped, crashed or did not start, so it
+   offers Report this game. */
+bool player_error_offers_report(const ErrorState *error);
+/* The short cause a report names: "stopped at <boundary>", or the stop code
+   and its exit code. */
+size_t player_error_report_problem(const ErrorState *error, char *out, size_t out_size);
+/* The report link for library game `game_index`, from the error card when
+   error is non-NULL, else from its title page; the current user's profile
+   folder and name are redacted. */
+bool player_app_report_url(const PlayerApp *app, int game_index, const ErrorState *error,
+                           const char *version, char *out, size_t out_size);
+/* Text after a leading "[CODE] " or "CODE: " prefix, so a card shows the
+   sentence, not the code. */
+const char *player_plain_reason(const char *text);
+/* What a runtime stop boundary needed, in plain words ("ad hoc wireless play",
+   "a processor feature", ...); "a system feature" for an unknown name. */
+const char *player_runtime_stop_feature(const char *boundary);
+/* The cards for a game that ended on its own: RUNTIME_SEMANTIC_BOUNDARY (the
+   runtime stopped at a named boundary, tracked by issue when non-zero),
+   RUNTIME_PREMATURE_EXIT, RUNTIME_ERROR_EXIT, and RUNTIME_START_TIMEOUT (the
+   launcher stopped a child that wrote no boot event in time; elapsed_ms is how
+   long it waited). The raw boundary and the exit code go into the details,
+   never the headline. */
+void player_app_set_game_stop_error(PlayerApp *app, const char *code,
+                                    const char *boundary, unsigned int issue,
+                                    int exit_code, uint64_t elapsed_ms,
+                                    const char *disc_id, const char *log_file_path);
+void player_app_populate_sample_games(PlayerApp *app);
+void player_app_sync_library(PlayerApp *app);
+bool player_app_discover_showcase(PlayerApp *app, const char *executable_directory);
+
+/* Maximum SDL3_ttf load candidates from player_app_ttf_library_candidates. */
+#define PLAYER_APP_TTF_MAX_CANDIDATES 4
+
+/* Ordered SDL3_ttf library candidates for a player running from exe_dir: the
+ * library beside the executable first, then the platform loader's default
+ * bare-name search (PATH on Windows). Pure: no filesystem or loader calls. */
+int player_app_ttf_library_candidates(const char *exe_dir,
+                                      char out[][MAX_PATH_LEN], int max_out);
+/* True when a disc directory entry name is safe to write under the private
+ * per-title folder (the tooling's FILENAME_RE and WINDOWS_RESERVED rules). */
+bool player_module_name_is_safe(const char *name);
+/* The path-qualified host name of a disc module whose file name another file in
+ * the module tree shares (see player_state.c). False when it does not fit. */
+bool player_module_qualified_name(const char *rel_path, const char *disc_name,
+                            char *out, size_t out_size);
+bool player_game_is_showcase(const GameRecord *game);
+void player_app_set_runtime_root(PlayerApp *app, const char *root);
+bool player_app_title_profile_refusal_for_disc(
+    const PlayerApp *app,
+    const char *disc_id,
+    char *reason,
+    size_t reason_size
+);
+NkLaunchDataRootStatus player_app_game_data_root_status(
+    const PlayerApp *app,
+    const GameRecord *game,
+    char *resolved_path,
+    size_t resolved_path_size,
+    char *reason,
+    size_t reason_size
+);
+NkRuntimePackageStatus player_app_validate_runtime_package(
+    const PlayerApp *app,
+    const GameRecord *game,
+    NkRuntimePackageInfo *out_info,
+    char *reason,
+    size_t reason_size
+);
+bool player_app_game_has_runtime(const PlayerApp *app, const GameRecord *game);
+/* The cache entry holds the status of exactly this title's package: the same
+ * disc, title, selected executable and package variant. */
+bool player_runtime_package_cache_entry_is_for(
+    const PlayerRuntimePackageCacheEntry *entry, const GameRecord *game);
+/* Two records name the same package (disc, title, executable and variant). */
+bool player_game_same_package(const GameRecord *a, const GameRecord *b);
+NkRuntimePackageStatus player_app_cached_runtime_package_status(
+    const PlayerApp *app, const GameRecord *game);
+bool player_app_cached_game_has_runtime(const PlayerApp *app,
+                                        const GameRecord *game);
+bool player_app_runtime_package_check_pending(const PlayerApp *app,
+                                               const GameRecord *game);
+bool player_app_runtime_package_check_failed(const PlayerApp *app,
+                                              const GameRecord *game);
+bool player_app_runtime_package_worker_start_failed(const PlayerApp *app,
+                                                     const GameRecord *game);
+bool player_app_runtime_package_worker_start_failed_retry_due(
+    const PlayerApp *app, const GameRecord *game, uint64_t now_ms);
+void player_app_runtime_package_worker_start_failed_record(
+    PlayerApp *app, const GameRecord *game, uint64_t now_ms);
+void player_app_runtime_package_worker_start_failed_clear(
+    PlayerApp *app, const GameRecord *game);
+void player_app_runtime_package_cache_mark_explicit_retry(PlayerApp *app,
+                                                          int game_index);
+void player_app_runtime_package_cache_mark_failed(PlayerApp *app,
+                                                  int game_index,
+                                                  uint64_t now_ms);
+void player_app_runtime_package_cache_invalidate(PlayerApp *app);
+void player_app_runtime_package_cache_mark_pending(PlayerApp *app, int game_index);
+void player_app_runtime_package_cache_store(
+    PlayerApp *app, int game_index, const GameRecord *game,
+    bool identity_valid, const char *package_identity,
+    NkRuntimePackageStatus status, bool runtime_available,
+    uint64_t checked_ms);
+/* Records the validator's reason for the entry stored at game_index. An empty
+ * reason leaves the stored one in place: a warm cache hit does not re-validate,
+ * so it has no new reason to give. */
+void player_app_runtime_package_cache_set_reason(PlayerApp *app, int game_index,
+                                                 const char *reason);
+/* The title's validated status is known (a check has finished and is not
+ * pending). Until then a card must say it is checking, not "Not prepared". */
+bool player_app_runtime_package_status_known(const PlayerApp *app,
+                                             const GameRecord *game);
+/* The validator's reason for the title's current package state, or NULL. */
+const char *player_app_runtime_package_reason(const PlayerApp *app,
+                                              const GameRecord *game);
+/* Library card status line. The card shows what is true of the package right
+ * now and, when the package cannot be used, the validator's first sentence as
+ * the reason. Returns the text length. */
+size_t player_library_status_text(bool has_runtime, bool checking, bool check_failed,
+                                  bool assets_staged, uint32_t staged_asset_count,
+                                  const char *reason, char *out, size_t out_size);
+/* The one line an INCOMPATIBLE card gives for why its package no longer fits
+ * this player: the validator's first sentence when it gave one, or a plain
+ * fallback. Both title cards show it beside REBUILD PACKAGE. */
+size_t player_incompatible_reason_line(const char *reason, char *out, size_t out_size);
+#ifdef NK_PLAYER_UI_REGRESSION_TEST
+uint64_t player_app_ui_test_validation_calls(void);
+#endif
+
+#define NK_PLAYER_SETTINGS_SCHEMA_VERSION 2
+
+/* Settings mutations. All values are validated and clamped; invalid inputs
+ * are ignored so a stray click or keypress can never corrupt launch config.
+ * Settings are persisted to a versioned JSON file (settings.json) in the
+ * per-user config directory and applied to the child runtime where supported
+ * via nk_launch_prepare_session. */
+void player_app_settings_init_default(PlayerSettings *settings);
+NkResult player_app_load_settings(PlayerApp *app, const char *file_path);
+NkResult player_app_save_settings(const PlayerApp *app, const char *file_path);
+
+/* The file pickers (Add disc, PSP fonts) open in the folder the user last
+ * picked from (settings.picker_folder). With none kept, or when it is gone,
+ * they open at the user's Desktop, so a first run, or one after a Factory
+ * reset, does not show the folder Windows last remembered for this program.
+ * False when there is neither; the picker then opens where the system picks. */
+bool player_app_picker_start_folder(const PlayerApp *app, char *out, size_t out_size);
+/* Keeps the folder of a picked file (or a picked folder) for the next picker
+ * and saves the settings. */
+void player_app_remember_picker_folder(PlayerApp *app, const char *picked, bool is_folder);
+/* The folder holding `path` (either separator), with a root kept whole:
+ * "<drive>:\x.iso" gives "<drive>:\", "/x.iso" gives "/". False for a bare name. */
+bool player_path_parent_folder(const char *path, char *out, size_t out_size);
+/* An absolute POSIX path as a file:// URL for SDL_OpenURL: bytes other than
+ * letters, digits and "/-_.~:" are percent-encoded. False for a path that does
+ * not start with "/" or a URL that does not fit. Pure, so it is tested on every
+ * host; only non-Windows hosts open folders this way (player_host.c). */
+bool player_file_url(const char *path, char *out, size_t out_size);
+
+void player_app_set_resolution_scale(PlayerApp *app, int scale);
+void player_app_cycle_resolution_scale(PlayerApp *app, int direction);
+void player_app_set_present_scaling(PlayerApp *app, int scaling);
+void player_app_cycle_present_scaling(PlayerApp *app, int direction);
+/* "Sharp", "Integer" or "Bilinear" for a NK_PRESENT_SCALING_* value. */
+const char *player_present_scaling_label(int scaling);
+void player_app_set_fps_cap(PlayerApp *app, int cap);
+void player_app_cycle_fps_cap(PlayerApp *app, int direction);
+void player_app_toggle_fullscreen(PlayerApp *app);
+void player_app_toggle_launcher_fullscreen(PlayerApp *app);
+PlayerCloseDecision player_app_close_decision(const PlayerApp *app,
+                                              bool user_confirmed);
+/* SDL may report one host close action with more than one close event type.
+ * Claim the first such event in a drained event batch only. */
+bool player_app_close_request_batch_claim(bool *close_request_handled);
+/* If the host confirmation dialog cannot be shown, keep the running game
+ * alive and require a second explicit close request before forcing quit. */
+void player_app_note_close_confirmation_failure(PlayerApp *app);
+bool player_app_take_close_confirmation_fallback(PlayerApp *app);
+/* The quit confirmation is the host's native message box. SDL3's Windows box
+ * does not widen a button for a long label: "Close game and quit" showed as
+ * "ose game and qu". Every button label stays within
+ * PLAYER_DIALOG_BUTTON_LABEL_MAX characters. Cancel is the Return and Escape
+ * default, so a stray Enter never ends the game. */
+#define PLAYER_DIALOG_BUTTON_LABEL_MAX 12
+#define PLAYER_QUIT_DIALOG_TITLE "Quit Nakagawa?"
+#define PLAYER_QUIT_DIALOG_CANCEL_LABEL "Cancel"
+#define PLAYER_QUIT_DIALOG_QUIT_LABEL "Quit"
+/* The quit confirmation's message. It names the running game by the title its
+ * launch carries (the disc title the library card shows), with its line breaks
+ * folded to spaces, or says "A game" when the launch has none. Two lines: the
+ * first says the game is running, the second what quitting does. False only
+ * for a missing or empty buffer. */
+bool player_app_quit_confirmation_message(const PlayerApp *app, char *out,
+                                          size_t out_size);
+bool player_app_boot_event_is_window_ready(const char *line);
+bool player_app_child_window_ready(PlayerApp *app);
+/* Fit a requested client rectangle into a display. `usable` is the display's
+ * usable bounds and `frame` the window decoration, so the client area is
+ * `usable` reduced by `frame`; `out` receives a CLIENT rectangle that fits
+ * inside that area, ready for SDL_SetWindowSize/SDL_SetWindowPosition and for
+ * the launcher's persisted launcher_window_* geometry. */
+bool player_window_fit_to_display(PlayerWindowRect requested,
+                                  PlayerWindowRect usable,
+                                  PlayerWindowFrame frame,
+                                  bool requested_position_valid,
+                                  PlayerWindowRect *out);
+/* Fit the launcher UI to a window whose drawable area is `pixel_width` x
+ * `pixel_height` output pixels (#1129). The design keeps the proportions the
+ * letterboxed 1280x720 canvas gave it: the scale is the one the letterbox
+ * used, so the screens never lay out smaller than the design. Instead of
+ * leaving bars, the canvas grows along the window's longer axis, and instead
+ * of stretching a finished picture, the UI is drawn straight into the output
+ * pixels with a uniform scale and no offset, so text is rasterised at exactly
+ * `scale` and lands on whole pixels. A high-DPI window has more pixels and
+ * therefore a larger scale. */
+bool player_ui_canvas_fit(int pixel_width, int pixel_height,
+                          PlayerUiCanvas *out);
+void player_app_toggle_vsync(PlayerApp *app);
+/* Settings > Accessibility. Each choice cycles Automatic, On, Off; the interface
+ * size cycles Automatic, 100, 125, 150 and 200%; the text size cycles Standard
+ * (100%), Large (125%) and Larger (150%). Each change is saved. */
+void player_app_cycle_reduce_motion(PlayerApp *app);
+void player_app_cycle_high_contrast_focus(PlayerApp *app);
+void player_app_cycle_interface_size(PlayerApp *app);
+void player_app_cycle_text_size(PlayerApp *app);
+/* "Standard", "Large" or "Larger" for a text size; "Standard" for anything else. */
+const char *player_text_size_label(int text_size_pct);
+/* "Automatic", "On" or "Off". */
+const char *player_system_choice_label(PlayerSystemChoice choice);
+/* Reads the operating system's display preferences into the app (nk_platform); the
+ * launcher calls it every frame, so a change in Windows applies at once. */
+void player_app_read_system_preferences(PlayerApp *app);
+/* The effective settings: the user's On or Off, or for Automatic the operating
+ * system's preference as last read. */
+bool player_app_reduce_motion(const PlayerApp *app);
+bool player_app_high_contrast_focus(const PlayerApp *app);
+void player_app_toggle_ui_sounds(PlayerApp *app);
+/* The library's sort: Recently played, Name A to Z, Recently added, and round
+ * again. The change is saved. */
+void player_app_cycle_library_sort(PlayerApp *app);
+/* "Recently played", "Name A to Z" or "Recently added". */
+const char *player_library_sort_label(PlayerLibrarySort sort);
+/* The 60 FPS game-logic enhancement, per title (docs/ENHANCEMENT_CONTRACT.md
+ * section 9). A title launches its enhanced build only when it has a usable
+ * enhancement package and the enhancement is on: saved for that disc, or for
+ * every such title by the session flag. Otherwise it launches the authentic
+ * package. GameRecord.enhancement_package_id carries the choice to package
+ * checks, builds and launches. */
+
+/* Reads <user_root>/enhancements/<disc ID, lowercase>-60hz.json for `game` with
+ * nk_json. Returns out->available. A showcase demo, a test program or a disc ID
+ * that is not a PSP disc ID has none. */
+bool player_read_title_enhancement(const char *user_root, const GameRecord *game,
+                                   PlayerTitleEnhancement *out);
+/* Re-reads every title's enhancement package and sets each GameRecord's
+ * enhancement_package_id. player_app_sync_library calls it. */
+void player_app_refresh_title_enhancements(PlayerApp *app);
+/* The saved per-title setting for a disc. */
+bool player_app_title_60hz_saved(const PlayerApp *app, const char *disc_id);
+/* The enhancement is on for the title: saved, or the session flag. */
+bool player_app_title_60hz_on(const PlayerApp *app, int game_index);
+/* Saved on, but the title has no usable enhancement package: nothing launches
+ * or builds until the package is back or the enhancement is turned off. */
+bool player_app_title_60hz_blocked(const PlayerApp *app, int game_index);
+/* Saves the per-title setting, re-selects the title's package variant, and asks
+ * for its package to be checked. */
+void player_app_set_title_60hz(PlayerApp *app, int game_index, bool on);
+/* The --experimental-60hz flag: on for this session only, never saved. */
+void player_app_set_experimental_60hz_session(PlayerApp *app, bool on);
+
+/* ---- Ace Mode (src/rt/ace.h) ---- */
+
+/* The title's saved choice for a disc, or NULL when it follows the library everywhere. */
+const PlayerAceTitle *player_settings_ace_title(const PlayerSettings *settings,
+                                                const char *disc_id);
+/* What a disc launches with: AUTHENTIC turns everything off; ON, or the library's switch,
+ * turns Ace on; each feature then takes the title's value, else the library's. */
+void player_ace_resolve(const PlayerSettings *settings, const char *disc_id,
+                        PlayerAceResolved *out);
+/* True 60 Hz game logic and smooth motion are refused together, not stacked (#1272): a title
+ * that launches its enhanced 60 FPS build (GameRecord.enhancement_package_id set) calls this
+ * with logic_60 true, and smooth motion is off for that launch whatever the settings say.
+ * Ace's other features are untouched. */
+void player_ace_apply_logic_60(PlayerAceResolved *ace, bool logic_60);
+/* The SR_ACE line for a resolution: "off", or "v1;af=16;text=on;readout=off;notice=on;
+ * wide=off;smooth=off" (smooth=x2 when smooth motion is on; wide is always off, and
+ * smooth=match is never written). Returns false when it does not fit. */
+bool player_ace_launch_line(const PlayerAceResolved *ace, char *out, size_t cap);
+/* <user_root>/ace/<disc ID>.json: the runtime's per-run report for that disc. */
+bool player_ace_report_path(const char *user_root, const char *disc_id, char *out, size_t cap);
+/* The title page's "Last session" line from that report ("Last session: 16x filtering,
+ * game at 30 Hz."). Returns false, with out empty, when there is no readable report. */
+bool player_ace_last_session_line(const char *user_root, const char *disc_id, char *out,
+                                  size_t cap);
+/* The library's settings (Settings > Ace Mode). Each change is saved. */
+void player_app_toggle_ace(PlayerApp *app);
+void player_app_cycle_ace_filtering(PlayerApp *app);   /* 16x, 8x, 4x, 2x, Off */
+void player_app_toggle_ace_text(PlayerApp *app);
+void player_app_toggle_ace_readout(PlayerApp *app);
+void player_app_toggle_ace_notice(PlayerApp *app);
+void player_app_toggle_ace_smooth(PlayerApp *app);     /* Off, x2 */
+/* "16x", "8x", "4x", "2x" or "Off". */
+const char *player_ace_filtering_label(int af);
+/* The title page: Library default, On, Authentic, then Library default again. Authentic
+ * also takes the title's 60 FPS game logic off for as long as it is chosen. */
+void player_app_cycle_title_ace_mode(PlayerApp *app, int game_index);
+PlayerAceTitleMode player_app_title_ace_mode(const PlayerApp *app, int game_index);
+/* The title page's smooth motion: Library default, On, Off, then Library default again. */
+void player_app_cycle_title_ace_smooth(PlayerApp *app, int game_index);
+/* The title's own smooth motion choice: -1 follows the library, 0 off, 1 x2. */
+int player_app_title_ace_smooth(const PlayerApp *app, int game_index);
+/* The title's "Last session" line from the report under the user data folder; false, with
+ * out empty, when there is none. */
+bool player_app_ace_last_session(const PlayerApp *app, int game_index, char *out, size_t cap);
+void player_app_toggle_share_system_libraries(PlayerApp *app);
+void player_app_adjust_volume(PlayerApp *app, int delta);
+void player_app_move_focus(PlayerApp *app, int delta, int focus_count);
+
+/* Index of the library entry carrying this disc ID, or -1 if there is none.
+   nk_library_add_or_update updates an existing record IN PLACE, so the entry
+   just written is not necessarily the last one; callers that need the record
+   they have just added must look it up rather than assume it was appended. */
+int player_app_find_game_by_disc_id(const PlayerApp *app, const char *disc_id);
+/* The card of the image just added, by its disc ID and file, or -1 when the add
+   failed. Two images can share a disc ID (a retail disc and a fan translation
+   of it), so the disc ID alone could pick the other card. */
+int player_app_find_added_game(const PlayerApp *app, const GameRecord *game);
+/* The card of the image a build made: by its file, or by its disc ID when one
+   card alone has it (a card added again from another folder meanwhile); -1
+   when two images share the disc ID and neither names the file. */
+int player_app_find_built_game(const PlayerApp *app, const char *disc_id,
+                               const char *iso_path);
+/* The card a package check of game is for: the same package and image, or else
+   the first card of that package. Two images of a disc ID share its package
+   folder, and each card's check lands on its own card. */
+int player_app_find_package_card(const PlayerApp *app, const GameRecord *game);
+/* How many cards carry disc_id (two images can share one). */
+int player_app_count_games_with_disc_id(const PlayerApp *app, const char *disc_id);
+/* The card of one image, by its disc ID and file, or -1. */
+int player_app_find_game_by_image(const PlayerApp *app, const char *disc_id,
+                                  const char *iso_path);
+
+/* Disc ID of the selected library card, or NULL when no card is selected. The
+   per-title controller mapping choice (#520) needs one to name. */
+const char *player_app_selected_disc_id(const PlayerApp *app);
+
+/* Move the library selection by `delta` entries, clamped to the library. */
+void player_app_move_selection(PlayerApp *app, int delta);
+
+/* How many library cards fit in the current window, at least one. */
+int player_app_visible_library_cards(const PlayerApp *app);
+
+/* Whether the settings renderer has enough client width and height for its
+ * two-column layout. This is pure state logic so the threshold is tested
+ * independently of SDL and the renderer cannot drift from the layout contract. */
+bool player_settings_uses_two_columns(int window_width, int window_height);
+
+/* Horizontal offset, from the card's left edge, where the settings right
+ * column begins. It is never left of the end of the launcher fullscreen
+ * control plus a gutter, so the columns cannot overlap at any card width the
+ * two-column layout accepts. */
+float player_settings_second_column_offset(float card_width);
+
+/* Whether the event loop should attempt the launcher-to-game focus handoff on
+ * this frame. Pure state logic so the once-per-launch contract is tested
+ * without SDL: the launcher stays open behind the game and hands it the
+ * foreground once, after the game reports its window (#1298); retrying every
+ * frame would take the foreground back from a user who moved away. */
+bool player_app_should_attempt_window_handoff(bool interactive_window,
+                                              bool game_running,
+                                              bool handoff_attempted,
+                                              bool child_window_ready);
+
+/* The boot-event marker pathname the next interactive launch will use, without
+ * consuming the sequence. Pure naming so tests can build a filesystem seam at
+ * the exact path production will choose instead of assuming a sequence. */
+void player_app_next_boot_event_path(char *out, size_t out_size);
+
+/* How many keyboard/gamepad focus stops the current view offers, at least
+ * one. Pure state logic (no SDL): the renderer draws its buttons in this
+ * exact order, so the event loop can clamp focus_index and tests can pin
+ * the contract without opening a window. */
+int player_app_focus_count(const PlayerApp *app);
+
+/* Process launch integration */
+bool player_app_launch_game(PlayerApp *app, int game_index);
+void player_app_stop_game(PlayerApp *app);
+void player_app_stop_stalled_game(PlayerApp *app);
+void player_app_keep_waiting_for_stalled_game(PlayerApp *app);
+
+/* One PLAY, split so its slow part can leave the UI thread (#1298). Checking a
+ * package hashes every artifact it lists (hundreds of MB for a retail title),
+ * and the launch checks it again while preparing and before spawning.
+ *
+ * player_app_launch_begin (UI thread) copies what the launch needs out of the
+ * app; player_launch_work_run touches only the work and may run on any
+ * thread; player_app_launch_finish (UI thread) adopts the started session or
+ * shows the error card the old single call showed. player_app_launch_game is
+ * all three in a row. */
+typedef enum {
+    PLAYER_LAUNCH_STEP_NONE = 0,
+    PLAYER_LAUNCH_STEP_PACKAGE,
+    PLAYER_LAUNCH_STEP_DATA_ROOT,
+    PLAYER_LAUNCH_STEP_PREPARE,
+    PLAYER_LAUNCH_STEP_START
+} PlayerLaunchStep;
+
+typedef struct {
+    int game_index;
+    GameRecord game;
+    char package_root[MAX_PATH_LEN];
+    bool has_package_root;
+    PlayerSettings settings;
+    bool launch_headless;
+    uint32_t headless_accept_presented_frames;
+    char boot_event_file_path[MAX_PATH_LEN];
+    char input_profile_path[NK_MAX_PATH];
+    char ui_root[MAX_PATH_LEN];
+    int launcher_display_bounds[4];
+    /* Results, written by player_launch_work_run. */
+    PlayerLaunchStep failed_step;
+    NkResult result;
+    NkLaunchDataRootStatus data_root_status;
+    char package_error[2048];
+    char data_root_reason[1024];
+    NkLaunchSession session;
+} PlayerLaunchWork;
+
+bool player_app_launch_begin(PlayerApp *app, int game_index, PlayerLaunchWork *work);
+void player_launch_work_run(PlayerLaunchWork *work);
+bool player_app_launch_finish(PlayerApp *app, PlayerLaunchWork *work);
+
+/* Ask the event loop to start game `game_index` (see request_launch). */
+void player_app_request_launch(PlayerApp *app, int game_index);
+
+/* Copy the launch-relevant player settings into a prepared session's runtime
+ * configuration (resolution, frame cap, vsync, fullscreen, master volume).
+ * The accessibility settings and ui_sounds are launcher-UI state and deliberately not copied. Kept as a
+ * named seam so tests can pin the settings -> session mapping without
+ * spawning a child. */
+void player_app_apply_settings_to_session(const PlayerSettings *settings,
+                                          NkRuntimeConfig *config);
+
+/**
+ * Copy the effective host input mapping for `game` into the prepared session's
+ * runtime configuration as the NK_INPUT_PROFILE path the child will load.
+ *
+ * A disc with its own per-title mapping gets that mapping written to
+ * <config>/input_profiles/<disc_id>.json and pointed at; every other disc is
+ * handed the global profile path. Two discs in one session therefore use
+ * different mappings without anyone editing a global file (#520). A mapping that
+ * cannot be resolved is reported in `input_profile_notice` and the session keeps
+ * the profile path it already had, rather than launching with a silent surprise.
+ */
+NkResult player_app_apply_input_profile_to_session(PlayerApp *app, const GameRecord *game);
+
+/* Advance the running-game session state machine one tick at `now_ms`.
+ *
+ * Returns true when this tick observed the child's exit and finalized the
+ * session. A child that exits before 500 ms of wall time is reported through
+ * the structured RUNTIME_PREMATURE_EXIT error; a later non-zero exit becomes
+ * RUNTIME_ERROR_EXIT. A child still running PLAYER_GAME_START_TIMEOUT_MS
+ * after launch without having written a single boot event never started: the
+ * tick stops it, reports RUNTIME_START_TIMEOUT and returns true (#1290).
+ * Either way the session's process handles are released and is_game_running
+ * is false before returning, so a subsequent launch starts from clean state.
+ * Pure state logic (no SDL): the caller supplies the clock so tests can drive
+ * classification deterministically. */
+#define PLAYER_GAME_START_NOTE_MS 5000u
+#define PLAYER_GAME_START_TIMEOUT_MS 15000u
+bool player_app_monitor_game_session(PlayerApp *app, uint64_t now_ms);
+
+/* Commit the inspected, successfully staged title to the persistent library
+ * and enter PLAYER_VIEW_READY_LIBRARY. Runtime readiness remains separate:
+ * assets_staged may be true while is_prepared is false. */
+bool player_app_register_staged_game(PlayerApp *app);
+
+/* Everything one staging run needs, taken from the title's manifest. The
+ * request points into the plan's own storage, so a plan is built in place and
+ * never copied. It owns its strings because the wizard's worker thread reads
+ * it while the UI thread keeps running. */
+typedef struct {
+    char iso_path[NK_MAX_PATH];
+    char disc_id[NK_MAX_DISC_ID_LEN];
+    char disc_version[16];
+    char user_data_root[NK_MAX_PATH];
+    char data_root[257];
+    char root_storage[NK_TITLE_MAX_LOOSE_CONTENT_ROOTS][241];
+    const char *roots[NK_TITLE_MAX_LOOSE_CONTENT_ROOTS];
+    PlayerStageTitleRequest request;
+} PlayerStagePlan;
+
+
+/* Fill the one staging request every route uses (the wizard's worker,
+ * --stage-only, --launch-now, ADD TO LIBRARY) from the game's catalog or
+ * experimental profile entry. Returns false when that entry cannot be read. */
+bool player_app_build_stage_plan(const GameRecord *game, PlayerStagePlan *plan);
+
+/* True when the inspected disc's title takes its data from the disc and the
+ * data is not in place yet, so ADD TO LIBRARY must set its files up first. */
+bool player_app_inspected_game_needs_staging(const PlayerApp *app);
+
+/* ADD TO LIBRARY for the inspected disc. A title that takes its data from the
+ * disc goes through the setup wizard's staging worker first (the same
+ * progress, cancel, retry and messages); the worker saves the game to the
+ * library once its files are in place. Any other title is saved directly and
+ * the library is shown. Returns false only when saving directly failed. */
+bool player_app_add_inspected_game(PlayerApp *app);
+
+/* Start the wizard's staging worker for the inspected disc. */
+void player_app_wizard_begin_extraction(PlayerApp *app);
+
+/* PSN releases of UMD games (#295 phase 2). */
+/* True when the file starts with the PBP package magic. */
+bool player_path_is_pbp_package(const char *path);
+/* Identify a picked package with no key lookup and name its private ISO.
+ * True for a PSN release of a UMD game; otherwise false with the named code
+ * (PSONE_CLASSIC_UNSUPPORTED, FIRMWARE_OUT_OF_SCOPE, PBP_PACKAGE_UNSUPPORTED or
+ * IO_FAILURE) and a plain sentence. */
+bool player_psn_package_inspect(const char *pbp_path, PlayerPsnPackage *package,
+                                char *code, size_t code_size,
+                                char *message, size_t message_size);
+/* Convert the package into package->iso_path: written beside it, checked
+ * (ISO9660 volume descriptor and the package's DISC_ID), then renamed into
+ * place; a failure or a cancel removes the partial file. On failure code is
+ * the boundary's named result (CANCELLED for a cancel). */
+bool player_psn_package_convert(const PlayerPsnPackage *package,
+                                const PlayerPsnConvertCallbacks *callbacks,
+                                char *code, size_t code_size,
+                                char *message, size_t message_size);
+/* The wizard's progress panel shows the conversion; the event loop starts the
+ * worker once it takes the request. finish restores the view the package was
+ * picked from, so the ISO is then imported exactly as a picked disc. */
+void player_app_psn_conversion_begin(PlayerApp *app, const PlayerPsnPackage *package);
+bool player_app_psn_conversion_take_request(PlayerApp *app);
+void player_app_psn_conversion_progress(PlayerApp *app, uint64_t done_bytes,
+                                        uint64_t total_bytes);
+void player_app_psn_conversion_finish(PlayerApp *app);
+
+/* Compressed disc images (.cso, .zso, .chd), expanded once at import. */
+/* Check a picked compressed image and fingerprint it. iso_ready is true when
+ * the same unchanged file was expanded before; otherwise the image goes to the
+ * conversion worker (player_app_psn_conversion_begin). False with a named
+ * DISC_IMAGE_* code and a plain sentence for an image the player refuses. */
+bool player_disc_image_inspect(const char *image_path, PlayerPsnPackage *package,
+                               char *code, size_t code_size,
+                               char *message, size_t message_size);
+/* Expand the image into its per-title folder (nk_disc_import) and fill in
+ * package->iso_path and package->disc_id. A failure or a cancel keeps nothing
+ * (code CANCELLED for a cancel). */
+bool player_disc_image_expand(PlayerPsnPackage *package,
+                              const PlayerPsnConvertCallbacks *callbacks,
+                              char *code, size_t code_size,
+                              char *message, size_t message_size);
+
+/* Setup Wizard API */
+void player_app_start_setup_wizard(PlayerApp *app);
+void player_app_wizard_next(PlayerApp *app);
+void player_app_wizard_back(PlayerApp *app);
+void player_app_wizard_cancel(PlayerApp *app);
+void player_app_wizard_reset_extraction(PlayerApp *app);
+bool player_app_wizard_take_extraction_request(PlayerApp *app);
+void player_app_wizard_request_cancel(PlayerApp *app);
+bool player_app_wizard_cancel_requested(const PlayerApp *app);
+void player_app_wizard_set_extraction_progress(PlayerApp *app, int percent,
+                                               int files_extracted, int total_files,
+                                               const char *current_file);
+void player_app_wizard_finish_extraction(PlayerApp *app, NkResult result,
+                                         const char *error_message);
+void player_app_build_compatibility_preflight(
+    PlayerApp *app, bool disc_readable, bool param_sfo_parsed,
+    const NkIsoExecutableReport *executables);
+/* Recheck the selected library title's current ISO and title profile before a
+   build. force=true bypasses the title-page cache; a refusal leaves its plain
+   blocking check in package_build_preflight. */
+bool player_app_build_package_preflight(PlayerApp *app, int game_index, bool force);
+const PlayerPreflightCheck *player_app_package_build_preflight_blocker(
+    const PlayerApp *app, int game_index);
+/* The program input the selected library title's last build check found, or
+   NULL when that check is not for this title. */
+const PlayerInputReport *player_app_package_build_input(const PlayerApp *app, int game_index);
+/* Check the disc being added again, from the same image, after the user put
+   files in its folder: no file picker and no new import. The disc must still
+   be the same game; the checks and their input report are rebuilt in
+   app->wizard.preflight. Returns true when nothing keeps the disc out. */
+bool player_app_recheck_inspected_disc(PlayerApp *app);
+/* PSP system fonts: the Fonts & System step's import and removal. Each refreshes the
+   per-slot status and the message. Import reads the folder's .pgf files once each, checks
+   them with the native reader, and copies each slot's file into the per-user cache. */
+bool player_app_fonts_import_folder(PlayerApp *app, const char *folder);
+/* "Get fonts from my PSP": find a PSP connected by USB (nk_font_find_psp_folder: its system
+   storage's font folder, or the <drive>/NAKAGAWA/fonts folder Nakagawa Font Copy filled) and
+   import it. The message names the storage and the drive's own name, never the folder's path,
+   and says what to do when no PSP is connected. */
+bool player_app_fonts_import_from_psp(PlayerApp *app);
+/* The same over the given drive roots instead of the mounted drives (tests). */
+bool player_app_fonts_import_from_psp_roots(PlayerApp *app, const char *const *roots,
+                                            int root_count);
+bool player_app_fonts_remove_imports(PlayerApp *app);
+void player_app_refresh_font_status(PlayerApp *app);
+
+/* Package build actions */
+bool player_app_start_package_build(PlayerApp *app, int game_index);
+/* Rebuild an existing package when validation marks it incompatible, or when an
+   older Nakagawa built it. Uses the same prerequisite consent and
+   package-builder transaction as a new build. */
+bool player_app_rebuild_package(PlayerApp *app, int game_index);
+
+/* Games built by an older Nakagawa. The scan is split like a launch, so its
+   hashing (this player's own source tree, about 20 MB, once a session) runs on
+   a worker: begin (UI thread) copies what it needs, run touches only the work,
+   finish (UI thread) applies it. begin returns false when there is nothing to
+   scan; finish shows the once-per-update prompt when outdated games are found
+   and settings.rebuild_prompt_version is not player_version. */
+typedef struct {
+    char source_root[NK_MAX_PATH];
+    char user_data_root[NK_MAX_PATH];
+    bool identity_known;
+    NkPackageBuildIdentity identity;
+    int count;
+    char disc_ids[MAX_LIBRARY_GAMES][MAX_DISC_ID_LEN];
+    char iso_paths[MAX_LIBRARY_GAMES][NK_MAX_PATH];
+    /* Results, written by player_outdated_scan_run. */
+    bool outdated[MAX_LIBRARY_GAMES];
+    bool disc_missing[MAX_LIBRARY_GAMES];
+} PlayerOutdatedScan;
+
+bool player_app_outdated_scan_begin(PlayerApp *app, PlayerOutdatedScan *scan);
+void player_outdated_scan_run(PlayerOutdatedScan *scan);
+void player_app_outdated_scan_finish(PlayerApp *app, const PlayerOutdatedScan *scan,
+                                     const char *player_version);
+/* The source tree a build would use: the folder above tools/nk_cli.py. */
+bool player_app_build_source_root(const PlayerApp *app, char *out, size_t out_size);
+
+bool player_app_game_is_outdated(const PlayerApp *app, const GameRecord *game);
+int player_app_outdated_count(const PlayerApp *app);
+
+/* The prompt: "N games were built by an older Nakagawa. ..." with Rebuild all
+   and Later. Either answer records this version in settings, so the prompt
+   does not come back until the next update. */
+bool player_app_rebuild_prompt_visible(const PlayerApp *app);
+size_t player_app_rebuild_prompt_text(const PlayerApp *app, char *out, size_t out_size);
+void player_app_rebuild_prompt_answer(PlayerApp *app, bool rebuild_all);
+/* The library banner: after Later, while outdated games remain and it was not
+   hidden this session, or while the queue runs ("Rebuilding 2 of 5"). Its
+   text, and whether it offers Rebuild all (not while the queue runs). */
+bool player_app_rebuild_banner_visible(const PlayerApp *app);
+size_t player_app_rebuild_banner_text(const PlayerApp *app, char *out, size_t out_size,
+                                      bool *offers_rebuild_all);
+void player_app_rebuild_banner_dismiss(PlayerApp *app);
+
+/* PLAY for a game. An outdated game whose disc is in place asks first (the
+   reminder: Rebuild now or Play anyway) unless Play anyway was chosen for it
+   this session; anything else asks the event loop to launch. Returns true when
+   the launch was asked for. A game whose own rebuild runs never launches. */
+bool player_app_request_play(PlayerApp *app, int game_index);
+bool player_app_rebuild_reminder_visible(const PlayerApp *app);
+void player_app_rebuild_reminder_play_anyway(PlayerApp *app);
+void player_app_rebuild_reminder_rebuild_now(PlayerApp *app);
+
+/* The Rebuild all queue. rebuild_all queues every outdated game (keeping any
+   still pending) and starts; enqueue adds one game. Both save the queue file
+   and return false when nothing was queued. step runs once a frame: it starts
+   the next title when no build, launch or tool download is under way, skips a
+   title whose disc is missing, and finishes the queue (removing its file) when
+   none is pending. load reads the file at start (the queue resumes); a file
+   from a newer player is not read. */
+bool player_app_rebuild_all(PlayerApp *app);
+bool player_app_rebuild_enqueue(PlayerApp *app, const char *disc_id);
+void player_app_rebuild_queue_step(PlayerApp *app);
+bool player_app_rebuild_queue_load(PlayerApp *app);
+bool player_app_rebuild_queue_save(const PlayerApp *app);
+bool player_app_rebuild_queue_path(const PlayerApp *app, char *out, size_t out_size);
+/* The build session that runs belongs to the queue. Its outcome goes to the
+   queue, not to a card, and the view stays where the user is. */
+bool player_app_rebuild_queue_owns_build(const PlayerApp *app);
+/* The check after a queue build finished: ok when the new package passed. */
+void player_app_rebuild_queue_build_checked(PlayerApp *app, bool ok);
+/* The queue's entry for a game, or NULL. */
+const PlayerRebuildEntry *player_app_rebuild_entry(const PlayerApp *app,
+                                                   const GameRecord *game);
+
+/* What a game's cards say about an older build: the library card's status
+   word, the title page's package sentence, and whether its rebuild runs (it
+   cannot launch then). fraction is the rebuild's compile share, or -1. Returns
+   false for a game with nothing to say (not outdated, not in the queue). */
+typedef struct {
+    const char *word;
+    const char *detail;
+    bool rebuilding;
+    /* Rebuild is offered on the title page: not while the game waits in the
+       queue or rebuilds, and not without its disc. */
+    bool can_rebuild;
+    float fraction;
+} PlayerRebuildCard;
+#define PLAYER_REBUILD_REMINDER_TEXT \
+    "This game was built by an older Nakagawa. Rebuild it for the latest fixes."
+bool player_app_rebuild_card(const PlayerApp *app, const GameRecord *game,
+                             PlayerRebuildCard *out);
+/* An experimental entry saved without a selected executable (its EBOOT.BIN was
+   encrypted at import) takes the one its validated profile binds, and the
+   library is saved. Returns true when the entry changed (#1276). */
+bool player_app_adopt_profile_executable(PlayerApp *app, int game_index);
+/* Show a failed or cancelled build session once per session: a failure opens
+   the build error card, a cancel returns to the Library. Later calls for the
+   same session do nothing, so the card can be dismissed and the Library left
+   (#1277). Returns true when it changed the view. */
+bool player_app_apply_build_outcome(PlayerApp *app);
+/* The package passed its build but not the check that follows it. The internal
+   code PACKAGE_REVALIDATION_FAILED goes to the developer log; the card does
+   not claim the build failed (#1276). */
+void player_app_set_package_revalidation_error(PlayerApp *app, const char *reason,
+                                               const char *log_file_path);
+/* Poll the active package builder once per player-loop iteration, independent
+   of which view is currently visible. */
+void player_app_poll_package_build(PlayerApp *app, uint64_t current_time_ms);
+void player_app_cancel_package_build(PlayerApp *app);
+/* Per-build consent and progress state. Consent is never persisted. */
+bool player_app_prereq_begin(PlayerApp *app, int game_index,
+                             bool python_missing, bool toolchain_missing);
+void player_app_prereq_accept(PlayerApp *app, bool bootstrap_python);
+void player_app_prereq_update_progress(PlayerApp *app, const char *item,
+                                       uint64_t item_received,
+                                       uint64_t item_total,
+                                       uint64_t total_received,
+                                       uint64_t total_bytes);
+void player_app_prereq_complete(PlayerApp *app);
+void player_app_prereq_fail(PlayerApp *app, const char *code,
+                            const char *message);
+void player_app_prereq_retry(PlayerApp *app);
+void player_app_prereq_cancel(PlayerApp *app);
+void player_app_prereq_finish_cancel(PlayerApp *app);
+bool player_app_prereq_take_resume(PlayerApp *app);
+bool player_app_open_prerequisite_about(PlayerApp *app);
+/* Asks the main loop to open the downloaded tools' licence texts folder. Asks
+   nothing, and returns false, when the per-user data folder can't be found. */
+bool player_app_request_open_folder(PlayerApp *app, const char *path);
+bool player_app_request_license_folder(PlayerApp *app);
+/* Settings > Open data folder / Open logs (#2007): asks the main loop to show the
+   per-user data folder (kind NK_PATH_DATA) or the logs folder (NK_PATH_LOGS),
+   creating it first so there is something to show. When the folder can't be
+   resolved or created it raises the DATA_DIR_UNAVAILABLE card, returning to
+   Settings, and returns false. Other kinds are refused. */
+bool player_app_request_user_folder(PlayerApp *app, NkPathType kind);
+void player_app_remove_prerequisites(PlayerApp *app);
+
+/* Factory reset: the player goes back to a first run by
+ * moving its user data aside, never by deleting it. The folders that move are
+ * the config, data, cache and saves folders (library, settings, saves,
+ * imported PSP fonts, keys, built games and downloaded build tools), and the
+ * runtime root when one is set; a folder inside another one moves with it.
+ * Each is renamed in place to
+ * "<folder>-backup-<stamp>", so the move is a rename on the same disk and the
+ * user can move it back. Logs stay: the player is writing to them.
+ *
+ * player_factory_reset_folders lists the folders that would move (at most
+ * `cap`). player_app_factory_reset refuses while a game, a launch, a build or
+ * a tool download runs; otherwise it renames each folder, and when one rename
+ * fails it moves the earlier ones back and raises FACTORY_RESET_FAILED naming
+ * the folder. On success it sets factory_reset_done and should_quit. `stamp`
+ * is the backup suffix (YYYYMMDD-HHMMSS). */
+#define PLAYER_FACTORY_RESET_FOLDERS 5
+size_t player_app_factory_reset_folders(const PlayerApp *app, char out[][NK_MAX_PATH],
+                                        size_t cap);
+bool player_app_factory_reset(PlayerApp *app, const char *stamp);
+/* Settings > Build tools and cache: delete the shared library cache and say so. */
+void player_app_clear_shared_library_cache(PlayerApp *app);
+void player_app_set_build_error(
+    PlayerApp *app,
+    const char *failed_stage,
+    const char *boundary_text,
+    const char *log_file_path
+);
+
+
+/* Online and developer options. None of these opens a connection: they record
+   the user's choice for the online features docs/ONLINE_FEATURES.md plans. */
+void player_app_set_online_mode(PlayerApp *app, bool on);
+void player_app_toggle_online_feature(PlayerApp *app, int feature); /* 0 news, 1 reports */
+void player_app_toggle_update_check_at_start(PlayerApp *app);
+void player_app_set_developer_mode(PlayerApp *app, bool on);
+/* The wizard's options step: skipping keeps both switches off. */
+void player_app_wizard_skip_options(PlayerApp *app);
+
+/* Developer log. Adding is cheap and always on; the panel shows it only with
+   developer mode. */
+void player_dev_log_add(PlayerApp *app, const char *source, const char *fmt, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 3, 4)))
+#endif
+    ;
+size_t player_dev_log_count(const PlayerApp *app);
+const char *player_dev_log_line(const PlayerApp *app, size_t index); /* 0 = oldest */
+/* Replaces the profile path (both slash styles, case-insensitive) with
+   %USERPROFILE% and the user name, as a whole word, with <user>. profile or
+   user may be NULL or empty. Returns false when out was too small (out is
+   still terminated). */
+bool player_dev_log_redact(const char *in, const char *profile, const char *user,
+                           char *out, size_t out_size);
+/* The whole log as text, oldest first, one line per entry. */
+size_t player_dev_log_text(const PlayerApp *app, char *out, size_t out_size);
+/* Writes the log to developer-log.txt in the logs folder; notice says where,
+   redacted. */
+bool player_dev_log_save(PlayerApp *app);
+bool player_app_open_developer_log(PlayerApp *app);  /* false without developer mode */
+void player_app_close_developer_log(PlayerApp *app);
+
+#endif /* NAKAGAWA_PLAYER_STATE_H */
