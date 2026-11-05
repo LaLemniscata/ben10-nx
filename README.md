@@ -34,7 +34,8 @@ On Windows 10 or 11, with about 3 GB free and your own disc image (`.iso`) of th
 
 1. **[Download the installer](https://github.com/LaLemniscata/ben10-nx/releases/download/v1.0.1/Ben10-NX-Installer.zip)**
    and extract the ZIP.
-2. Double-click **Install Ben 10.bat** and choose your disc image.
+2. Double-click **Install Ben 10.exe** and choose your disc image. Windows may warn about a new, unsigned
+   program: choose "More info", then "Run anyway".
 3. The first time, it opens the page of devkitPro, the free Switch compiler. Download devkitProUpdater, run it with
    its suggested options, then go back to the installer.
 4. Wait while it builds the port: 5 to 30 minutes, depending on your computer.

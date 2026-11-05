@@ -4,7 +4,8 @@
 decryption tool, the fonts and the compiled shaders. Nothing in it comes from a game.
 
 usage: make_release.py <stage folder> --python-embed <python-*-embed-amd64.zip> --nk-decrypt <nk_decrypt.exe>
-                       --fonts <folder> --vfpu <folder> --shaders <folder of *.dksh.o>
+                       --launcher <launcher.exe> --fonts <folder> --vfpu <folder> --shaders <folder of *.dksh.o>
+                       --zip <output zip>
 Run from the root of the full project, which holds tools/.
 """
 import argparse
@@ -38,6 +39,8 @@ def main():
     parser.add_argument("stage", type=pathlib.Path)
     parser.add_argument("--python-embed", type=pathlib.Path, required=True)
     parser.add_argument("--nk-decrypt", type=pathlib.Path, required=True)
+    parser.add_argument("--launcher", type=pathlib.Path, required=True)
+    parser.add_argument("--zip", type=pathlib.Path, required=True)
     parser.add_argument("--fonts", type=pathlib.Path, required=True)
     parser.add_argument("--vfpu", type=pathlib.Path, required=True)
     parser.add_argument("--shaders", type=pathlib.Path, required=True)
@@ -53,8 +56,8 @@ def main():
     for path in (stage / "python").glob("*._pth"):
         path.unlink()
 
-    copy(root / "installer" / "Install Ben 10.bat", stage / "Install Ben 10.bat")
-    for name in ("install.py", "title.json", "sr_title_config.h"):
+    copy(args.launcher, stage / "Install Ben 10.exe")
+    for name in ("install.py", "title.json", "sr_title_config.h", "launcher.c"):
         copy(root / "installer" / name, stage / "installer" / name)
     copy(args.nk_decrypt, stage / "installer" / "nk_decrypt.exe")
     for path in args.shaders.glob("*.o"):
@@ -71,7 +74,11 @@ def main():
         if name and not any(part in SKIP for part in pathlib.PurePosixPath(name).parts):
             copy(root / name, stage / name)
     copy(root / "README.md", stage / "README.md")
-    print("staged", sum(1 for path in stage.rglob("*") if path.is_file()), "files")
+    files = sorted(path for path in stage.rglob("*") if path.is_file())
+    with zipfile.ZipFile(args.zip, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in files:
+            archive.write(path, path.relative_to(stage).as_posix())
+    print("staged", len(files), "files;", args.zip.stat().st_size, "bytes")
 
 
 if __name__ == "__main__":
