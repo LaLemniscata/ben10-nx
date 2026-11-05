@@ -1,0 +1,158 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ben 10: Protector of Earth for Nintendo Switch</title>
+<meta name="description" content="An unofficial fan port. Build it on your PC from your own copy of the game.">
+<link rel="icon" href="cover.png">
+<style>
+  :root {
+    --bg: #05100e; --panel: #0b1b18; --line: #1d3a33; --text: #e8f5ef; --muted: #9db8ae;
+    --accent: #3dffa0; --accent-ink: #03140d; --warn: #ffd479;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); line-height: 1.6;
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif;
+    background-image: radial-gradient(900px 520px at 50% -120px, #123f33 0%, transparent 70%);
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+  .lang { display: flex; justify-content: flex-end; gap: 8px; }
+  .lang button {
+    background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 6px;
+    padding: 4px 10px; font: inherit; font-size: 14px; cursor: pointer;
+  }
+  .lang button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+  .hero { text-align: center; padding: 16px 0 8px; }
+  .hero img { width: min(340px, 78vw); height: auto; border-radius: 16px; border: 1px solid var(--line); box-shadow: 0 0 60px #2bff9333; }
+  h1 { font-size: clamp(26px, 6vw, 38px); line-height: 1.15; margin: 24px 0 8px; }
+  h2 { font-size: 21px; margin: 40px 0 12px; }
+  .lead { color: var(--muted); font-size: 18px; margin: 0 auto 24px; max-width: 580px; }
+  .download {
+    display: inline-block; background: var(--accent); color: var(--accent-ink); font-weight: 700; font-size: 18px;
+    padding: 14px 28px; border-radius: 10px; text-decoration: none;
+  }
+  .download:hover, .download:focus-visible { background: #7dffc3; }
+  .note { color: var(--muted); font-size: 14px; margin-top: 10px; }
+  .test { border: 1px solid #5a4a22; background: #2a220f; color: var(--warn); border-radius: 10px; padding: 12px 16px; margin: 28px 0 0; }
+  ol.steps { list-style: none; counter-reset: step; padding: 0; margin: 0; }
+  ol.steps li {
+    counter-increment: step; position: relative; padding: 14px 16px 14px 60px; margin-bottom: 10px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  }
+  ol.steps li::before {
+    content: counter(step); position: absolute; left: 16px; top: 13px; width: 30px; height: 30px; border-radius: 50%;
+    background: #123f33; color: var(--accent); font-weight: 700; display: flex; align-items: center; justify-content: center;
+  }
+  ul.facts { padding-left: 20px; margin: 0; }
+  ul.facts li { margin-bottom: 6px; }
+  details { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; margin-bottom: 10px; }
+  summary { cursor: pointer; font-weight: 600; }
+  details p { margin: 10px 0 2px; color: var(--muted); }
+  a { color: var(--accent); }
+  code { background: #12302a; padding: 1px 6px; border-radius: 4px; font-size: 0.92em; overflow-wrap: anywhere; }
+  footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+  [data-lang="pt"] [lang="en"], [data-lang="en"] [lang="pt"] { display: none; }
+</style>
+</head>
+<body data-lang="en">
+<main>
+  <div class="lang" role="group" aria-label="Language / Idioma">
+    <button type="button" data-set="en" aria-pressed="true">English</button>
+    <button type="button" data-set="pt" aria-pressed="false">Português</button>
+  </div>
+
+  <section class="hero">
+    <img src="cover.png" width="1024" height="1024" alt="Fan-made cover art: the title over the Earth under an energy shield">
+    <h1>Ben 10: Protector of Earth<br>for Nintendo Switch</h1>
+    <p class="lead" lang="en">A native port of the PSP game, about 30 FPS at twice the original resolution. You build it on your own PC from your own copy of the game.</p>
+    <p class="lead" lang="pt">Um port nativo do jogo de PSP, a cerca de 30 FPS no dobro da resolução original. Você gera o port no seu PC, a partir da sua própria cópia do jogo.</p>
+    <a class="download" href="https://github.com/LaLemniscata/ben10-nx/releases/download/v1.0.1/Ben10-NX-Installer.zip">
+      <span lang="en">Download the installer</span><span lang="pt">Baixar o instalador</span>
+    </a>
+    <p class="note" lang="en">Windows 10 or 11 · 20 MB · no game files inside</p>
+    <p class="note" lang="pt">Windows 10 ou 11 · 20 MB · sem arquivos do jogo</p>
+  </section>
+
+  <p class="test" lang="en"><strong>Test release:</strong> the installer has not yet run from start to finish on a Windows PC, so a step may fail. Please report what happens.</p>
+  <p class="test" lang="pt"><strong>Versão de teste:</strong> o instalador ainda não rodou do início ao fim em um PC com Windows, então alguma etapa pode falhar. Conte o que acontecer.</p>
+
+  <h2><span lang="en">What you need</span><span lang="pt">O que você precisa</span></h2>
+  <ul class="facts" lang="en">
+    <li>A Switch running Atmosphère, with the Homebrew Menu.</li>
+    <li>Your own disc image (<code>.iso</code>) of the American edition, <code>ULUS10307</code>. The installer stops on any other copy.</li>
+    <li>A Windows 10 or 11 PC with about 3 GB free.</li>
+  </ul>
+  <ul class="facts" lang="pt">
+    <li>Um Switch com Atmosphère e o menu de homebrew.</li>
+    <li>Sua própria imagem do disco (<code>.iso</code>) da edição americana, <code>ULUS10307</code>. O instalador para em qualquer outra cópia.</li>
+    <li>Um PC com Windows 10 ou 11 e cerca de 3 GB livres.</li>
+  </ul>
+
+  <h2><span lang="en">How to install</span><span lang="pt">Como instalar</span></h2>
+  <ol class="steps" lang="en">
+    <li>Download the ZIP above and extract it to a new folder.</li>
+    <li>Double-click <strong>Install Ben 10.exe</strong> and choose your disc image.</li>
+    <li>The first time, it opens the page of devkitPro, the free Switch compiler. Download devkitProUpdater, run it with its suggested options, then go back to the installer.</li>
+    <li>Wait while it builds the port: 5 to 30 minutes, depending on your PC.</li>
+    <li>Type your SD card's drive letter to copy the files, or copy the <code>switch</code> folder from <code>output</code> to the root of the card.</li>
+    <li>On the Switch, hold <strong>R</strong> while starting any installed game, then open <strong>Ben 10: Protector of Earth</strong>.</li>
+  </ol>
+  <ol class="steps" lang="pt">
+    <li>Baixe o ZIP acima e extraia em uma pasta nova.</li>
+    <li>Clique duas vezes em <strong>Install Ben 10.exe</strong> e escolha a imagem do seu disco.</li>
+    <li>Na primeira vez, ele abre a página do devkitPro, o compilador gratuito do Switch. Baixe o devkitProUpdater, execute com as opções sugeridas e volte ao instalador.</li>
+    <li>Espere enquanto ele gera o port: de 5 a 30 minutos, conforme o seu PC.</li>
+    <li>Digite a letra do cartão para copiar os arquivos, ou copie a pasta <code>switch</code> de dentro de <code>output</code> para a raiz do cartão.</li>
+    <li>No Switch, segure <strong>R</strong> ao abrir qualquer jogo instalado e escolha <strong>Ben 10: Protector of Earth</strong>.</li>
+  </ol>
+
+  <h2><span lang="en">Good to know</span><span lang="pt">Bom saber</span></h2>
+  <details>
+    <summary><span lang="en">Why do I have to build it myself?</span><span lang="pt">Por que preciso gerar o port?</span></summary>
+    <p lang="en">Because the finished program contains code translated from the game, it is not published here. The installer makes it on your PC, only from your copy. Please do not share what it builds.</p>
+    <p lang="pt">Porque o programa pronto contém código traduzido do jogo, e por isso ele não é publicado aqui. O instalador o gera no seu PC, só a partir da sua cópia. Não compartilhe o resultado.</p>
+  </details>
+  <details>
+    <summary><span lang="en">Windows warned me about the program</span><span lang="pt">O Windows avisou sobre o programa</span></summary>
+    <p lang="en">The installer is new and unsigned, so SmartScreen may warn about it: "More info", then "Run anyway" continues. If you would rather check first, all of its <a href="https://github.com/LaLemniscata/ben10-nx">source code is public</a>. A "virus detected" message is different: do not turn off your antivirus, and please report it.</p>
+    <p lang="pt">O instalador é novo e não tem assinatura, então o SmartScreen pode avisar: "Mais informações" e depois "Executar assim mesmo" continua. Se preferir conferir antes, todo o <a href="https://github.com/LaLemniscata/ben10-nx">código-fonte é público</a>. Uma mensagem de "vírus detectado" é diferente: não desative o antivírus e relate o caso.</p>
+  </details>
+  <details>
+    <summary><span lang="en">How well does it run?</span><span lang="pt">Como ele roda?</span></summary>
+    <p lang="en">In handheld mode, about 30 FPS at twice the PSP's resolution, with short dips in the heaviest scenes. Saves, HOME and powering off and on work. Docked 1080p has not been verified yet, and only part of the game has been played.</p>
+    <p lang="pt">No portátil, cerca de 30 FPS no dobro da resolução do PSP, com quedas curtas nas cenas mais pesadas. Saves, HOME e desligar e ligar funcionam. O 1080p no dock ainda não foi verificado, e só parte do jogo foi jogada.</p>
+  </details>
+  <details>
+    <summary><span lang="en">Controls</span><span lang="pt">Controles</span></summary>
+    <p lang="en">The face buttons match the PSP by position: A is Circle, B is Cross, X is Triangle, Y is Square. L or ZL is L, R or ZR is R, + is Start and − is Select. Press + and − together to quit.</p>
+    <p lang="pt">Os botões seguem a posição do PSP: A é Círculo, B é Xis, X é Triângulo, Y é Quadrado. L ou ZL é L, R ou ZR é R, + é Start e − é Select. Aperte + e − juntos para sair.</p>
+  </details>
+
+  <footer>
+    <p lang="en">Unofficial, non-commercial fan project, with no affiliation with Cartoon Network, D3 Publisher, High Voltage Software or Nintendo. "Ben 10" is a trademark of its owners. The cover is original fan art. Nothing of the game is hosted here. Running homebrew requires custom firmware, which violates Nintendo's terms and can get a console banned.</p>
+    <p lang="pt">Projeto de fã, não oficial e sem fins comerciais, sem vínculo com Cartoon Network, D3 Publisher, High Voltage Software ou Nintendo. "Ben 10" é marca de seus donos. A capa é arte original de fã. Nada do jogo é hospedado aqui. Rodar homebrew exige firmware modificado, o que viola os termos da Nintendo e pode banir o console.</p>
+    <p><a href="https://github.com/LaLemniscata/ben10-nx">GitHub</a> · GPL-3.0-or-later · <span lang="en">built on</span><span lang="pt">feito com</span> <a href="https://github.com/Jstar269/nakagawa-recomp">Nakagawa Recomp</a> · LaLemniscata</p>
+  </footer>
+</main>
+<script>
+  function setLanguage(lang) {
+    document.body.dataset.lang = lang;
+    document.documentElement.lang = lang === 'pt' ? 'pt-BR' : 'en';
+    document.querySelectorAll('.lang button').forEach(function (button) {
+      button.setAttribute('aria-pressed', String(button.dataset.set === lang));
+    });
+    try { localStorage.setItem('lang', lang); } catch (error) { /* the page works without it */ }
+  }
+  var saved = null;
+  try { saved = localStorage.getItem('lang'); } catch (error) { /* the page works without it */ }
+  setLanguage(saved || (navigator.language.toLowerCase().indexOf('pt') === 0 ? 'pt' : 'en'));
+  document.querySelectorAll('.lang button').forEach(function (button) {
+    button.addEventListener('click', function () { setLanguage(button.dataset.set); });
+  });
+</script>
+</body>
+</html>
