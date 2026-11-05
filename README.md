@@ -26,25 +26,26 @@ a native renderer on deko3d, the Switch's own GPU API. It targets **30 FPS at tw
 - Saves, closing and reopening the game, the HOME button, and powering the console off and on all work.
 - Docked 1080p output is written but not yet verified on a console.
 - Only part of the game has been played on this build.
-- The installer is a test release: it has not yet run on a Windows PC from start to finish.
+- The installer has run on one Windows PC so far, and its build is still being tested on a console.
 
 ## How to install
 
 Follow the **[install page](https://lalemniscata.github.io/ben10-nx/)**. In short, on Windows 10 or 11, with about 3 GB
 free and your own disc image (`.iso`) of the game:
 
-1. **[Download the installer](https://github.com/LaLemniscata/ben10-nx/releases/download/v1.0.1/Ben10-NX-Installer.zip)**
+1. **[Download the installer](https://github.com/LaLemniscata/ben10-nx/releases/download/v1.1.0/Ben10-NX-Installer.zip)**
    and extract the ZIP.
-2. Double-click **Install Ben 10.exe** and choose your disc image. Windows may warn about a new, unsigned program:
-   choose "More info", then "Run anyway".
-3. The first time, it opens the page of devkitPro, the free Switch compiler. Download devkitProUpdater, run it with
-   its suggested options, then go back to the installer.
-4. Wait while it builds the port: 5 to 30 minutes, depending on your computer.
-5. Type your SD card's drive letter to copy the files, or copy the `switch` folder from `output` to the root of the card.
+2. Double-click **Install Ben 10.exe**. Windows may warn about a new, unsigned program: choose "More info", then
+   "Run anyway". A page opens in your browser, served only from your own computer.
+3. Choose your disc image and wait while it builds the port: 5 to 30 minutes, depending on your computer.
+4. Connect your SD card and click it to copy the files. You can also copy the `switch` folder from `output` to the root
+   of the card.
 
 Nothing of the game comes with the installer. It builds the port on your computer from your own disc image, and stops
-if the disc is not the supported edition. What it builds contains code from the game, so it is for your own console:
-please do not share it.
+if the disc is not the supported edition. The only thing it downloads is Arm's free compiler, the
+[Arm GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads), about 170 MB, which it checks by
+SHA-256 and deletes when it finishes. What it builds contains code from the game, so it is for your own console: please
+do not share it.
 
 On the Switch, hold **R** while starting any installed game, then open **Ben 10: Protector of Earth**. Starting from
 the Album has not been tested, and the CPU boost may not work there.
@@ -174,6 +175,7 @@ uses; the full project, with its tests, tools and documentation, is [upstream](h
 - **[Nakagawa Recomp](https://github.com/Jstar269/nakagawa-recomp)** — the recompiler and runtime this port is built on.
   Its notices are in [`NOTICE.md`](NOTICE.md) and [`CREDITS.md`](CREDITS.md).
 - **devkitPro and switchbrew** — devkitA64, libnx and deko3d.
+- **Arm** — the GNU Toolchain the installer compiles with.
 
 ## Legal
 

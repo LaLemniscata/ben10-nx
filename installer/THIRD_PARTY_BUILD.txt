@@ -1,0 +1,23 @@
+What comes prebuilt in installer/bundle, and where its source is.
+
+The port's runtime (bundle/lib/libruntime.a) is built from this project's repository at the tag of the
+release this package came from: https://github.com/LaLemniscata/ben10-nx. It is under GPL-3.0-or-later and
+includes FFmpeg subsets under LGPL-2.1-or-later; see LICENSE, NOTICE.md, CREDITS.md and THIRD_PARTY_LICENSES.
+Because the installer links it again on your computer, you can replace any of these objects and link again.
+
+The Switch libraries come from devkitPro packages. Their licence texts are in installer/licenses:
+- libnx (libnx.a, switch.ld), ISC licence: https://github.com/switchbrew/libnx
+- deko3d (libdeko3d.a), zlib licence: https://github.com/devkitPro/deko3d
+- newlib (libc.a, libm.a, libsysbase.a and the headers in bundle/include/sys), BSD-style licences:
+  https://github.com/devkitPro/newlib and https://github.com/devkitPro/libsysbase
+- libgcc and the C runtime objects (libgcc.a, crt*.o), GPL-3.0 with the GCC Runtime Library Exception:
+  https://github.com/devkitPro/gcc
+
+The ".nro" tool step is a port of elf2nro from switch-tools, ISC licence:
+https://github.com/switchbrew/switch-tools
+
+The compiler is not part of this package. The installer downloads the Arm GNU Toolchain, version 15.2.Rel1, from
+Arm's website and checks its SHA-256 before use. It deletes it when it finishes:
+https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads
+
+Python comes from python.org, under the PSF licence.
