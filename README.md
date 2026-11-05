@@ -1,40 +1,127 @@
-<p align="center"><img src="src/rt/switch/icon/cover-1024.png" width="320" alt="Fan-made cover art: the title over the Earth under an energy shield"></p>
+<div align=center>
 
-# Ben 10: Protector of Earth for Nintendo Switch
+<img src="src/rt/switch/icon/cover-1024.png" alt="Fan-made cover art: the title over the Earth under an energy shield" width="40%">
 
-An unofficial, non-commercial fan port of the PSP game *Ben 10: Protector of Earth* (ULUS10307) to
-Nintendo Switch homebrew on Atmosphère. The game's MIPS code is translated to C ahead of time and runs
-natively on the console, with a renderer written for its GPU.
+</div>
+<h1 align=center>Ben 10: Protector of Earth — Nintendo Switch port</h1>
 
-**This repository contains no game code or assets.** You need your own copy of the game. The C translated
-from it and the `.nro` built from it contain code from the game, so they are not part of this source tree.
+A native Nintendo Switch port of the PSP version of **Ben 10: Protector of Earth** (2007).
 
-The game, its name and its characters belong to their owners. This project is not affiliated with them
-or with Nintendo.
+It's not an emulator. The MIPS code of the game is statically recompiled to C with
+[Nakagawa Recomp](https://github.com/Jstar269/nakagawa-recomp) and compiled for the Switch, and the game is drawn by
+a native renderer on deko3d, the Switch's own GPU API. It targets **30 FPS at twice the PSP's resolution**.
+
+> [!NOTE]
+> You need your own copy of the PSP game: a disc image (`.iso`) of the edition below.
+
+## Supported editions
+
+| Game ID | Edition |
+|---|---|
+| `ULUS10307` | NTSC-U, version 1.01 |
 
 ## Status
 
-- Handheld: about 30 fps with internal rendering at twice the PSP's resolution.
-  Heavy scenes can dip for a moment.
+- Handheld: about 30 FPS, with short dips in the heaviest scenes.
 - Saves, closing and reopening the game, the HOME button, and powering the console off and on all work.
 - Docked 1080p output is written but not yet verified on a console.
 - Only part of the game has been played on this build.
 - The build steps below have not yet been followed from scratch on another machine.
 
-## What you need
+## How to install
 
-- A Switch running Atmosphère. Launch in title mode: hold R while starting an installed game. The
-  album's applet mode has too little memory and no CPU boost.
-- Your own disc image of the game (ULUS10307).
-- On a PC: [devkitPro](https://devkitpro.org/wiki/Getting_Started) with `switch-dev` and `deko3d`,
-  and the Windows setup in [`docs/SETUP.md`](docs/SETUP.md) to build the desktop player.
+Build the port (see [Build](#build)), then put these files in `sdmc:/switch/ben10-psp/`:
 
-## Building
+```
+/switch/ben10-psp/
+  ben10-psp.nro
+  game.iso                            (your own disc image, renamed)
+  experimental-ulus10307_image.bin    (from the game's package, made from your disc)
+  assets/                             (from this repository)
+  font/                               (from this repository)
+```
 
-1. Build the desktop player, add your disc image to its library, and let it build the game's package.
-   The package holds `experimental-ulus10307_image.bin` and the headers the port uses.
+Launch with a game override (hold **R** while starting an installed title). Album applet mode does not provide
+enough memory or the CPU boost.
 
-2. Translate the game again with register promotion, into a new private folder. The package's
+Saves go to `memstick/` in that folder, and the log to `log.txt`.
+
+## Controls
+
+The face buttons match the PSP by position.
+
+| Switch | PSP |
+|---|---|
+| A | Circle |
+| B | Cross |
+| X | Triangle |
+| Y | Square |
+| L / ZL | L |
+| R / ZR | R |
+| + | Start |
+| − | Select |
+| Left stick | Analog nub |
+| D-pad | D-pad |
+
+Press **+** and **−** together to quit.
+
+## Settings
+
+An empty file with one of these names, next to the NRO, changes how the game runs:
+
+| File | Effect |
+|---|---|
+| `scale1.txt`, `scale3.txt`, `scale4.txt` | Internal render scale instead of 2 |
+| `debug.txt` | Frame, GPU and save measurements in `log.txt` |
+| `profile.txt` | Samples where the CPU goes into `profile.bin` |
+| `noboost.txt` | Normal clocks instead of the CPU boost |
+| `nogethread.txt` | The GE on the game's core |
+| `notnl.txt` | Vertex processing on the CPU |
+| `software.txt` | The CPU renderer |
+
+## Resolution
+
+The game renders at 960x544, twice the PSP's 480x272, and is shown at 1280x720 in handheld mode and 1920x1080 docked.
+If the GPU falls behind for a few seconds in a row, the render scale steps down by itself and says so in the log.
+
+## Performance
+
+The port asks the system for its official CPU boost mode, not an overclock:
+
+| Mode | CPU | GPU |
+|---|---|---|
+| Handheld and docked | 1785 MHz | 76.8 MHz |
+
+Measured in about 17 minutes of handheld play, in 5-second samples: 186 of 203 between 28 and 31 FPS, 9 below 28, and
+a lowest sample of 22 FPS. GPU time was about 20 ms per frame.
+
+## How it works
+
+- **The game's code is translated, not emulated.** Nakagawa Recomp translates the game's program to C, which is then
+  compiled for the Switch. Its runtime gives the game what it expects from a PSP: its system, files, audio and
+  controllers. This port adds the Switch part: threads, files on the SD card, audio output, input and clocks.
+- **Its own renderer.** The GE's draws become deko3d commands, with mip levels and vertex processing on the GPU. The
+  states most pixels use run a short fragment shader, because the GPU is at its lowest clock in the boost mode.
+- **The GE on its own core.** As on a PSP, display lists run on a separate thread while the game goes on.
+- **Optimization.** Guest registers stay in local variables, floating-point operations skip the environment switch
+  when the game does not need it, and a sampling profiler can give the linker a function order.
+
+## Build
+
+You need devkitPro with `switch-dev` and `deko3d`, Python, and your own copy of the game. The translated C and the NRO
+contain code from the game, so they are not part of this source tree.
+
+1. Get the full project, which holds the translator and the desktop player that prepares the game's package:
+
+   ```bash
+   git clone https://github.com/Jstar269/nakagawa-recomp
+   cd nakagawa-recomp
+   git checkout 70b1d3f8
+   ```
+
+   Build the player as its `docs/SETUP.md` describes, add your disc image to its library, and let it build the package.
+
+2. In that clone, translate the game again with register promotion, into a new private folder. The package's
    `codegen_profile.json` lists the `--extra-elf` arguments in `EXTRA_ELF_ARGS`.
 
    ```bash
@@ -44,73 +131,50 @@ or with Nintendo.
 
    Then copy the package's `*.h` files that are not already in `<out>`.
 
-3. Build the port, from WSL or Linux:
+3. In this repository, from WSL or Linux:
 
    ```bash
    export DEVKITPRO=/opt/devkitpro
    make -f Makefile.switch -j6 PACKAGE_DIR=<out>
    ```
 
-   `Makefile.switch` has no header dependencies: after changing a header or a flag, remove
-   `build_switch/src` and `build_switch/gen` first.
+   `Makefile.switch` has no header dependencies: after changing a header or a flag, remove `build_switch/src` and
+   `build_switch/gen` first.
 
-## Installing
+| Folder | Contents |
+|---|---|
+| `src/rt/switch/` | The port: entry point, renderer and shaders, GE thread, audio, input, file calls, profiler, cover art |
+| `src/rt/`, `src/core/` | The parts of Nakagawa Recomp's runtime the port uses |
+| `assets/`, `font/` | Runtime tables and open replacement fonts |
 
-Put these files in `sdmc:/switch/ben10-psp/`:
+## Changes to Nakagawa Recomp
 
-| File | Comes from |
-| --- | --- |
-| `ben10-psp.nro` | the build above |
-| `game.iso` | your own disc image, renamed |
-| `experimental-ulus10307_image.bin` | the package |
-| `assets/`, `font/` | the package |
-
-Saves go to `memstick/` in that folder, and the log to `log.txt`.
-
-## Controls
-
-The face buttons match the PSP by position. L and ZL are the PSP's L, R and ZR its R, + is START and
-− is SELECT. Press + and − together to quit.
-
-## Switches
-
-An empty file with one of these names in the game's folder changes how it runs:
-
-| File | Effect |
-| --- | --- |
-| `scale1.txt`, `scale3.txt`, `scale4.txt` | Internal render scale instead of 2. The scale also lowers itself if the GPU falls behind. |
-| `debug.txt` | Frame, GPU and save measurements in `log.txt` |
-| `profile.txt` | Samples where the CPU goes into `profile.bin` |
-| `noboost.txt` | Normal clocks instead of the CPU boost |
-| `nogethread.txt` | The GE on the game's core |
-| `notnl.txt` | Vertex processing on the CPU |
-| `software.txt` | The CPU renderer |
-
-## What this adds
-
-This work is based on [Nakagawa Recomp](https://github.com/Jstar269/nakagawa-recomp) at commit
-`70b1d3f8`, under GPL-3.0-or-later, and stays under that licence. Its notices and credits are kept:
-see [`NOTICE.md`](NOTICE.md) and [`CREDITS.md`](CREDITS.md). As the GPL requires, these are the changes,
-made in November 2026.
-
-**New:** `Makefile.switch`, this file, and `src/rt/switch/`: entry point, SDL3 subset over libnx, pad and
-presenter, audio over audout, POSIX calls newlib lacks, deko3d renderer and shaders, a worker thread for
-the GE, a sampling profiler, and the cover art in `src/rt/switch/icon/`.
-
-**Modified:**
+Based on commit `70b1d3f8`, with changes made in November 2026. This repository keeps only the files the Switch build
+uses; the full project, with its tests, tools and documentation, is [upstream](https://github.com/Jstar269/nakagawa-recomp).
 
 | File | Change |
-| --- | --- |
-| `README.md` | This page; the original is now [`README.nakagawa.md`](README.nakagawa.md) |
+|---|---|
 | `src/rt/hle_kernel_sync.c` | First-come semaphore hand-off, which fixes a starved audio thread at a loading screen |
 | `src/rt/fp_convert.h` | On the Switch, guest float operations in round-to-nearest skip the FP environment switch |
 | `src/rt/recomp.h` | On the Switch, a cheaper time-slice count and no store-watch check |
 | `src/rt/sched.c` | A longer time slice on the Switch |
 | `src/rt/sr_coro.c` | Main stack bounds on the Switch |
-| `src/rt/ge.c`, `src/rt/hle.c`, `src/rt/hle_ge.c`, `src/rt/hle_internal.h` | Display lists run on the GE worker thread |
+| `src/rt/ge.c`, `src/rt/hle.c`, `src/rt/hle_ge.c`, `src/rt/hle_internal.h` | Display lists run on the GE thread |
 
-The build links [libnx](https://github.com/switchbrew/libnx) and
-[deko3d](https://github.com/devkitPro/deko3d), which come with devkitPro and are not in this repository.
+## Credits
 
-The cover art is original and uses no art from the game. The name and the symbol it reinterprets belong
-to their owners.
+- **High Voltage Software and D3 Publisher** — creators of Ben 10: Protector of Earth. This is an unofficial, fan-made
+  port with no affiliation.
+- **[Nakagawa Recomp](https://github.com/Jstar269/nakagawa-recomp)** — the recompiler and runtime this port is built on.
+  Its notices are in [`NOTICE.md`](NOTICE.md) and [`CREDITS.md`](CREDITS.md).
+- **devkitPro and switchbrew** — devkitA64, libnx and deko3d.
+
+## Legal
+
+No affiliation with Cartoon Network, D3 Publisher or Nintendo. "Ben 10" is a trademark of its owners. This repository
+contains no assets or program code from the original game. Users must provide their own legally obtained copy. The
+cover art is original and uses no art from the game; the name and the symbol it reinterprets belong to their owners.
+Running homebrew requires custom firmware, which violates Nintendo's ToS and can get a console banned — your call.
+
+Source code is provided under the GPL-3.0-or-later license (see [`LICENSE`](LICENSE)), inherited from Nakagawa Recomp.
+Third-party code keeps its own licenses: see [`THIRD_PARTY_LICENSES`](THIRD_PARTY_LICENSES).

@@ -1,5 +1,0 @@
-# Ownership record. Ownership is recorded here, not enforced by code-owner
-# review; the required status checks enforce the publication boundary (see
-# docs/CI.md).
-
-*       @Jstar269

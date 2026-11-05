@@ -42,8 +42,8 @@ GEN_FLAGS := $(ARCH) -ffunction-sections -D__SWITCH__ -w -fno-strict-aliasing -f
              -I$(PACKAGE_DIR) -Isrc/rt/switch/sdl_shim -Isrc/rt -I$(DEVKITPRO)/libnx/include
 
 RT_SRCS   := $(shell tr -d '\r' < src/rt/switch/sources.txt) src/rt/ge.c
-ATRAC_SRCS := $(shell tr -d '\r' < CMakeLists.txt | grep -oE '^[[:space:]]*src/rt/atrac3p/[^ ]+\.c' | tr -d ' ' | sort -u)
-H264_SRCS := $(shell tr -d '\r' < CMakeLists.txt | grep -oE '^[[:space:]]*src/rt/h264_ffmpeg_sub/[^ ]+\.c' | tr -d ' ' | sort -u)
+ATRAC_SRCS := $(shell tr -d '\r' < src/rt/switch/sources_atrac.txt)
+H264_SRCS := $(shell tr -d '\r' < src/rt/switch/sources_h264.txt)
 GEN_SRCS  := $(wildcard $(PACKAGE_DIR)/$(TITLE)_recomp.c $(PACKAGE_DIR)/$(TITLE)_recomp_*.c $(PACKAGE_DIR)/nk_lib_*.c)
 
 RT_OBJS    := $(addprefix $(BUILD)/,$(RT_SRCS:.c=.o))

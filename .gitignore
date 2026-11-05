@@ -221,3 +221,7 @@ keys.dat
 /android/gradlew.bat
 /android/gradle/wrapper/gradle-wrapper.jar
 /android/.kotlin/
+
+# The Switch build: it contains code from your game.
+build_switch/
+*.nro

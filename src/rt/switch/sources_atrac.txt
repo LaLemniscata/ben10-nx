@@ -1,0 +1,16 @@
+src/rt/atrac3p/atrac3p_api.c
+src/rt/atrac3p/libavcodec/atrac.c
+src/rt/atrac3p/libavcodec/atrac3.c
+src/rt/atrac3p/libavcodec/atrac3plus.c
+src/rt/atrac3p/libavcodec/atrac3plusdec.c
+src/rt/atrac3p/libavcodec/atrac3plusdsp.c
+src/rt/atrac3p/libavcodec/bitstream.c
+src/rt/atrac3p/libavcodec/fft_float.c
+src/rt/atrac3p/libavcodec/fft_init_table.c
+src/rt/atrac3p/libavcodec/mdct_float.c
+src/rt/atrac3p/libavcodec/sinewin.c
+src/rt/atrac3p/libavutil/float_dsp.c
+src/rt/atrac3p/libavutil/intmath.c
+src/rt/atrac3p/libavutil/log2_tab.c
+src/rt/atrac3p/libavutil/mem.c
+src/rt/atrac3p/libavutil/reverse.c
