@@ -135,7 +135,6 @@ contain code from the game, so they are not part of this source tree.
 |---|---|
 | `src/rt/switch/` | The port: entry point, renderer and shaders, GE thread, audio, input, file calls, profiler, cover art |
 | `src/rt/`, `src/core/` | The parts of Nakagawa Recomp's runtime the port uses |
-| `installer/` | The installer and the script that packs its release |
 | `assets/vfpu/` | Runtime tables for the PSP's vector unit |
 
 ## Changes to Nakagawa Recomp
