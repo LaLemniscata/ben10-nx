@@ -26,25 +26,29 @@ a native renderer on deko3d, the Switch's own GPU API. It targets **30 FPS at tw
 - Saves, closing and reopening the game, the HOME button, and powering the console off and on all work.
 - Docked 1080p output is written but not yet verified on a console.
 - Only part of the game has been played on this build.
-- The build steps below have not yet been followed from scratch on another machine.
+- The installer is new: it has not yet run on a Windows PC from start to finish.
 
 ## How to install
 
-Build the port (see [Build](#build)), then put these files in `sdmc:/switch/ben10-psp/`:
+On Windows 10 or 11, with about 3 GB free and your own disc image (`.iso`) of the game:
 
-```
-/switch/ben10-psp/
-  ben10-psp.nro
-  game.iso                            (your own disc image, renamed)
-  experimental-ulus10307_image.bin    (from the game's package, made from your disc)
-  assets/                             (from the game's package)
-  font/                               (from the game's package: open replacement fonts)
-```
+1. **[Download the installer](https://github.com/LaLemniscata/ben10-nx/releases/download/v1.0.1/Ben10-NX-Installer.zip)**
+   and extract the ZIP.
+2. Double-click **Install Ben 10.bat** and choose your disc image.
+3. The first time, it opens the page of devkitPro, the free Switch compiler. Download devkitProUpdater, run it with
+   its suggested options, then go back to the installer.
+4. Wait while it builds the port: 5 to 30 minutes, depending on your computer.
+5. When it finishes, type your SD card's drive letter to copy the files, or copy the `switch` folder from `output` to
+   the root of the card yourself.
 
-Launch with a game override (hold **R** while starting an installed title). Album applet mode does not provide
-enough memory or the CPU boost.
+On the Switch, hold **R** while starting any installed game, then open **Ben 10: Protector of Earth**. Starting from
+the Album has not been tested, and the CPU boost may not work there.
 
-Saves go to `memstick/` in that folder, and the log to `log.txt`.
+Nothing of the game comes with the installer. It reads your disc image and builds everything on your computer, and it
+stops if the disc is not the supported edition. What it builds contains code from the game, so it is for your own
+console: please do not share it. To update, download the new installer and run it again; your saves stay on the card.
+
+Saves go to `memstick/` in the game's folder, and the log to `log.txt`.
 
 ## Controls
 
@@ -106,10 +110,11 @@ a lowest sample of 22 FPS. GPU time was about 20 ms per frame.
 - **Optimization.** Guest registers stay in local variables, floating-point operations skip the environment switch
   when the game does not need it, and a sampling profiler can give the linker a function order.
 
-## Build
+## Build by hand
 
-You need devkitPro with `switch-dev` and `deko3d`, Python, and your own copy of the game. The translated C and the NRO
-contain code from the game, so they are not part of this source tree.
+The installer does all of this. These steps are for working on the port itself. You need devkitPro with `switch-dev`
+and `deko3d`, Python, and your own copy of the game. The translated C and the NRO contain code from the game, so they
+are not part of this source tree.
 
 1. Get the full project, which holds the translator and the desktop player that prepares the game's package:
 
@@ -145,6 +150,7 @@ contain code from the game, so they are not part of this source tree.
 |---|---|
 | `src/rt/switch/` | The port: entry point, renderer and shaders, GE thread, audio, input, file calls, profiler, cover art |
 | `src/rt/`, `src/core/` | The parts of Nakagawa Recomp's runtime the port uses |
+| `installer/` | The installer and the script that packs its release |
 | `assets/vfpu/` | Runtime tables for the PSP's vector unit |
 
 ## Changes to Nakagawa Recomp
