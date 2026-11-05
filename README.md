@@ -26,10 +26,25 @@ a native renderer on deko3d, the Switch's own GPU API. It targets **30 FPS at tw
 - Saves, closing and reopening the game, the HOME button, and powering the console off and on all work.
 - Docked 1080p output is written but not yet verified on a console.
 - Only part of the game has been played on this build.
+- The installer is a test release: it has not yet run on a Windows PC from start to finish.
 
 ## How to install
 
-(NULO)
+Follow the **[install page](https://lalemniscata.github.io/ben10-nx/)**. In short, on Windows 10 or 11, with about 3 GB
+free and your own disc image (`.iso`) of the game:
+
+1. **[Download the installer](https://github.com/LaLemniscata/ben10-nx/releases/download/v1.0.1/Ben10-NX-Installer.zip)**
+   and extract the ZIP.
+2. Double-click **Install Ben 10.exe** and choose your disc image. Windows may warn about a new, unsigned program:
+   choose "More info", then "Run anyway".
+3. The first time, it opens the page of devkitPro, the free Switch compiler. Download devkitProUpdater, run it with
+   its suggested options, then go back to the installer.
+4. Wait while it builds the port: 5 to 30 minutes, depending on your computer.
+5. Type your SD card's drive letter to copy the files, or copy the `switch` folder from `output` to the root of the card.
+
+Nothing of the game comes with the installer. It builds the port on your computer from your own disc image, and stops
+if the disc is not the supported edition. What it builds contains code from the game, so it is for your own console:
+please do not share it.
 
 On the Switch, hold **R** while starting any installed game, then open **Ben 10: Protector of Earth**. Starting from
 the Album has not been tested, and the CPU boost may not work there.
@@ -135,6 +150,7 @@ contain code from the game, so they are not part of this source tree.
 |---|---|
 | `src/rt/switch/` | The port: entry point, renderer and shaders, GE thread, audio, input, file calls, profiler, cover art |
 | `src/rt/`, `src/core/` | The parts of Nakagawa Recomp's runtime the port uses |
+| `installer/` | The installer and the script that packs its release |
 | `assets/vfpu/` | Runtime tables for the PSP's vector unit |
 
 ## Changes to Nakagawa Recomp
@@ -161,8 +177,9 @@ uses; the full project, with its tests, tools and documentation, is [upstream](h
 
 ## Legal
 
-No affiliation with Cartoon Network, D3 Publisher or Nintendo. "Ben 10" is a trademark of its owners. This source
-tree contains no assets or program code from the original game. (NULO) Users must provide their own legally obtained copy. The
+No affiliation with Cartoon Network, D3 Publisher or Nintendo. "Ben 10" is a trademark of its owners. This repository
+and its releases contain no assets or program code from the original game. Users must provide their own legally
+obtained copy, and the installer builds the port from it on their own computer. The
 cover art is original and uses no art from the game; the name and the symbol it reinterprets belong to their owners.
 Running homebrew requires custom firmware, which violates Nintendo's ToS and can get a console banned — your call.
 
