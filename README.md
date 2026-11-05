@@ -37,8 +37,8 @@ Build the port (see [Build](#build)), then put these files in `sdmc:/switch/ben1
   ben10-psp.nro
   game.iso                            (your own disc image, renamed)
   experimental-ulus10307_image.bin    (from the game's package, made from your disc)
-  assets/                             (from this repository)
-  font/                               (from this repository)
+  assets/                             (from the game's package)
+  font/                               (from the game's package: open replacement fonts)
 ```
 
 Launch with a game override (hold **R** while starting an installed title). Album applet mode does not provide
@@ -145,7 +145,7 @@ contain code from the game, so they are not part of this source tree.
 |---|---|
 | `src/rt/switch/` | The port: entry point, renderer and shaders, GE thread, audio, input, file calls, profiler, cover art |
 | `src/rt/`, `src/core/` | The parts of Nakagawa Recomp's runtime the port uses |
-| `assets/`, `font/` | Runtime tables and open replacement fonts |
+| `assets/vfpu/` | Runtime tables for the PSP's vector unit |
 
 ## Changes to Nakagawa Recomp
 
