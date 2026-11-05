@@ -126,10 +126,10 @@
       <div>
         <span class="pill">Beta</span>
         <h1><span lang="en">Ben 10: Protector of Earth on your Nintendo Switch</span><span lang="pt">Ben 10: Protector of Earth no seu Nintendo Switch</span></h1>
-        <p class="lead" lang="en">A native, open source port of the PSP game, at about 30 FPS and twice the original resolution. Choose your own copy of the game, and your PC builds the port and puts it on your SD card.</p>
-        <p class="lead" lang="pt">Um port nativo e de código aberto do jogo de PSP, a cerca de 30 FPS e no dobro da resolução original. Escolha a sua cópia do jogo, e o seu PC gera o port e coloca no cartão SD.</p>
-        <a class="button" href="https://github.com/LaLemniscata/ben10-nx/releases/download/v1.1.0/Ben10-NX-Installer.zip"><span lang="en">Download for Windows</span><span lang="pt">Baixar para Windows</span></a>
-        <span class="under"><span lang="en">Windows 10 or 11 · 27 MB · version 1.1.0</span><span lang="pt">Windows 10 ou 11 · 27 MB · versão 1.1.0</span></span>
+        <p class="lead" lang="en">A native, open source port of the PSP game, at about 30 FPS and twice the original resolution. You need the game's .iso file: the installer uses it to build the port on your PC and copy it to your SD card.</p>
+        <p class="lead" lang="pt">Um port nativo e de código aberto do jogo de PSP, a cerca de 30 FPS e no dobro da resolução original. Você precisa do arquivo .iso do jogo: o instalador usa esse arquivo para gerar o port no seu PC e copiar para o cartão SD.</p>
+        <a class="button" href="https://github.com/LaLemniscata/ben10-nx/releases/download/v1.1.1/Ben10-NX-Installer.zip"><span lang="en">Download for Windows</span><span lang="pt">Baixar para Windows</span></a>
+        <span class="under"><span lang="en">Windows 10 or 11 · 27 MB · version 1.1.1</span><span lang="pt">Windows 10 ou 11 · 27 MB · versão 1.1.1</span></span>
       </div>
       <img class="cover" src="cover.png" width="1024" height="1024" alt="Fan-made cover art: the title over the Earth under an energy shield">
     </section>
@@ -146,14 +146,14 @@
       <p class="sub" lang="en">No command line, and nothing else to install.</p>
       <p class="sub" lang="pt">Sem linha de comando e sem mais nada para instalar.</p>
       <ol class="steps" lang="en">
-        <li><strong>Download and extract</strong><p>Extract the ZIP to a new folder and open <code>Install Ben 10</code>.</p></li>
-        <li><strong>Choose your copy</strong><p>Pick your disc image (<code>.iso</code>) of the American edition, <code>ULUS10307</code>, and wait 5 to 30 minutes.</p></li>
-        <li><strong>Copy and play</strong><p>Connect your SD card and click it. On the Switch, hold R while starting any installed game and open Ben 10.</p></li>
+        <li><strong>Download the installer</strong><p>Right-click the ZIP, choose Extract All, and open <code>Install Ben 10</code> in the extracted folder. If Windows warns you, click More info, then Run anyway.</p></li>
+        <li><strong>Choose the game file</strong><p>A page opens in your browser. Click Choose the .iso file, select Ben 10 for PSP, American version (code <code>ULUS10307</code>), and click Build the port. It takes 5 to 30 minutes.</p></li>
+        <li><strong>Copy and play</strong><p>Put the Switch's SD card in your PC and click it on the page. Then, on the Switch, hold R while starting any installed game and choose Ben 10.</p></li>
       </ol>
       <ol class="steps" lang="pt">
-        <li><strong>Baixe e extraia</strong><p>Extraia o ZIP em uma pasta nova e abra o <code>Install Ben 10</code>.</p></li>
-        <li><strong>Escolha sua cópia</strong><p>Selecione a imagem do seu disco (<code>.iso</code>) da edição americana, <code>ULUS10307</code>, e espere de 5 a 30 minutos.</p></li>
-        <li><strong>Copie e jogue</strong><p>Conecte o cartão SD e clique nele. No Switch, segure R ao abrir qualquer jogo instalado e escolha Ben 10.</p></li>
+        <li><strong>Baixe o instalador</strong><p>Clique com o botão direito no ZIP, escolha Extrair tudo e abra o <code>Install Ben 10</code> na pasta extraída. Se o Windows avisar, clique em Mais informações e em Executar assim mesmo.</p></li>
+        <li><strong>Escolha o arquivo do jogo</strong><p>Uma página abre no navegador. Clique em Escolher o arquivo .iso, selecione o Ben 10 de PSP, versão americana (código <code>ULUS10307</code>), e clique em Gerar o port. Leva de 5 a 30 minutos.</p></li>
+        <li><strong>Copie e jogue</strong><p>Coloque o cartão SD do Switch no PC e clique nele na página. Depois, no Switch, segure R ao abrir qualquer jogo instalado e escolha Ben 10.</p></li>
       </ol>
     </section>
 
@@ -161,8 +161,8 @@
       <div class="split">
         <div>
           <h2><span lang="en">What it does on your PC</span><span lang="pt">O que ele faz no seu PC</span></h2>
-          <p class="sub" lang="en">The installer opens as a page in your browser, served only from your own computer.</p>
-          <p class="sub" lang="pt">O instalador abre como uma página no navegador, servida apenas pelo seu computador.</p>
+          <p class="sub" lang="en">The installer's page runs only on your computer, which is why its address starts with 127.0.0.1. To share the port, send people the link to this site.</p>
+          <p class="sub" lang="pt">A página do instalador roda só no seu computador, por isso o endereço começa com 127.0.0.1. Para divulgar o port, envie o link deste site.</p>
           <ul class="plain" lang="en">
             <li><strong>Checks your disc.</strong> It stops on any copy other than the supported one.</li>
             <li><strong>Downloads a compiler.</strong> Arm's free GNU Toolchain, about 170 MB, from Arm's website, checked by SHA-256.</li>
@@ -200,8 +200,8 @@
       <h2><span lang="en">Questions</span><span lang="pt">Dúvidas</span></h2>
       <details>
         <summary><span lang="en">What do I need?</span><span lang="pt">O que eu preciso ter?</span></summary>
-        <p lang="en">A Switch running Atmosphère with the Homebrew Menu; your own disc image (<code>.iso</code>) of the American edition, <code>ULUS10307</code>; and a Windows 10 or 11 PC with about 3 GB free and an internet connection for the first download.</p>
-        <p lang="pt">Um Switch com Atmosphère e o menu de homebrew; a sua própria imagem do disco (<code>.iso</code>) da edição americana, <code>ULUS10307</code>; e um PC com Windows 10 ou 11, cerca de 3 GB livres e internet para o primeiro download.</p>
+        <p lang="en">A Switch running Atmosphère with the Homebrew Menu; the <code>.iso</code> file of your own copy of the game, American version (code <code>ULUS10307</code>), which this project does not provide; and a Windows 10 or 11 PC with about 3 GB free and internet access.</p>
+        <p lang="pt">Um Switch com Atmosphère e o menu de homebrew; o arquivo <code>.iso</code> da sua própria cópia do jogo, versão americana (código <code>ULUS10307</code>), que este projeto não fornece; e um PC com Windows 10 ou 11, cerca de 3 GB livres e internet.</p>
       </details>
       <details>
         <summary><span lang="en">Why isn't there a ready-made file to download?</span><span lang="pt">Por que não há um arquivo pronto para baixar?</span></summary>
@@ -227,7 +227,7 @@
   </main>
 
   <footer>
-    <p><strong>SHA-256</strong> <code>1935366aa5a9fbe2aa2c2bf59049fcb985c05a055ae81848d4492c781ef941df</code></p>
+    <p><strong>SHA-256</strong> <code>5cc2afc7e3ef84ad316ef3d86165fea963c212682d3ef5d97a901cb7fc8f0c1b</code></p>
     <p lang="en">Unofficial, non-commercial fan project, with no affiliation with Cartoon Network, D3 Publisher, High Voltage Software or Nintendo. "Ben 10" is a trademark of its owners. The cover is original fan art. Nothing of the game is hosted here. Running homebrew requires custom firmware, which violates Nintendo's terms and can get a console banned.</p>
     <p lang="pt">Projeto de fã, não oficial e sem fins comerciais, sem vínculo com Cartoon Network, D3 Publisher, High Voltage Software ou Nintendo. "Ben 10" é marca de seus donos. A capa é arte original de fã. Nada do jogo é hospedado aqui. Rodar homebrew exige firmware modificado, o que viola os termos da Nintendo e pode banir o console.</p>
     <p><a href="https://github.com/LaLemniscata/ben10-nx">GitHub</a> · GPL-3.0-or-later · <span lang="en">built on</span><span lang="pt">feito com</span> <a href="https://github.com/Jstar269/nakagawa-recomp">Nakagawa Recomp</a> · LaLemniscata</p>
