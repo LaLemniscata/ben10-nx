@@ -128,8 +128,8 @@
         <h1><span lang="en">Ben 10: Protector of Earth on your Nintendo Switch</span><span lang="pt">Ben 10: Protector of Earth no seu Nintendo Switch</span></h1>
         <p class="lead" lang="en">A native, open source port of the PSP game, at about 30 FPS and twice the original resolution. You need the game's .iso file: the installer uses it to build the port on your PC and copy it to your SD card.</p>
         <p class="lead" lang="pt">Um port nativo e de código aberto do jogo de PSP, a cerca de 30 FPS e no dobro da resolução original. Você precisa do arquivo .iso do jogo: o instalador usa esse arquivo para gerar o port no seu PC e copiar para o cartão SD.</p>
-        <a class="button" href="https://github.com/LaLemniscata/ben10-nx/releases/download/v1.1.2/Ben10-NX-Installer.zip"><span lang="en">Download for Windows</span><span lang="pt">Baixar para Windows</span></a>
-        <span class="under"><span lang="en">Windows 10 or 11 · 27 MB · version 1.1.2</span><span lang="pt">Windows 10 ou 11 · 27 MB · versão 1.1.2</span></span>
+        <a class="button" href="https://github.com/LaLemniscata/ben10-nx/releases/download/v1.1.3/Ben10-NX-Installer.zip"><span lang="en">Download for Windows</span><span lang="pt">Baixar para Windows</span></a>
+        <span class="under"><span lang="en">Windows 10 or 11 · 27 MB · version 1.1.3</span><span lang="pt">Windows 10 ou 11 · 27 MB · versão 1.1.3</span></span>
       </div>
       <img class="cover" src="cover.png" width="1024" height="1024" alt="Fan-made cover art: the title over the Earth under an energy shield">
     </section>
@@ -227,7 +227,7 @@
   </main>
 
   <footer>
-    <p><strong>SHA-256</strong> <code>9990f298dc1fc8343830ea850d12e0acf7aae09240e0ff4d09b9e7b1b49a28ef</code></p>
+    <p><strong>SHA-256</strong> <code>124c9a84bc6cab407cdb3631e8a53be0b318c4f0fb86c3165d9de1e8e027eb8a</code></p>
     <p lang="en">Unofficial, non-commercial fan project, with no affiliation with Cartoon Network, D3 Publisher, High Voltage Software or Nintendo. "Ben 10" is a trademark of its owners. The cover is original fan art. Nothing of the game is hosted here. Running homebrew requires custom firmware, which violates Nintendo's terms and can get a console banned.</p>
     <p lang="pt">Projeto de fã, não oficial e sem fins comerciais, sem vínculo com Cartoon Network, D3 Publisher, High Voltage Software ou Nintendo. "Ben 10" é marca de seus donos. A capa é arte original de fã. Nada do jogo é hospedado aqui. Rodar homebrew exige firmware modificado, o que viola os termos da Nintendo e pode banir o console.</p>
     <p><a href="https://github.com/LaLemniscata/ben10-nx">GitHub</a> · GPL-3.0-or-later · <span lang="en">built on</span><span lang="pt">feito com</span> <a href="https://github.com/Jstar269/nakagawa-recomp">Nakagawa Recomp</a> · LaLemniscata</p>
@@ -244,7 +244,7 @@
   }
   var saved = null;
   try { saved = localStorage.getItem('lang'); } catch (error) { /* the page works without it */ }
-  setLanguage(saved || (navigator.language.toLowerCase().indexOf('pt') === 0 ? 'pt' : 'en'));
+  setLanguage(saved || 'en');
   document.querySelectorAll('.lang button').forEach(function (button) {
     button.addEventListener('click', function () { setLanguage(button.dataset.set); });
   });
