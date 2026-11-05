@@ -72,6 +72,11 @@
     </div>
   </header>
 
+  <section id="closed" hidden>
+    <h2 data-t="closed_title"></h2>
+    <p data-t="closed_text"></p>
+  </section>
+
   <section id="welcome" hidden>
     <h2 data-t="welcome_title"></h2>
     <p data-t="welcome_text"></p>
@@ -125,18 +130,20 @@
 const TEXT = {
   en: {
     subtitle: 'Port for Nintendo Switch',
-    welcome_title: 'Choose your copy of the game',
-    welcome_text: 'Pick your own disc image (.iso) of the American edition, ULUS10307. The port is built from it, here on this computer.',
-    welcome_note: 'Nothing is uploaded. It downloads one thing: Arm\'s free compiler, about 170 MB.',
-    pick: 'Choose disc image', pick_other: 'Choose another', start: 'Build the port',
+    closed_title: 'The installer is closed',
+    closed_text: 'This page has stopped working. Open Install Ben 10 again to continue, and you can close this tab.',
+    welcome_title: 'Choose the game file',
+    welcome_text: 'Select the .iso file of Ben 10: Protector of Earth for PSP, American version (code ULUS10307). You need to have this file on your PC.',
+    welcome_note: 'This page runs only on your computer, which is why its address starts with 127.0.0.1. Your game is not sent anywhere. The program downloads one thing: Arm\'s free compiler, about 170 MB.',
+    pick: 'Choose the .iso file', pick_other: 'Choose another', start: 'Build the port',
     working_title: 'Building your port',
     working_text: 'This takes 5 to 30 minutes, and the computer will be busy. You can leave this page open and do something else.',
     s_compiler: 'Getting the compiler', s_decrypt: 'Reading the game from your disc', s_translate: 'Translating the game',
     s_compile: 'Compiling for the Switch', s_link: 'Making the Switch program', s_ready: 'Preparing your files',
     failed_title: 'The build stopped', retry: 'Try again', log: 'Open the log',
     done_title: 'Your port is ready',
-    done_text: 'Connect your SD card and choose it below to copy everything. Your saves are kept.',
-    no_card: 'No SD card found. Connect it and it appears here, or copy the "switch" folder from the output folder to the root of the card.',
+    done_text: 'Put the Switch\'s SD card in your PC and click it below to copy everything. Your saves are kept.',
+    no_card: 'No SD card found. Put the card in your PC and it appears here in a few seconds. If it doesn\'t, open the output folder and copy the "switch" folder to the card.',
     folder: 'Open the output folder', copying: 'Copying to the card...', free: 'free', switch_card: 'Switch card',
     copied_title: 'Copied. Now, on the Switch:',
     copied_text: 'Hold R while starting any installed game, then open Ben 10: Protector of Earth. To quit, press + and − together.',
@@ -144,18 +151,20 @@ const TEXT = {
   },
   pt: {
     subtitle: 'Port para Nintendo Switch',
-    welcome_title: 'Escolha sua cópia do jogo',
-    welcome_text: 'Selecione a sua própria imagem do disco (.iso) da edição americana, ULUS10307. O port é gerado a partir dela, aqui neste computador.',
-    welcome_note: 'Nada é enviado para a internet. Ele só baixa uma coisa: o compilador gratuito da Arm, de cerca de 170 MB.',
-    pick: 'Escolher imagem do disco', pick_other: 'Escolher outra', start: 'Gerar o port',
+    closed_title: 'O instalador está fechado',
+    closed_text: 'Esta página parou de funcionar. Abra o Install Ben 10 de novo para continuar. Esta aba pode ser fechada.',
+    welcome_title: 'Escolha o arquivo do jogo',
+    welcome_text: 'Selecione o arquivo .iso do Ben 10: Protector of Earth de PSP, versão americana (código ULUS10307). Você precisa ter esse arquivo no seu PC.',
+    welcome_note: 'Esta página roda só no seu computador, por isso o endereço começa com 127.0.0.1. Seu jogo não é enviado para lugar nenhum. O programa só baixa uma coisa: o compilador gratuito da Arm, de cerca de 170 MB.',
+    pick: 'Escolher o arquivo .iso', pick_other: 'Escolher outro', start: 'Gerar o port',
     working_title: 'Gerando o seu port',
     working_text: 'Isso leva de 5 a 30 minutos, e o computador vai ficar ocupado. Pode deixar esta página aberta e fazer outra coisa.',
     s_compiler: 'Obtendo o compilador', s_decrypt: 'Lendo o jogo do seu disco', s_translate: 'Traduzindo o jogo',
     s_compile: 'Compilando para o Switch', s_link: 'Gerando o programa do Switch', s_ready: 'Preparando os arquivos',
     failed_title: 'A geração parou', retry: 'Tentar de novo', log: 'Abrir o log',
     done_title: 'Seu port está pronto',
-    done_text: 'Conecte o cartão e escolha abaixo para copiar tudo. Seus saves são mantidos.',
-    no_card: 'Nenhum cartão encontrado. Conecte e ele aparece aqui, ou copie a pasta "switch" da pasta de saída para a raiz do cartão.',
+    done_text: 'Coloque o cartão SD do Switch no PC e clique nele abaixo para copiar tudo. Seus saves são mantidos.',
+    no_card: 'Nenhum cartão encontrado. Coloque o cartão no PC e ele aparece aqui em alguns segundos. Se não aparecer, abra a pasta de saída e copie a pasta "switch" para o cartão.',
     folder: 'Abrir a pasta de saída', copying: 'Copiando para o cartão...', free: 'livres', switch_card: 'Cartão do Switch',
     copied_title: 'Copiado. Agora, no Switch:',
     copied_text: 'Segure R ao abrir qualquer jogo instalado e escolha Ben 10: Protector of Earth. Para sair, aperte + e − juntos.',
@@ -240,12 +249,25 @@ function render(state) {
   }
 }
 
+let missedPolls = 0;
+
+function showClosed() {
+  ['welcome', 'working', 'failed', 'done'].forEach(id => { $(id).hidden = true; });
+  $('closed').hidden = false;
+}
+
 async function poll() {
   try {
     const reply = await fetch(`/state?t=${token}`);
-    render(await reply.json());
+    if (!reply.ok) throw new Error(String(reply.status));
+    const state = await reply.json();
+    missedPolls = 0;
+    $('closed').hidden = true;
+    render(state);
   } catch (error) {
-    /* the program has ended or is busy: the next poll decides */
+    // One miss can be a busy computer; several mean this page has lost its program.
+    missedPolls += 1;
+    if (missedPolls >= 4) showClosed();
   }
   setTimeout(poll, 800);
 }
