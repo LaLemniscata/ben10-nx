@@ -93,11 +93,16 @@ If the GPU falls behind for a few seconds in a row, the render scale steps down 
 
 ## Performance
 
-The port asks the system for its official CPU boost mode, not an overclock:
+The port asks the system for its official CPU boost mode, not an overclock. It trades GPU speed for CPU speed,
+because translated PSP code is limited by the CPU. Clocks read back on a console with a test build:
 
-| Mode | CPU | GPU |
-|---|---|---|
-| Handheld and docked | 1785 MHz | 76.8 MHz |
+| Mode | CPU | GPU | Memory |
+|---|---|---|---|
+| Handheld | 1785 MHz | 76.8 MHz | 1331.2 MHz |
+| Docked | not yet measured | | |
+
+In handheld, one of six 30-second readings showed the CPU at 1020 MHz, as the system can reset the clocks for a
+moment; the port asks for boost mode again when that happens.
 
 Measured in about 17 minutes of handheld play, in 5-second samples: 186 of 203 between 28 and 31 FPS, 9 below 28, and
 a lowest sample of 22 FPS. GPU time was about 20 ms per frame.
