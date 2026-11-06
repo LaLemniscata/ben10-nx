@@ -68,6 +68,7 @@ ERRORS = {
         "download": "The compiler could not be downloaded from Arm's website. Check your internet connection and try again.",
         "disk": "There is not enough free space on this drive. The installer needs about 4 GB.",
         "receive": "The file could not be read. Try choosing it again.",
+        "already_open": "The installer is already open, maybe from another folder. Close its browser tab, wait a minute and open it again.",
         "step": "This step failed. The details are in the log.",
         "sd_space": "The card does not have enough free space: {needed} MB are needed.",
         "sd_write": "The files could not be copied to the card. Check that it is connected and not locked.",
@@ -79,6 +80,7 @@ ERRORS = {
         "download": "Não foi possível baixar o compilador do site da Arm. Confira sua internet e tente de novo.",
         "disk": "Não há espaço livre suficiente nesta unidade. O instalador precisa de cerca de 4 GB.",
         "receive": "Não foi possível ler o arquivo. Tente escolher de novo.",
+        "already_open": "O instalador já está aberto, talvez de outra pasta. Feche a aba dele no navegador, espere um minuto e abra de novo.",
         "step": "Esta etapa falhou. Os detalhes estão no log.",
         "sd_space": "O cartão não tem espaço livre suficiente: são necessários {needed} MB.",
         "sd_write": "Não foi possível copiar os arquivos para o cartão. Confira se ele está conectado e destravado.",
@@ -704,39 +706,82 @@ class Page(http.server.BaseHTTPRequestHandler):
             STATE.set(lang=LANG)
         elif url.path == "/folder" and snapshot["screen"] == "done":
             os.startfile(OUTPUT)
+        elif url.path == "/handover":
+            busy = snapshot["screen"] == "working" or snapshot["copy_state"] == "copying"
+            if not busy:
+                HANDED_OVER.set()
+            self._send(json.dumps({"busy": busy}).encode("ascii"))
+            return
         elif url.path == "/log":
             if (WORK / "install.log").exists():
                 os.startfile(WORK / "install.log")
         self._send(b"{}")
 
 
+def shared_token_file():
+    """Where the running copy leaves its page's token, the same for every folder the ZIP was extracted to."""
+    base = Path(os.environ.get("LOCALAPPDATA") or Path.home())
+    return base / "Ben10-NX" / "window.token"
+
+
+def ask_running_copy(token, path):
+    try:
+        request = urllib.request.Request(f"http://127.0.0.1:{UI_PORT}{path}?t={token}", data=b"", method="POST")
+        with urllib.request.urlopen(request, timeout=5) as reply:
+            return json.loads(reply.read() or b"{}")
+    except (OSError, ValueError):
+        return None
+
+
+def tell_user(text):
+    if os.name == "nt":
+        ctypes.windll.user32.MessageBoxW(None, text, "Ben 10: Protector of Earth", 0x40)
+
+
 def run_window(keep_work):
-    token_file = WORK / "window.token"
+    token_file = shared_token_file()
+    token_file.parent.mkdir(parents=True, exist_ok=True)
     WORK.mkdir(parents=True, exist_ok=True)
     # On Windows, address reuse would let a second copy bind the same port instead of finding the first.
     http.server.ThreadingHTTPServer.allow_reuse_address = False
-    try:
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", UI_PORT), Page)
-    except OSError:
-        # Already running: bring its page back.
-        if token_file.exists():
-            webbrowser.open(f"http://127.0.0.1:{UI_PORT}/?t={token_file.read_text(encoding='ascii').strip()}")
-        return
+    server = None
+    for attempt in range(2):
+        try:
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", UI_PORT), Page)
+            break
+        except OSError:
+            # Another copy is open, maybe from another folder. An idle one hands over to this one; a busy one
+            # keeps going and its page comes back.
+            token = token_file.read_text(encoding="ascii").strip() if token_file.exists() else ""
+            answer = ask_running_copy(token, "/handover") if token else None
+            if answer and answer.get("busy"):
+                webbrowser.open(f"http://127.0.0.1:{UI_PORT}/?t={token}")
+                return
+            if answer is None or attempt:
+                tell_user(ERRORS[LANG]["already_open"])
+                return
+            time.sleep(2)
     Page.token = secrets.token_urlsafe(24)
     Page.keep_work = keep_work
     token_file.write_text(Page.token, encoding="ascii")
     threading.Thread(target=server.serve_forever, daemon=True).start()
     webbrowser.open(f"http://127.0.0.1:{UI_PORT}/?t={Page.token}")
-    # The program ends once the page has been closed for a while and nothing is running.
-    while True:
-        time.sleep(5)
+    # The program ends once the page has been closed for a while and nothing is running, or when a newer
+    # copy takes over.
+    while not HANDED_OVER.is_set():
+        HANDED_OVER.wait(5)
         with STATE.lock:
             idle = time.monotonic() - STATE.last_seen
             busy = STATE.fields["screen"] == "working" or STATE.fields["copy_state"] == "copying"
         if idle > IDLE_EXIT_SECONDS and not busy:
             break
-    token_file.unlink(missing_ok=True)
+    if token_file.exists() and token_file.read_text(encoding="ascii").strip() == Page.token:
+        token_file.unlink(missing_ok=True)
     server.shutdown()
+    server.server_close()
+
+
+HANDED_OVER = threading.Event()
 
 
 def main():
